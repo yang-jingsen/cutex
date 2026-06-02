@@ -22,7 +22,7 @@ use url::Url;
 use uuid::Uuid;
 
 const STORE_VERSION: u32 = 3;
-const CODEZ_BUILD: &str = "2026-06-02-ubuntu-desktop-notify-v55";
+const CODEZ_BUILD: &str = "2026-06-02-api-key-provider-v57";
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -2095,7 +2095,7 @@ fn build_copied_profile_config(
         })?;
         ensure_model_provider_name(provider_table, &target_provider);
         if source_account.source.as_deref() == Some("api-key") {
-            ensure_model_provider_uses_profile_auth(provider_table);
+            ensure_model_provider_uses_api_key_env(provider_table);
         }
         provider_table.insert("base_url".to_string(), toml::Value::String(base_url));
     } else {
@@ -2146,7 +2146,7 @@ fn normalize_profile_config_for_account(
                 .and_then(|value| value.as_table_mut())
             {
                 ensure_model_provider_name(provider_table, &provider_name);
-                ensure_model_provider_uses_profile_auth(provider_table);
+                ensure_model_provider_uses_api_key_env(provider_table);
             }
         }
     }
@@ -2213,10 +2213,14 @@ fn ensure_model_provider_name(provider_table: &mut Table, provider_name: &str) {
     }
 }
 
-fn ensure_model_provider_uses_profile_auth(provider_table: &mut Table) {
+fn ensure_model_provider_uses_api_key_env(provider_table: &mut Table) {
+    provider_table.insert(
+        "env_key".to_string(),
+        toml::Value::String("OPENAI_API_KEY".to_string()),
+    );
     provider_table.insert(
         "requires_openai_auth".to_string(),
-        toml::Value::Boolean(true),
+        toml::Value::Boolean(false),
     );
 }
 
@@ -3227,7 +3231,8 @@ fn codex_api_key_config_toml(provider: &str, base_url: Option<&str>) -> String {
         config_lines.push(format!("\n[model_providers.{}]", provider));
         config_lines.push(format!("name = \"{}\"", provider));
         config_lines.push(format!("base_url = \"{}\"", url));
-        config_lines.push("requires_openai_auth = true".to_string());
+        config_lines.push("env_key = \"OPENAI_API_KEY\"".to_string());
+        config_lines.push("requires_openai_auth = false".to_string());
     }
     config_lines.join("\n") + "\n"
 }
@@ -6730,9 +6735,10 @@ fn codex_launch_command(
             files.auth_path.to_string_lossy().as_ref(),
             files.config_path.to_string_lossy().as_ref(),
             files.custom_status_items_path.to_string_lossy().as_ref(),
+            Some(&files.auth_path),
         )),
         RuntimeConfig::Docker { image, .. } => {
-            docker_codex_launch_command(account, image, codex_args)
+            docker_codex_launch_command(account, image, codex_args, &files.auth_path)
         }
     }
 }
@@ -6741,6 +6747,7 @@ fn docker_codex_launch_command(
     account: &StoredAccount,
     image: &str,
     codex_args: &[String],
+    host_auth_path: &Path,
 ) -> anyhow::Result<LaunchCommand> {
     let cwd = std::env::current_dir().context("Failed to determine current directory")?;
     let user_name = docker_user_name(match &account.runtime {
@@ -6772,6 +6779,7 @@ fn docker_codex_launch_command(
         &container_auth_path,
         &container_config_path,
         &container_custom_status_items_path,
+        Some(host_auth_path),
     );
     let mut launch = docker_command();
 
@@ -6828,12 +6836,17 @@ fn codex_launch_envs(
     auth_path: &str,
     config_path: &str,
     custom_status_items_path: &str,
+    api_key_auth_path: Option<&Path>,
 ) -> Vec<(String, String)> {
     let mut envs = match account.cli_kind {
         CliKind::Claude => claude_launch_envs(account),
-        CliKind::Codex => {
-            codex_specific_launch_envs(account, auth_path, config_path, custom_status_items_path)
-        }
+        CliKind::Codex => codex_specific_launch_envs(
+            account,
+            auth_path,
+            config_path,
+            custom_status_items_path,
+            api_key_auth_path,
+        ),
     };
 
     let global_config = load_codez_config();
@@ -6987,6 +7000,7 @@ fn codex_specific_launch_envs(
     auth_path: &str,
     config_path: &str,
     custom_status_items_path: &str,
+    api_key_auth_path: Option<&Path>,
 ) -> Vec<(String, String)> {
     let global_config = load_codez_config();
     let mut envs = vec![
@@ -7027,11 +7041,27 @@ fn codex_specific_launch_envs(
     if let Some(install_dir) = codex_install_dir_for_host_launch(account) {
         envs.push((CODEX_INSTALL_DIR_ENV_VAR.to_string(), install_dir));
     }
+    if account.source.as_deref() == Some("api-key") {
+        if let Some(api_key) = api_key_auth_path.and_then(codex_api_key_from_auth_file) {
+            envs.push(("OPENAI_API_KEY".to_string(), api_key));
+        }
+    }
     envs.extend(proxy_envs(
         effective_proxy_config(account, &global_config),
         Some(&account.runtime),
     ));
     envs
+}
+
+fn codex_api_key_from_auth_file(path: &Path) -> Option<String> {
+    let raw = fs::read_to_string(path).ok()?;
+    let json: Value = serde_json::from_str(&raw).ok()?;
+    json.get("OPENAI_API_KEY")
+        .or_else(|| json.get("openai_api_key"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn apply_codex_launch_envs(
@@ -7040,9 +7070,15 @@ fn apply_codex_launch_envs(
     auth_path: &str,
     config_path: &str,
     custom_status_items_path: &str,
+    api_key_auth_path: Option<&Path>,
 ) -> LaunchCommand {
-    for (key, value) in codex_launch_envs(account, auth_path, config_path, custom_status_items_path)
-    {
+    for (key, value) in codex_launch_envs(
+        account,
+        auth_path,
+        config_path,
+        custom_status_items_path,
+        api_key_auth_path,
+    ) {
         launch = launch.env(key, value);
     }
     launch
@@ -8949,6 +8985,138 @@ status_line = ["launch-profile", "current-dir"]
     }
 
     #[test]
+    fn host_api_key_launch_exports_openai_api_key_from_profile_auth() {
+        let _guard = env_lock().lock().expect("env lock should not be poisoned");
+        let temp_home = std::env::temp_dir().join(format!("cutex-home-{}", Uuid::new_v4()));
+        let old_home = std::env::var_os("HOME");
+        let old_cutex_codex_bin = std::env::var_os(CUTEX_CODEX_BIN_ENV_VAR);
+        let old_codez_codex_bin = std::env::var_os(CODEZ_CODEX_BIN_ENV_VAR);
+        fs::create_dir_all(temp_home.join(".cutex")).expect("temp cutex home should be created");
+        unsafe {
+            std::env::set_var("HOME", &temp_home);
+            std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, "/tmp/cute-codex");
+            std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR);
+        }
+
+        let mut account = sample_account("api-key-host");
+        account.source = Some("api-key".to_string());
+        write_profile_files(
+            &account,
+            r#"{ "openai_api_key": "sk-host-test", "tokens": null }"#,
+            Some(
+                r#"
+model_provider = "codexapis"
+
+[model_providers.codexapis]
+base_url = "https://www.codexapis.com/v1"
+env_key = "OPENAI_API_KEY"
+requires_openai_auth = false
+"#,
+            ),
+        )
+        .expect("profile files should be written");
+
+        let launch = codex_launch_command(&account, &[]).expect("launch should build");
+
+        assert!(launch
+            .envs
+            .iter()
+            .any(|(key, value)| key == "OPENAI_API_KEY" && value == "sk-host-test"));
+        let files = materialized_account_files(&account).expect("account files should resolve");
+        let config =
+            fs::read_to_string(&files.config_path).expect("profile config should be readable");
+        let table = parse_toml_table(&config).expect("profile config should parse");
+        let provider = table
+            .get("model_providers")
+            .and_then(|value| value.as_table())
+            .and_then(|providers| providers.get("codexapis"))
+            .and_then(|value| value.as_table())
+            .expect("codexapis provider should exist");
+        assert_eq!(
+            provider.get("env_key").and_then(|value| value.as_str()),
+            Some("OPENAI_API_KEY")
+        );
+        assert_eq!(
+            provider
+                .get("requires_openai_auth")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+
+        match old_home {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match old_cutex_codex_bin {
+            Some(value) => unsafe { std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, value) },
+            None => unsafe { std::env::remove_var(CUTEX_CODEX_BIN_ENV_VAR) },
+        }
+        match old_codez_codex_bin {
+            Some(value) => unsafe { std::env::set_var(CODEZ_CODEX_BIN_ENV_VAR, value) },
+            None => unsafe { std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR) },
+        }
+        let _ = fs::remove_dir_all(temp_home);
+    }
+
+    #[test]
+    fn docker_api_key_launch_exports_openai_api_key_from_profile_auth() {
+        let _guard = env_lock().lock().expect("env lock should not be poisoned");
+        let temp_home = std::env::temp_dir().join(format!("cutex-home-{}", Uuid::new_v4()));
+        let old_home = std::env::var_os("HOME");
+        let old_cutex_codex_bin = std::env::var_os(CUTEX_CODEX_BIN_ENV_VAR);
+        let old_codez_codex_bin = std::env::var_os(CODEZ_CODEX_BIN_ENV_VAR);
+        fs::create_dir_all(temp_home.join(".cutex")).expect("temp cutex home should be created");
+        unsafe {
+            std::env::set_var("HOME", &temp_home);
+            std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, "cute-codex");
+            std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR);
+        }
+
+        let mut account = sample_account("api-key-docker");
+        account.source = Some("api-key".to_string());
+        account.runtime = RuntimeConfig::Docker {
+            image: "cutex-dev-v2".to_string(),
+            user_name: Some("cutex".to_string()),
+        };
+        write_profile_files(
+            &account,
+            r#"{ "OPENAI_API_KEY": "sk-docker-test", "tokens": null }"#,
+            Some(
+                r#"
+model_provider = "codexapis"
+
+[model_providers.codexapis]
+base_url = "https://www.codexapis.com/v1"
+env_key = "OPENAI_API_KEY"
+requires_openai_auth = false
+"#,
+            ),
+        )
+        .expect("profile files should be written");
+
+        let launch = codex_launch_command(&account, &[]).expect("launch should build");
+
+        assert!(launch
+            .args
+            .windows(2)
+            .any(|args| { args[0] == "-e" && args[1] == "OPENAI_API_KEY=sk-docker-test" }));
+
+        match old_home {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match old_cutex_codex_bin {
+            Some(value) => unsafe { std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, value) },
+            None => unsafe { std::env::remove_var(CUTEX_CODEX_BIN_ENV_VAR) },
+        }
+        match old_codez_codex_bin {
+            Some(value) => unsafe { std::env::set_var(CODEZ_CODEX_BIN_ENV_VAR, value) },
+            None => unsafe { std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR) },
+        }
+        let _ = fs::remove_dir_all(temp_home);
+    }
+
+    #[test]
     fn managed_session_wraps_default_host_launch() {
         let _guard = env_lock().lock().expect("env lock should not be poisoned");
         let temp_home = std::env::temp_dir().join(format!("cutex-home-{}", Uuid::new_v4()));
@@ -9323,10 +9491,14 @@ base_url = "https://example.test/v1"
             Some("https://api.example.test/v1")
         );
         assert_eq!(
+            provider.get("env_key").and_then(|value| value.as_str()),
+            Some("OPENAI_API_KEY")
+        );
+        assert_eq!(
             provider
                 .get("requires_openai_auth")
                 .and_then(|value| value.as_bool()),
-            Some(true)
+            Some(false)
         );
     }
 
