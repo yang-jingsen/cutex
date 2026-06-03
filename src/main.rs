@@ -24,7 +24,7 @@ use url::Url;
 use uuid::Uuid;
 
 const STORE_VERSION: u32 = 3;
-const CODEZ_BUILD: &str = "2026-06-03-run-profile-isolated-v70";
+const CODEZ_BUILD: &str = "2026-06-04-agent-message-ui-v71";
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -5412,9 +5412,7 @@ fn handle_agent_bus_request(
                     "from": send_record.from,
                     "to": send_record.to,
                     "to_name": send_record.to_name,
-                    "toName": send_record.to_name,
                     "trigger_turn": send_record.trigger_turn,
-                    "triggerTurn": send_record.trigger_turn,
                     "queued": send_record.queued,
                     "deduplicated": outcome.deduplicated,
                 }),
