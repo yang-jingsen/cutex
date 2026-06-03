@@ -15,6 +15,8 @@ then starts the selected CLI with the right environment.
 - Shared local desktop notification bridge for Linux/Kubuntu.
 - Optional managed detachable sessions through `cute-alden`.
 - Per-profile `cute-codex` status-line configuration.
+- Opt-in agent-to-agent messaging: one `cute-codex` session can discover and
+  message another local `cutex --agent` session.
 
 ## Install
 
@@ -85,6 +87,39 @@ Set a global default profile:
 cutex global set --default-profile <profile>
 cutex global set --default-profile-direct-launch true
 ```
+
+## Agent Messaging
+
+`cutex` can run a shared local agent bus so multiple `cute-codex` sessions can
+talk to each other. This is opt-in per launch; plain `cutex` keeps the native
+solo behavior and does not expose agent tools to the model.
+
+Start a collaborating session:
+
+```sh
+cutex --agent
+cutex run <profile> --agent
+```
+
+List peers and send a message:
+
+```sh
+cutex agent list
+cutex agent send <agent-name-or-id> "please report status"
+```
+
+Normal sends wake the recipient so it can answer promptly. Use `--queue-only`
+only for FYI or heartbeat messages that should be delivered without starting a
+new turn:
+
+```sh
+cutex agent send <agent-name-or-id> "FYI: transfer is still running" --queue-only
+```
+
+In collaboration mode, patched `cute-codex` also exposes native model tools
+(`cutex_agent_list` and `cutex_agent_send`), so agents can message peers without
+shelling out. Incoming messages are shown in the target TUI history and are
+injected into model context once through mailbox delivery.
 
 ## Profiles
 

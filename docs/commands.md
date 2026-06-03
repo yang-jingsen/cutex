@@ -6,8 +6,11 @@ Current command surface:
 cutex
 cutex --quick
 cutex --host
+cutex --agent
+cutex --collab
 cutex -- <cli args...>
 cutex --host -- <cli args...>
+cutex --agent -- <cli args...>
 
 cutex wizard
 cutex config
@@ -31,6 +34,8 @@ cutex profile set <profile> --source <label> --plan <label> --email <label>
 cutex profile set <profile> --clear-source --clear-plan --clear-email
 cutex profile set <profile> --default-cli-args='--sandbox danger-full-access'
 cutex profile set <profile> --clear-default-cli-args
+cutex profile set <profile> --agent-name <agent-name>
+cutex profile set <profile> --clear-agent-name
 cutex profile set <profile> --host
 cutex profile set <profile> --docker-image <image> --docker-user-name <name>
 cutex profile set <profile> --proxy-url <url> --proxy-no-proxy <list> --proxy-force-http true
@@ -39,6 +44,8 @@ cutex profile set <profile> --proxy-inherit
 
 cutex run <profile>
 cutex run <profile> --host
+cutex run <profile> --agent
+cutex run <profile> --collab
 cutex run <profile> --docker-image <image> --docker-user-name <name>
 cutex run <profile> -- <cli args...>
 
@@ -64,6 +71,19 @@ cutex global set --notify-user-message-content none|preview|full
 cutex global set --notify-user-message-preview-chars <chars>
 cutex global set --rate-limit-threshold-warning-mode off|daily|always
 cutex global set --rate-limit-model-nudge-mode off|daily|always
+cutex global set --agent-bus-enable true
+cutex global set --agent-bus-port 24260
+cutex global set --agent-bus-token <token-or-dash>
+cutex global set --agent-message-prefix <template-or-dash>
+cutex global set --agent-message-suffix <template-or-dash>
+
+cutex agent list
+cutex agent send <agent-name-or-id> "message"
+cutex agent send <agent-name-or-id> "message" --queue-only
+cutex agent status
+cutex agent log
+cutex agent log --agent <agent-name-or-id> --limit 20
+cutex agent log --json
 
 cutex notify desktop status
 cutex notify desktop start
@@ -89,13 +109,20 @@ Runtime behavior:
 - plain `cutex` can launch directly into the configured fallback profile when `default-profile-direct-launch` is enabled
 - Selection order is `CUTEX_CODEX_BIN` / `CODEZ_CODEX_BIN`, then `cute-codex`, then `cutex-codex`, then `codex`.
 - `cutex` prints `CLI binary: ...` before each launch so fallback is obvious.
-- `cutex` also prints a launch summary (`profile/runtime/proxy/provider/api/tool_proxy`) before starting the selected CLI.
+- `cutex` also prints a launch summary (`profile/runtime/proxy/session/agent/provider/api/tool_proxy`) before starting the selected CLI.
+- `cutex run <profile>` starts that profile for this invocation only. It does not change the active profile and does not rewrite the shared active `CODEX_HOME/auth.json` or `config.toml`; use `cutex profile use <profile>` when you intentionally want to switch the active/default profile.
+- `cutex` launches with `agent=off` by default: no `CUTEX_AGENT_*` envs are injected, the session does not register/poll the agent bus, and cute-codex does not expose model-native agent tools.
+- `cutex --agent` / `cutex --collab` and `cutex run <profile> --agent` / `--collab` launch with `agent=collab`: host-side `cute-codex` registers on one shared local agent bus so peer agents can be discovered and messaged.
+- In collaboration mode, cute-codex also exposes model-native `cutex_agent_list` and `cutex_agent_send` tools, so agents can communicate without shelling out to `cutex agent send`.
+- agent display names come from the current thread name plus a cwd hash, for example `aria-it.124f234`; send to the plain thread name when it is unique, or the display name/full id when duplicated.
+- `cutex agent send` prints the message id, resolved target, and delivery mode. Normal sends use `trigger-turn` and wake the recipient; `--queue-only` is only for FYI/no-action messages that should wait for the recipient's next activity. The target TUI also inserts a visible history row for the received message, but the message is injected into model context only once through mailbox delivery.
+- `cutex agent log` reads `~/.cutex/runtime/agent-bus-audit.jsonl`, which records `sent` and non-empty `polled` events for local troubleshooting.
 - explicit `cutex session ...` / `cutex ss ...` commands manage live `cute-alden` sessions directly.
 - `cutex session list` prints `PID<TAB>NAME`, matching `cute-alden --list`.
 - `cutex runtime <profile> --host` rewrites the stored runtime for that profile.
 - `cutex runtime <profile> --docker-image <image> --docker-user-name <name>` rewrites the stored runtime for that profile.
 - `cutex profile set <profile> --host|--docker-image ...` is the unified runtime edit path.
-- `cutex --host` and `cutex run <profile> --host` only affect the current invocation.
+- `cutex --host`, `cutex run <profile> --host`, and the `--agent` / `--collab` flags only affect the current invocation.
 
 Profile display metadata:
 
@@ -105,7 +132,8 @@ Profile display metadata:
 - `cutex profile set <profile> ...` can update name/metadata/runtime/proxy in one command.
 - `cutex profile set <profile> --session-enable|--session-disable|--session-inherit` overrides the managed-session default for one profile.
 - `cutex profile set <profile> --default-cli-args='...'` stores per-profile startup args that are prepended to every launch of that profile.
-- Source/plan/email are display-only. Runtime/proxy/session/default-cli-args change launch behavior.
+- `cutex profile set <profile> --agent-name <name>` sets only the fallback agent label used before a thread has a name; `/rename` and resumed thread names win after session configuration.
+- Source/plan/email are display-only. Runtime/proxy/session/default-cli-args/fallback agent name change launch behavior.
 
 Unified profile workflow:
 
@@ -125,6 +153,7 @@ Codex argument passthrough:
 
 - Use `--` before Codex arguments in no-subcommand mode: `cutex -- --help`.
 - Use `--` before Codex arguments in explicit run mode: `cutex run <profile> -- --help`.
+- Use `cutex --agent -- <args>` or `cutex run <profile> --agent -- <args>` when the launched Codex session should participate in agent-to-agent messaging.
 
 Persistent config:
 
@@ -139,6 +168,8 @@ Persistent config:
   - `cutex global set --proxy-clear`
   - `cutex global set --notify-idle-timeout <seconds> --notify-composer-idle-timeout <seconds> --notify-approval-timeout <seconds>`
   - `cutex global set --notify-events <csv> --notify-user-message-content none|preview|full --notify-user-message-preview-chars <chars>`
+  - `cutex global set --agent-bus-enable true|false --agent-bus-port <24xxx> --agent-bus-token <token-or-dash>`
+  - `cutex global set --agent-message-prefix <template-or-dash> --agent-message-suffix <template-or-dash>`
 - `cutex wizard` opens the main interactive configuration wizard.
 - `cutex config` is an alias for `cutex wizard`; it does not take `set/show/edit` subcommands.
 - `cutex global edit` opens the global settings wizard. Use this wizard for fields that intentionally do not have a non-interactive setter, including external notify service URL/token.
@@ -152,7 +183,9 @@ Persistent config:
 - Managed `cute-alden` sessions keep the environment from the process that originally started them. After changing notify config or env overrides, start a fresh session before testing the new values.
 - `~/.cutex/config.json` also stores the reusable `custom_status_items` catalog for `cute-codex`.
 - `~/.cutex/config.json` can store a global proxy fallback used by profiles without an override.
-- Built-in default is `docker-use-sudo=false`, `session=disabled`, `default-profile-direct-launch=false`, and no proxy.
+- The shared agent bus service defaults to enabled on port `24260`; when `bridgeboard` is available it records handoff id `cutex-agent-bus`. Launches still opt into collaboration per invocation with `--agent` / `--collab`.
+- Delivered peer messages use the default prefix `[message from {from}] `. Prefix/suffix templates support `{from}` and `{to}` and can be cleared with `-`.
+- Built-in default is `docker-use-sudo=false`, `session=disabled`, `default-profile-direct-launch=false`, agent bus enabled, and no proxy.
 - `~/.cutex/accounts.json` is now a lightweight profile index (name/runtime/proxy/metadata/order only).
 - Per-profile auth/config live only in `~/.cutex/profiles/<account-id>/auth.json` and `config.toml`.
 - Existing v2 stores are migrated once to v3, with backup written to `~/.cutex/accounts.v2.backup.json`.

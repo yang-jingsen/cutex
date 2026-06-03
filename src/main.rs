@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
 use base64::Engine as _;
@@ -22,7 +24,7 @@ use url::Url;
 use uuid::Uuid;
 
 const STORE_VERSION: u32 = 3;
-const CODEZ_BUILD: &str = "2026-06-02-api-key-provider-v57";
+const CODEZ_BUILD: &str = "2026-06-03-run-profile-isolated-v70";
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -56,11 +58,20 @@ const CODEX_NOTIFY_USER_MESSAGE_PREVIEW_CHARS_ENV_VAR: &str =
 const CODEX_RATE_LIMIT_THRESHOLD_WARNING_MODE_ENV_VAR: &str =
     "CODEX_RATE_LIMIT_THRESHOLD_WARNING_MODE";
 const CODEX_RATE_LIMIT_MODEL_NUDGE_MODE_ENV_VAR: &str = "CODEX_RATE_LIMIT_MODEL_NUDGE_MODE";
+const CUTEX_AGENT_BUS_URL_ENV_VAR: &str = "CUTEX_AGENT_BUS_URL";
+const CUTEX_AGENT_BUS_TOKEN_ENV_VAR: &str = "CUTEX_AGENT_BUS_TOKEN";
+const CUTEX_AGENT_ID_ENV_VAR: &str = "CUTEX_AGENT_ID";
+const CUTEX_AGENT_NAME_ENV_VAR: &str = "CUTEX_AGENT_NAME";
+const CUTEX_AGENT_HINT_ENV_VAR: &str = "CUTEX_AGENT_HINT";
 const DOCKER_PROXY_HOST_ALIAS: &str = "host.docker.internal";
 const DEFAULT_NOTIFY_EVENTS: &str =
     "task_completed,thinking_too_long,waiting_approval,connection_error,session_exit,session_started,session_startup_idle,user_message_sent,user_message_dispatched,turn_started,turn_completed,turn_interrupted,turn_failed,approval_requested,approval_resolved,thread_closed,context_compacted,rate_limit_warning,rate_limit_prompt_shown";
 const DEFAULT_DESKTOP_NOTIFY_PORT: u16 = 24250;
 const DESKTOP_NOTIFY_BRIDGE_ID: &str = "cutex-desktop-notify";
+const DEFAULT_AGENT_BUS_PORT: u16 = 24260;
+const AGENT_BUS_BRIDGE_ID: &str = "cutex-agent-bus";
+const AGENT_BUS_DEDUPE_WINDOW_SECS: u64 = 30;
+const DEFAULT_AGENT_MESSAGE_PREFIX_TEMPLATE: &str = "[message from {from}] ";
 
 /// cutex - profile launcher for cute-codex
 #[derive(Parser, Debug)]
@@ -84,6 +95,10 @@ struct Cli {
     /// Force this invocation to run the selected CLI on the host, even for Docker profiles.
     #[arg(long = "host")]
     host: bool,
+
+    /// Enable cutex inter-agent collaboration for this launch.
+    #[arg(long = "agent", visible_alias = "collab")]
+    agent: bool,
 
     /// When no subcommand is provided, any remaining arguments are
     /// passed through to the selected CLI invocation.
@@ -115,6 +130,9 @@ enum CommandKind {
         /// Force this invocation to run the selected CLI on the host.
         #[arg(long = "host", conflicts_with = "docker_image")]
         host: bool,
+        /// Enable cutex inter-agent collaboration for this launch.
+        #[arg(long = "agent", visible_alias = "collab")]
+        agent: bool,
         /// Override the Docker image only for this invocation.
         #[arg(long, value_name = "IMAGE")]
         docker_image: Option<String>,
@@ -258,6 +276,12 @@ enum CommandKind {
         command: NotifyCommand,
     },
 
+    /// List and message cutex-launched agents
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
+
     /// Open the main interactive configuration wizard
     #[command(visible_alias = "config")]
     Wizard,
@@ -332,6 +356,21 @@ enum GlobalCommand {
         /// Set model nudge reminder mode: off, daily, always
         #[arg(long = "rate-limit-model-nudge-mode", value_name = "MODE")]
         rate_limit_model_nudge_mode: Option<String>,
+        /// Enable or disable the local inter-agent message bus
+        #[arg(long = "agent-bus-enable", value_name = "BOOL")]
+        agent_bus_enable: Option<bool>,
+        /// Fixed local port for the inter-agent message bus
+        #[arg(long = "agent-bus-port", value_name = "PORT")]
+        agent_bus_port: Option<u16>,
+        /// Shared token for the inter-agent message bus; pass '-' to clear
+        #[arg(long = "agent-bus-token", value_name = "TOKEN")]
+        agent_bus_token: Option<String>,
+        /// Prefix template applied to delivered agent messages; use {from}/{to}
+        #[arg(long = "agent-message-prefix", value_name = "TEMPLATE")]
+        agent_message_prefix: Option<String>,
+        /// Suffix template applied to delivered agent messages; use {from}/{to}
+        #[arg(long = "agent-message-suffix", value_name = "TEMPLATE")]
+        agent_message_suffix: Option<String>,
     },
 }
 
@@ -395,6 +434,53 @@ enum SessionCommand {
         /// Session name
         #[arg(long)]
         name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AgentCommand {
+    /// List currently registered cutex agents
+    List,
+
+    /// Send a message to another cutex agent
+    Send {
+        /// Target agent id or unique agent name
+        target: String,
+        /// Message to deliver
+        message: String,
+        /// Do not wake the target immediately; queue for its next turn
+        #[arg(long = "queue-only")]
+        queue_only: bool,
+        /// Override the sender label
+        #[arg(long)]
+        from: Option<String>,
+    },
+
+    /// Show agent bus config and health
+    Status,
+
+    /// Show recent local agent-bus audit events
+    Log {
+        /// Only show records related to this agent id/name
+        #[arg(long)]
+        agent: Option<String>,
+        /// Maximum records to print
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Print raw JSONL records
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Run the shared agent bus in the foreground
+    #[command(hide = true)]
+    Serve {
+        /// Port to bind on 127.0.0.1
+        #[arg(long)]
+        port: Option<u16>,
+        /// Bearer token accepted by the bus
+        #[arg(long)]
+        token: Option<String>,
     },
 }
 
@@ -557,6 +643,12 @@ enum ProfileCommand {
         /// Clear the stored default CLI args for this profile
         #[arg(long = "clear-default-cli-args", conflicts_with = "default_cli_args")]
         clear_default_cli_args: bool,
+        /// Name exposed through `cutex agent list`
+        #[arg(long = "agent-name", conflicts_with = "clear_agent_name")]
+        agent_name: Option<String>,
+        /// Clear the stored agent name and use the profile name
+        #[arg(long = "clear-agent-name", conflicts_with = "agent_name")]
+        clear_agent_name: bool,
         /// Run this profile on the host
         #[arg(long = "host", conflicts_with = "docker_image")]
         host: bool,
@@ -674,6 +766,8 @@ struct StoredAccount {
     cli_kind: CliKind,
     #[serde(default)]
     default_cli_args: Vec<String>,
+    #[serde(default)]
+    agent_name: Option<String>,
     last_used_at: Option<DateTime<Utc>>,
 }
 
@@ -786,6 +880,16 @@ struct CodezConfig {
     desktop_notify_port: Option<u16>,
     #[serde(default)]
     desktop_notify_token: Option<String>,
+    #[serde(default = "default_true")]
+    agent_bus_enabled: bool,
+    #[serde(default)]
+    agent_bus_port: Option<u16>,
+    #[serde(default)]
+    agent_bus_token: Option<String>,
+    #[serde(default = "default_agent_message_prefix_template")]
+    agent_message_prefix_template: Option<String>,
+    #[serde(default)]
+    agent_message_suffix_template: Option<String>,
 }
 
 impl Default for CodezConfig {
@@ -811,8 +915,17 @@ impl Default for CodezConfig {
             desktop_notify_enabled: false,
             desktop_notify_port: None,
             desktop_notify_token: None,
+            agent_bus_enabled: true,
+            agent_bus_port: None,
+            agent_bus_token: None,
+            agent_message_prefix_template: default_agent_message_prefix_template(),
+            agent_message_suffix_template: None,
         }
     }
+}
+
+fn default_agent_message_prefix_template() -> Option<String> {
+    Some(DEFAULT_AGENT_MESSAGE_PREFIX_TEMPLATE.to_string())
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -1010,6 +1123,7 @@ fn real_main() -> anyhow::Result<()> {
         Some(CommandKind::Run {
             profile,
             host,
+            agent,
             docker_image,
             docker_user_name,
             codex_args,
@@ -1019,6 +1133,7 @@ fn real_main() -> anyhow::Result<()> {
                 &profile,
                 codex_args,
                 cli.host || host,
+                cli.agent || agent,
                 docker_image,
                 docker_user_name,
             )?
@@ -1081,10 +1196,11 @@ fn real_main() -> anyhow::Result<()> {
         Some(CommandKind::Proxy { command }) => cmd_proxy(command)?,
         Some(CommandKind::Session { command }) => cmd_session(command)?,
         Some(CommandKind::Notify { command }) => cmd_notify(command)?,
+        Some(CommandKind::Agent { command }) => cmd_agent(command)?,
         Some(CommandKind::Wizard) => cmd_wizard()?,
         None => {
             print_cutex_build();
-            cmd_quick_run(cli.codex_args, cli.quick, cli.host)?
+            cmd_quick_run(cli.codex_args, cli.quick, cli.host, cli.agent)?
         }
     }
 
@@ -1300,6 +1416,7 @@ fn migrate_legacy_store_v2_to_v3(
             session: legacy_account.session,
             cli_kind: CliKind::Codex,
             default_cli_args: Vec::new(),
+            agent_name: None,
             last_used_at: legacy_account.last_used_at,
         };
 
@@ -1463,7 +1580,7 @@ fn cmd_wizard() -> anyhow::Result<()> {
         };
 
         match choice {
-            1 => return cmd_quick_run(Vec::new(), true, false),
+            1 => return cmd_quick_run(Vec::new(), true, false, false),
             2 => cmd_profile_list()?,
             3 => cmd_profile_show(None)?,
             4 => cmd_profile_edit(None)?,
@@ -1669,6 +1786,8 @@ fn cmd_profile(command: ProfileCommand) -> anyhow::Result<()> {
             clear_email,
             default_cli_args,
             clear_default_cli_args,
+            agent_name,
+            clear_agent_name,
             host,
             docker_image,
             docker_user_name,
@@ -1691,6 +1810,8 @@ fn cmd_profile(command: ProfileCommand) -> anyhow::Result<()> {
             clear_email,
             default_cli_args,
             clear_default_cli_args,
+            agent_name,
+            clear_agent_name,
             host,
             docker_image,
             docker_user_name,
@@ -1833,6 +1954,7 @@ fn print_profile_details(
         "{DIM}DefaultArgs{RESET} {}",
         cli_args_label(&account.default_cli_args)
     );
+    println!("{DIM}AgentName{RESET} {}", account_agent_name(account));
     println!(
         "{DIM}Runtime{RESET} {}",
         runtime_description(&account.runtime)
@@ -2236,6 +2358,8 @@ fn cmd_profile_set(
     clear_email: bool,
     default_cli_args: Option<String>,
     clear_default_cli_args: bool,
+    agent_name: Option<String>,
+    clear_agent_name: bool,
     host: bool,
     docker_image: Option<String>,
     docker_user_name: Option<String>,
@@ -2274,6 +2398,7 @@ fn cmd_profile_set(
         || email.is_some()
         || clear_email;
     let default_cli_args_requested = default_cli_args.is_some() || clear_default_cli_args;
+    let agent_name_requested = agent_name.is_some() || clear_agent_name;
     let runtime_requested = host || docker_image.is_some();
     let proxy_requested = proxy_inherit || proxy_disable || proxy_url.is_some();
     let session_requested = session_enable || session_disable || session_inherit;
@@ -2281,12 +2406,13 @@ fn cmd_profile_set(
     if name.is_none()
         && !metadata_requested
         && !default_cli_args_requested
+        && !agent_name_requested
         && !runtime_requested
         && !proxy_requested
         && !session_requested
     {
         anyhow::bail!(
-            "No changes requested. Provide at least one of --name, metadata flags, default CLI args, runtime flags, proxy flags, or session flags."
+            "No changes requested. Provide at least one of --name, metadata flags, default CLI args, agent name, runtime flags, proxy flags, or session flags."
         );
     }
 
@@ -2342,6 +2468,21 @@ fn cmd_profile_set(
             let next_default_cli_args = parse_cli_args_value(value)?;
             if account.default_cli_args != next_default_cli_args {
                 account.default_cli_args = next_default_cli_args;
+                changed = true;
+            }
+        }
+
+        if clear_agent_name {
+            if account.agent_name.take().is_some() {
+                changed = true;
+            }
+        } else if let Some(value) = agent_name.as_deref() {
+            let value = value.trim();
+            if value.is_empty() {
+                anyhow::bail!("Agent name cannot be empty");
+            }
+            if account.agent_name.as_deref() != Some(value) {
+                account.agent_name = Some(value.to_string());
                 changed = true;
             }
         }
@@ -2992,6 +3133,7 @@ fn cmd_add(
             session: None,
             cli_kind: CliKind::Claude,
             default_cli_args: Vec::new(),
+            agent_name: None,
             last_used_at: Some(Utc::now()),
         };
         ensure_claude_profile_dir(&account, auth_path)?;
@@ -3173,6 +3315,7 @@ fn cmd_login_api_key(
         session: None,
         cli_kind: cli_kind.clone(),
         default_cli_args: Vec::new(),
+        agent_name: None,
         last_used_at: Some(Utc::now()),
     };
 
@@ -3367,6 +3510,7 @@ fn cmd_login_claude_official(name: &str, store: &mut AccountsStore) -> anyhow::R
         session: None,
         cli_kind: CliKind::Claude,
         default_cli_args: Vec::new(),
+        agent_name: None,
         last_used_at: Some(Utc::now()),
     };
 
@@ -3687,6 +3831,34 @@ fn print_global_settings(config: &CodezConfig) {
             "-"
         }
     );
+    println!(
+        "{DIM}agent_bus_enabled{RESET} {}",
+        bool_label(config.agent_bus_enabled)
+    );
+    println!(
+        "{DIM}agent_bus_port{RESET} {}",
+        config.agent_bus_port.unwrap_or(DEFAULT_AGENT_BUS_PORT)
+    );
+    println!(
+        "{DIM}agent_bus_token{RESET} {}",
+        if config
+            .agent_bus_token
+            .as_ref()
+            .is_some_and(|token| !token.is_empty())
+        {
+            "(set)"
+        } else {
+            "-"
+        }
+    );
+    println!(
+        "{DIM}agent_message_prefix_template{RESET} {}",
+        optional_label(config.agent_message_prefix_template.as_deref())
+    );
+    println!(
+        "{DIM}agent_message_suffix_template{RESET} {}",
+        optional_label(config.agent_message_suffix_template.as_deref())
+    );
 }
 
 fn checkbox(value: bool) -> String {
@@ -3711,6 +3883,15 @@ fn optional_label(value: Option<&str>) -> String {
         .filter(|value| !value.is_empty())
         .unwrap_or("-")
         .to_string()
+}
+
+fn parse_optional_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "-" {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn optional_u64_label(value: Option<u64>) -> String {
@@ -3913,9 +4094,44 @@ fn cmd_global_edit() -> anyhow::Result<()> {
             " 19.     rate limit model nudge mode            {}",
             config.rate_limit_model_nudge_mode.as_deref().unwrap_or("-")
         );
-        println!(" 20.     show current settings");
+        println!(
+            " 20. {} agent bus enabled                     {}",
+            checkbox(config.agent_bus_enabled),
+            bool_label(config.agent_bus_enabled)
+        );
+        println!(
+            " 21.     agent bus port                        {}",
+            config.agent_bus_port.unwrap_or(DEFAULT_AGENT_BUS_PORT)
+        );
+        println!(
+            " 22.     agent bus token                       {}",
+            if config
+                .agent_bus_token
+                .as_ref()
+                .is_some_and(|token| !token.is_empty())
+            {
+                "(set)"
+            } else {
+                "-"
+            }
+        );
+        println!(
+            " 23.     agent message prefix                  {}",
+            config
+                .agent_message_prefix_template
+                .as_deref()
+                .unwrap_or("-")
+        );
+        println!(
+            " 24.     agent message suffix                  {}",
+            config
+                .agent_message_suffix_template
+                .as_deref()
+                .unwrap_or("-")
+        );
+        println!(" 25.     show current settings");
 
-        let Some(choice) = read_wizard_choice(20)? else {
+        let Some(choice) = read_wizard_choice(25)? else {
             println!("Done.");
             return Ok(());
         };
@@ -4063,7 +4279,37 @@ fn cmd_global_edit() -> anyhow::Result<()> {
                 )?;
                 next.rate_limit_model_nudge_mode = parse_optional_rate_limit_mode(&value)?;
             }
-            20 => {
+            20 => next.agent_bus_enabled = !next.agent_bus_enabled,
+            21 => {
+                let current = next
+                    .agent_bus_port
+                    .unwrap_or(DEFAULT_AGENT_BUS_PORT)
+                    .to_string();
+                let value = prompt_line("Agent bus port", &current)?;
+                let port = value
+                    .trim()
+                    .parse::<u16>()
+                    .with_context(|| format!("Invalid agent bus port: {value}"))?;
+                validate_agent_bus_port(port)?;
+                next.agent_bus_port = Some(port);
+            }
+            22 => {
+                next.agent_bus_token =
+                    prompt_optional_string("Agent bus token", next.agent_bus_token.as_deref())?;
+            }
+            23 => {
+                next.agent_message_prefix_template = prompt_optional_string(
+                    "Agent message prefix template",
+                    next.agent_message_prefix_template.as_deref(),
+                )?;
+            }
+            24 => {
+                next.agent_message_suffix_template = prompt_optional_string(
+                    "Agent message suffix template",
+                    next.agent_message_suffix_template.as_deref(),
+                )?;
+            }
+            25 => {
                 print_global_settings(&config);
                 continue;
             }
@@ -4101,12 +4347,20 @@ fn cmd_global(command: GlobalCommand) -> anyhow::Result<()> {
             notify_user_message_preview_chars,
             rate_limit_threshold_warning_mode,
             rate_limit_model_nudge_mode,
+            agent_bus_enable,
+            agent_bus_port,
+            agent_bus_token,
+            agent_message_prefix,
+            agent_message_suffix,
         } => {
             if proxy_no_proxy.is_some() && proxy_url.is_none() {
                 anyhow::bail!("--proxy-no-proxy requires --proxy-url");
             }
             if proxy_force_http_transport.is_some() && proxy_url.is_none() {
                 anyhow::bail!("--proxy-force-http requires --proxy-url");
+            }
+            if let Some(port) = agent_bus_port {
+                validate_agent_bus_port(port)?;
             }
 
             if docker_use_sudo.is_none()
@@ -4125,9 +4379,14 @@ fn cmd_global(command: GlobalCommand) -> anyhow::Result<()> {
                 && notify_user_message_preview_chars.is_none()
                 && rate_limit_threshold_warning_mode.is_none()
                 && rate_limit_model_nudge_mode.is_none()
+                && agent_bus_enable.is_none()
+                && agent_bus_port.is_none()
+                && agent_bus_token.is_none()
+                && agent_message_prefix.is_none()
+                && agent_message_suffix.is_none()
             {
                 anyhow::bail!(
-                    "No changes requested. Provide --docker-use-sudo <BOOL>, --session-enable <BOOL>, --default-profile <PROFILE>, --clear-default-profile, --default-profile-direct-launch <BOOL>, --proxy-url <URL>, --proxy-clear, --notify-idle-timeout <SECS>, --notify-composer-idle-timeout <SECS>, --notify-approval-timeout <SECS>, --notify-startup-idle-timeout <SECS>, --notify-events <CSV>, --notify-user-message-content <MODE>, --notify-user-message-preview-chars <CHARS>, --rate-limit-threshold-warning-mode <MODE>, or --rate-limit-model-nudge-mode <MODE>."
+                    "No changes requested. Provide --docker-use-sudo <BOOL>, --session-enable <BOOL>, --default-profile <PROFILE>, --clear-default-profile, --default-profile-direct-launch <BOOL>, --proxy-url <URL>, --proxy-clear, --notify-idle-timeout <SECS>, --notify-composer-idle-timeout <SECS>, --notify-approval-timeout <SECS>, --notify-startup-idle-timeout <SECS>, --notify-events <CSV>, --notify-user-message-content <MODE>, --notify-user-message-preview-chars <CHARS>, --rate-limit-threshold-warning-mode <MODE>, --rate-limit-model-nudge-mode <MODE>, --agent-bus-enable <BOOL>, --agent-bus-port <PORT>, --agent-bus-token <TOKEN>, --agent-message-prefix <TEMPLATE>, or --agent-message-suffix <TEMPLATE>."
                 );
             }
 
@@ -4255,6 +4514,44 @@ fn cmd_global(command: GlobalCommand) -> anyhow::Result<()> {
                 }
             }
 
+            if let Some(next_enabled) = agent_bus_enable {
+                if config.agent_bus_enabled != next_enabled {
+                    config.agent_bus_enabled = next_enabled;
+                    changed = true;
+                }
+            }
+
+            if let Some(next_port) = agent_bus_port {
+                if config.agent_bus_port != Some(next_port) {
+                    config.agent_bus_port = Some(next_port);
+                    changed = true;
+                }
+            }
+
+            if let Some(next_token) = agent_bus_token {
+                let next_token = parse_optional_string(&next_token);
+                if config.agent_bus_token != next_token {
+                    config.agent_bus_token = next_token;
+                    changed = true;
+                }
+            }
+
+            if let Some(next_prefix) = agent_message_prefix {
+                let next_prefix = parse_optional_string(&next_prefix);
+                if config.agent_message_prefix_template != next_prefix {
+                    config.agent_message_prefix_template = next_prefix;
+                    changed = true;
+                }
+            }
+
+            if let Some(next_suffix) = agent_message_suffix {
+                let next_suffix = parse_optional_string(&next_suffix);
+                if config.agent_message_suffix_template != next_suffix {
+                    config.agent_message_suffix_template = next_suffix;
+                    changed = true;
+                }
+            }
+
             if changed {
                 save_codez_config(&config)?;
                 println!("{GREEN}Updated{RESET} global settings");
@@ -4372,6 +4669,1113 @@ fn cmd_proxy(command: ProxyCommand) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AgentBusAgent {
+    id: String,
+    name: String,
+    #[serde(default)]
+    base_name: Option<String>,
+    #[serde(default)]
+    path_key: Option<String>,
+    profile: String,
+    cwd: String,
+    pid: u32,
+    last_seen_epoch_secs: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentBusRegisterRequest {
+    id: String,
+    name: String,
+    #[serde(default)]
+    base_name: Option<String>,
+    #[serde(default)]
+    path_key: Option<String>,
+    profile: String,
+    cwd: String,
+    #[serde(default)]
+    pid: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentBusHeartbeatRequest {
+    id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentBusMessage {
+    id: String,
+    from: String,
+    to: String,
+    content: String,
+    trigger_turn: bool,
+    created_at_epoch_secs: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AgentBusSendRequest {
+    to: String,
+    #[serde(default)]
+    from: Option<String>,
+    content: String,
+    #[serde(default = "default_true", alias = "triggerTurn")]
+    trigger_turn: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AgentBusRecentSend {
+    id: String,
+    from: String,
+    to: String,
+    to_name: String,
+    trigger_turn: bool,
+    queued: bool,
+    created_at_epoch_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+struct AgentBusSendOutcome {
+    record: AgentBusRecentSend,
+    deduplicated: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentBusPollResponse {
+    messages: Vec<AgentBusMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentBusAckRequest {
+    agent_id: String,
+    message_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentBusSendResponse {
+    id: String,
+    #[serde(default)]
+    from: Option<String>,
+    to: String,
+    #[serde(default)]
+    to_name: Option<String>,
+    trigger_turn: bool,
+    queued: bool,
+    #[serde(default)]
+    deduplicated: bool,
+}
+
+#[derive(Debug, Default)]
+struct AgentBusState {
+    agents: HashMap<String, AgentBusAgent>,
+    messages: HashMap<String, VecDeque<AgentBusMessage>>,
+    recent_sends: HashMap<String, AgentBusRecentSend>,
+}
+
+fn cmd_agent(command: AgentCommand) -> anyhow::Result<()> {
+    match command {
+        AgentCommand::List => cmd_agent_list(),
+        AgentCommand::Send {
+            target,
+            message,
+            queue_only,
+            from,
+        } => cmd_agent_send(&target, &message, !queue_only, from.as_deref()),
+        AgentCommand::Status => cmd_agent_status(),
+        AgentCommand::Log { agent, limit, json } => cmd_agent_log(agent.as_deref(), limit, json),
+        AgentCommand::Serve { port, token } => {
+            let mut config = load_codez_config();
+            if let Some(port) = port {
+                config.agent_bus_port = Some(port);
+            }
+            if let Some(token) = token {
+                config.agent_bus_token = Some(token);
+            }
+            run_agent_bus(config)
+        }
+    }
+}
+
+fn cmd_agent_list() -> anyhow::Result<()> {
+    let config = ensure_agent_bus_config(true, None)?;
+    ensure_agent_bus_running(&config, false)?;
+    let agents = agent_bus_fetch_agents(&config)?;
+    if agents.is_empty() {
+        println!("{DIM}No cutex agents are registered.{RESET}");
+        return Ok(());
+    }
+    let current_agent_id = std::env::var(CUTEX_AGENT_ID_ENV_VAR)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    println!("{BOLD}{CYAN}cutex agents{RESET}");
+    if let Some(current_agent_id) = current_agent_id.as_deref() {
+        if let Some(agent) = agents.iter().find(|agent| agent.id == current_agent_id) {
+            println!(
+                "{GREEN}this agent{RESET} {}  {DIM}name={} cwd={}{RESET}",
+                agent.id, agent.name, agent.cwd
+            );
+        } else {
+            println!(
+                "{YELLOW}this agent{RESET} {}  {DIM}not registered yet{RESET}",
+                current_agent_id
+            );
+        }
+    }
+    for agent in agents {
+        let base = agent.base_name.as_deref().unwrap_or("-");
+        let path_key = agent.path_key.as_deref().unwrap_or("-");
+        let this_marker = if current_agent_id.as_deref() == Some(agent.id.as_str()) {
+            "  this"
+        } else {
+            ""
+        };
+        println!(
+            "{BOLD}{}{RESET}{GREEN}{}{RESET}  {DIM}base={} path={} id={} profile={} pid={} cwd={} last_seen={}s ago{RESET}",
+            agent.name,
+            this_marker,
+            base,
+            path_key,
+            agent.id,
+            agent.profile,
+            agent.pid,
+            agent.cwd,
+            now_epoch_secs().saturating_sub(agent.last_seen_epoch_secs)
+        );
+    }
+    Ok(())
+}
+
+fn cmd_agent_send(
+    target: &str,
+    message: &str,
+    trigger_turn: bool,
+    from: Option<&str>,
+) -> anyhow::Result<()> {
+    if message.trim().is_empty() {
+        anyhow::bail!("Agent message cannot be empty");
+    }
+    let config = ensure_agent_bus_config(true, None)?;
+    ensure_agent_bus_running(&config, false)?;
+    let sender = resolve_agent_sender_name(&config, from);
+    let body = serde_json::to_vec(&AgentBusSendRequest {
+        to: target.to_string(),
+        from: Some(sender),
+        content: message.to_string(),
+        trigger_turn,
+    })?;
+    let response = agent_bus_http_json(
+        &agent_bus_base_url(agent_bus_port(&config)),
+        "POST",
+        "/api/messages/send",
+        config.agent_bus_token.as_deref(),
+        Some(&body),
+    )?;
+    let response = serde_json::from_value::<AgentBusSendResponse>(response)
+        .context("Failed to parse agent send response")?;
+    let delivered_to = response.to_name.as_deref().unwrap_or(response.to.as_str());
+    let delivered_from = response.from.as_deref().unwrap_or("cutex");
+    let mode = if response.trigger_turn {
+        "trigger-turn"
+    } else {
+        "queue-only"
+    };
+    println!(
+        "{GREEN}Sent{RESET} message {BOLD}{}{RESET} from {BOLD}{}{RESET} to {BOLD}{}{RESET} ({mode}, queued={}, deduplicated={})",
+        response.id, delivered_from, delivered_to, response.queued, response.deduplicated
+    );
+    Ok(())
+}
+
+fn resolve_agent_sender_name(config: &CodezConfig, explicit_from: Option<&str>) -> String {
+    if let Some(from) = explicit_from.filter(|value| !value.trim().is_empty()) {
+        return from.to_string();
+    }
+    if let Ok(agent_id) = std::env::var(CUTEX_AGENT_ID_ENV_VAR) {
+        if let Ok(agents) = agent_bus_fetch_agents(config) {
+            if let Some(agent) = agents.iter().find(|agent| agent.id == agent_id) {
+                return agent_sender_label(agent);
+            }
+        }
+        return std::env::var(CUTEX_AGENT_NAME_ENV_VAR)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(agent_id);
+    }
+    std::env::var(CUTEX_AGENT_NAME_ENV_VAR)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "cutex".to_string())
+}
+
+fn agent_sender_label(agent: &AgentBusAgent) -> String {
+    agent
+        .base_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| (!agent.name.trim().is_empty()).then_some(agent.name.as_str()))
+        .unwrap_or(agent.id.as_str())
+        .to_string()
+}
+
+fn cmd_agent_status() -> anyhow::Result<()> {
+    let config = load_codez_config();
+    let port = agent_bus_port(&config);
+    let healthy = agent_bus_healthy(port, config.agent_bus_token.as_deref());
+    println!("{BOLD}{CYAN}cutex agent bus{RESET}");
+    println!(
+        "{DIM}enabled{RESET} {}",
+        bool_label(config.agent_bus_enabled)
+    );
+    println!("{DIM}port{RESET} {port}");
+    println!(
+        "{DIM}token{RESET} {}",
+        if config
+            .agent_bus_token
+            .as_ref()
+            .is_some_and(|token| !token.is_empty())
+        {
+            "(set)"
+        } else {
+            "-"
+        }
+    );
+    println!(
+        "{DIM}health{RESET} {}",
+        if healthy { "healthy" } else { "not running" }
+    );
+    Ok(())
+}
+
+fn cmd_agent_log(agent: Option<&str>, limit: usize, json: bool) -> anyhow::Result<()> {
+    let path = agent_bus_audit_log_path()?;
+    if !path.exists() {
+        println!(
+            "{DIM}No cutex agent audit log exists yet: {}{RESET}",
+            path.display()
+        );
+        return Ok(());
+    }
+    let file = fs::File::open(&path)
+        .with_context(|| format!("Failed to open agent audit log: {}", path.display()))?;
+    let mut records = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(agent) = agent {
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if !agent_audit_record_matches(&value, agent) {
+                continue;
+            }
+        }
+        records.push(line);
+    }
+    let start = records.len().saturating_sub(limit.max(1));
+    for line in records.into_iter().skip(start) {
+        if json {
+            println!("{line}");
+        } else if let Ok(value) = serde_json::from_str::<Value>(&line) {
+            print_agent_audit_record(&value);
+        }
+    }
+    Ok(())
+}
+
+fn agent_audit_record_matches(value: &Value, agent: &str) -> bool {
+    [
+        "from",
+        "to",
+        "to_name",
+        "agent_id",
+        "agent_name",
+        "message_id",
+    ]
+    .iter()
+    .any(|key| value.get(*key).and_then(Value::as_str) == Some(agent))
+        || value
+            .get("message_ids")
+            .and_then(Value::as_array)
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(agent)))
+}
+
+fn print_agent_audit_record(value: &Value) {
+    let ts = value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    match value.get("event").and_then(Value::as_str).unwrap_or("-") {
+        "sent" => {
+            let id = value
+                .get("message_id")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            let from = value.get("from").and_then(Value::as_str).unwrap_or("-");
+            let to = value
+                .get("to_name")
+                .and_then(Value::as_str)
+                .or_else(|| value.get("to").and_then(Value::as_str))
+                .unwrap_or("-");
+            let trigger = value
+                .get("trigger_turn")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let deduplicated = value
+                .get("deduplicated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let preview = value
+                .get("content_preview")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            println!(
+                "{DIM}{ts}{RESET} {GREEN}sent{RESET} {id} {from} -> {to} trigger_turn={trigger} deduplicated={deduplicated} {preview}"
+            );
+        }
+        "polled" => {
+            let agent_id = value.get("agent_id").and_then(Value::as_str).unwrap_or("-");
+            let agent_name = value
+                .get("agent_name")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            let count = value.get("count").and_then(Value::as_u64).unwrap_or(0);
+            println!(
+                "{DIM}{ts}{RESET} {CYAN}polled{RESET} agent={agent_name} id={agent_id} count={count}"
+            );
+        }
+        "acked" => {
+            let agent_id = value.get("agent_id").and_then(Value::as_str).unwrap_or("-");
+            let count = value.get("count").and_then(Value::as_u64).unwrap_or(0);
+            println!("{DIM}{ts}{RESET} {GREEN}acked{RESET} agent={agent_id} count={count}");
+        }
+        event => println!("{DIM}{ts}{RESET} {event} {value}"),
+    }
+}
+
+fn ensure_agent_bus_for_launch(account: &StoredAccount) -> anyhow::Result<()> {
+    if account.cli_kind != CliKind::Codex || !matches!(account.runtime, RuntimeConfig::Host) {
+        return Ok(());
+    }
+    let config = load_codez_config();
+    if !config.agent_bus_enabled {
+        return Ok(());
+    }
+    let config = ensure_agent_bus_config(true, None)?;
+    ensure_agent_bus_running(&config, true)
+}
+
+fn ensure_agent_bus_config(enabled: bool, port: Option<u16>) -> anyhow::Result<CodezConfig> {
+    let mut config = load_codez_config();
+    config.agent_bus_enabled = enabled;
+    if let Some(port) = port {
+        validate_agent_bus_port(port)?;
+        config.agent_bus_port = Some(port);
+    } else if config.agent_bus_port.is_none() {
+        config.agent_bus_port = Some(DEFAULT_AGENT_BUS_PORT);
+    }
+    if config
+        .agent_bus_token
+        .as_ref()
+        .is_none_or(|token| token.trim().is_empty())
+    {
+        config.agent_bus_token = Some(format!("cutex-agent-{}", Uuid::new_v4()));
+    }
+    save_codez_config(&config)?;
+    Ok(config)
+}
+
+fn validate_agent_bus_port(port: u16) -> anyhow::Result<()> {
+    if !(24000..=24999).contains(&port) {
+        anyhow::bail!("Agent bus port must be in the Bridgeboard 24xxx range");
+    }
+    Ok(())
+}
+
+fn agent_bus_port(config: &CodezConfig) -> u16 {
+    config.agent_bus_port.unwrap_or(DEFAULT_AGENT_BUS_PORT)
+}
+
+fn agent_bus_base_url(port: u16) -> String {
+    format!("http://127.0.0.1:{port}")
+}
+
+fn agent_bus_health_url(port: u16) -> String {
+    format!("{}/", agent_bus_base_url(port))
+}
+
+fn agent_bus_audit_log_path() -> anyhow::Result<PathBuf> {
+    Ok(runtime_dir()?.join("agent-bus-audit.jsonl"))
+}
+
+fn append_agent_bus_audit_record(value: Value) -> anyhow::Result<()> {
+    let path = agent_bus_audit_log_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create runtime dir: {}", parent.display()))?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("Failed to open agent audit log: {}", path.display()))?;
+    serde_json::to_writer(&mut file, &value)?;
+    writeln!(file)?;
+    Ok(())
+}
+
+fn content_preview(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let mut preview = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn ensure_agent_bus_running(
+    config: &CodezConfig,
+    register_handoff_if_healthy: bool,
+) -> anyhow::Result<()> {
+    let port = agent_bus_port(config);
+    validate_agent_bus_port(port)?;
+    if agent_bus_healthy(port, config.agent_bus_token.as_deref()) {
+        if register_handoff_if_healthy {
+            register_agent_bus_handoff(port);
+        }
+        return Ok(());
+    }
+
+    let exe = std::env::current_exe().context("Failed to resolve current cutex executable")?;
+    let log_dir = runtime_dir()?;
+    fs::create_dir_all(&log_dir)
+        .with_context(|| format!("Failed to create runtime dir: {}", log_dir.display()))?;
+    let log_path = log_dir.join("agent-bus.log");
+    let stdout = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("Failed to open log file: {}", log_path.display()))?;
+    let stderr = stdout.try_clone().context("Failed to clone bus log file")?;
+
+    let mut child = Command::new(exe);
+    child
+        .arg("agent")
+        .arg("serve")
+        .arg("--port")
+        .arg(port.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    if let Some(token) = config.agent_bus_token.as_ref() {
+        child.arg("--token").arg(token);
+    }
+    #[cfg(unix)]
+    unsafe {
+        child.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    child
+        .spawn()
+        .with_context(|| format!("Failed to start cutex agent bus on port {port}"))?;
+
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(100));
+        if agent_bus_healthy(port, config.agent_bus_token.as_deref()) {
+            register_agent_bus_handoff(port);
+            return Ok(());
+        }
+    }
+
+    anyhow::bail!(
+        "cutex agent bus did not become healthy on port {port}. See {}",
+        log_path.display()
+    )
+}
+
+fn agent_bus_healthy(port: u16, token: Option<&str>) -> bool {
+    let Ok(mut stream) = connect_local_port(port, Duration::from_millis(250)) else {
+        return false;
+    };
+    let auth = token
+        .filter(|token| !token.is_empty())
+        .map(|token| format!("Authorization: Bearer {token}\r\n"))
+        .unwrap_or_default();
+    let request =
+        format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Content-Length: 0\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0_u8; 128];
+    match stream.read(&mut buf) {
+        Ok(n) => String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"),
+        Err(_) => false,
+    }
+}
+
+fn register_agent_bus_handoff(port: u16) {
+    if !command_exists_in_path("bridgeboard") {
+        return;
+    }
+    let owner_host = std::env::var("HOSTNAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            Command::new("hostname")
+                .output()
+                .ok()
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "unknown".to_string())
+        });
+    let _ = Command::new("bridgeboard")
+        .arg("handoff")
+        .arg("--id")
+        .arg(AGENT_BUS_BRIDGE_ID)
+        .arg("--title")
+        .arg("cutex agent bus")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--owner-host")
+        .arg(owner_host)
+        .arg("--pid-from-port")
+        .arg("--health-url")
+        .arg(agent_bus_health_url(port))
+        .arg("--require-healthy")
+        .status();
+}
+
+fn run_agent_bus(config: CodezConfig) -> anyhow::Result<()> {
+    let port = agent_bus_port(&config);
+    validate_agent_bus_port(port)?;
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .with_context(|| format!("Failed to bind cutex agent bus on 127.0.0.1:{port}"))?;
+    println!(
+        "cutex agent bus listening on {}",
+        agent_bus_health_url(port)
+    );
+    register_agent_bus_handoff(port);
+
+    let token = config.agent_bus_token.clone();
+    let state = Arc::new(Mutex::new(AgentBusState::default()));
+    for stream in listener.incoming() {
+        match stream {
+            Ok(mut stream) => {
+                let state = Arc::clone(&state);
+                let token = token.clone();
+                std::thread::spawn(move || {
+                    if let Err(err) =
+                        handle_agent_bus_request(&mut stream, &state, token.as_deref())
+                    {
+                        let _ = write_http_response(
+                            &mut stream,
+                            500,
+                            "Internal Server Error",
+                            "text/plain",
+                            format!("{err:#}").as_bytes(),
+                        );
+                    }
+                });
+            }
+            Err(err) => eprintln!("{YELLOW}warning:{RESET} agent bus accept failed: {err}"),
+        }
+    }
+    Ok(())
+}
+
+fn handle_agent_bus_request(
+    stream: &mut TcpStream,
+    state: &Arc<Mutex<AgentBusState>>,
+    token: Option<&str>,
+) -> anyhow::Result<()> {
+    let request = read_simple_http_request(stream)?;
+    let path_only = request
+        .path
+        .split('?')
+        .next()
+        .unwrap_or(request.path.as_str());
+    match (request.method.as_str(), path_only) {
+        ("GET", "/") => write_http_response(stream, 200, "OK", "text/plain", b"ok"),
+        ("GET", "/api/agents") => {
+            require_bridge_token(&request, token)?;
+            prune_stale_agents(state)?;
+            let agents = {
+                let state = state
+                    .lock()
+                    .map_err(|_| anyhow!("agent bus state lock poisoned"))?;
+                let mut agents = state.agents.values().cloned().collect::<Vec<_>>();
+                agents.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+                agents
+            };
+            write_json_response(stream, 200, "OK", &serde_json::to_value(agents)?)
+        }
+        ("POST", "/api/agents/register") => {
+            require_bridge_token(&request, token)?;
+            let payload: AgentBusRegisterRequest = serde_json::from_slice(&request.body)
+                .context("Failed to parse agent register JSON")?;
+            let now = now_epoch_secs();
+            let agent = AgentBusAgent {
+                id: payload.id.clone(),
+                name: payload.name,
+                base_name: payload.base_name.filter(|value| !value.trim().is_empty()),
+                path_key: payload.path_key.filter(|value| !value.trim().is_empty()),
+                profile: payload.profile,
+                cwd: payload.cwd,
+                pid: payload.pid,
+                last_seen_epoch_secs: now,
+            };
+            {
+                let mut state = state
+                    .lock()
+                    .map_err(|_| anyhow!("agent bus state lock poisoned"))?;
+                state.agents.insert(payload.id, agent);
+            }
+            write_json_response(stream, 200, "OK", &serde_json::json!({"ok": true}))
+        }
+        ("POST", "/api/agents/heartbeat") => {
+            require_bridge_token(&request, token)?;
+            let payload: AgentBusHeartbeatRequest = serde_json::from_slice(&request.body)
+                .context("Failed to parse agent heartbeat JSON")?;
+            let now = now_epoch_secs();
+            {
+                let mut state = state
+                    .lock()
+                    .map_err(|_| anyhow!("agent bus state lock poisoned"))?;
+                if let Some(agent) = state.agents.get_mut(&payload.id) {
+                    agent.last_seen_epoch_secs = now;
+                }
+            }
+            write_json_response(stream, 200, "OK", &serde_json::json!({"ok": true}))
+        }
+        ("POST", "/api/messages/send") => {
+            require_bridge_token(&request, token)?;
+            prune_stale_agents(state)?;
+            let payload: AgentBusSendRequest = serde_json::from_slice(&request.body)
+                .context("Failed to parse agent message JSON")?;
+            let sender = payload
+                .from
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "cutex".to_string());
+            let target_id = resolve_agent_target(state, &payload.to)?;
+            let target_name =
+                resolve_agent_display_name(state, &target_id).unwrap_or_else(|| target_id.clone());
+            let config = load_codez_config();
+            let content = format_agent_message_content(
+                config.agent_message_prefix_template.as_deref(),
+                config.agent_message_suffix_template.as_deref(),
+                &sender,
+                &target_name,
+                &payload.content,
+            );
+            let outcome = enqueue_agent_bus_message_once(
+                state,
+                &sender,
+                &target_id,
+                &target_name,
+                &content,
+                payload.trigger_turn,
+                now_epoch_secs(),
+            )?;
+            let send_record = outcome.record;
+            if let Err(err) = append_agent_bus_audit_record(serde_json::json!({
+                "event": "sent",
+                "timestamp": Utc::now().to_rfc3339(),
+                "message_id": send_record.id.clone(),
+                "from": send_record.from.clone(),
+                "to": send_record.to.clone(),
+                "to_name": send_record.to_name.clone(),
+                "trigger_turn": send_record.trigger_turn,
+                "queued": send_record.queued,
+                "deduplicated": outcome.deduplicated,
+                "content_chars": content.chars().count(),
+                "content_preview": content_preview(&content, 500),
+            })) {
+                eprintln!("{YELLOW}warning:{RESET} failed to write agent audit log: {err:#}");
+            }
+            write_json_response(
+                stream,
+                200,
+                "OK",
+                &serde_json::json!({
+                    "ok": true,
+                    "id": send_record.id,
+                    "from": send_record.from,
+                    "to": send_record.to,
+                    "to_name": send_record.to_name,
+                    "toName": send_record.to_name,
+                    "trigger_turn": send_record.trigger_turn,
+                    "triggerTurn": send_record.trigger_turn,
+                    "queued": send_record.queued,
+                    "deduplicated": outcome.deduplicated,
+                }),
+            )
+        }
+        ("GET", "/api/messages/poll") => {
+            require_bridge_token(&request, token)?;
+            let agent_id = query_value(&request.path, "agent_id")
+                .ok_or_else(|| anyhow!("Missing agent_id query parameter"))?;
+            let ack_mode = query_value(&request.path, "ack")
+                .as_deref()
+                .is_some_and(|value| matches!(value, "1" | "true" | "yes"));
+            let (agent_name, messages) = {
+                let mut state = state
+                    .lock()
+                    .map_err(|_| anyhow!("agent bus state lock poisoned"))?;
+                let agent_name = if let Some(agent) = state.agents.get_mut(&agent_id) {
+                    agent.last_seen_epoch_secs = now_epoch_secs();
+                    agent.name.clone()
+                } else {
+                    agent_id.clone()
+                };
+                let messages = if ack_mode {
+                    state
+                        .messages
+                        .get(&agent_id)
+                        .map(|queue| queue.iter().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default()
+                } else {
+                    state
+                        .messages
+                        .remove(&agent_id)
+                        .map(|queue| queue.into_iter().collect::<Vec<_>>())
+                        .unwrap_or_default()
+                };
+                (agent_name, messages)
+            };
+            if !messages.is_empty() {
+                if let Err(err) = append_agent_bus_audit_record(serde_json::json!({
+                    "event": "polled",
+                    "timestamp": Utc::now().to_rfc3339(),
+                    "agent_id": agent_id,
+                    "agent_name": agent_name,
+                    "ack_mode": ack_mode,
+                    "count": messages.len(),
+                    "message_ids": messages.iter().map(|message| message.id.clone()).collect::<Vec<_>>(),
+                })) {
+                    eprintln!("{YELLOW}warning:{RESET} failed to write agent audit log: {err:#}");
+                }
+            }
+            write_json_response(
+                stream,
+                200,
+                "OK",
+                &serde_json::to_value(AgentBusPollResponse { messages })?,
+            )
+        }
+        ("POST", "/api/messages/ack") => {
+            require_bridge_token(&request, token)?;
+            let payload: AgentBusAckRequest = serde_json::from_slice(&request.body)
+                .context("Failed to parse agent message ack JSON")?;
+            let acked = ack_agent_messages(state, &payload.agent_id, &payload.message_ids)?;
+            if acked > 0 {
+                if let Err(err) = append_agent_bus_audit_record(serde_json::json!({
+                    "event": "acked",
+                    "timestamp": Utc::now().to_rfc3339(),
+                    "agent_id": payload.agent_id,
+                    "count": acked,
+                    "message_ids": payload.message_ids,
+                })) {
+                    eprintln!("{YELLOW}warning:{RESET} failed to write agent audit log: {err:#}");
+                }
+            }
+            write_json_response(
+                stream,
+                200,
+                "OK",
+                &serde_json::json!({
+                    "ok": true,
+                    "acked": acked,
+                }),
+            )
+        }
+        _ => write_http_response(stream, 404, "Not Found", "text/plain", b"not found"),
+    }
+}
+
+fn write_json_response(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    value: &Value,
+) -> anyhow::Result<()> {
+    let body = serde_json::to_vec(value)?;
+    write_http_response(stream, status, reason, "application/json", &body)
+}
+
+fn prune_stale_agents(state: &Arc<Mutex<AgentBusState>>) -> anyhow::Result<()> {
+    let cutoff = now_epoch_secs().saturating_sub(120);
+    let mut state = state
+        .lock()
+        .map_err(|_| anyhow!("agent bus state lock poisoned"))?;
+    let stale = state
+        .agents
+        .iter()
+        .filter_map(|(id, agent)| {
+            (agent.last_seen_epoch_secs < cutoff || !agent_process_may_be_alive(agent.pid))
+                .then(|| id.clone())
+        })
+        .collect::<Vec<_>>();
+    for id in stale {
+        state.agents.remove(&id);
+        state.messages.remove(&id);
+    }
+    Ok(())
+}
+
+fn ack_agent_messages(
+    state: &Arc<Mutex<AgentBusState>>,
+    agent_id: &str,
+    message_ids: &[String],
+) -> anyhow::Result<usize> {
+    if message_ids.is_empty() {
+        return Ok(0);
+    }
+    let message_ids = message_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut state = state
+        .lock()
+        .map_err(|_| anyhow!("agent bus state lock poisoned"))?;
+    let Some(queue) = state.messages.get_mut(agent_id) else {
+        return Ok(0);
+    };
+    let before = queue.len();
+    queue.retain(|message| !message_ids.contains(message.id.as_str()));
+    let acked = before.saturating_sub(queue.len());
+    if queue.is_empty() {
+        state.messages.remove(agent_id);
+    }
+    Ok(acked)
+}
+
+fn enqueue_agent_bus_message_once(
+    state: &Arc<Mutex<AgentBusState>>,
+    sender: &str,
+    target_id: &str,
+    target_name: &str,
+    content: &str,
+    trigger_turn: bool,
+    now: u64,
+) -> anyhow::Result<AgentBusSendOutcome> {
+    let dedupe_key = agent_bus_send_dedupe_key(sender, target_id, content, trigger_turn);
+    let mut state = state
+        .lock()
+        .map_err(|_| anyhow!("agent bus state lock poisoned"))?;
+    prune_recent_agent_sends(&mut state, now);
+    if let Some(record) = state.recent_sends.get(&dedupe_key).cloned() {
+        return Ok(AgentBusSendOutcome {
+            record,
+            deduplicated: true,
+        });
+    }
+
+    let message_id = Uuid::new_v4().to_string();
+    let message = AgentBusMessage {
+        id: message_id.clone(),
+        from: sender.to_string(),
+        to: target_id.to_string(),
+        content: content.to_string(),
+        trigger_turn,
+        created_at_epoch_secs: now,
+    };
+    state
+        .messages
+        .entry(target_id.to_string())
+        .or_default()
+        .push_back(message);
+    let record = AgentBusRecentSend {
+        id: message_id,
+        from: sender.to_string(),
+        to: target_id.to_string(),
+        to_name: target_name.to_string(),
+        trigger_turn,
+        queued: true,
+        created_at_epoch_secs: now,
+    };
+    state.recent_sends.insert(dedupe_key, record.clone());
+    Ok(AgentBusSendOutcome {
+        record,
+        deduplicated: false,
+    })
+}
+
+fn agent_bus_send_dedupe_key(from: &str, to: &str, content: &str, trigger_turn: bool) -> String {
+    format!("{from}\u{1f}{to}\u{1f}{trigger_turn}\u{1f}{content}")
+}
+
+fn prune_recent_agent_sends(state: &mut AgentBusState, now: u64) {
+    state.recent_sends.retain(|_, recent| {
+        now.saturating_sub(recent.created_at_epoch_secs) <= AGENT_BUS_DEDUPE_WINDOW_SECS
+    });
+}
+
+#[cfg(unix)]
+fn agent_process_may_be_alive(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    let rc = unsafe { libc::kill(pid as i32, 0) };
+    rc == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(not(unix))]
+fn agent_process_may_be_alive(_pid: u32) -> bool {
+    true
+}
+
+fn resolve_agent_target(state: &Arc<Mutex<AgentBusState>>, target: &str) -> anyhow::Result<String> {
+    let state = state
+        .lock()
+        .map_err(|_| anyhow!("agent bus state lock poisoned"))?;
+    if state.agents.contains_key(target) {
+        return Ok(target.to_string());
+    }
+    let display_matches = state
+        .agents
+        .values()
+        .filter(|agent| agent.name == target)
+        .map(|agent| agent.id.clone())
+        .collect::<Vec<_>>();
+    match display_matches.as_slice() {
+        [id] => Ok(id.clone()),
+        [] => {
+            let base_matches = state
+                .agents
+                .values()
+                .filter(|agent| agent.base_name.as_deref() == Some(target))
+                .map(|agent| agent.id.clone())
+                .collect::<Vec<_>>();
+            match base_matches.as_slice() {
+                [id] => Ok(id.clone()),
+                [] => anyhow::bail!("No registered cutex agent matches `{target}`"),
+                _ => anyhow::bail!(
+                    "Agent thread name `{target}` is ambiguous; use `cutex agent list` and send to the display name or full id"
+                ),
+            }
+        }
+        _ => anyhow::bail!(
+            "Agent name `{target}` is ambiguous; use `cutex agent list` and send to a full id"
+        ),
+    }
+}
+
+fn resolve_agent_display_name(state: &Arc<Mutex<AgentBusState>>, agent_id: &str) -> Option<String> {
+    state
+        .lock()
+        .ok()
+        .and_then(|state| state.agents.get(agent_id).map(|agent| agent.name.clone()))
+}
+
+fn format_agent_message_content(
+    prefix_template: Option<&str>,
+    suffix_template: Option<&str>,
+    from: &str,
+    to: &str,
+    content: &str,
+) -> String {
+    let prefix = render_agent_message_template(prefix_template.unwrap_or(""), from, to);
+    let suffix = render_agent_message_template(suffix_template.unwrap_or(""), from, to);
+    format!("{prefix}{content}{suffix}")
+}
+
+fn render_agent_message_template(template: &str, from: &str, to: &str) -> String {
+    template.replace("{from}", from).replace("{to}", to)
+}
+
+fn query_value(path: &str, key: &str) -> Option<String> {
+    let query = path.split_once('?')?.1;
+    query.split('&').find_map(|part| {
+        let (name, value) = part.split_once('=')?;
+        (name == key).then(|| value.to_string())
+    })
+}
+
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn agent_bus_fetch_agents(config: &CodezConfig) -> anyhow::Result<Vec<AgentBusAgent>> {
+    let value = agent_bus_http_json(
+        &agent_bus_base_url(agent_bus_port(config)),
+        "GET",
+        "/api/agents",
+        config.agent_bus_token.as_deref(),
+        None,
+    )?;
+    serde_json::from_value(value).context("Failed to parse agent list response")
+}
+
+fn agent_bus_http_json(
+    base_url: &str,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<&[u8]>,
+) -> anyhow::Result<Value> {
+    let url = Url::parse(&format!("{base_url}{path}"))
+        .with_context(|| format!("Invalid agent bus URL: {base_url}{path}"))?;
+    if url.scheme() != "http" {
+        anyhow::bail!("Only http:// agent bus URLs are supported");
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("Agent bus URL has no host: {base_url}{path}"))?;
+    let port = url.port_or_known_default().unwrap_or(80);
+    let addr = format!("{host}:{port}");
+    let mut stream = TcpStream::connect(addr).context("Failed to connect cutex agent bus")?;
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let mut request_path = url.path().to_string();
+    if request_path.is_empty() {
+        request_path.push('/');
+    }
+    if let Some(query) = url.query() {
+        request_path.push('?');
+        request_path.push_str(query);
+    }
+    let body = body.unwrap_or(b"");
+    let auth = token
+        .filter(|token| !token.is_empty())
+        .map(|token| format!("Authorization: Bearer {token}\r\n"))
+        .unwrap_or_default();
+    let content_type = if body.is_empty() {
+        String::new()
+    } else {
+        "Content-Type: application/json\r\n".to_string()
+    };
+    let request = format!(
+        "{method} {request_path} HTTP/1.1\r\nHost: {host}:{port}\r\n{auth}{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(request.as_bytes())?;
+    stream.write_all(body)?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .context("Failed to read agent bus response")?;
+    let text = String::from_utf8_lossy(&response);
+    let (headers, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_ref(), ""));
+    if !headers.starts_with("HTTP/1.1 2") {
+        anyhow::bail!("cutex agent bus returned non-success: {headers}\n{body}");
+    }
+    if body.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(body).context("Failed to parse agent bus JSON response")
 }
 
 fn cmd_notify(command: NotifyCommand) -> anyhow::Result<()> {
@@ -5258,14 +6662,15 @@ fn cmd_run(
     profile: &str,
     codex_args: Vec<String>,
     force_host: bool,
+    agent_mode: bool,
     docker_image: Option<String>,
     docker_user_name: Option<String>,
 ) -> anyhow::Result<()> {
-    let account = activate_account(profile)?;
+    let account = prepare_account_for_launch(profile)?;
     let effective_account =
         apply_runtime_override(&account, force_host, docker_image, docker_user_name)?;
     println!(
-        "{GREEN}Switched{RESET} active profile to {BOLD}{}{RESET}",
+        "{GREEN}Running{RESET} profile {BOLD}{}{RESET} without changing active profile",
         account.name
     );
     if effective_account.runtime != account.runtime {
@@ -5274,11 +6679,16 @@ fn cmd_run(
             runtime_description(&effective_account.runtime)
         );
     }
-    run_codex_process(&effective_account, codex_args)?;
+    run_codex_process(&effective_account, codex_args, agent_mode)?;
     Ok(())
 }
 
-fn cmd_quick_run(codex_args: Vec<String>, quick: bool, force_host: bool) -> anyhow::Result<()> {
+fn cmd_quick_run(
+    codex_args: Vec<String>,
+    quick: bool,
+    force_host: bool,
+    agent_mode: bool,
+) -> anyhow::Result<()> {
     let store = load_store()?;
     if store.accounts.is_empty() {
         println!(
@@ -5345,7 +6755,7 @@ fn cmd_quick_run(codex_args: Vec<String>, quick: bool, force_host: bool) -> anyh
         println!("Running profile '{}' with: {}", chosen, program);
     }
 
-    cmd_run(&chosen, codex_args, force_host, None, None)
+    cmd_run(&chosen, codex_args, force_host, agent_mode, None, None)
 }
 
 fn determine_default_profile(
@@ -6126,6 +7536,7 @@ impl StoredAccount {
             session: None,
             cli_kind: CliKind::default(),
             default_cli_args: Vec::new(),
+            agent_name: None,
             last_used_at: None,
         }
     }
@@ -6147,6 +7558,29 @@ fn activate_account(target: &str) -> anyhow::Result<StoredAccount> {
     switch_to_account(&account)?;
 
     store.active_account_id = Some(account.id.clone());
+    if let Some(acc) = store.accounts.iter_mut().find(|a| a.id == account.id) {
+        acc.last_used_at = Some(Utc::now());
+    }
+    save_store(&store)?;
+
+    Ok(account)
+}
+
+fn prepare_account_for_launch(target: &str) -> anyhow::Result<StoredAccount> {
+    let mut store = load_store()?;
+    let account_id = find_account(&store, target)?
+        .map(|account| account.id.clone())
+        .ok_or_else(|| anyhow!("Account not found: {target}"))?;
+
+    let account = store
+        .accounts
+        .iter()
+        .find(|account| account.id == account_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("Account not found after sync: {target}"))?;
+
+    ensure_materialized_account_files(&account)?;
+
     if let Some(acc) = store.accounts.iter_mut().find(|a| a.id == account.id) {
         acc.last_used_at = Some(Utc::now());
     }
@@ -6620,13 +8054,17 @@ fn apply_annotation(
     }
 }
 
-fn run_codex_process(account: &StoredAccount, codex_args: Vec<String>) -> anyhow::Result<()> {
+fn run_codex_process(
+    account: &StoredAccount,
+    codex_args: Vec<String>,
+    agent_mode: bool,
+) -> anyhow::Result<()> {
     let program = cli_program(&account.cli_kind);
     let base_codex_args = combined_profile_cli_args(account, codex_args);
     let add_docker_sandbox_bypass = should_add_docker_sandbox_bypass(account, &base_codex_args);
     let effective_codex_args = codex_args_for_runtime(account, base_codex_args);
     println!("CLI binary: {BOLD}{}{RESET}", program);
-    print_launch_summary(account);
+    print_launch_summary(account, agent_mode);
     if !account.default_cli_args.is_empty() {
         println!(
             "Default CLI args: {}",
@@ -6643,10 +8081,13 @@ fn run_codex_process(account: &StoredAccount, codex_args: Vec<String>) -> anyhow
         );
     }
     ensure_desktop_notify_bridge_for_launch(account)?;
+    if agent_mode {
+        ensure_agent_bus_for_launch(account)?;
+    }
     let launch = maybe_wrap_launch_with_session(
         account,
         &effective_codex_args,
-        codex_launch_command(account, &effective_codex_args)?,
+        codex_launch_command_with_agent_mode(account, &effective_codex_args, agent_mode)?,
     )?;
     let exit_code = exit_code_from_status(
         launch
@@ -6658,7 +8099,7 @@ fn run_codex_process(account: &StoredAccount, codex_args: Vec<String>) -> anyhow
     std::process::exit(exit_code);
 }
 
-fn print_launch_summary(account: &StoredAccount) {
+fn print_launch_summary(account: &StoredAccount, agent_mode: bool) {
     let global_config = load_codez_config();
     let effective_proxy = effective_proxy_config(account, &global_config);
     let proxy_scope = account_proxy_scope_label(account, &global_config);
@@ -6674,7 +8115,7 @@ fn print_launch_summary(account: &StoredAccount) {
     };
 
     println!(
-        "Launch: cli={} profile={} runtime=\"{}\" proxy_scope={} proxy=\"{}\" session_scope={} session={} provider={} api={} tool_proxy={}",
+        "Launch: cli={} profile={} runtime=\"{}\" proxy_scope={} proxy=\"{}\" session_scope={} session={} agent={} provider={} api={} tool_proxy={}",
         account.cli_kind,
         account.name,
         runtime_description(&account.runtime),
@@ -6682,6 +8123,7 @@ fn print_launch_summary(account: &StoredAccount) {
         proxy_label,
         session_scope,
         session_label,
+        if agent_mode { "collab" } else { "off" },
         provider,
         api,
         tool_proxy_mode
@@ -6723,9 +8165,18 @@ fn should_add_docker_sandbox_bypass(account: &StoredAccount, codex_args: &[Strin
             .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
 }
 
+#[cfg(test)]
 fn codex_launch_command(
     account: &StoredAccount,
     codex_args: &[String],
+) -> anyhow::Result<LaunchCommand> {
+    codex_launch_command_with_agent_mode(account, codex_args, false)
+}
+
+fn codex_launch_command_with_agent_mode(
+    account: &StoredAccount,
+    codex_args: &[String],
+    agent_mode: bool,
 ) -> anyhow::Result<LaunchCommand> {
     let files = ensure_materialized_account_files(account)?;
     match &account.runtime {
@@ -6736,9 +8187,10 @@ fn codex_launch_command(
             files.config_path.to_string_lossy().as_ref(),
             files.custom_status_items_path.to_string_lossy().as_ref(),
             Some(&files.auth_path),
+            agent_mode,
         )),
         RuntimeConfig::Docker { image, .. } => {
-            docker_codex_launch_command(account, image, codex_args, &files.auth_path)
+            docker_codex_launch_command(account, image, codex_args, &files.auth_path, agent_mode)
         }
     }
 }
@@ -6748,6 +8200,7 @@ fn docker_codex_launch_command(
     image: &str,
     codex_args: &[String],
     host_auth_path: &Path,
+    agent_mode: bool,
 ) -> anyhow::Result<LaunchCommand> {
     let cwd = std::env::current_dir().context("Failed to determine current directory")?;
     let user_name = docker_user_name(match &account.runtime {
@@ -6780,6 +8233,7 @@ fn docker_codex_launch_command(
         &container_config_path,
         &container_custom_status_items_path,
         Some(host_auth_path),
+        agent_mode,
     );
     let mut launch = docker_command();
 
@@ -6837,6 +8291,7 @@ fn codex_launch_envs(
     config_path: &str,
     custom_status_items_path: &str,
     api_key_auth_path: Option<&Path>,
+    agent_mode: bool,
 ) -> Vec<(String, String)> {
     let mut envs = match account.cli_kind {
         CliKind::Claude => claude_launch_envs(account),
@@ -6942,8 +8397,63 @@ fn codex_launch_envs(
             ));
         }
     }
+    if agent_mode
+        && global_config.agent_bus_enabled
+        && matches!(account.runtime, RuntimeConfig::Host)
+    {
+        let agent_name = account_agent_name(account);
+        envs.push((
+            CUTEX_AGENT_BUS_URL_ENV_VAR.to_string(),
+            agent_bus_base_url(agent_bus_port(&global_config)),
+        ));
+        if let Some(token) = &global_config.agent_bus_token {
+            if !token.is_empty() {
+                envs.push((CUTEX_AGENT_BUS_TOKEN_ENV_VAR.to_string(), token.clone()));
+            }
+        }
+        envs.push((
+            CUTEX_AGENT_ID_ENV_VAR.to_string(),
+            agent_id_for_launch(account),
+        ));
+        envs.push((CUTEX_AGENT_NAME_ENV_VAR.to_string(), agent_name.clone()));
+        envs.push((CUTEX_AGENT_HINT_ENV_VAR.to_string(), cutex_agent_hint()));
+    }
 
     envs
+}
+
+fn account_agent_name(account: &StoredAccount) -> String {
+    account
+        .agent_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(account.name.as_str())
+        .to_string()
+}
+
+fn agent_id_for_launch(account: &StoredAccount) -> String {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project = sanitize_session_component(
+        cwd.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("project"),
+        24,
+        "project",
+    );
+    let name = sanitize_session_component(&account_agent_name(account), 24, "agent");
+    let hash = fnv1a_hex(format!(
+        "{}\0{}\0{}\0{}",
+        account.id,
+        account.name,
+        cwd.display(),
+        std::process::id()
+    ));
+    format!("cutex.{name}.{project}.{}", &hash[..10])
+}
+
+fn cutex_agent_hint() -> String {
+    "Peer agents may be available. Use `cutex agent list` to see agents and your current id. If you receive `[message from X]`, reply with `cutex agent send X \"message\"`; cutex labels you automatically. Normal sends wake the peer; add `--queue-only` only for FYI/no-action messages.".to_string()
 }
 
 fn claude_launch_envs(account: &StoredAccount) -> Vec<(String, String)> {
@@ -7071,6 +8581,7 @@ fn apply_codex_launch_envs(
     config_path: &str,
     custom_status_items_path: &str,
     api_key_auth_path: Option<&Path>,
+    agent_mode: bool,
 ) -> LaunchCommand {
     for (key, value) in codex_launch_envs(
         account,
@@ -7078,6 +8589,7 @@ fn apply_codex_launch_envs(
         config_path,
         custom_status_items_path,
         api_key_auth_path,
+        agent_mode,
     ) {
         launch = launch.env(key, value);
     }
@@ -7374,6 +8886,7 @@ mod tests {
             session: None,
             cli_kind: CliKind::Codex,
             default_cli_args: Vec::new(),
+            agent_name: None,
             last_used_at: None,
         }
     }
@@ -7403,6 +8916,337 @@ mod tests {
                 }
             })
         ));
+    }
+
+    #[test]
+    fn agent_send_command_parses() {
+        let cli = Cli::try_parse_from([
+            "cutex",
+            "agent",
+            "send",
+            "worker",
+            "please inspect the latest logs",
+            "--queue-only",
+            "--from",
+            "lead",
+        ])
+        .expect("agent send should parse");
+        assert!(matches!(
+            cli.command,
+            Some(CommandKind::Agent {
+                command: AgentCommand::Send {
+                    target,
+                    message,
+                    queue_only: true,
+                    from: Some(from),
+                }
+            }) if target == "worker"
+                && message == "please inspect the latest logs"
+                && from == "lead"
+        ));
+    }
+
+    #[test]
+    fn agent_log_command_parses() {
+        let cli = Cli::try_parse_from([
+            "cutex", "agent", "log", "--agent", "aria-it", "--limit", "20", "--json",
+        ])
+        .expect("agent log should parse");
+        assert!(matches!(
+            cli.command,
+            Some(CommandKind::Agent {
+                command: AgentCommand::Log {
+                    agent: Some(agent),
+                    limit: 20,
+                    json: true,
+                }
+            }) if agent == "aria-it"
+        ));
+    }
+
+    #[test]
+    fn global_agent_bus_set_command_parses() {
+        let cli = Cli::try_parse_from([
+            "cutex",
+            "global",
+            "set",
+            "--agent-bus-enable",
+            "false",
+            "--agent-bus-port",
+            "24261",
+            "--agent-bus-token",
+            "-",
+        ])
+        .expect("global agent bus settings should parse");
+        assert!(matches!(
+            cli.command,
+            Some(CommandKind::Global {
+                command: GlobalCommand::Set {
+                    agent_bus_enable: Some(false),
+                    agent_bus_port: Some(24261),
+                    agent_bus_token: Some(token),
+                    ..
+                }
+            }) if token == "-"
+        ));
+    }
+
+    #[test]
+    fn global_agent_message_template_set_command_parses() {
+        let cli = Cli::try_parse_from([
+            "cutex",
+            "global",
+            "set",
+            "--agent-message-prefix",
+            "[message from {from}] ",
+            "--agent-message-suffix",
+            "-",
+        ])
+        .expect("global agent message template settings should parse");
+        assert!(matches!(
+            cli.command,
+            Some(CommandKind::Global {
+                command: GlobalCommand::Set {
+                    agent_message_prefix: Some(prefix),
+                    agent_message_suffix: Some(suffix),
+                    ..
+                }
+            }) if prefix == "[message from {from}] " && suffix == "-"
+        ));
+    }
+
+    fn sample_bus_agent(
+        id: &str,
+        name: &str,
+        base_name: Option<&str>,
+        path_key: Option<&str>,
+    ) -> AgentBusAgent {
+        AgentBusAgent {
+            id: id.to_string(),
+            name: name.to_string(),
+            base_name: base_name.map(str::to_string),
+            path_key: path_key.map(str::to_string),
+            profile: "aemeath".to_string(),
+            cwd: "/tmp/project".to_string(),
+            pid: 42,
+            last_seen_epoch_secs: now_epoch_secs(),
+        }
+    }
+
+    #[test]
+    fn agent_target_resolves_id_display_name_and_unique_base_name() {
+        let state = std::sync::Arc::new(Mutex::new(AgentBusState::default()));
+        {
+            let mut state_lock = state.lock().expect("state lock should not be poisoned");
+            state_lock.agents.insert(
+                "agent-a".to_string(),
+                sample_bus_agent(
+                    "agent-a",
+                    "aria-it.124f234",
+                    Some("aria-it"),
+                    Some("124f234"),
+                ),
+            );
+            state_lock.agents.insert(
+                "agent-b".to_string(),
+                sample_bus_agent("agent-b", "writer.4455667", Some("writer"), Some("4455667")),
+            );
+        }
+
+        assert_eq!(resolve_agent_target(&state, "agent-a").unwrap(), "agent-a");
+        assert_eq!(
+            resolve_agent_target(&state, "aria-it.124f234").unwrap(),
+            "agent-a"
+        );
+        assert_eq!(resolve_agent_target(&state, "writer").unwrap(), "agent-b");
+    }
+
+    #[test]
+    fn agent_target_rejects_ambiguous_base_name() {
+        let state = std::sync::Arc::new(Mutex::new(AgentBusState::default()));
+        {
+            let mut state_lock = state.lock().expect("state lock should not be poisoned");
+            state_lock.agents.insert(
+                "agent-a".to_string(),
+                sample_bus_agent(
+                    "agent-a",
+                    "aria-it.124f234",
+                    Some("aria-it"),
+                    Some("124f234"),
+                ),
+            );
+            state_lock.agents.insert(
+                "agent-b".to_string(),
+                sample_bus_agent(
+                    "agent-b",
+                    "aria-it.7654321",
+                    Some("aria-it"),
+                    Some("7654321"),
+                ),
+            );
+        }
+
+        let err = resolve_agent_target(&state, "aria-it").expect_err("base name is ambiguous");
+        assert!(err.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn agent_sender_label_prefers_current_thread_base_name() {
+        let agent = sample_bus_agent(
+            "cutex.aemeath.scgpt.421708310f",
+            "msgbot-1.8de58c1",
+            Some("msgbot-1"),
+            Some("8de58c1"),
+        );
+
+        assert_eq!(agent_sender_label(&agent), "msgbot-1");
+    }
+
+    #[test]
+    fn agent_message_template_wraps_content() {
+        let content = format_agent_message_content(
+            Some("[message from {from}] "),
+            Some(" [to {to}]"),
+            "agent.ceo",
+            "aria-it.124f234",
+            "please inspect logs",
+        );
+
+        assert_eq!(
+            content,
+            "[message from agent.ceo] please inspect logs [to aria-it.124f234]"
+        );
+    }
+
+    #[test]
+    fn agent_messages_are_removed_only_after_ack() {
+        let state = std::sync::Arc::new(Mutex::new(AgentBusState::default()));
+        let message = AgentBusMessage {
+            id: "message-1".to_string(),
+            from: "agent-b".to_string(),
+            to: "agent-a".to_string(),
+            content: "hello".to_string(),
+            trigger_turn: true,
+            created_at_epoch_secs: now_epoch_secs(),
+        };
+        let encoded = serde_json::to_value(&message).expect("message should encode");
+        assert!(encoded.get("triggerTurn").is_some());
+        assert!(encoded.get("trigger_turn").is_none());
+        {
+            let mut state_lock = state.lock().expect("state lock should not be poisoned");
+            state_lock
+                .messages
+                .entry("agent-a".to_string())
+                .or_default()
+                .push_back(message);
+        }
+
+        {
+            let state_lock = state.lock().expect("state lock should not be poisoned");
+            assert_eq!(
+                state_lock
+                    .messages
+                    .get("agent-a")
+                    .expect("queue should exist")
+                    .len(),
+                1
+            );
+        }
+
+        assert_eq!(
+            ack_agent_messages(&state, "agent-a", &["message-1".to_string()])
+                .expect("ack should succeed"),
+            1
+        );
+        assert!(state
+            .lock()
+            .expect("state lock should not be poisoned")
+            .messages
+            .get("agent-a")
+            .is_none());
+        assert_eq!(
+            ack_agent_messages(&state, "agent-a", &["message-1".to_string()])
+                .expect("duplicate ack should succeed"),
+            0
+        );
+    }
+
+    #[test]
+    fn agent_bus_dedupes_recent_identical_messages() {
+        let state = std::sync::Arc::new(Mutex::new(AgentBusState::default()));
+        let first = enqueue_agent_bus_message_once(
+            &state,
+            "agent.ceo",
+            "agent-worker",
+            "worker.1234567",
+            "[message from agent.ceo] please report",
+            true,
+            1_000,
+        )
+        .expect("first send should enqueue");
+        let duplicate = enqueue_agent_bus_message_once(
+            &state,
+            "agent.ceo",
+            "agent-worker",
+            "worker.1234567",
+            "[message from agent.ceo] please report",
+            true,
+            1_000 + AGENT_BUS_DEDUPE_WINDOW_SECS,
+        )
+        .expect("duplicate send should be accepted");
+
+        assert!(!first.deduplicated);
+        assert!(duplicate.deduplicated);
+        assert_eq!(first.record.id, duplicate.record.id);
+        assert_eq!(
+            state
+                .lock()
+                .expect("state lock should not be poisoned")
+                .messages
+                .get("agent-worker")
+                .expect("queue should exist")
+                .len(),
+            1
+        );
+
+        let later = enqueue_agent_bus_message_once(
+            &state,
+            "agent.ceo",
+            "agent-worker",
+            "worker.1234567",
+            "[message from agent.ceo] please report",
+            true,
+            1_001 + AGENT_BUS_DEDUPE_WINDOW_SECS,
+        )
+        .expect("later send should enqueue again");
+        assert!(!later.deduplicated);
+        assert_ne!(first.record.id, later.record.id);
+        assert_eq!(
+            state
+                .lock()
+                .expect("state lock should not be poisoned")
+                .messages
+                .get("agent-worker")
+                .expect("queue should exist")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn agent_bus_send_request_accepts_camel_case_trigger_turn() {
+        let request: AgentBusSendRequest = serde_json::from_value(serde_json::json!({
+            "to": "worker",
+            "from": "leader",
+            "content": "queue this for later",
+            "triggerTurn": false
+        }))
+        .expect("camelCase triggerTurn should parse");
+
+        assert_eq!(request.to, "worker");
+        assert_eq!(request.from.as_deref(), Some("leader"));
+        assert_eq!(request.content, "queue this for later");
+        assert!(!request.trigger_turn);
     }
 
     #[test]
@@ -7614,6 +9458,7 @@ base_url = "https://new.example"
             session: None,
             cli_kind: CliKind::Codex,
             default_cli_args: Vec::new(),
+            agent_name: None,
             last_used_at: None,
         };
 
@@ -7654,6 +9499,7 @@ base_url = "https://new.example"
             session: None,
             cli_kind: CliKind::Codex,
             default_cli_args: Vec::new(),
+            agent_name: None,
             last_used_at: None,
         };
         let existing = r#"
@@ -8360,6 +10206,71 @@ status_line = ["launch-profile", "current-dir"]
     }
 
     #[test]
+    fn prepare_account_for_launch_does_not_switch_or_sync_active_codex_home() {
+        let _guard = env_lock().lock().expect("env lock should not be poisoned");
+        let temp_home = std::env::temp_dir().join(format!("codez-home-{}", Uuid::new_v4()));
+        let old_home = std::env::var_os("HOME");
+        fs::create_dir_all(&temp_home).expect("temp home should be created");
+        unsafe {
+            std::env::set_var("HOME", &temp_home);
+        }
+
+        let mut store = AccountsStore::default();
+        let active = sample_account("active");
+        let run_only = sample_account("run-only");
+        store.accounts.push(active.clone());
+        store.accounts.push(run_only.clone());
+        store.active_account_id = Some(active.id.clone());
+        save_store(&store).expect("store should save");
+
+        let codex_home = host_codex_home_dir().expect("host codex home should resolve");
+        fs::create_dir_all(&codex_home).expect("codex home should be created");
+        fs::write(codex_home.join("auth.json"), "{\"active\":true}\n")
+            .expect("active auth should be written");
+        fs::write(
+            codex_home.join("config.toml"),
+            "model_provider = \"active\"\n",
+        )
+        .expect("active config should be written");
+
+        write_profile_files(
+            &run_only,
+            "{\"run_only\":true}\n",
+            Some("model_provider = \"run_only\"\n"),
+        )
+        .expect("run-only profile files should be written");
+
+        let prepared =
+            prepare_account_for_launch("run-only").expect("account should prepare for launch");
+        assert_eq!(prepared.id, run_only.id);
+
+        let reloaded = load_store().expect("store should reload");
+        assert_eq!(
+            reloaded.active_account_id.as_deref(),
+            Some(active.id.as_str())
+        );
+        assert!(reloaded
+            .accounts
+            .iter()
+            .find(|account| account.id == run_only.id)
+            .and_then(|account| account.last_used_at.as_ref())
+            .is_some());
+
+        let active_auth =
+            fs::read_to_string(codex_home.join("auth.json")).expect("active auth should remain");
+        let active_config = fs::read_to_string(codex_home.join("config.toml"))
+            .expect("active config should remain");
+        assert_eq!(active_auth, "{\"active\":true}\n");
+        assert_eq!(active_config, "model_provider = \"active\"\n");
+
+        match old_home {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = fs::remove_dir_all(temp_home);
+    }
+
+    #[test]
     fn save_store_round_trips_profile_default_cli_args() {
         let _guard = env_lock().lock().expect("env lock should not be poisoned");
         let temp_home = std::env::temp_dir().join(format!("cutex-home-{}", Uuid::new_v4()));
@@ -8968,6 +10879,172 @@ status_line = ["launch-profile", "current-dir"]
         assert!(launch.envs.iter().any(|(key, value)| {
             key == CODEX_LAUNCH_PROFILE_EMAIL_ENV_VAR && value == "test-profile@example.test"
         }));
+
+        match old_home {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match old_cutex_codex_bin {
+            Some(value) => unsafe { std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, value) },
+            None => unsafe { std::env::remove_var(CUTEX_CODEX_BIN_ENV_VAR) },
+        }
+        match old_codez_codex_bin {
+            Some(value) => unsafe { std::env::set_var(CODEZ_CODEX_BIN_ENV_VAR, value) },
+            None => unsafe { std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR) },
+        }
+        let _ = fs::remove_dir_all(temp_home);
+    }
+
+    #[test]
+    fn host_launch_command_omits_agent_bus_envs_by_default() {
+        let _guard = env_lock().lock().expect("env lock should not be poisoned");
+        let temp_home = std::env::temp_dir().join(format!("cutex-home-{}", Uuid::new_v4()));
+        let old_home = std::env::var_os("HOME");
+        let old_cutex_codex_bin = std::env::var_os(CUTEX_CODEX_BIN_ENV_VAR);
+        let old_codez_codex_bin = std::env::var_os(CODEZ_CODEX_BIN_ENV_VAR);
+        fs::create_dir_all(temp_home.join(".cutex")).expect("temp cutex home should be created");
+        unsafe {
+            std::env::set_var("HOME", &temp_home);
+            std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, "/tmp/cute-codex");
+            std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR);
+        }
+
+        let mut config = CodezConfig::default();
+        config.agent_bus_enabled = true;
+        config.agent_bus_port = Some(24261);
+        config.agent_bus_token = Some("agent-test-token".to_string());
+        save_codez_config(&config).expect("config should be saved");
+
+        let mut account = sample_account("profile-name");
+        account.agent_name = Some("worker-one".to_string());
+        write_profile_files(&account, "{\"demo\":true}\n", None)
+            .expect("profile files should be written");
+
+        let launch =
+            codex_launch_command(&account, &["resume".to_string()]).expect("launch should build");
+
+        assert!(!launch
+            .envs
+            .iter()
+            .any(|(key, _)| key == CUTEX_AGENT_BUS_URL_ENV_VAR));
+        assert!(!launch
+            .envs
+            .iter()
+            .any(|(key, _)| key == CUTEX_AGENT_ID_ENV_VAR));
+
+        match old_home {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match old_cutex_codex_bin {
+            Some(value) => unsafe { std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, value) },
+            None => unsafe { std::env::remove_var(CUTEX_CODEX_BIN_ENV_VAR) },
+        }
+        match old_codez_codex_bin {
+            Some(value) => unsafe { std::env::set_var(CODEZ_CODEX_BIN_ENV_VAR, value) },
+            None => unsafe { std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR) },
+        }
+        let _ = fs::remove_dir_all(temp_home);
+    }
+
+    #[test]
+    fn host_launch_command_includes_agent_bus_envs_in_agent_mode() {
+        let _guard = env_lock().lock().expect("env lock should not be poisoned");
+        let temp_home = std::env::temp_dir().join(format!("cutex-home-{}", Uuid::new_v4()));
+        let old_home = std::env::var_os("HOME");
+        let old_cutex_codex_bin = std::env::var_os(CUTEX_CODEX_BIN_ENV_VAR);
+        let old_codez_codex_bin = std::env::var_os(CODEZ_CODEX_BIN_ENV_VAR);
+        fs::create_dir_all(temp_home.join(".cutex")).expect("temp cutex home should be created");
+        unsafe {
+            std::env::set_var("HOME", &temp_home);
+            std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, "/tmp/cute-codex");
+            std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR);
+        }
+
+        let mut config = CodezConfig::default();
+        config.agent_bus_enabled = true;
+        config.agent_bus_port = Some(24261);
+        config.agent_bus_token = Some("agent-test-token".to_string());
+        save_codez_config(&config).expect("config should be saved");
+
+        let mut account = sample_account("profile-name");
+        account.agent_name = Some("worker-one".to_string());
+        write_profile_files(&account, "{\"demo\":true}\n", None)
+            .expect("profile files should be written");
+
+        let launch = codex_launch_command_with_agent_mode(&account, &["resume".to_string()], true)
+            .expect("launch should build");
+
+        assert!(launch.envs.iter().any(|(key, value)| {
+            key == CUTEX_AGENT_BUS_URL_ENV_VAR && value == "http://127.0.0.1:24261"
+        }));
+        assert!(launch.envs.iter().any(|(key, value)| {
+            key == CUTEX_AGENT_BUS_TOKEN_ENV_VAR && value == "agent-test-token"
+        }));
+        assert!(launch
+            .envs
+            .iter()
+            .any(|(key, value)| { key == CUTEX_AGENT_NAME_ENV_VAR && value == "worker-one" }));
+        assert!(launch.envs.iter().any(|(key, value)| {
+            key == CUTEX_AGENT_ID_ENV_VAR && value.starts_with("cutex.worker-one.")
+        }));
+        assert!(launch.envs.iter().any(|(key, value)| {
+            key == CUTEX_AGENT_HINT_ENV_VAR && value.contains("cutex agent send")
+        }));
+
+        match old_home {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match old_cutex_codex_bin {
+            Some(value) => unsafe { std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, value) },
+            None => unsafe { std::env::remove_var(CUTEX_CODEX_BIN_ENV_VAR) },
+        }
+        match old_codez_codex_bin {
+            Some(value) => unsafe { std::env::set_var(CODEZ_CODEX_BIN_ENV_VAR, value) },
+            None => unsafe { std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR) },
+        }
+        let _ = fs::remove_dir_all(temp_home);
+    }
+
+    #[test]
+    fn docker_launch_command_omits_agent_bus_envs() {
+        let _guard = env_lock().lock().expect("env lock should not be poisoned");
+        let temp_home = std::env::temp_dir().join(format!("cutex-home-{}", Uuid::new_v4()));
+        let old_home = std::env::var_os("HOME");
+        let old_cutex_codex_bin = std::env::var_os(CUTEX_CODEX_BIN_ENV_VAR);
+        let old_codez_codex_bin = std::env::var_os(CODEZ_CODEX_BIN_ENV_VAR);
+        fs::create_dir_all(temp_home.join(".cutex")).expect("temp cutex home should be created");
+        unsafe {
+            std::env::set_var("HOME", &temp_home);
+            std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, "cute-codex");
+            std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR);
+        }
+
+        let mut config = CodezConfig::default();
+        config.agent_bus_enabled = true;
+        config.agent_bus_port = Some(24261);
+        config.agent_bus_token = Some("agent-test-token".to_string());
+        save_codez_config(&config).expect("config should be saved");
+
+        let mut account = sample_account("docker-worker");
+        account.runtime = RuntimeConfig::Docker {
+            image: "cutex-dev-v2".to_string(),
+            user_name: Some("cutex".to_string()),
+        };
+        write_profile_files(&account, "{\"demo\":true}\n", None)
+            .expect("profile files should be written");
+
+        let launch = codex_launch_command(&account, &[]).expect("launch should build");
+
+        assert!(!launch
+            .args
+            .iter()
+            .any(|arg| arg.starts_with(&format!("{CUTEX_AGENT_BUS_URL_ENV_VAR}="))));
+        assert!(!launch
+            .args
+            .iter()
+            .any(|arg| arg.starts_with(&format!("{CUTEX_AGENT_ID_ENV_VAR}="))));
 
         match old_home {
             Some(value) => unsafe { std::env::set_var("HOME", value) },
