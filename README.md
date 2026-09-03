@@ -60,6 +60,7 @@ Requirements:
 
 - a Rust toolchain supported by this workspace;
 - a compatible `cute-codex` (preferred) or Codex-compatible CLI;
+- `codex-code-mode-host` beside `cute-codex` when Code Mode is enabled;
 - `cute-alden` when detachable/reattachable terminal sessions are required;
 - Docker and Bridgeboard only for the corresponding optional features.
 
@@ -72,6 +73,25 @@ cargo build --release --locked
 The result is `target/release/cutex` on Unix-like systems and
 `target/release/cutex.exe` on Windows. Put it on `PATH` together with the
 runtime dependencies you intend to use.
+
+A Cutex release that enables cute-codex Code Mode is one three-program bundle:
+`cutex`, `cute-codex`, and `codex-code-mode-host` (with `.exe` suffixes on
+Windows). `cute-codex` resolves the host relative to its own executable, so the
+two cute-codex programs must be regular files in the same release directory.
+Build the latter two from the same cute-codex source commit, then reject an
+incomplete bundle before changing a live shortcut or service:
+
+```sh
+scripts/verify-release-bundle.sh /path/to/linux-bundle
+```
+
+```powershell
+./scripts/verify-release-bundle.ps1 -Bundle C:\path\to\windows-bundle
+```
+
+The verifier runs target-native version/help smokes for all three programs.
+Disabling Code Mode is an explicit product/configuration decision, not an
+automatic packaging fallback.
 
 Cutex resolves the Codex-compatible binary in this order:
 
