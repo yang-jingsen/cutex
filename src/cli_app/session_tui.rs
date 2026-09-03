@@ -26,6 +26,7 @@ use cutex::config::store::load_codez_config_checked;
 use cutex::config::store::save_codez_config;
 use cutex::management::v2::activity::load_session_activity_states;
 use cutex::management::v2::activity::SessionActivityState;
+use cutex::observability::{SafeToolCallClass, SafeToolCallStatus};
 use cutex::platform::host::current_host_name;
 use cutex::profiles::model::CodezConfig;
 use cutex::runtime::alden::{cute_alden_sessions, CuteAldenSession};
@@ -175,7 +176,7 @@ struct SelectorRow {
     retired_at: Option<String>,
     revision: u64,
     activity_session_id: Option<String>,
-    last_output_at: Option<String>,
+    activity: Option<SelectorActivity>,
     actions: Vec<SessionTuiActionItem>,
     settings: Vec<SessionTuiSettingCategory>,
     settings_snapshot: Option<SessionSettingsSnapshot>,
@@ -183,6 +184,38 @@ struct SelectorRow {
     attachable: bool,
     pinned: bool,
     managed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectorActivityClass {
+    Output,
+    Command,
+    Mcp,
+    Tool,
+    Agent,
+    Edit,
+    Image,
+}
+
+impl SelectorActivityClass {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Output => "OUT",
+            Self::Command => "CMD",
+            Self::Mcp => "MCP",
+            Self::Tool => "TOOL",
+            Self::Agent => "AGT",
+            Self::Edit => "EDIT",
+            Self::Image => "IMG",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectorActivity {
+    class: SelectorActivityClass,
+    updated_at: String,
+    failed: bool,
 }
 
 impl SelectorRow {
@@ -3172,11 +3205,11 @@ impl SelectorModel {
 
     fn refresh_activity_states(&mut self, activity_states: &HashMap<String, SessionActivityState>) {
         for row in &mut self.rows {
-            row.last_output_at = row
+            row.activity = row
                 .activity_session_id
                 .as_deref()
                 .and_then(|session_id| activity_states.get(session_id))
-                .and_then(|activity| activity.last_output_at.clone());
+                .and_then(selector_activity_from_state);
         }
     }
 
@@ -3965,6 +3998,78 @@ fn combine_warnings(left: Option<String>, right: Option<String>) -> Option<Strin
     }
 }
 
+fn selector_activity_from_state(state: &SessionActivityState) -> Option<SelectorActivity> {
+    let output = state
+        .last_output
+        .as_ref()
+        .and_then(|projection| {
+            parse_selector_activity_timestamp(&projection.updated_at).map(|timestamp| {
+                (
+                    timestamp,
+                    SelectorActivity {
+                        class: SelectorActivityClass::Output,
+                        updated_at: projection.updated_at.clone(),
+                        failed: false,
+                    },
+                )
+            })
+        })
+        .or_else(|| {
+            state.last_output_at.as_deref().and_then(|updated_at| {
+                parse_selector_activity_timestamp(updated_at).map(|timestamp| {
+                    (
+                        timestamp,
+                        SelectorActivity {
+                            class: SelectorActivityClass::Output,
+                            updated_at: updated_at.to_string(),
+                            failed: false,
+                        },
+                    )
+                })
+            })
+        });
+    let tool = state.last_tool_call.as_ref().and_then(|projection| {
+        parse_selector_activity_timestamp(&projection.updated_at).map(|timestamp| {
+            (
+                timestamp,
+                SelectorActivity {
+                    class: selector_activity_class_for_tool(projection.class),
+                    updated_at: projection.updated_at.clone(),
+                    failed: projection.status == SafeToolCallStatus::Failed,
+                },
+            )
+        })
+    });
+
+    match (output, tool) {
+        (Some((output_at, output)), Some((tool_at, tool))) => {
+            // A tie always prefers output, so malformed ordering metadata cannot make the
+            // homepage projection flicker between refreshes.
+            Some(if tool_at > output_at { tool } else { output })
+        }
+        (Some((_, output)), None) => Some(output),
+        (None, Some((_, tool))) => Some(tool),
+        (None, None) => None,
+    }
+}
+
+fn parse_selector_activity_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+fn selector_activity_class_for_tool(class: SafeToolCallClass) -> SelectorActivityClass {
+    match class {
+        SafeToolCallClass::Command => SelectorActivityClass::Command,
+        SafeToolCallClass::McpTool => SelectorActivityClass::Mcp,
+        SafeToolCallClass::DynamicTool => SelectorActivityClass::Tool,
+        SafeToolCallClass::CollaborationTool => SelectorActivityClass::Agent,
+        SafeToolCallClass::FileChange => SelectorActivityClass::Edit,
+        SafeToolCallClass::ImageView => SelectorActivityClass::Image,
+    }
+}
+
 fn selector_rows_from_store(
     store: &CutexSessionStore,
     alden_sessions: &[CuteAldenSession],
@@ -3979,9 +4084,9 @@ fn selector_rows_from_store(
         .filter(|(_, record)| record.is_active())
         .map(|(key, record)| {
             let mut row = selector_row(key, record, alden_sessions, live_agents, profile_names);
-            row.last_output_at = activity_states
+            row.activity = activity_states
                 .get(&record.cutex_session_id)
-                .and_then(|activity| activity.last_output_at.clone());
+                .and_then(selector_activity_from_state);
             row
         })
         .collect::<Vec<_>>();
@@ -4027,7 +4132,7 @@ fn retired_selector_row(key: &str, record: &CutexSessionRecord) -> SelectorRow {
         retired_at: record.retired_at.clone(),
         revision: record.durable_revision(),
         activity_session_id: None,
-        last_output_at: None,
+        activity: None,
         actions: vec![SessionTuiActionItem {
             action: SessionTuiAction::RestoreSession,
             detail: "Restore active and offline without launching",
@@ -4079,7 +4184,7 @@ fn selector_row(
         retired_at: None,
         revision: record.durable_revision(),
         activity_session_id: Some(record.cutex_session_id.clone()),
-        last_output_at: None,
+        activity: None,
         actions,
         settings,
         settings_snapshot: Some(settings_snapshot),
@@ -4102,7 +4207,7 @@ fn retired_sessions_row(retired_count: usize) -> SelectorRow {
         retired_at: None,
         revision: 0,
         activity_session_id: None,
-        last_output_at: None,
+        activity: None,
         actions: Vec::new(),
         settings: Vec::new(),
         settings_snapshot: None,
@@ -4125,7 +4230,7 @@ fn projects_row() -> SelectorRow {
         retired_at: None,
         revision: 0,
         activity_session_id: None,
-        last_output_at: None,
+        activity: None,
         actions: Vec::new(),
         settings: Vec::new(),
         settings_snapshot: None,
@@ -4171,7 +4276,7 @@ fn recent_sessions_row() -> SelectorRow {
         retired_at: None,
         revision: 0,
         activity_session_id: None,
-        last_output_at: None,
+        activity: None,
         actions: Vec::new(),
         settings: Vec::new(),
         settings_snapshot: None,
@@ -4224,7 +4329,7 @@ fn global_settings_row_with_profiles(
         retired_at: None,
         revision: 0,
         activity_session_id: None,
-        last_output_at: None,
+        activity: None,
         actions: Vec::new(),
         settings: settings_snapshot.categories(&GlobalSettingsDraft::default()),
         settings_snapshot: None,
@@ -4249,7 +4354,7 @@ fn profiles_row(config: &CodezConfig, profile_names: &[String]) -> SelectorRow {
         retired_at: None,
         revision: 0,
         activity_session_id: None,
-        last_output_at: None,
+        activity: None,
         actions: Vec::new(),
         settings: Vec::new(),
         settings_snapshot: None,
@@ -5869,57 +5974,44 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
         .map(|row| selector_table_row(row, wide, extra_wide, default_profile))
         .collect::<Vec<_>>();
     let header_style = Style::new().fg(Color::Gray).add_modifier(Modifier::BOLD);
-    let header = if extra_wide {
+    let header = if wide {
         Row::new([
             "AGENT",
             "PROFILE",
-            "STATE",
-            "LAST OUTPUT",
-            "HOST",
-            "BACKEND",
+            "ST",
+            "ACTIVITY",
             "MANAGED PATH",
-            "PRIMARY ACTION",
-        ])
-    } else if wide {
-        Row::new([
-            "AGENT",
-            "PROFILE",
-            "STATE",
-            "LAST OUTPUT",
-            "MANAGED PATH",
-            "PRIMARY ACTION",
+            "ACTION",
         ])
     } else {
-        Row::new(["AGENT", "PROFILE", "STATE", "PRIMARY"])
+        Row::new(["AGENT", "PROFILE", "ST", "ACTION"])
     }
     .style(header_style)
     .bottom_margin(1);
     let widths = if extra_wide {
         vec![
-            Constraint::Min(16),
-            Constraint::Length(18),
-            Constraint::Length(9),
+            Constraint::Min(22),
+            Constraint::Length(20),
+            Constraint::Length(5),
             Constraint::Length(11),
-            Constraint::Length(13),
-            Constraint::Length(9),
-            Constraint::Min(20),
-            Constraint::Length(16),
+            Constraint::Min(30),
+            Constraint::Length(10),
         ]
     } else if wide {
         vec![
             Constraint::Min(14),
             Constraint::Length(18),
-            Constraint::Length(9),
+            Constraint::Length(5),
             Constraint::Length(11),
             Constraint::Min(18),
-            Constraint::Length(16),
+            Constraint::Length(10),
         ]
     } else {
         vec![
             Constraint::Min(14),
             Constraint::Length(18),
-            Constraint::Length(9),
-            Constraint::Length(14),
+            Constraint::Length(5),
+            Constraint::Length(10),
         ]
     };
     let table = Table::new(rows, widths)
@@ -6624,7 +6716,7 @@ fn selector_table_row<'a>(
 ) -> Row<'a> {
     let state = if let Some(lifecycle) = row.lifecycle {
         let label = selector_state_label(row);
-        let style = if label == "detached" {
+        let style = if selector_row_is_detached(row) {
             Style::new().fg(Color::Yellow)
         } else {
             lifecycle_style(lifecycle)
@@ -6653,7 +6745,7 @@ fn selector_table_row<'a>(
         row.actions
             .iter()
             .find(|item| item.primary)
-            .map(|item| item.action.label())
+            .map(|item| homepage_action_label(item.action))
             .unwrap_or("-")
     };
     let primary = Cell::from(primary_label).style(Style::new().fg(Color::Cyan));
@@ -6667,22 +6759,17 @@ fn selector_table_row<'a>(
     } else if let Some(profile) = row.configured_profile.as_deref() {
         Cell::from(profile).style(Style::new().fg(Color::Magenta))
     } else {
-        Cell::from(format!("Default ({})", default_profile.unwrap_or("unset")))
-            .style(Style::new().fg(Color::Gray))
+        Cell::from(format!("~{}", default_profile.unwrap_or("unset")))
+            .style(Style::new().fg(Color::DarkGray))
     };
-    let last_output = Cell::from(format_last_output_at(
-        row.last_output_at.as_deref(),
-        Utc::now(),
-    ))
-    .style(Style::new().fg(Color::Gray));
+    let activity = Cell::from(format_selector_activity(row.activity.as_ref(), Utc::now()))
+        .style(Style::new().fg(Color::Gray));
     if extra_wide {
         Row::new([
             agent,
             profile,
             state,
-            last_output,
-            Cell::from(row.host.as_str()),
-            Cell::from(row.backend.as_str()),
+            activity,
             Cell::from(row.managed_path.as_str()),
             primary,
         ])
@@ -6691,7 +6778,7 @@ fn selector_table_row<'a>(
             agent,
             profile,
             state,
-            last_output,
+            activity,
             Cell::from(row.managed_path.as_str()),
             primary,
         ])
@@ -6700,37 +6787,59 @@ fn selector_table_row<'a>(
     }
 }
 
-fn format_last_output_at(value: Option<&str>, now: DateTime<Utc>) -> String {
+fn homepage_action_label(action: SessionTuiAction) -> &'static str {
+    match action {
+        SessionTuiAction::ResumeAttach | SessionTuiAction::TakeoverExisting => "takeover",
+        SessionTuiAction::AttachExisting => "attach",
+        SessionTuiAction::OpenTui => "open",
+        SessionTuiAction::Online => "start",
+        SessionTuiAction::ResumeHere | SessionTuiAction::ResumeManaged => "resume",
+        SessionTuiAction::CloseAndRestart
+        | SessionTuiAction::CloseRuntime
+        | SessionTuiAction::RetireSession
+        | SessionTuiAction::RestoreSession => "manage",
+    }
+}
+
+fn format_selector_activity(value: Option<&SelectorActivity>, now: DateTime<Utc>) -> String {
     let Some(value) = value else {
         return "-".to_string();
     };
-    let Ok(value) = DateTime::parse_from_rfc3339(value) else {
+    let Some(timestamp) = parse_selector_activity_timestamp(&value.updated_at) else {
         return "-".to_string();
     };
-    let elapsed = now.signed_duration_since(value.with_timezone(&Utc));
+    let elapsed = now.signed_duration_since(timestamp);
     let seconds = elapsed.num_seconds().max(0);
-    match seconds {
+    let age = match seconds {
         0..=4 => "now".to_string(),
-        5..=59 => format!("{seconds}s ago"),
-        60..=3_599 => format!("{}m ago", seconds / 60),
-        3_600..=86_399 => format!("{}h ago", seconds / 3_600),
-        86_400..=604_799 => format!("{}d ago", seconds / 86_400),
-        _ => value.format("%Y-%m-%d").to_string(),
-    }
+        5..=59 => format!("{seconds}s"),
+        60..=3_599 => format!("{}m", seconds / 60),
+        3_600..=86_399 => format!("{}h", seconds / 3_600),
+        86_400..=604_799 => format!("{}d", seconds / 86_400),
+        _ => timestamp.format("%Y-%m-%d").to_string(),
+    };
+    let failed = if value.failed { "!" } else { "" };
+    format!("{}{failed} {age}", value.class.label())
 }
 
 fn selector_state_label(row: &SelectorRow) -> &'static str {
     match row.lifecycle {
-        Some(CutexSessionLifecycleState::Online) if row.backend == "alden" && !row.attachable => {
-            "detached"
-        }
-        Some(lifecycle) => lifecycle.label(),
+        Some(CutexSessionLifecycleState::Online) if selector_row_is_detached(row) => "DET",
+        Some(CutexSessionLifecycleState::Online) => "ON",
+        Some(CutexSessionLifecycleState::Offline) => "OFF",
+        Some(CutexSessionLifecycleState::Stale) => "STALE",
         None if row.target.is_profiles() => "accounts",
         None if row.target.is_retired_sessions() => "archive",
         None if row.target.is_cutex_projects() => "permissions",
         None if row.target.is_projects() => "workspace",
         None => "global",
     }
+}
+
+fn selector_row_is_detached(row: &SelectorRow) -> bool {
+    row.lifecycle == Some(CutexSessionLifecycleState::Online)
+        && row.backend == "alden"
+        && !row.attachable
 }
 
 fn selector_default_profile_name(model: &SelectorModel) -> Option<&str> {
@@ -6912,6 +7021,9 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
                 ]);
                 if model.enhanced_keyboard && area.width >= 120 {
                     spans.extend(footer_hints(&[("Shift+Enter", "actions")]));
+                }
+                if area.width >= 120 {
+                    spans.extend(footer_hints(&[("~", "global profile")]));
                 }
                 spans.extend(footer_hints(&[("Esc", "clear/exit")]));
                 spans
@@ -7210,12 +7322,40 @@ mod tests {
     use cutex::agent_bus::model::AgentRegistrationClass;
     use cutex::cli::args::{Cli, CommandKind};
     use cutex::im::registry::ImRegistry;
+    use cutex::observability::{
+        ObservationAssociation, SafeOutputClass, SafeOutputProjection, SafeToolCallProjection,
+    };
     use cutex::profiles::deepseek;
     use cutex::profiles::model::RuntimeConfig;
     use cutex::session::model::CutexSessionRuntimeBackend;
     use ratatui::backend::TestBackend;
 
     use super::super::test_home::IsolatedTestHome;
+
+    fn output_projection(updated_at: &str) -> SafeOutputProjection {
+        SafeOutputProjection {
+            association: ObservationAssociation::session("test-session"),
+            class: SafeOutputClass::FinalVisible,
+            display_text: "completed".to_string(),
+            updated_at: updated_at.to_string(),
+            runtime_generation: 1,
+        }
+    }
+
+    fn tool_projection(
+        class: SafeToolCallClass,
+        status: SafeToolCallStatus,
+        updated_at: &str,
+    ) -> SafeToolCallProjection {
+        SafeToolCallProjection {
+            association: ObservationAssociation::session("test-session"),
+            class,
+            status,
+            display_text: "safe label only".to_string(),
+            updated_at: updated_at.to_string(),
+            runtime_generation: 1,
+        }
+    }
 
     fn row(
         key: &str,
@@ -7259,7 +7399,7 @@ mod tests {
             retired_at: None,
             revision: 1,
             activity_session_id: Some(key.to_string()),
-            last_output_at: None,
+            activity: None,
             actions,
             settings: vec![
                 SessionTuiSettingCategory {
@@ -7484,7 +7624,7 @@ mod tests {
                 retired_at: None,
                 revision: 0,
                 activity_session_id: None,
-                last_output_at: None,
+                activity: None,
                 actions: Vec::new(),
                 settings: Vec::new(),
                 settings_snapshot: None,
@@ -7639,7 +7779,36 @@ mod tests {
 
         assert_eq!(row.lifecycle, Some(CutexSessionLifecycleState::Online));
         assert!(!row.attachable);
-        assert_eq!(selector_state_label(&row), "detached");
+        assert_eq!(selector_state_label(&row), "DET");
+        let mut other = row.clone();
+        other.target = SelectorTarget::Agent("other".to_string());
+        other.agent = "other".to_string();
+        other.attachable = true;
+        let mut model = SelectorModel::new(vec![row.clone(), other], false, false);
+        model.handle(SelectorEvent::Down);
+        let backend = TestBackend::new(WIDE_LAYOUT_MIN_WIDTH, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render_selector(frame, &model))
+            .expect("render detached row");
+        let buffer = terminal.backend().buffer();
+        let det_cell = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .find_map(|position| {
+                let (x, y) = position;
+                (buffer
+                    .cell(position)
+                    .is_some_and(|cell| cell.symbol() == "D")
+                    && buffer
+                        .cell((x.saturating_add(1), y))
+                        .is_some_and(|cell| cell.symbol() == "E")
+                    && buffer
+                        .cell((x.saturating_add(2), y))
+                        .is_some_and(|cell| cell.symbol() == "T"))
+                .then(|| buffer.cell(position).expect("DET cell"))
+            })
+            .expect("DET cell");
+        assert_eq!(det_cell.fg, Color::Yellow);
         assert_eq!(
             row.actions
                 .iter()
@@ -11145,107 +11314,201 @@ mod tests {
             false,
             true,
         );
-        activity_row.last_output_at =
-            Some((Utc::now() - chrono::Duration::minutes(10)).to_rfc3339());
+        activity_row.activity = Some(SelectorActivity {
+            class: SelectorActivityClass::Output,
+            updated_at: (Utc::now() - chrono::Duration::minutes(10)).to_rfc3339(),
+            failed: false,
+        });
         let model = SelectorModel::new(vec![activity_row], false, false);
+
+        let wide_boundary = rendered_text_at(WIDE_LAYOUT_MIN_WIDTH, 8, &model);
+        assert_eq!(
+            wide_boundary.lines().nth(4),
+            Some("  AGENT                 PROFILE             ST     ACTIVITY     MANAGED PATH          ACTION    ")
+        );
+        assert_eq!(
+            wide_boundary.lines().nth(6),
+            Some("> cutex-dev-v5          aemeath             ON     OUT 10m      ~/Projects/cutex      takeover  ")
+        );
+        let extra_wide_boundary = rendered_text_at(EXTRA_WIDE_LAYOUT_MIN_WIDTH, 8, &model);
+        assert_eq!(
+            extra_wide_boundary.lines().nth(4),
+            Some("  AGENT                                    PROFILE               ST     ACTIVITY     MANAGED PATH                             ACTION    ")
+        );
+        assert_eq!(
+            extra_wide_boundary.lines().nth(6),
+            Some("> cutex-dev-v5                             aemeath               ON     OUT 10m      ~/Projects/cutex                         takeover  ")
+        );
 
         let extra_wide = rendered_text(150, &model);
         let agent = extra_wide.find("AGENT").expect("agent heading");
         let profile = extra_wide.find("PROFILE").expect("profile heading");
-        let state = extra_wide.find("STATE").expect("state heading");
-        let last_output = extra_wide.find("LAST OUTPUT").expect("last output heading");
-        let host = extra_wide.find("HOST").expect("host heading");
-        let backend = extra_wide.find("BACKEND").expect("backend heading");
+        let state = extra_wide.find("ST").expect("state heading");
+        let activity = extra_wide.find("ACTIVITY").expect("activity heading");
         let managed_path = extra_wide
             .find("MANAGED PATH")
             .expect("managed path heading");
-        let primary = extra_wide.find("PRIMARY ACTION").expect("primary heading");
+        let primary = extra_wide.find("ACTION").expect("action heading");
         assert!(
             agent < profile
                 && profile < state
-                && state < last_output
-                && last_output < host
-                && host < backend
-                && backend < managed_path
+                && state < activity
+                && activity < managed_path
                 && managed_path < primary
         );
         assert!(extra_wide.contains("cutex-dev-v5"));
         assert!(extra_wide.contains("~/Projects/cutex"));
         assert!(extra_wide.contains("aemeath"));
-        assert!(extra_wide.contains("10m ago"));
+        assert!(extra_wide.contains("OUT 10m"));
         assert!(extra_wide.contains("takeover"));
+        assert!(extra_wide.contains("~ global profile"));
 
         let wide = rendered_text(120, &model);
         let agent = wide.find("AGENT").expect("agent heading");
         let profile = wide.find("PROFILE").expect("profile heading");
-        let state = wide.find("STATE").expect("state heading");
-        let last_output = wide.find("LAST OUTPUT").expect("last output heading");
+        let state = wide.find("ST").expect("state heading");
+        let activity = wide.find("ACTIVITY").expect("activity heading");
         let managed_path = wide.find("MANAGED PATH").expect("managed path heading");
-        let primary = wide.find("PRIMARY ACTION").expect("primary heading");
+        let primary = wide.find("ACTION").expect("action heading");
         assert!(
             agent < profile
                 && profile < state
-                && state < last_output
-                && last_output < managed_path
+                && state < activity
+                && activity < managed_path
                 && managed_path < primary
         );
-        assert!(!wide.contains("HOST"));
-        assert!(!wide.contains("BACKEND"));
+        assert!(!extra_wide.contains("HOST"));
+        assert!(!extra_wide.contains("BACKEND"));
         assert!(wide.contains("~/Projects/cutex"));
 
         let minimum_wide = rendered_text(WIDE_LAYOUT_MIN_WIDTH, &model);
-        assert!(minimum_wide.contains("LAST OUTPUT"));
+        assert!(minimum_wide.contains("ACTIVITY"));
         assert!(minimum_wide.contains("MANAGED PATH"));
-        assert!(minimum_wide.contains("PRIMARY ACTION"));
+        assert!(minimum_wide.contains("ACTION"));
         assert!(minimum_wide.contains("takeover"));
 
         let narrow = rendered_text(72, &model);
         let agent = narrow.find("AGENT").expect("agent heading");
         let profile = narrow.find("PROFILE").expect("profile heading");
-        let state = narrow.find("STATE").expect("state heading");
-        let primary = narrow.find("PRIMARY").expect("primary heading");
+        let state = narrow.find("ST").expect("state heading");
+        let primary = narrow.find("ACTION").expect("action heading");
         assert!(agent < profile && profile < state && state < primary);
         assert!(!narrow.contains("HOST"));
         assert!(!narrow.contains("BACKEND"));
-        assert!(!narrow.contains("LAST OUTPUT"));
+        assert!(!narrow.contains("ACTIVITY"));
         assert!(!narrow.contains("MANAGED PATH"));
+        assert!(!narrow.contains("~ global profile"));
         assert!(narrow.contains("aemeath"));
         assert!(narrow.contains("Ctrl+X close"));
         assert!(narrow.contains("Ctrl+C exit"));
     }
 
     #[test]
-    fn last_output_time_uses_compact_stable_labels() {
+    fn activity_labels_are_compact_and_safe() {
         let now = DateTime::parse_from_rfc3339("2026-08-13T12:00:00Z")
             .expect("test timestamp")
             .with_timezone(&Utc);
 
-        assert_eq!(format_last_output_at(None, now), "-");
+        assert_eq!(format_selector_activity(None, now), "-");
         assert_eq!(
-            format_last_output_at(Some("2026-08-13T11:59:58Z"), now),
-            "now"
+            format_selector_activity(
+                Some(&SelectorActivity {
+                    class: SelectorActivityClass::Output,
+                    updated_at: "2026-08-13T11:59:58Z".to_string(),
+                    failed: false,
+                }),
+                now,
+            ),
+            "OUT now"
         );
         assert_eq!(
-            format_last_output_at(Some("2026-08-13T11:59:18Z"), now),
-            "42s ago"
+            format_selector_activity(
+                Some(&SelectorActivity {
+                    class: SelectorActivityClass::Command,
+                    updated_at: "2026-08-13T11:59:18Z".to_string(),
+                    failed: true,
+                }),
+                now,
+            ),
+            "CMD! 42s"
         );
         assert_eq!(
-            format_last_output_at(Some("2026-08-13T11:52:00Z"), now),
-            "8m ago"
+            format_selector_activity(
+                Some(&SelectorActivity {
+                    class: SelectorActivityClass::Edit,
+                    updated_at: "2026-08-13T11:52:00Z".to_string(),
+                    failed: false,
+                }),
+                now,
+            ),
+            "EDIT 8m"
         );
         assert_eq!(
-            format_last_output_at(Some("2026-08-13T08:00:00Z"), now),
-            "4h ago"
+            format_selector_activity(
+                Some(&SelectorActivity {
+                    class: SelectorActivityClass::Image,
+                    updated_at: "2026-08-13T08:00:00Z".to_string(),
+                    failed: false,
+                }),
+                now,
+            ),
+            "IMG 4h"
         );
         assert_eq!(
-            format_last_output_at(Some("2026-08-10T12:00:00Z"), now),
-            "3d ago"
+            format_selector_activity(
+                Some(&SelectorActivity {
+                    class: SelectorActivityClass::Mcp,
+                    updated_at: "2026-08-10T12:00:00Z".to_string(),
+                    failed: false,
+                }),
+                now,
+            ),
+            "MCP 3d"
         );
         assert_eq!(
-            format_last_output_at(Some("2026-08-01T12:00:00Z"), now),
-            "2026-08-01"
+            format_selector_activity(
+                Some(&SelectorActivity {
+                    class: SelectorActivityClass::Agent,
+                    updated_at: "2026-08-01T12:00:00Z".to_string(),
+                    failed: false,
+                }),
+                now,
+            ),
+            "AGT 2026-08-01"
         );
-        assert_eq!(format_last_output_at(Some("invalid"), now), "-");
+        assert_eq!(
+            format_selector_activity(
+                Some(&SelectorActivity {
+                    class: SelectorActivityClass::Tool,
+                    updated_at: "invalid".to_string(),
+                    failed: false,
+                }),
+                now,
+            ),
+            "-"
+        );
+    }
+
+    #[test]
+    fn homepage_action_labels_are_compact_without_changing_action_identities() {
+        assert_eq!(homepage_action_label(SessionTuiAction::OpenTui), "open");
+        assert_eq!(homepage_action_label(SessionTuiAction::Online), "start");
+        assert_eq!(
+            homepage_action_label(SessionTuiAction::AttachExisting),
+            "attach"
+        );
+        assert_eq!(
+            homepage_action_label(SessionTuiAction::TakeoverExisting),
+            "takeover"
+        );
+        assert_eq!(
+            homepage_action_label(SessionTuiAction::ResumeManaged),
+            "resume"
+        );
+        assert_eq!(
+            homepage_action_label(SessionTuiAction::CloseRuntime),
+            "manage"
+        );
     }
 
     #[test]
@@ -11257,7 +11520,7 @@ mod tests {
             .insert("store-key".to_string(), record.clone());
         let mut initial_activity = SessionActivityState::default();
         initial_activity.revision = 1;
-        initial_activity.last_output_at = Some("2026-08-13T06:00:00Z".to_string());
+        initial_activity.last_output = Some(output_projection("2026-08-13T06:00:00Z"));
         let activity_states = HashMap::from([(record.cutex_session_id.clone(), initial_activity)]);
 
         let rows = selector_rows_from_store(
@@ -11274,8 +11537,8 @@ mod tests {
             SelectorTarget::Agent("store-key".to_string())
         );
         assert_eq!(
-            rows[0].last_output_at.as_deref(),
-            Some("2026-08-13T06:00:00Z")
+            rows[0].activity.as_ref().map(|activity| activity.class),
+            Some(SelectorActivityClass::Output)
         );
         assert_eq!(
             rows.iter()
@@ -11291,26 +11554,135 @@ mod tests {
                 SelectorTarget::GlobalSettings,
             ]
         );
-        assert!(rows[1..].iter().all(|row| row.last_output_at.is_none()));
+        assert!(rows[1..].iter().all(|row| row.activity.is_none()));
 
         let mut model = SelectorModel::new(rows, false, false);
         let mut refreshed_activity = SessionActivityState::default();
         refreshed_activity.revision = 2;
-        refreshed_activity.last_output_at = Some("2026-08-13T06:00:01Z".to_string());
+        refreshed_activity.last_tool_call = Some(tool_projection(
+            SafeToolCallClass::CollaborationTool,
+            SafeToolCallStatus::Finished,
+            "2026-08-13T06:00:01Z",
+        ));
         model.refresh_activity_states(&HashMap::from([(
             record.cutex_session_id.clone(),
             refreshed_activity,
         )]));
         assert_eq!(
-            model.rows[0].last_output_at.as_deref(),
-            Some("2026-08-13T06:00:01Z")
+            model.rows[0]
+                .activity
+                .as_ref()
+                .map(|activity| activity.class),
+            Some(SelectorActivityClass::Agent)
         );
-        assert!(model.rows[1..]
-            .iter()
-            .all(|row| row.last_output_at.is_none()));
+        assert!(model.rows[1..].iter().all(|row| row.activity.is_none()));
 
         model.refresh_activity_states(&HashMap::new());
-        assert!(model.rows[0].last_output_at.is_none());
+        assert!(model.rows[0].activity.is_none());
+    }
+
+    #[test]
+    fn homepage_activity_uses_newest_safe_projection_with_deterministic_fallbacks() {
+        let mut state = SessionActivityState::default();
+        // A valid safe projection remains authoritative over legacy timestamp metadata.
+        state.last_output_at = Some("2099-01-01T00:00:00Z".to_string());
+        state.last_output = Some(output_projection("2026-08-13T06:00:00Z"));
+        state.last_tool_call = Some(tool_projection(
+            SafeToolCallClass::Command,
+            SafeToolCallStatus::Failed,
+            "2026-08-13T06:00:01Z",
+        ));
+        assert_eq!(
+            selector_activity_from_state(&state),
+            Some(SelectorActivity {
+                class: SelectorActivityClass::Command,
+                updated_at: "2026-08-13T06:00:01Z".to_string(),
+                failed: true,
+            })
+        );
+
+        // A valid legacy output timestamp fills the compatibility gap when the projection is
+        // absent, but a newer safe tool projection still wins.
+        state.last_output = None;
+        state.last_output_at = Some("2026-08-13T06:00:00Z".to_string());
+        state.last_tool_call = Some(tool_projection(
+            SafeToolCallClass::McpTool,
+            SafeToolCallStatus::Finished,
+            "2026-08-13T06:00:01Z",
+        ));
+        assert_eq!(
+            selector_activity_from_state(&state),
+            Some(SelectorActivity {
+                class: SelectorActivityClass::Mcp,
+                updated_at: "2026-08-13T06:00:01Z".to_string(),
+                failed: false,
+            })
+        );
+
+        state.last_tool_call = Some(tool_projection(
+            SafeToolCallClass::McpTool,
+            SafeToolCallStatus::Finished,
+            "2026-08-13T05:59:59Z",
+        ));
+        assert_eq!(
+            selector_activity_from_state(&state),
+            Some(SelectorActivity {
+                class: SelectorActivityClass::Output,
+                updated_at: "2026-08-13T06:00:00Z".to_string(),
+                failed: false,
+            })
+        );
+
+        state.last_tool_call = Some(tool_projection(
+            SafeToolCallClass::McpTool,
+            SafeToolCallStatus::Finished,
+            "2026-08-13T06:00:00Z",
+        ));
+        assert_eq!(
+            selector_activity_from_state(&state)
+                .expect("stable legacy-output tie projection")
+                .class,
+            SelectorActivityClass::Output
+        );
+
+        // Invalid safe projection timestamps use the valid legacy projection instead.
+        state.last_output = Some(output_projection("invalid"));
+        state.last_tool_call = None;
+        assert_eq!(
+            selector_activity_from_state(&state),
+            Some(SelectorActivity {
+                class: SelectorActivityClass::Output,
+                updated_at: "2026-08-13T06:00:00Z".to_string(),
+                failed: false,
+            })
+        );
+
+        state.last_output = Some(output_projection("2026-08-13T06:00:00Z"));
+        state.last_tool_call = Some(tool_projection(
+            SafeToolCallClass::McpTool,
+            SafeToolCallStatus::Finished,
+            "invalid",
+        ));
+        assert_eq!(
+            selector_activity_from_state(&state),
+            Some(SelectorActivity {
+                class: SelectorActivityClass::Output,
+                updated_at: "2026-08-13T06:00:00Z".to_string(),
+                failed: false,
+            })
+        );
+
+        state.last_tool_call = Some(tool_projection(
+            SafeToolCallClass::McpTool,
+            SafeToolCallStatus::Finished,
+            "2026-08-13T06:00:00Z",
+        ));
+        assert_eq!(
+            selector_activity_from_state(&state)
+                .expect("stable tie projection")
+                .class,
+            SelectorActivityClass::Output
+        );
     }
 
     #[test]
@@ -11344,7 +11716,7 @@ mod tests {
         for width in [120, 72] {
             let rendered = rendered_text(width, &model);
             assert!(rendered.contains("deepseek"));
-            assert!(rendered.contains("Default (colab)"));
+            assert!(rendered.contains("~colab"));
         }
 
         let updated_config = CodezConfig {
@@ -11352,7 +11724,7 @@ mod tests {
             ..CodezConfig::default()
         };
         model.global_settings_apply_succeeded(&updated_config, &[], 1);
-        assert!(rendered_text(120, &model).contains("Default (deepseek)"));
+        assert!(rendered_text(120, &model).contains("~deepseek"));
     }
 
     #[test]
