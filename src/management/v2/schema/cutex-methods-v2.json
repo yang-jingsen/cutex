@@ -1,0 +1,1209 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "cutex management v2 method registry",
+  "$defs": {
+    "safeInteger": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "positiveSafeInteger": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "requestId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "nativeRequestId": {
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "integer",
+          "minimum": -9223372036854775808,
+          "maximum": 9223372036854775807
+        }
+      ]
+    },
+    "empty": {
+      "type": "object",
+      "maxProperties": 0
+    },
+    "runtimeBackend": {
+      "enum": ["host", "host_foreground", "docker", "cute_alden", "future"]
+    },
+    "origin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "clientId"],
+      "properties": {
+        "kind": {
+          "enum": ["android", "backend", "tui", "agent_bus", "automation", "other"]
+        },
+        "clientId": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "userInput": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type", "text"],
+          "properties": {
+            "type": { "const": "text" },
+            "text": { "type": "string" },
+            "text_elements": {
+              "type": "array",
+              "items": { "type": "object", "additionalProperties": true }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "url"],
+          "properties": {
+            "type": { "const": "image" },
+            "url": { "type": "string" },
+            "detail": { "type": ["string", "null"] }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "path"],
+          "properties": {
+            "type": { "const": "localImage" },
+            "path": { "type": "string" },
+            "detail": { "type": ["string", "null"] }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "name", "path"],
+          "properties": {
+            "type": { "const": "skill" },
+            "name": { "type": "string" },
+            "path": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "name", "path"],
+          "properties": {
+            "type": { "const": "mention" },
+            "name": { "type": "string" },
+            "path": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "userInputArray": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/userInput" }
+    },
+    "runtimeDefaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "backend": { "$ref": "#/$defs/runtimeBackend" },
+        "managedCwd": { "type": ["string", "null"] },
+        "permissions": { "type": ["string", "null"] },
+        "approvalPolicy": { "type": ["string", "null"] },
+        "sandboxMode": { "type": ["string", "null"] },
+        "model": { "type": ["string", "null"] },
+        "reasoningEffort": { "type": ["string", "null"] },
+        "cliArgs": { "type": "array", "items": { "type": "string" } },
+        "groups": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/nonEmptyString" }
+        }
+      }
+    },
+    "expectedRevision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expectedRevision"],
+      "properties": {
+        "expectedRevision": { "$ref": "#/$defs/safeInteger" }
+      }
+    },
+    "sessionDefaultsUpdate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expectedRevision", "patch"],
+      "properties": {
+        "expectedRevision": { "$ref": "#/$defs/safeInteger" },
+        "patch": {
+          "allOf": [{ "$ref": "#/$defs/runtimeDefaults" }],
+          "minProperties": 1
+        }
+      }
+    },
+    "sessionProfileSet": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expectedRevision", "profile"],
+      "properties": {
+        "expectedRevision": { "$ref": "#/$defs/safeInteger" },
+        "profile": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "groupsMutation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expectedRevision", "groups"],
+      "properties": {
+        "expectedRevision": { "$ref": "#/$defs/safeInteger" },
+        "groups": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/nonEmptyString" }
+        }
+      }
+    },
+    "sessionRetireMutation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expectedRevision", "expectedRuntimeGeneration"],
+      "properties": {
+        "expectedRevision": { "$ref": "#/$defs/positiveSafeInteger" },
+        "expectedRuntimeGeneration": { "$ref": "#/$defs/safeInteger" },
+        "reason": { "type": "string" }
+      }
+    },
+    "sessionRestoreMutation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expectedRevision"],
+      "properties": {
+        "expectedRevision": { "$ref": "#/$defs/positiveSafeInteger" }
+      }
+    },
+    "runtimeMutation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expectedRuntimeGeneration"],
+      "properties": {
+        "expectedRuntimeGeneration": { "$ref": "#/$defs/safeInteger" },
+        "reason": { "type": "string" }
+      }
+    },
+    "runtimeOnlineMutation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expectedRuntimeGeneration"],
+      "properties": {
+        "expectedRuntimeGeneration": { "$ref": "#/$defs/safeInteger" },
+        "reason": { "type": "string" },
+        "openVisibleTerminal": { "type": "boolean" },
+        "launchProfile": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "runtimeStopMutation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expectedRuntimeGeneration"],
+      "properties": {
+        "expectedRuntimeGeneration": { "$ref": "#/$defs/safeInteger" },
+        "reason": { "type": "string" },
+        "force": { "type": "boolean" }
+      }
+    },
+    "focusMutation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expectedRevision", "owner", "mobileMuted", "source"],
+      "properties": {
+        "expectedRevision": { "$ref": "#/$defs/safeInteger" },
+        "owner": { "enum": ["pc", "mobile", "backend", "none"] },
+        "mobileMuted": { "type": "boolean" },
+        "source": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "userInputSubmit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["clientUserMessageId", "origin", "strategy", "input"],
+      "properties": {
+        "clientUserMessageId": { "$ref": "#/$defs/nonEmptyString" },
+        "origin": { "$ref": "#/$defs/origin" },
+        "strategy": { "enum": ["auto", "queue", "interrupt"] },
+        "input": { "$ref": "#/$defs/userInputArray" },
+        "expectedTurnId": { "type": ["string", "null"] }
+      }
+    },
+    "queueIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["queueId", "expectedRevision"],
+      "properties": {
+        "queueId": { "$ref": "#/$defs/nonEmptyString" },
+        "expectedRevision": { "$ref": "#/$defs/safeInteger" }
+      }
+    },
+    "queueUpdate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["queueId", "expectedRevision", "input"],
+      "properties": {
+        "queueId": { "$ref": "#/$defs/nonEmptyString" },
+        "expectedRevision": { "$ref": "#/$defs/safeInteger" },
+        "input": { "$ref": "#/$defs/userInputArray" }
+      }
+    },
+    "queueFlush": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expectedQueueRevision"],
+      "properties": {
+        "expectedQueueRevision": { "$ref": "#/$defs/safeInteger" },
+        "maxItems": { "type": "integer", "minimum": 1, "maximum": 100 }
+      }
+    },
+    "queueItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "queueId",
+        "clientUserMessageId",
+        "origin",
+        "input",
+        "position",
+        "revision",
+        "state",
+        "createdAt",
+        "updatedAt"
+      ],
+      "properties": {
+        "queueId": { "$ref": "#/$defs/nonEmptyString" },
+        "clientUserMessageId": { "$ref": "#/$defs/nonEmptyString" },
+        "origin": { "$ref": "#/$defs/origin" },
+        "input": { "$ref": "#/$defs/userInputArray" },
+        "position": { "$ref": "#/$defs/safeInteger" },
+        "revision": { "$ref": "#/$defs/positiveSafeInteger" },
+        "state": { "const": "queued" },
+        "createdAt": { "$ref": "#/$defs/timestamp" },
+        "updatedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "cutexError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "code", "message", "retryable"],
+      "properties": {
+        "source": { "const": "cutex" },
+        "code": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "message": { "type": "string" },
+        "retryable": { "type": "boolean" },
+        "details": { "type": "object", "additionalProperties": true }
+      }
+    },
+    "sessionRegistered": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sessionRevision", "registrationClass", "registeredAt"],
+      "properties": {
+        "sessionRevision": { "$ref": "#/$defs/positiveSafeInteger" },
+        "registrationClass": { "enum": ["persistent", "local_only"] },
+        "registeredAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "sessionUnregistered": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sessionRevision", "unregisteredAt", "reason"],
+      "properties": {
+        "sessionRevision": { "$ref": "#/$defs/positiveSafeInteger" },
+        "unregisteredAt": { "$ref": "#/$defs/timestamp" },
+        "reason": { "type": "string" }
+      }
+    },
+    "sessionRetired": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cutexSessionId", "sessionRevision", "runtimeGeneration", "retiredAt"],
+      "properties": {
+        "cutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
+        "sessionRevision": { "$ref": "#/$defs/positiveSafeInteger" },
+        "runtimeGeneration": { "$ref": "#/$defs/safeInteger" },
+        "retiredAt": { "$ref": "#/$defs/timestamp" },
+        "reason": { "type": "string" }
+      }
+    },
+    "sessionRestored": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cutexSessionId", "sessionRevision", "runtimeGeneration", "restoredAt"],
+      "properties": {
+        "cutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
+        "sessionRevision": { "$ref": "#/$defs/positiveSafeInteger" },
+        "runtimeGeneration": { "$ref": "#/$defs/safeInteger" },
+        "restoredAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "sessionDefaultsUpdated": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sessionRevision", "runtimeDefaults", "updatedAt"],
+      "properties": {
+        "sessionRevision": { "$ref": "#/$defs/positiveSafeInteger" },
+        "runtimeDefaults": { "$ref": "#/$defs/runtimeDefaults" },
+        "updatedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "groupsUpdated": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sessionRevision", "groups", "updatedAt"],
+      "properties": {
+        "sessionRevision": { "$ref": "#/$defs/positiveSafeInteger" },
+        "groups": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/nonEmptyString" }
+        },
+        "updatedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "runtimeEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runtimeGeneration", "backend", "status", "occurredAt"],
+      "properties": {
+        "runtimeGeneration": { "$ref": "#/$defs/safeInteger" },
+        "backend": { "$ref": "#/$defs/runtimeBackend" },
+        "status": {
+          "enum": ["starting", "online", "offline", "closing", "closed", "error"]
+        },
+        "runtimeAgentId": { "type": ["string", "null"] },
+        "reason": { "type": "string" },
+        "occurredAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "runtimeFailed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runtimeGeneration", "backend", "status", "occurredAt", "error"],
+      "properties": {
+        "runtimeGeneration": { "$ref": "#/$defs/safeInteger" },
+        "backend": { "$ref": "#/$defs/runtimeBackend" },
+        "status": { "const": "error" },
+        "runtimeAgentId": { "type": ["string", "null"] },
+        "reason": { "type": "string" },
+        "occurredAt": { "$ref": "#/$defs/timestamp" },
+        "error": { "$ref": "#/$defs/cutexError" }
+      }
+    },
+    "endpointChanged": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runtimeGeneration", "appServerConnected", "changedAt"],
+      "properties": {
+        "runtimeGeneration": { "$ref": "#/$defs/safeInteger" },
+        "appServerConnected": { "type": "boolean" },
+        "changedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "protocolViolation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "resyncRequired", "detectedAt"],
+      "properties": {
+        "code": { "$ref": "#/$defs/nonEmptyString" },
+        "message": { "type": "string" },
+        "nativeEventId": { "type": ["string", "null"] },
+        "resyncRequired": { "type": "boolean" },
+        "detectedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "userInputRouteAccepted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "managementRequestId",
+        "clientUserMessageId",
+        "origin",
+        "input",
+        "strategy",
+        "state",
+        "acceptedAt"
+      ],
+      "properties": {
+        "managementRequestId": { "$ref": "#/$defs/requestId" },
+        "clientUserMessageId": { "$ref": "#/$defs/nonEmptyString" },
+        "origin": { "$ref": "#/$defs/origin" },
+        "input": { "$ref": "#/$defs/userInputArray" },
+        "strategy": { "enum": ["auto", "queue", "interrupt"] },
+        "state": { "const": "routed_to_cutex" },
+        "acceptedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "queueRemoved": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["queueId", "clientUserMessageId", "revision", "reason", "removedAt"],
+      "properties": {
+        "queueId": { "$ref": "#/$defs/nonEmptyString" },
+        "clientUserMessageId": { "$ref": "#/$defs/nonEmptyString" },
+        "revision": { "$ref": "#/$defs/positiveSafeInteger" },
+        "reason": { "enum": ["submitted", "cancelled", "flushed", "failed"] },
+        "removedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "userInputSubmitted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "managementRequestId",
+        "clientUserMessageId",
+        "origin",
+        "input",
+        "disposition",
+        "nativeRequestId",
+        "nativeMethod",
+        "appServerAccepted",
+        "submittedAt"
+      ],
+      "properties": {
+        "managementRequestId": { "$ref": "#/$defs/requestId" },
+        "clientUserMessageId": { "$ref": "#/$defs/nonEmptyString" },
+        "origin": { "$ref": "#/$defs/origin" },
+        "input": { "$ref": "#/$defs/userInputArray" },
+        "disposition": { "enum": ["started", "steered"] },
+        "nativeRequestId": { "$ref": "#/$defs/nativeRequestId" },
+        "nativeMethod": { "enum": ["turn/start", "turn/steer"] },
+        "turnId": { "type": ["string", "null"] },
+        "appServerAccepted": { "const": true },
+        "submittedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "userInputFailed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "managementRequestId",
+        "clientUserMessageId",
+        "origin",
+        "input",
+        "stage",
+        "error",
+        "failedAt"
+      ],
+      "properties": {
+        "managementRequestId": { "$ref": "#/$defs/requestId" },
+        "clientUserMessageId": { "$ref": "#/$defs/nonEmptyString" },
+        "origin": { "$ref": "#/$defs/origin" },
+        "input": { "$ref": "#/$defs/userInputArray" },
+        "stage": {
+          "enum": ["route", "queue", "interrupt", "native_request", "materialization_timeout"]
+        },
+        "error": { "$ref": "#/$defs/cutexError" },
+        "failedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "agentBusIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["messageId", "fromCutexSessionId", "toCutexSessionId"],
+      "properties": {
+        "messageId": { "$ref": "#/$defs/nonEmptyString" },
+        "fromCutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
+        "toCutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
+        "fromRuntimeAgentId": { "type": ["string", "null"] },
+        "toRuntimeAgentId": { "type": ["string", "null"] }
+      }
+    },
+    "agentBusQueued": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "messageId",
+        "fromCutexSessionId",
+        "toCutexSessionId",
+        "deliveryMode",
+        "content",
+        "queuedAt"
+      ],
+      "properties": {
+        "messageId": { "$ref": "#/$defs/nonEmptyString" },
+        "fromCutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
+        "toCutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
+        "fromRuntimeAgentId": { "type": ["string", "null"] },
+        "toRuntimeAgentId": { "type": ["string", "null"] },
+        "deliveryMode": { "enum": ["after_turn", "soon", "passive"] },
+        "content": { "type": "string" },
+        "queuedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "agentBusSent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "messageId",
+        "fromCutexSessionId",
+        "toCutexSessionId",
+        "deliveryMode",
+        "content",
+        "sentAt"
+      ],
+      "properties": {
+        "messageId": { "$ref": "#/$defs/nonEmptyString" },
+        "fromCutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
+        "toCutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
+        "fromRuntimeAgentId": { "type": ["string", "null"] },
+        "toRuntimeAgentId": { "type": ["string", "null"] },
+        "deliveryMode": { "enum": ["after_turn", "soon", "passive"] },
+        "content": { "type": "string" },
+        "sentAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "agentBusOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["messageId", "fromCutexSessionId", "toCutexSessionId", "deliveredAt"],
+      "properties": {
+        "messageId": { "$ref": "#/$defs/nonEmptyString" },
+        "fromCutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
+        "toCutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
+        "fromRuntimeAgentId": { "type": ["string", "null"] },
+        "toRuntimeAgentId": { "type": ["string", "null"] },
+        "nativeSubmissionId": { "type": ["string", "null"] },
+        "deliveredAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "agentBusFailed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["messageId", "fromCutexSessionId", "toCutexSessionId", "error", "failedAt"],
+      "properties": {
+        "messageId": { "$ref": "#/$defs/nonEmptyString" },
+        "fromCutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
+        "toCutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
+        "fromRuntimeAgentId": { "type": ["string", "null"] },
+        "toRuntimeAgentId": { "type": ["string", "null"] },
+        "error": { "$ref": "#/$defs/cutexError" },
+        "failedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "agentManagementReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "action_id",
+        "request_sha256",
+        "operation",
+        "project_id",
+        "completed_at",
+        "result"
+      ],
+      "properties": {
+        "schema": { "const": "cutex/agent-management-receipt/v1" },
+        "action_id": { "$ref": "#/$defs/requestId" },
+        "request_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "operation": {
+          "enum": ["create", "query_managed", "online", "offline", "restart", "close", "replace", "director_rotate"]
+        },
+        "project_id": { "$ref": "#/$defs/nonEmptyString" },
+        "completed_at": { "$ref": "#/$defs/timestamp" },
+        "result": { "type": "object", "required": ["kind"], "additionalProperties": true }
+      }
+    },
+    "agentManagementFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "event_id",
+        "action_id",
+        "project_id",
+        "operation",
+        "code",
+        "detail",
+        "routing_status",
+        "created_at"
+      ],
+      "properties": {
+        "schema": { "const": "cutex/agent-management-failure/v1" },
+        "event_id": { "$ref": "#/$defs/nonEmptyString" },
+        "action_id": { "$ref": "#/$defs/requestId" },
+        "project_id": { "$ref": "#/$defs/nonEmptyString" },
+        "operation": {
+          "enum": ["create", "query_managed", "online", "offline", "restart", "close", "replace", "director_rotate"]
+        },
+        "code": { "$ref": "#/$defs/nonEmptyString" },
+        "detail": { "type": "string" },
+        "routing_status": { "enum": ["routable", "unrouted"] },
+        "route_to_director_session": { "type": ["string", "null"] },
+        "target_cutex_session_id": { "type": ["string", "null"] },
+        "created_at": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "participantPresentationMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "displayName": { "type": ["string", "null"], "maxLength": 512 },
+        "cutexSessionId": { "type": ["string", "null"], "maxLength": 512 },
+        "profile": { "type": ["string", "null"], "maxLength": 512 },
+        "model": { "type": ["string", "null"], "maxLength": 512 },
+        "reasoning": { "type": ["string", "null"], "maxLength": 512 },
+        "role": { "type": ["string", "null"], "maxLength": 512 },
+        "runtimeBackend": { "type": ["string", "null"], "maxLength": 512 }
+      }
+    },
+    "agentManagementPhaseTransition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "phase_event_id", "action_id", "project_id", "operation", "phase",
+        "phase_sequence", "committed_at", "primary_presentation_target_cutex_session_id",
+        "primary_presentation_target_metadata", "predecessor_cutex_session_id",
+        "predecessor_metadata", "successor_cutex_session_id", "successor_metadata",
+        "replace_policy", "rotation_mode", "authority_epoch"
+      ],
+      "properties": {
+        "schema": { "const": "cutex/agent-management-phase-transition/v1" },
+        "phase_event_id": { "$ref": "#/$defs/nonEmptyString" },
+        "action_id": { "$ref": "#/$defs/requestId" },
+        "project_id": { "$ref": "#/$defs/nonEmptyString" },
+        "operation": {
+          "enum": ["create", "query_managed", "online", "offline", "restart", "close", "replace", "director_rotate"]
+        },
+        "phase": {
+          "enum": [
+            "prepared", "private_cwd_ready", "native_bootstrap_pending",
+            "native_session_captured", "adopted", "configured", "online", "ready",
+            "message_pending", "message_queued", "predecessor_closing",
+            "predecessor_closed", "authority_transfer_pending", "authority_transferred",
+            "successor_ready", "complete", "no_write", "owner_action_required", "failure"
+          ]
+        },
+        "phase_sequence": { "$ref": "#/$defs/positiveSafeInteger" },
+        "committed_at": { "$ref": "#/$defs/timestamp" },
+        "primary_presentation_target_cutex_session_id": { "$ref": "#/$defs/nonEmptyString" },
+        "primary_presentation_target_metadata": {
+          "oneOf": [{ "$ref": "#/$defs/participantPresentationMetadata" }, { "type": "null" }]
+        },
+        "subject_cutex_session_id": { "type": ["string", "null"] },
+        "subject_agent_name": { "type": ["string", "null"], "maxLength": 512 },
+        "predecessor_cutex_session_id": { "type": ["string", "null"] },
+        "predecessor_metadata": {
+          "oneOf": [{ "$ref": "#/$defs/participantPresentationMetadata" }, { "type": "null" }]
+        },
+        "successor_cutex_session_id": { "type": ["string", "null"] },
+        "successor_metadata": {
+          "oneOf": [{ "$ref": "#/$defs/participantPresentationMetadata" }, { "type": "null" }]
+        },
+        "replace_policy": {
+          "type": ["string", "null"],
+          "enum": ["close_before_create", "close_after_ready", "keep_old", null]
+        },
+        "rotation_mode": {
+          "type": ["string", "null"],
+          "enum": [
+            "close_predecessor_then_create_with_message", "retain_predecessor_with_message",
+            "retain_predecessor_bootstrap_only", null
+          ]
+        },
+        "authority_epoch": {
+          "oneOf": [{ "$ref": "#/$defs/positiveSafeInteger" }, { "type": "null" }]
+        }
+      }
+    },
+    "taskServiceReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "action_id",
+        "request_sha256",
+        "attempt_binding",
+        "committed_at",
+        "journal_sequence",
+        "result"
+      ],
+      "properties": {
+        "schema": {
+          "enum": ["cutex/task-service-receipt/v2", "cutex/task-service-receipt/v3"]
+        },
+        "action_id": { "$ref": "#/$defs/requestId" },
+        "request_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "attempt_binding": { "type": ["object", "null"] },
+        "committed_at": { "$ref": "#/$defs/timestamp" },
+        "journal_sequence": { "$ref": "#/$defs/positiveSafeInteger" },
+        "result": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "body"],
+          "properties": {
+            "kind": { "enum": ["assignment", "send_attempt"] },
+            "body": { "type": "object", "additionalProperties": true }
+          }
+        }
+      }
+    },
+    "taskServiceAssignmentTransition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "transition", "action_id", "assignment_id", "task_id",
+        "assignee_cutex_session_id", "attempt_number", "closure_reason",
+        "detail", "committed_at", "journal_sequence"
+      ],
+      "properties": {
+        "schema": { "const": "cutex/task-service-assignment-transition/v1" },
+        "project_id": { "$ref": "#/$defs/nonEmptyString" },
+        "transition": {
+          "enum": [
+            "attempt_started", "attempt_acknowledged", "attempt_progressed",
+            "attempt_blocked", "attempt_resumed", "review_ready",
+            "retry_scheduled", "completed", "failed", "closed", "declined", "aborted"
+          ]
+        },
+        "action_id": { "$ref": "#/$defs/requestId" },
+        "assignment_id": { "$ref": "#/$defs/nonEmptyString" },
+        "task_id": { "$ref": "#/$defs/nonEmptyString" },
+        "assignee_cutex_session_id": { "$ref": "#/$defs/nonEmptyString" },
+        "attempt_number": { "type": ["integer", "null"], "minimum": 1, "maximum": 9007199254740991 },
+        "closure_reason": { "type": ["string", "null"], "enum": ["completed", "failed", "cancelled", "declined", "aborted", null] },
+        "detail": { "type": ["string", "null"] },
+        "committed_at": { "$ref": "#/$defs/timestamp" },
+        "journal_sequence": { "$ref": "#/$defs/positiveSafeInteger" }
+      }
+    },
+    "imRegistration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["registrationId", "provider", "externalConversationId", "changedAt"],
+      "properties": {
+        "registrationId": { "$ref": "#/$defs/nonEmptyString" },
+        "provider": { "$ref": "#/$defs/nonEmptyString" },
+        "externalConversationId": { "$ref": "#/$defs/nonEmptyString" },
+        "changedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "focus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision", "owner", "mobileMuted", "source", "updatedAt"],
+      "properties": {
+        "revision": { "$ref": "#/$defs/positiveSafeInteger" },
+        "owner": { "enum": ["pc", "mobile", "backend", "none"] },
+        "mobileMuted": { "type": "boolean" },
+        "source": { "type": ["string", "null"] },
+        "updatedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "artifactAvailable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifactId", "mediaType", "sizeBytes", "sha256", "downloadPath", "createdAt"],
+      "properties": {
+        "artifactId": { "$ref": "#/$defs/nonEmptyString" },
+        "mediaType": { "$ref": "#/$defs/nonEmptyString" },
+        "sizeBytes": { "$ref": "#/$defs/safeInteger" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+        "downloadPath": { "type": "string", "pattern": "^/v2/" },
+        "createdAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "foregroundRequired": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runtimeGeneration", "reason", "requiredAt"],
+      "properties": {
+        "runtimeGeneration": { "$ref": "#/$defs/safeInteger" },
+        "reason": { "$ref": "#/$defs/nonEmptyString" },
+        "requiredAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "requestCompleted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["managementRequestId", "method", "completedAt"],
+      "properties": {
+        "managementRequestId": { "$ref": "#/$defs/requestId" },
+        "method": { "$ref": "#/$defs/nonEmptyString" },
+        "nativeRequestId": { "$ref": "#/$defs/nativeRequestId" },
+        "completedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "requestFailed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["managementRequestId", "method", "error", "failedAt"],
+      "properties": {
+        "managementRequestId": { "$ref": "#/$defs/requestId" },
+        "method": { "$ref": "#/$defs/nonEmptyString" },
+        "nativeRequestId": { "$ref": "#/$defs/nativeRequestId" },
+        "error": { "$ref": "#/$defs/cutexError" },
+        "failedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "streamReset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "previousStreamId",
+        "previousLastSequence",
+        "reason",
+        "lostEventCount",
+        "resyncRequired",
+        "detectedAt"
+      ],
+      "properties": {
+        "previousStreamId": { "type": ["string", "null"], "format": "uuid" },
+        "previousLastSequence": { "$ref": "#/$defs/safeInteger" },
+        "reason": {
+          "enum": ["state_lost", "persistence_failure", "operator_reset", "protocol_violation"]
+        },
+        "lostEventCount": {
+          "oneOf": [{ "$ref": "#/$defs/safeInteger" }, { "type": "null" }]
+        },
+        "resyncRequired": { "const": true },
+        "detectedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "sessionResult": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["cutexSessionId", "revision"],
+      "properties": {
+        "cutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
+        "revision": { "$ref": "#/$defs/positiveSafeInteger" },
+        "profile": { "type": ["string", "null"] },
+        "configuredProfile": { "type": ["string", "null"] },
+        "effectiveNextLaunch": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["profile", "source"],
+          "properties": {
+            "profile": { "type": ["string", "null"] },
+            "source": { "enum": ["session_configured", "global_default", "unavailable"] }
+          }
+        },
+        "launchedProfile": { "type": ["string", "null"] },
+        "launchProfileSource": { "type": ["string", "null"], "enum": ["one_launch_override", "session_configured", "global_default", "unknown", null] }
+      }
+    },
+    "sessionMutationResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision"],
+      "properties": { "revision": { "$ref": "#/$defs/positiveSafeInteger" } }
+    },
+    "sessionRetireMutationResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cutexSessionId",
+        "revision",
+        "lifecycle",
+        "runtimeGeneration",
+        "status",
+        "retiredAt"
+      ],
+      "properties": {
+        "cutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
+        "revision": { "$ref": "#/$defs/positiveSafeInteger" },
+        "lifecycle": { "const": "retired" },
+        "runtimeGeneration": { "$ref": "#/$defs/safeInteger" },
+        "status": { "const": "offline" },
+        "retiredAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "sessionRestoreMutationResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cutexSessionId",
+        "revision",
+        "lifecycle",
+        "runtimeGeneration",
+        "status",
+        "retiredAt"
+      ],
+      "properties": {
+        "cutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
+        "revision": { "$ref": "#/$defs/positiveSafeInteger" },
+        "lifecycle": { "const": "active" },
+        "runtimeGeneration": { "$ref": "#/$defs/safeInteger" },
+        "status": { "const": "offline" },
+        "retiredAt": { "type": "null" }
+      }
+    },
+    "groupsResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision", "groups"],
+      "properties": {
+        "revision": { "$ref": "#/$defs/positiveSafeInteger" },
+        "groups": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/nonEmptyString" }
+        }
+      }
+    },
+    "launchProfileReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested", "selected", "effective", "source", "applicationScope", "persisted"],
+      "properties": {
+        "requested": { "$ref": "#/$defs/nonEmptyString" },
+        "effective": { "$ref": "#/$defs/nonEmptyString" },
+        "applicationScope": { "enum": ["runtime", "tui", "runtime_and_tui"] },
+        "selected": { "$ref": "#/$defs/nonEmptyString" },
+        "source": { "enum": ["one_launch_override", "session_configured", "global_default", "unknown"] },
+        "persisted": { "const": false }
+      }
+    },
+    "runtimeMutationResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runtimeGeneration", "status"],
+      "properties": {
+        "runtimeGeneration": { "$ref": "#/$defs/safeInteger" },
+        "status": {
+          "enum": ["starting", "online", "offline", "closing", "closed", "error"]
+        },
+        "launchProfile": { "$ref": "#/$defs/launchProfileReceipt" }
+      }
+    },
+    "userInputSubmitResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "clientUserMessageId",
+        "disposition",
+        "appServerAccepted",
+        "nativeRequestId",
+        "turnId",
+        "queue"
+      ],
+      "properties": {
+        "clientUserMessageId": { "$ref": "#/$defs/nonEmptyString" },
+        "disposition": { "enum": ["started", "steered", "queued", "deduplicated"] },
+        "appServerAccepted": { "type": "boolean" },
+        "nativeRequestId": {
+          "oneOf": [{ "$ref": "#/$defs/nativeRequestId" }, { "type": "null" }]
+        },
+        "turnId": { "type": ["string", "null"] },
+        "queue": {
+          "oneOf": [{ "$ref": "#/$defs/queueItem" }, { "type": "null" }]
+        }
+      }
+    },
+    "queueListResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision", "items"],
+      "properties": {
+        "revision": { "$ref": "#/$defs/safeInteger" },
+        "items": { "type": "array", "items": { "$ref": "#/$defs/queueItem" } }
+      }
+    },
+    "queueMutationResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision", "affectedQueueIds"],
+      "properties": {
+        "revision": { "$ref": "#/$defs/safeInteger" },
+        "affectedQueueIds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/nonEmptyString" }
+        }
+      }
+    },
+    "eventMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "params"],
+      "properties": {
+        "method": {
+          "type": "string",
+          "pattern": "^cutex(?:/[A-Za-z][A-Za-z0-9]*){2,}$"
+        },
+        "params": { "type": "object", "additionalProperties": true }
+      },
+      "allOf": [
+        { "$ref": "#/$defs/sessionEventConditions" },
+        { "$ref": "#/$defs/runtimeEventConditions" },
+        { "$ref": "#/$defs/userInputEventConditions" },
+        { "$ref": "#/$defs/integrationEventConditions" }
+      ]
+    },
+    "sessionEventConditions": {
+      "allOf": [
+        { "if": { "properties": { "method": { "const": "cutex/session/registered" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/sessionRegistered" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/session/unregistered" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/sessionUnregistered" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/session/retired" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/sessionRetired" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/session/restored" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/sessionRestored" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/session/defaultsUpdated" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/sessionDefaultsUpdated" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/session/groupsUpdated" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/groupsUpdated" } } } }
+      ]
+    },
+    "runtimeEventConditions": {
+      "allOf": [
+        { "if": { "properties": { "method": { "enum": ["cutex/runtime/onlineRequested", "cutex/runtime/online", "cutex/runtime/offlineRequested", "cutex/runtime/offline", "cutex/runtime/closing", "cutex/runtime/closed"] } } }, "then": { "properties": { "params": { "$ref": "#/$defs/runtimeEvent" } } } },
+        { "if": { "properties": { "method": { "enum": ["cutex/runtime/failed", "cutex/runtime/disconnected"] } } }, "then": { "properties": { "params": { "$ref": "#/$defs/runtimeFailed" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/runtime/endpointChanged" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/endpointChanged" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/runtime/protocolViolation" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/protocolViolation" } } } }
+      ]
+    },
+    "userInputEventConditions": {
+      "allOf": [
+        { "if": { "properties": { "method": { "const": "cutex/userInput/routeAccepted" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/userInputRouteAccepted" } } } },
+        { "if": { "properties": { "method": { "enum": ["cutex/userInput/queued", "cutex/userInput/queueUpdated"] } } }, "then": { "properties": { "params": { "$ref": "#/$defs/queueItem" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/userInput/queueRemoved" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/queueRemoved" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/userInput/submitted" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/userInputSubmitted" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/userInput/failed" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/userInputFailed" } } } }
+      ]
+    },
+    "integrationEventConditions": {
+      "allOf": [
+        { "if": { "properties": { "method": { "const": "cutex/agentManagement/actionCompleted" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/agentManagementReceipt" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/agentManagement/actionFailed" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/agentManagementFailure" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/agentManagement/actionPhaseTransitionCommitted" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/agentManagementPhaseTransition" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/agentBus/messageSent" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/agentBusSent" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/agentBus/messageQueued" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/agentBusQueued" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/agentBus/messageDelivered" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/agentBusOutcome" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/agentBus/messageFailed" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/agentBusFailed" } } } },
+        { "if": { "properties": { "method": { "enum": ["cutex/taskService/assignmentCommitted", "cutex/taskService/communicationRecorded"] } } }, "then": { "properties": { "params": { "$ref": "#/$defs/taskServiceReceipt" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/taskService/assignmentTransitionCommitted" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/taskServiceAssignmentTransition" } } } },
+        { "if": { "properties": { "method": { "enum": ["cutex/im/registered", "cutex/im/unregistered"] } } }, "then": { "properties": { "params": { "$ref": "#/$defs/imRegistration" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/focus/changed" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/focus" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/artifact/available" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/artifactAvailable" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/host/foregroundRequired" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/foregroundRequired" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/request/completed" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/requestCompleted" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/request/failed" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/requestFailed" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/stream/reset" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/streamReset" } } } }
+      ]
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requestId", "method", "params"],
+      "properties": {
+        "requestId": { "$ref": "#/$defs/requestId" },
+        "method": {
+          "enum": [
+                "cutex/session/get",
+                "cutex/session/retire",
+                "cutex/session/restore",
+                "cutex/session/defaults/update",
+                "cutex/session/profile/set",
+                "cutex/session/profile/clear",
+            "cutex/session/groups/get",
+            "cutex/session/groups/set",
+            "cutex/session/groups/add",
+            "cutex/session/groups/remove",
+            "cutex/session/visibility/show",
+            "cutex/session/visibility/hide",
+            "cutex/runtime/online",
+            "cutex/runtime/offline",
+            "cutex/runtime/close",
+            "cutex/focus/get",
+            "cutex/focus/set",
+            "cutex/focus/clear",
+            "cutex/userInput/submit",
+            "cutex/userInput/queue/list",
+            "cutex/userInput/queue/update",
+            "cutex/userInput/queue/remove",
+            "cutex/userInput/queue/flush"
+          ]
+        },
+        "params": { "type": "object" }
+      },
+      "allOf": [
+        { "if": { "properties": { "method": { "enum": ["cutex/session/get", "cutex/session/groups/get", "cutex/focus/get", "cutex/userInput/queue/list"] } } }, "then": { "properties": { "params": { "$ref": "#/$defs/empty" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/session/defaults/update" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/sessionDefaultsUpdate" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/session/profile/set" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/sessionProfileSet" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/session/profile/clear" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/expectedRevision" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/session/retire" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/sessionRetireMutation" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/session/restore" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/sessionRestoreMutation" } } } },
+        { "if": { "properties": { "method": { "enum": ["cutex/session/groups/set", "cutex/session/groups/add", "cutex/session/groups/remove"] } } }, "then": { "properties": { "params": { "$ref": "#/$defs/groupsMutation" } } } },
+        { "if": { "properties": { "method": { "enum": ["cutex/session/visibility/show", "cutex/session/visibility/hide", "cutex/focus/clear"] } } }, "then": { "properties": { "params": { "$ref": "#/$defs/expectedRevision" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/runtime/online" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/runtimeOnlineMutation" } } } },
+        { "if": { "properties": { "method": { "enum": ["cutex/runtime/offline", "cutex/runtime/close"] } } }, "then": { "properties": { "params": { "$ref": "#/$defs/runtimeStopMutation" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/focus/set" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/focusMutation" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/userInput/submit" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/userInputSubmit" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/userInput/queue/update" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/queueUpdate" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/userInput/queue/remove" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/queueIdentity" } } } },
+        { "if": { "properties": { "method": { "const": "cutex/userInput/queue/flush" } } }, "then": { "properties": { "params": { "$ref": "#/$defs/queueFlush" } } } }
+      ]
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contractVersion", "requestId", "cutexSessionId", "cutex"],
+      "properties": {
+        "contractVersion": { "const": 2 },
+        "requestId": { "$ref": "#/$defs/requestId" },
+        "cutexSessionId": { "$ref": "#/$defs/nonEmptyString" },
+        "cutex": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["method", "result"],
+          "properties": {
+            "method": {
+              "enum": [
+            "cutex/session/get",
+            "cutex/session/retire",
+            "cutex/session/restore",
+            "cutex/session/defaults/update",
+            "cutex/session/profile/set",
+            "cutex/session/profile/clear",
+                "cutex/session/groups/get",
+                "cutex/session/groups/set",
+                "cutex/session/groups/add",
+                "cutex/session/groups/remove",
+                "cutex/session/visibility/show",
+                "cutex/session/visibility/hide",
+                "cutex/runtime/online",
+                "cutex/runtime/offline",
+                "cutex/runtime/close",
+                "cutex/focus/get",
+                "cutex/focus/set",
+                "cutex/focus/clear",
+                "cutex/userInput/submit",
+                "cutex/userInput/queue/list",
+                "cutex/userInput/queue/update",
+                "cutex/userInput/queue/remove",
+                "cutex/userInput/queue/flush"
+              ]
+            },
+            "result": true
+          },
+          "allOf": [
+            { "if": { "properties": { "method": { "const": "cutex/session/get" } } }, "then": { "properties": { "result": { "$ref": "#/$defs/sessionResult" } } } },
+            { "if": { "properties": { "method": { "enum": ["cutex/session/profile/set", "cutex/session/profile/clear"] } } }, "then": { "properties": { "result": { "$ref": "#/$defs/sessionResult" } } } },
+            { "if": { "properties": { "method": { "const": "cutex/session/retire" } } }, "then": { "properties": { "result": { "$ref": "#/$defs/sessionRetireMutationResult" } } } },
+            { "if": { "properties": { "method": { "const": "cutex/session/restore" } } }, "then": { "properties": { "result": { "$ref": "#/$defs/sessionRestoreMutationResult" } } } },
+            { "if": { "properties": { "method": { "enum": ["cutex/session/defaults/update", "cutex/session/visibility/show", "cutex/session/visibility/hide"] } } }, "then": { "properties": { "result": { "$ref": "#/$defs/sessionMutationResult" } } } },
+            { "if": { "properties": { "method": { "enum": ["cutex/session/groups/get", "cutex/session/groups/set", "cutex/session/groups/add", "cutex/session/groups/remove"] } } }, "then": { "properties": { "result": { "$ref": "#/$defs/groupsResult" } } } },
+            { "if": { "properties": { "method": { "enum": ["cutex/runtime/online", "cutex/runtime/offline", "cutex/runtime/close"] } } }, "then": { "properties": { "result": { "$ref": "#/$defs/runtimeMutationResult" } } } },
+            { "if": { "properties": { "method": { "enum": ["cutex/focus/get", "cutex/focus/set", "cutex/focus/clear"] } } }, "then": { "properties": { "result": { "$ref": "#/$defs/focus" } } } },
+            { "if": { "properties": { "method": { "const": "cutex/userInput/submit" } } }, "then": { "properties": { "result": { "$ref": "#/$defs/userInputSubmitResult" } } } },
+            { "if": { "properties": { "method": { "const": "cutex/userInput/queue/list" } } }, "then": { "properties": { "result": { "$ref": "#/$defs/queueListResult" } } } },
+            { "if": { "properties": { "method": { "const": "cutex/userInput/queue/update" } } }, "then": { "properties": { "result": { "$ref": "#/$defs/queueItem" } } } },
+            { "if": { "properties": { "method": { "enum": ["cutex/userInput/queue/remove", "cutex/userInput/queue/flush"] } } }, "then": { "properties": { "result": { "$ref": "#/$defs/queueMutationResult" } } } }
+          ]
+        }
+      }
+    }
+  }
+}

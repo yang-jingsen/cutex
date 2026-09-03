@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cutex/task-watchdog/v1",
+  "title": "Cutex Task Service stale-running watchdog contracts",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["fact", "message"],
+  "properties": {
+    "fact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "event_key", "fact_id", "episode_id", "task_id",
+        "task_revision", "assignment_id", "attempt_number",
+        "assignee_cutex_session_id", "activity_watermark", "activity_kind",
+        "idle_duration_secs", "stage", "source_sequence", "occurred_at"
+      ],
+      "properties": {
+        "schema": { "const": "cutex/task-watchdog-fact/v1" },
+        "event_key": {
+          "enum": [
+            "task_watchdog.first_stale",
+            "task_watchdog.director_escalated",
+            "task_watchdog.recovered"
+          ]
+        },
+        "fact_id": { "$ref": "#/$defs/boundedId" },
+        "episode_id": { "$ref": "#/$defs/boundedId" },
+        "project_id": { "$ref": "#/$defs/boundedId" },
+        "task_id": { "$ref": "#/$defs/boundedId" },
+        "task_revision": { "$ref": "#/$defs/positiveSafeInteger" },
+        "assignment_id": { "$ref": "#/$defs/boundedId" },
+        "attempt_number": { "$ref": "#/$defs/positiveSafeInteger" },
+        "assignee_cutex_session_id": { "$ref": "#/$defs/boundedId" },
+        "activity_watermark": { "type": "string", "format": "date-time" },
+        "activity_kind": {
+          "enum": ["phase_transition", "status_progress", "last_output", "last_tool_call"]
+        },
+        "idle_duration_secs": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "stage": { "enum": ["first_stale", "director_escalated"] },
+        "source_sequence": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "occurred_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "message": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "notification_id", "external_message_id", "episode_id",
+        "assignment_id", "attempt_number", "stage", "target",
+        "delivery_mode", "content", "facts"
+      ],
+      "properties": {
+        "schema": { "const": "cutex/task-watchdog-message/v1" },
+        "notification_id": { "$ref": "#/$defs/modelItemSafeId" },
+        "external_message_id": { "$ref": "#/$defs/modelItemSafeId" },
+        "episode_id": { "$ref": "#/$defs/boundedId" },
+        "project_id": { "$ref": "#/$defs/boundedId" },
+        "assignment_id": { "$ref": "#/$defs/boundedId" },
+        "attempt_number": { "$ref": "#/$defs/positiveSafeInteger" },
+        "stage": { "enum": ["first_stale", "director_escalated"] },
+        "target": { "type": "object" },
+        "delivery_mode": { "enum": ["soon", "after_turn"] },
+        "content": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "facts": { "type": "array", "maxItems": 8 }
+      }
+    }
+  },
+  "$defs": {
+    "boundedId": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "modelItemSafeId": { "type": "string", "minLength": 1, "maxLength": 48 },
+    "positiveSafeInteger": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "registryVersion": 3,
+  "contractVersion": 2,
+  "methods": [
+    "cutex/session/get",
+    "cutex/session/retire",
+    "cutex/session/restore",
+    "cutex/session/defaults/update",
+    "cutex/session/profile/set",
+    "cutex/session/profile/clear",
+    "cutex/session/groups/get",
+    "cutex/session/groups/set",
+    "cutex/session/groups/add",
+    "cutex/session/groups/remove",
+    "cutex/session/visibility/show",
+    "cutex/session/visibility/hide",
+    "cutex/runtime/online",
+    "cutex/runtime/offline",
+    "cutex/runtime/close",
+    "cutex/focus/get",
+    "cutex/focus/set",
+    "cutex/focus/clear",
+    "cutex/userInput/submit",
+    "cutex/userInput/queue/list",
+    "cutex/userInput/queue/update",
+    "cutex/userInput/queue/remove",
+    "cutex/userInput/queue/flush"
+  ],
+  "queries": [
+    {
+      "method": "GET",
+      "path": "/v2/sessions",
+      "lifecycleParameter": "lifecycle",
+      "values": ["active", "retired"]
+    },
+    {
+      "method": "GET",
+      "path": "/v2/sessions/{cutexSessionId}",
+      "lifecycleParameter": "lifecycle",
+      "values": ["active", "retired"]
+    }
+  ],
+  "sessionArchive": {
+    "version": 1,
+    "retireRequires": ["expectedRevision", "expectedRuntimeGeneration"],
+    "restoreRequires": ["expectedRevision"],
+    "restoreStartsRuntime": false,
+    "retireStopsBeforeCommit": true
+  }
+}
