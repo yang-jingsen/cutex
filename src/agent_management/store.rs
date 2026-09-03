@@ -23,11 +23,15 @@ const STORE_FILE: &str = "agent-management-v1.json";
 const LOCK_FILE: &str = "agent-management-v1.lock";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct AgentManagementSnapshot {
     pub schema: AgentManagementStoreSchema,
     pub store_revision: u64,
     pub projects: BTreeMap<ProjectId, ProjectAuthority>,
+    /// Non-authoritative UI metadata. Its map key is always the canonical
+    /// provider-owned project identity; none of these values participate in
+    /// authorization.
+    #[serde(default)]
+    pub project_presentations: BTreeMap<ProjectId, super::ProjectPresentationSettings>,
     pub agents: BTreeMap<crate::role_revision::CutexSessionId, ManagedAgentRecord>,
     pub actions: BTreeMap<AgentActionId, AgentActionRecord>,
     #[serde(default)]
@@ -37,6 +41,10 @@ pub struct AgentManagementSnapshot {
     pub legacy_director_ownership_import_receipts:
         BTreeMap<AgentActionId, LegacyDirectorOwnershipImportReceipt>,
     pub failure_events: BTreeMap<String, AgentManagementFailureEvent>,
+    /// Preserve additive provider fields across presentation-only writes so a
+    /// newer store is not silently downgraded by this reader.
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl AgentManagementSnapshot {
@@ -45,12 +53,14 @@ impl AgentManagementSnapshot {
             schema: AgentManagementStoreSchema::V1,
             store_revision: 0,
             projects: BTreeMap::new(),
+            project_presentations: BTreeMap::new(),
             agents: BTreeMap::new(),
             actions: BTreeMap::new(),
             phase_events: BTreeMap::new(),
             authority_receipts: BTreeMap::new(),
             legacy_director_ownership_import_receipts: BTreeMap::new(),
             failure_events: BTreeMap::new(),
+            extra: BTreeMap::new(),
         }
     }
 }

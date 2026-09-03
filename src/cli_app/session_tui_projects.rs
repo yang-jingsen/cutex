@@ -1,4 +1,4 @@
-//! Native Codex project catalog workspace.
+//! Native Codex workspace catalog.
 //!
 //! The app-server connection is intentionally owned by one worker for the
 //! lifetime of this workspace. The terminal thread only sends commands and
@@ -208,7 +208,7 @@ impl ProjectModel {
                     self.preferred_project_id = Some(project.id);
                     self.view = ProjectView::List;
                     self.failure = None;
-                    self.notice = Some("Native project catalog updated".to_string());
+                    self.notice = Some("Codex workspace catalog updated".to_string());
                     return Some(self.list_request(self.cursor.clone()));
                 }
                 Err(failure) => self.set_failure(failure),
@@ -217,7 +217,7 @@ impl ProjectModel {
                 Ok(()) => {
                     self.view = ProjectView::List;
                     self.failure = None;
-                    self.notice = Some("Native project catalog updated".to_string());
+                    self.notice = Some("Codex workspace catalog updated".to_string());
                     return Some(self.list_request(self.cursor.clone()));
                 }
                 Err(failure) => self.set_failure(failure),
@@ -249,7 +249,7 @@ impl ProjectModel {
 
     fn form_request(&self) -> Result<ProjectRequest, String> {
         let ProjectView::Form(form) = &self.view else {
-            return Err("No project form is active".to_string());
+            return Err("No workspace form is active".to_string());
         };
         let name = valid_name(&form.name)?;
         let roots = if form.kind == FormKind::Rename {
@@ -272,7 +272,7 @@ impl ProjectModel {
             FormKind::Rename => ProjectRequest::Rename {
                 id: self
                     .selected_project()
-                    .ok_or_else(|| "Select a project first".to_string())?
+                    .ok_or_else(|| "Select a workspace first".to_string())?
                     .id
                     .clone(),
                 name,
@@ -280,7 +280,7 @@ impl ProjectModel {
             FormKind::Update => ProjectRequest::Update {
                 id: self
                     .selected_project()
-                    .ok_or_else(|| "Select a project first".to_string())?
+                    .ok_or_else(|| "Select a workspace first".to_string())?
                     .id
                     .clone(),
                 name,
@@ -382,7 +382,7 @@ fn handle_key(
             KeyCode::Char('r') => model.begin_form(FormKind::Rename),
             KeyCode::Char('u') => model.begin_form(FormKind::Update),
             KeyCode::Char('d') => if let Some(project) = model.selected_project() {
-                model.view = ProjectView::Confirm { request: ProjectRequest::Delete { id: project.id.clone() }, prompt: format!("Delete project '{}' permanently?", project.name), confirmed: false };
+                model.view = ProjectView::Confirm { request: ProjectRequest::Delete { id: project.id.clone() }, prompt: format!("Delete Codex workspace '{}' permanently?", project.name), confirmed: false };
             },
             KeyCode::Char('m') => if model.selected > 0 {
                 let id = model.projects[model.selected].id.clone();
@@ -404,7 +404,7 @@ fn handle_key(
             KeyCode::Char('r') => model.begin_form(FormKind::Rename),
             KeyCode::Char('u') => model.begin_form(FormKind::Update),
             KeyCode::Char('d') => if let Some(project) = model.selected_project() {
-                model.view = ProjectView::Confirm { request: ProjectRequest::Delete { id: project.id.clone() }, prompt: format!("Delete project '{}' permanently?", project.name), confirmed: false };
+                model.view = ProjectView::Confirm { request: ProjectRequest::Delete { id: project.id.clone() }, prompt: format!("Delete Codex workspace '{}' permanently?", project.name), confirmed: false };
             },
             KeyCode::Char('R') => retry(model, runtime)?,
             _ => {}
@@ -416,7 +416,7 @@ fn handle_key(
             KeyCode::Backspace => { active_form_text(form).pop(); }
             KeyCode::Char(character) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => active_form_text(form).push(character),
             KeyCode::Enter => match model.form_request() {
-                Ok(request @ ProjectRequest::Import { .. }) => model.view = ProjectView::Confirm { request, prompt: "Import may assign existing threads to this project. Review the thread IDs above; default is Cancel.".to_string(), confirmed: false },
+                Ok(request @ ProjectRequest::Import { .. }) => model.view = ProjectView::Confirm { request, prompt: "Import may assign existing threads to this Codex workspace. Review the thread IDs above; default is Cancel.".to_string(), confirmed: false },
                 Ok(request) => { model.start_request(request.clone()); runtime.send(request)?; }
                 Err(message) => model.failure = Some(ProjectFailure { kind: FailureKind::Other, message }),
             },
@@ -465,13 +465,13 @@ fn active_form_text(form: &mut Form) -> &mut String {
 fn valid_name(value: &str) -> Result<String, String> {
     let value = value.trim();
     if value.is_empty() {
-        return Err("Project name is required".to_string());
+        return Err("Workspace name is required".to_string());
     }
     if value.chars().count() > 200 {
-        return Err("Project name must be at most 200 characters".to_string());
+        return Err("Workspace name must be at most 200 characters".to_string());
     }
     if value.chars().any(char::is_control) {
-        return Err("Project name cannot contain control characters".to_string());
+        return Err("Workspace name cannot contain control characters".to_string());
     }
     Ok(value.to_string())
 }
@@ -486,12 +486,12 @@ fn valid_roots(value: &str) -> Result<Vec<ProjectRoot>, String> {
             if Path::new(root).is_absolute() {
                 Ok(ProjectRoot { path: root.into() })
             } else {
-                Err(format!("Project root must be an absolute path: {root}"))
+                Err(format!("Workspace root must be an absolute path: {root}"))
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
     if roots.is_empty() {
-        Err("At least one absolute project root is required".to_string())
+        Err("At least one absolute workspace root is required".to_string())
     } else {
         Ok(roots)
     }
@@ -533,7 +533,7 @@ impl ProjectRuntime {
         thread::Builder::new()
             .name("cutex-project-catalog".to_string())
             .spawn(move || project_worker(command_receiver, event_sender))
-            .context("Failed to start project catalog worker")?;
+            .context("Failed to start Codex workspace catalog worker")?;
         Ok(Self { sender, receiver })
     }
     fn restart(&mut self) -> anyhow::Result<()> {
@@ -543,7 +543,7 @@ impl ProjectRuntime {
     fn send(&self, request: ProjectRequest) -> anyhow::Result<()> {
         self.sender
             .send(request)
-            .context("project catalog worker stopped")
+            .context("Codex workspace catalog worker stopped")
     }
     fn poll(&self) -> Option<WorkerEvent> {
         match self.receiver.try_recv() {
@@ -661,7 +661,7 @@ fn render(frame: &mut Frame<'_>, model: &ProjectModel) {
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                "cutex projects",
+                "Codex Workspaces",
                 Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
             Span::styled(status, Style::new().fg(Color::Yellow)),
@@ -721,7 +721,7 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, model: &ProjectModel) {
         Row::new(["NAME", "ROOTS", "ORDER"])
             .style(Style::new().fg(Color::Gray).add_modifier(Modifier::BOLD)),
     )
-    .block(Block::bordered().title(" Native projects "))
+    .block(Block::bordered().title(" Native Codex workspaces "))
     .row_highlight_style(
         Style::new()
             .bg(Color::DarkGray)
@@ -733,7 +733,7 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, model: &ProjectModel) {
     frame.render_stateful_widget(table, area, &mut state);
     if model.projects.is_empty() && !model.loading {
         frame.render_widget(
-            Paragraph::new("No native projects. Press c to create one.")
+            Paragraph::new("No Codex workspaces. Press c to create one.")
                 .alignment(Alignment::Center)
                 .style(Style::new().fg(Color::DarkGray)),
             Rect {
@@ -772,7 +772,7 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, project: &Project) {
     }
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::bordered().title(" Project details "))
+            .block(Block::bordered().title(" Codex workspace details "))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -780,10 +780,10 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, project: &Project) {
 
 fn render_form(frame: &mut Frame<'_>, area: Rect, form: &Form) {
     let title = match form.kind {
-        FormKind::Create => " Create native project ",
-        FormKind::Import => " Import native project ",
-        FormKind::Rename => " Rename native project ",
-        FormKind::Update => " Update native project ",
+        FormKind::Create => " Create Codex workspace ",
+        FormKind::Import => " Import Codex workspace ",
+        FormKind::Rename => " Rename Codex workspace ",
+        FormKind::Update => " Update Codex workspace ",
     };
     let mut lines = vec![Line::from(format!("Name: {}", form.name))];
     if form.kind != FormKind::Rename {
@@ -879,7 +879,8 @@ fn open_terminal() -> anyhow::Result<ProjectTerminal> {
         let _ = disable_raw_mode();
         return Err(error).context("Failed to enter alternate screen");
     }
-    Terminal::new(CrosstermBackend::new(stdout)).context("Failed to initialize projects terminal")
+    Terminal::new(CrosstermBackend::new(stdout))
+        .context("Failed to initialize Codex Workspaces terminal")
 }
 
 impl Drop for ProjectTerminalRestore {
@@ -947,7 +948,7 @@ mod tests {
         assert_eq!(model.preferred_project_id.as_deref(), Some("new"));
         assert_eq!(
             model.notice.as_deref(),
-            Some("Native project catalog updated")
+            Some("Codex workspace catalog updated")
         );
     }
     #[test]
@@ -1036,7 +1037,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(text.contains("No native projects"));
+        assert!(text.contains("No Codex workspaces"));
     }
     #[test]
     fn provider_errors_are_classified() {

@@ -31,6 +31,7 @@ tungstenite = { version = "0.27", default-features = false, features = ["handsha
 crossterm = "0.29"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
 tui-input = { version = "0.15", default-features = false }
+unicode-width = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

@@ -233,3 +233,27 @@ unavailable evidence returns a transient typed reconciliation fence and never
 authorizes another bootstrap. Concurrent replay and service restart converge
 on the captured SID, original request digest/reservation/spec/groups, and
 original message ID. The historical failure event remains immutable.
+
+## Cutex Projects read and presentation projection
+
+`AgentManagementProvider::list_cutex_projects` and `read_cutex_project` expose
+the bounded workspace projection for an authenticated Agent Management
+principal. The provider store's exact `ProjectId` key is the sole ownership
+identity. Reads require the caller's durable Cutex session to occupy the
+current Director seat and return only that exact project's authority epoch,
+Director, active durable Agents, retired durable Agents, and runtime
+observations where available. Groups, cwd, names, runtime IDs, and native Codex
+workspace records never select a project or grant access.
+
+Project presentation is a separate non-authoritative record keyed by canonical
+`ProjectId`. It contains only a display name, a one- or two-cell badge, a color
+from the finite high-contrast palette, update provenance, and an independent
+revision. Missing presentation records produce deterministic defaults without
+writing. Only the authenticated current Director can update presentation, and
+the canonical ID and authority fields are absent from the editable payload.
+Optimistic presentation revisions prevent lost updates. Additive store and
+presentation fields survive presentation-only writes.
+
+The terminal UI presents this projection as **Cutex Projects**. The unrelated
+native Codex catalog remains available as **Workspaces / Codex Workspaces** and
+retains its existing create and import operations.

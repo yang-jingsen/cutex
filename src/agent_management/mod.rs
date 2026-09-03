@@ -6,10 +6,12 @@
 //! without creating real Agents.
 
 mod model;
+mod projects;
 mod provider;
 mod store;
 
 pub use model::*;
+pub use projects::*;
 pub use provider::*;
 pub use store::*;
 

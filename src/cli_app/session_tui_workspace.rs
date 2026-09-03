@@ -9,6 +9,7 @@ pub(super) enum SessionTuiWorkspace {
     Agents,
     RecentSessions,
     RetiredSessions,
+    CutexProjects,
     Projects,
     Profiles,
     GlobalSettings,
@@ -16,10 +17,11 @@ pub(super) enum SessionTuiWorkspace {
 
 impl SessionTuiWorkspace {
     /// Workspaces that are intentionally available in the production selector.
-    pub(super) const PRODUCTION: [Self; 6] = [
+    pub(super) const PRODUCTION: [Self; 7] = [
         Self::Agents,
         Self::RecentSessions,
         Self::RetiredSessions,
+        Self::CutexProjects,
         Self::Projects,
         Self::Profiles,
         Self::GlobalSettings,
@@ -68,13 +70,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn production_workspace_list_exposes_projects_and_recent_sessions() {
+    fn production_workspace_list_keeps_cutex_projects_separate_from_codex_workspaces() {
         assert_eq!(
             SessionTuiWorkspace::PRODUCTION,
             [
                 SessionTuiWorkspace::Agents,
                 SessionTuiWorkspace::RecentSessions,
                 SessionTuiWorkspace::RetiredSessions,
+                SessionTuiWorkspace::CutexProjects,
                 SessionTuiWorkspace::Projects,
                 SessionTuiWorkspace::Profiles,
                 SessionTuiWorkspace::GlobalSettings,

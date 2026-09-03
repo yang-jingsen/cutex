@@ -358,6 +358,7 @@ dependencies = [
  "toml",
  "tui-input",
  "tungstenite",
+ "unicode-width",
  "url",
  "uuid",
  "windows-sys",

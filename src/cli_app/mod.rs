@@ -45,6 +45,7 @@ mod session_settings;
 mod session_start_menu;
 mod session_tui;
 mod session_tui_actions;
+mod session_tui_cutex_projects;
 mod session_tui_dispatch;
 mod session_tui_profile_settings;
 mod session_tui_projects;
