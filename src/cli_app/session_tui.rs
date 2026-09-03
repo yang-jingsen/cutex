@@ -20,6 +20,9 @@ use crossterm::terminal::{
 };
 use cutex::agent_bus::client::agent_bus_fetch_agents_if_healthy;
 use cutex::agent_bus::model::{AgentBusAgent, AgentGroupUpdateMode};
+use cutex::agent_management::{
+    effective_presentation, AgentManagementSnapshot, AgentManagementStore, ProjectPaletteColor,
+};
 use cutex::config::global_settings::apply_global_config_patch;
 use cutex::config::store::load_codez_config;
 use cutex::config::store::load_codez_config_checked;
@@ -65,6 +68,7 @@ use super::profile_settings::ProfileSettingsPatch;
 use super::session_tui_actions::{
     session_tui_actions_for_record, SessionTuiAction, SessionTuiActionItem,
 };
+use super::session_tui_cutex_projects::palette_color as project_palette_color;
 use super::session_tui_profile_settings::{
     ProfileSettingsDraft, ProfileSettingsField, ProfileSettingsSnapshot,
 };
@@ -168,6 +172,7 @@ impl SelectorTarget {
 struct SelectorRow {
     target: SelectorTarget,
     agent: String,
+    project: Option<SelectorProjectContext>,
     configured_profile: Option<String>,
     lifecycle: Option<CutexSessionLifecycleState>,
     host: String,
@@ -184,6 +189,14 @@ struct SelectorRow {
     attachable: bool,
     pinned: bool,
     managed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectorProjectContext {
+    project_id: String,
+    display_name: String,
+    badge_label: String,
+    color: ProjectPaletteColor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -752,9 +765,8 @@ impl SelectorModel {
             .iter()
             .enumerate()
             .filter_map(|(index, row)| {
-                (row.target.is_system()
-                    || (row.managed && row.agent.to_lowercase().contains(&query)))
-                .then_some(index)
+                (row.target.is_system() || (row.managed && selector_row_matches_query(row, &query)))
+                    .then_some(index)
             })
             .collect()
     }
@@ -3832,14 +3844,25 @@ fn run_terminal_cycle(
     let config = load_codez_config();
     let (profile_names, profile_warning) = profile_names_with_warning();
     let (activity_states, activity_warning) = activity_states_with_warning();
-    let initial_rows =
-        selector_rows_from_store(&store, &[], &[], &config, &profile_names, &activity_states);
+    let (project_contexts, project_warning) = project_contexts_with_warning();
+    let initial_rows = selector_rows_from_store(
+        &store,
+        &[],
+        &[],
+        &config,
+        &profile_names,
+        &activity_states,
+        &project_contexts,
+    );
     let mut refresh = spawn_snapshot_refresh()?;
     let recent_catalog = RecentCatalog::spawn()?;
     let startup_profiles = startup.as_ref().map(|_| load_profile_catalog_read_only());
     let (mut terminal, restore, enhanced_keyboard) = open_terminal()?;
     let mut model = SelectorModel::new(initial_rows, refresh.is_loading(), enhanced_keyboard);
-    model.warning = combine_warnings(profile_warning, activity_warning);
+    model.warning = combine_warnings(
+        combine_warnings(profile_warning, activity_warning),
+        project_warning,
+    );
     if let Some(startup) = startup {
         match startup_profiles.expect("profile startup catalog should exist") {
             Ok(profiles) => model.open_profile_manager(profiles),
@@ -3929,6 +3952,7 @@ fn load_live_snapshot() -> anyhow::Result<SelectorSnapshot> {
     };
     let (profile_names, profile_warning) = profile_names_with_warning();
     let (activity_states, activity_warning) = activity_states_with_warning();
+    let (project_contexts, project_warning) = project_contexts_with_warning();
     let config = load_codez_config();
     let live_agents = agent_bus_fetch_agents_if_healthy(&config);
     Ok(SelectorSnapshot {
@@ -3939,10 +3963,14 @@ fn load_live_snapshot() -> anyhow::Result<SelectorSnapshot> {
             &config,
             &profile_names,
             &activity_states,
+            &project_contexts,
         ),
         warning: combine_warnings(
-            combine_warnings(alden_warning, profile_warning),
-            activity_warning,
+            combine_warnings(
+                combine_warnings(alden_warning, profile_warning),
+                activity_warning,
+            ),
+            project_warning,
         ),
     })
 }
@@ -3990,12 +4018,57 @@ fn activity_states_with_warning() -> (HashMap<String, SessionActivityState>, Opt
     }
 }
 
+fn project_contexts_with_warning() -> (HashMap<String, SelectorProjectContext>, Option<String>) {
+    match AgentManagementStore::open_default()
+        .and_then(|store| store.snapshot().map_err(anyhow::Error::new))
+    {
+        Ok(snapshot) => (selector_project_contexts(&snapshot), None),
+        Err(error) => (
+            HashMap::new(),
+            Some(format!("Project context unavailable: {error:#}")),
+        ),
+    }
+}
+
+fn selector_project_contexts(
+    snapshot: &AgentManagementSnapshot,
+) -> HashMap<String, SelectorProjectContext> {
+    snapshot
+        .agents
+        .iter()
+        .map(|(cutex_session_id, agent)| {
+            let presentation = effective_presentation(
+                &agent.project_id,
+                snapshot.project_presentations.get(&agent.project_id),
+            );
+            (
+                cutex_session_id.as_str().to_string(),
+                SelectorProjectContext {
+                    project_id: agent.project_id.as_str().to_string(),
+                    display_name: presentation.display_name,
+                    badge_label: presentation.badge_label,
+                    color: presentation.color,
+                },
+            )
+        })
+        .collect()
+}
+
 fn combine_warnings(left: Option<String>, right: Option<String>) -> Option<String> {
     match (left, right) {
         (Some(left), Some(right)) => Some(format!("{left}; {right}")),
         (Some(warning), None) | (None, Some(warning)) => Some(warning),
         (None, None) => None,
     }
+}
+
+fn selector_row_matches_query(row: &SelectorRow, query: &str) -> bool {
+    row.agent.to_lowercase().contains(query)
+        || row.project.as_ref().is_some_and(|project| {
+            project.display_name.to_lowercase().contains(query)
+                || project.project_id.to_lowercase().contains(query)
+                || project.badge_label.to_lowercase().contains(query)
+        })
 }
 
 fn selector_activity_from_state(state: &SessionActivityState) -> Option<SelectorActivity> {
@@ -4077,6 +4150,7 @@ fn selector_rows_from_store(
     config: &CodezConfig,
     profile_names: &[String],
     activity_states: &HashMap<String, SessionActivityState>,
+    project_contexts: &HashMap<String, SelectorProjectContext>,
 ) -> Vec<SelectorRow> {
     let mut rows = store
         .sessions
@@ -4087,6 +4161,9 @@ fn selector_rows_from_store(
             row.activity = activity_states
                 .get(&record.cutex_session_id)
                 .and_then(selector_activity_from_state);
+            if row.managed {
+                row.project = project_contexts.get(&record.cutex_session_id).cloned();
+            }
             row
         })
         .collect::<Vec<_>>();
@@ -4120,6 +4197,7 @@ fn retired_selector_row(key: &str, record: &CutexSessionRecord) -> SelectorRow {
     SelectorRow {
         target: SelectorTarget::RetiredAgent(key.to_string()),
         agent: cutex_session_display_name(record),
+        project: None,
         configured_profile: record.profile.clone(),
         lifecycle: Some(CutexSessionLifecycleState::Offline),
         host: nonempty_or_dash(&record.host_id),
@@ -4168,6 +4246,7 @@ fn selector_row(
     SelectorRow {
         target: SelectorTarget::Agent(key.to_string()),
         agent: cutex_session_display_name(record),
+        project: None,
         configured_profile: record.profile.clone(),
         lifecycle: Some(cutex_session_lifecycle_state_with_agents(
             record,
@@ -4199,6 +4278,7 @@ fn retired_sessions_row(retired_count: usize) -> SelectorRow {
     SelectorRow {
         target: SelectorTarget::RetiredSessions,
         agent: format!("Retired sessions ({retired_count})"),
+        project: None,
         configured_profile: None,
         lifecycle: None,
         host: "-".to_string(),
@@ -4222,6 +4302,7 @@ fn projects_row() -> SelectorRow {
     SelectorRow {
         target: SelectorTarget::Projects,
         agent: "Workspaces".to_string(),
+        project: None,
         configured_profile: None,
         lifecycle: None,
         host: "-".to_string(),
@@ -4245,6 +4326,7 @@ fn cutex_projects_row() -> SelectorRow {
     SelectorRow {
         target: SelectorTarget::CutexProjects,
         agent: "Cutex Projects".to_string(),
+        project: None,
         configured_profile: None,
         lifecycle: None,
         host: "-".to_string(),
@@ -4253,7 +4335,7 @@ fn cutex_projects_row() -> SelectorRow {
         retired_at: None,
         revision: 0,
         activity_session_id: None,
-        last_output_at: None,
+        activity: None,
         actions: Vec::new(),
         settings: Vec::new(),
         settings_snapshot: None,
@@ -4268,6 +4350,7 @@ fn recent_sessions_row() -> SelectorRow {
     SelectorRow {
         target: SelectorTarget::RecentSessions,
         agent: "Recent sessions".to_string(),
+        project: None,
         configured_profile: None,
         lifecycle: None,
         host: "-".to_string(),
@@ -4321,6 +4404,7 @@ fn global_settings_row_with_profiles(
     SelectorRow {
         target: SelectorTarget::GlobalSettings,
         agent: "Global settings".to_string(),
+        project: None,
         configured_profile: None,
         lifecycle: None,
         host: "-".to_string(),
@@ -4346,6 +4430,7 @@ fn profiles_row(config: &CodezConfig, profile_names: &[String]) -> SelectorRow {
     SelectorRow {
         target: SelectorTarget::Profiles,
         agent: "Profiles".to_string(),
+        project: None,
         configured_profile: None,
         lifecycle: None,
         host: "-".to_string(),
@@ -5949,7 +6034,7 @@ fn render_filter(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
         .scroll((0, scroll as u16))
         .block(
             Block::bordered()
-                .title(" Filter agents ")
+                .title(" Filter agents / Projects ")
                 .border_style(Style::new().fg(Color::DarkGray)),
         );
     frame.render_widget(input, area);
@@ -6017,12 +6102,7 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(2)
-        .row_highlight_style(
-            Style::new()
-                .fg(Color::White)
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
+        .row_highlight_style(Style::new().fg(Color::White).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     let mut state = TableState::default().with_selected(model.selected_visible_index());
     frame.render_stateful_widget(table, area, &mut state);
@@ -6031,7 +6111,10 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
         let message = if model.query.value().is_empty() {
             "No live or pinned agents".to_string()
         } else {
-            format!("No managed agents match {:?}", model.query.value())
+            format!(
+                "No managed agents or Projects match {:?}",
+                model.query.value()
+            )
         };
         let empty_area = Rect {
             y: area.y + 2,
@@ -6749,7 +6832,19 @@ fn selector_table_row<'a>(
             .unwrap_or("-")
     };
     let primary = Cell::from(primary_label).style(Style::new().fg(Color::Cyan));
-    let agent = if row.target.is_system() {
+    let agent = if let Some(project) = row.project.as_ref() {
+        Cell::from(Line::from(vec![
+            Span::styled(
+                project.badge_label.as_str(),
+                Style::new()
+                    .fg(Color::White)
+                    .bg(project_palette_color(project.color))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::raw(row.agent.as_str()),
+        ]))
+    } else if row.target.is_system() {
         Cell::from(row.agent.as_str()).style(Style::new().fg(Color::Cyan))
     } else {
         Cell::from(row.agent.as_str())
@@ -7318,8 +7413,14 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
 mod tests {
     use super::*;
 
+    use std::collections::BTreeMap;
+
     use clap::Parser;
     use cutex::agent_bus::model::AgentRegistrationClass;
+    use cutex::agent_management::{
+        AgentManagementStoreSchema, ManagedAgentRecord, ManagedAgentSpec, ProjectId,
+        ProjectPresentationSettings,
+    };
     use cutex::cli::args::{Cli, CommandKind};
     use cutex::im::registry::ImRegistry;
     use cutex::observability::{
@@ -7327,6 +7428,7 @@ mod tests {
     };
     use cutex::profiles::deepseek;
     use cutex::profiles::model::RuntimeConfig;
+    use cutex::role_revision::{CutexSessionId, Rfc3339};
     use cutex::session::model::CutexSessionRuntimeBackend;
     use ratatui::backend::TestBackend;
 
@@ -7391,6 +7493,7 @@ mod tests {
         SelectorRow {
             target: SelectorTarget::Agent(key.to_string()),
             agent: agent.to_string(),
+            project: None,
             configured_profile: Some("aemeath".to_string()),
             lifecycle: Some(lifecycle),
             host: "tethys".to_string(),
@@ -7443,6 +7546,65 @@ mod tests {
             attachable: lifecycle == CutexSessionLifecycleState::Online,
             pinned,
             managed,
+        }
+    }
+
+    fn project_snapshot(
+        cutex_session_id: &str,
+        project_id: &str,
+        presentation: Option<ProjectPresentationSettings>,
+    ) -> AgentManagementSnapshot {
+        let cutex_session_id = CutexSessionId::new(cutex_session_id).expect("session id");
+        let project_id = ProjectId::new(project_id).expect("project id");
+        let timestamp = Rfc3339::new("2026-09-03T00:00:00Z").expect("timestamp");
+        let agent = ManagedAgentRecord {
+            project_id: project_id.clone(),
+            created_by_director_session: CutexSessionId::new("cutex.director").unwrap(),
+            cutex_session_id: cutex_session_id.clone(),
+            native_session_id: "native-worker".to_string(),
+            spec: ManagedAgentSpec {
+                name: "worker-zeta".to_string(),
+                cwd: "/tmp/canonical-worker".to_string(),
+                profile: "default".to_string(),
+                runtime_backend: "app_server".to_string(),
+                model: "gpt-test".to_string(),
+                reasoning: "medium".to_string(),
+                permissions: "default".to_string(),
+                approval_policy: "never".to_string(),
+                sandbox_mode: "workspace-write".to_string(),
+                groups: vec!["workers".to_string()],
+                expose_to_im: false,
+                pin: false,
+            },
+            created_at: timestamp,
+            retired_at: None,
+        };
+        AgentManagementSnapshot {
+            schema: AgentManagementStoreSchema::V1,
+            store_revision: 1,
+            projects: BTreeMap::new(),
+            project_presentations: presentation
+                .map(|presentation| BTreeMap::from([(project_id, presentation)]))
+                .unwrap_or_default(),
+            agents: BTreeMap::from([(cutex_session_id, agent)]),
+            actions: BTreeMap::new(),
+            phase_events: BTreeMap::new(),
+            authority_receipts: BTreeMap::new(),
+            legacy_director_ownership_import_receipts: BTreeMap::new(),
+            failure_events: BTreeMap::new(),
+            extra: BTreeMap::new(),
+        }
+    }
+
+    fn stored_project_presentation() -> ProjectPresentationSettings {
+        ProjectPresentationSettings {
+            display_name: "Nova Operations".to_string(),
+            badge_label: "NX".to_string(),
+            color: ProjectPaletteColor::Green,
+            revision: 4,
+            updated_at: Rfc3339::new("2026-09-03T00:00:00Z").unwrap(),
+            updated_by_director_session: CutexSessionId::new("cutex.director").unwrap(),
+            extra: BTreeMap::new(),
         }
     }
 
@@ -7616,6 +7778,7 @@ mod tests {
             model.rows.push(SelectorRow {
                 target: SelectorTarget::Profiles,
                 agent: "Profiles".to_string(),
+                project: None,
                 configured_profile: None,
                 lifecycle: None,
                 host: "-".to_string(),
@@ -7682,6 +7845,172 @@ mod tests {
         assert_eq!(native_workspace.agent, "Workspaces");
         assert_eq!(native_workspace.backend, "Codex catalog");
         assert_ne!(permission_project.target, native_workspace.target);
+    }
+
+    #[test]
+    fn homepage_project_context_uses_stable_effective_defaults() {
+        let snapshot = project_snapshot("cutex.worker-zeta", "project-alpha", None);
+        let first = selector_project_contexts(&snapshot);
+        let second = selector_project_contexts(&snapshot);
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first.get("cutex.worker-zeta"),
+            Some(&SelectorProjectContext {
+                project_id: "project-alpha".to_string(),
+                display_name: "project-alpha".to_string(),
+                badge_label: "PA".to_string(),
+                color: effective_presentation(&ProjectId::new("project-alpha").unwrap(), None,)
+                    .color,
+            })
+        );
+    }
+
+    #[test]
+    fn homepage_project_ownership_is_an_exact_canonical_session_join() {
+        let snapshot = project_snapshot(
+            "cutex.exact-worker",
+            "project-alpha",
+            Some(stored_project_presentation()),
+        );
+        let project_contexts = selector_project_contexts(&snapshot);
+        let mut exact = editable_record();
+        exact.cutex_session_id = "cutex.exact-worker".to_string();
+        exact.display_name_hint = Some("exact-worker".to_string());
+        exact.registration_class = AgentRegistrationClass::Persistent;
+        exact.agent_groups = vec!["unrelated".to_string()];
+        exact.cwd = "/tmp/unrelated".to_string();
+        exact.managed_cwd = Some("/tmp/unrelated".to_string());
+        let mut decoy = editable_record();
+        decoy.cutex_session_id = "cutex.decoy-worker".to_string();
+        decoy.display_name_hint = Some("decoy-worker".to_string());
+        decoy.registration_class = AgentRegistrationClass::Persistent;
+        decoy.agent_groups = vec!["project-alpha".to_string(), "NX".to_string()];
+        decoy.cwd = "/tmp/Nova Operations/project-alpha".to_string();
+        decoy.managed_cwd = Some("/tmp/Nova Operations/project-alpha".to_string());
+        let store = CutexSessionStore {
+            sessions: HashMap::from([
+                ("store-exact".to_string(), exact),
+                ("store-decoy".to_string(), decoy),
+            ]),
+            ..CutexSessionStore::default()
+        };
+
+        let rows = selector_rows_from_store(
+            &store,
+            &[],
+            &[],
+            &CodezConfig::default(),
+            &[],
+            &HashMap::new(),
+            &project_contexts,
+        );
+        let exact = rows
+            .iter()
+            .find(|row| row.target == SelectorTarget::Agent("store-exact".to_string()))
+            .expect("exact row");
+        let decoy = rows
+            .iter()
+            .find(|row| row.target == SelectorTarget::Agent("store-decoy".to_string()))
+            .expect("decoy row");
+
+        assert_eq!(
+            exact
+                .project
+                .as_ref()
+                .map(|project| project.project_id.as_str()),
+            Some("project-alpha")
+        );
+        assert!(decoy.project.is_none());
+        assert!(rows
+            .iter()
+            .filter(|row| row.target.is_system())
+            .all(|row| row.project.is_none()));
+    }
+
+    #[test]
+    fn homepage_filter_matches_project_name_id_and_badge_only_for_associated_agents() {
+        let mut associated = row(
+            "associated",
+            "worker-zeta",
+            CutexSessionLifecycleState::Offline,
+            false,
+            true,
+        );
+        associated.project = Some(SelectorProjectContext {
+            project_id: "project-8f31".to_string(),
+            display_name: "Nova Operations".to_string(),
+            badge_label: "NX".to_string(),
+            color: ProjectPaletteColor::Green,
+        });
+
+        for query in ["nova operations", "project-8f31", "nx"] {
+            let mut model = SelectorModel::new(vec![associated.clone()], false, false);
+            for character in query.chars() {
+                model.handle(SelectorEvent::Insert(character));
+            }
+            assert_eq!(model.visible_rows().len(), 1, "query {query:?}");
+            assert_eq!(
+                model.visible_rows()[0].target,
+                SelectorTarget::Agent("associated".to_string())
+            );
+        }
+
+        let mut unowned = associated;
+        unowned.target = SelectorTarget::Agent("unowned".to_string());
+        unowned.project = None;
+        unowned.managed_path = "/tmp/Nova Operations/project-8f31/NX".to_string();
+        let mut model = SelectorModel::new(vec![unowned], false, false);
+        for character in "project-8f31".chars() {
+            model.handle(SelectorEvent::Insert(character));
+        }
+        assert!(model.visible_rows().is_empty());
+    }
+
+    #[test]
+    fn homepage_badge_is_colored_before_agent_in_narrow_and_wide_layouts() {
+        let mut project_row = row(
+            "associated",
+            "worker-zeta",
+            CutexSessionLifecycleState::Online,
+            false,
+            true,
+        );
+        project_row.project = Some(SelectorProjectContext {
+            project_id: "project-8f31".to_string(),
+            display_name: "Nova Operations".to_string(),
+            badge_label: "NX".to_string(),
+            color: ProjectPaletteColor::Green,
+        });
+        let model = SelectorModel::new(vec![project_row], false, false);
+
+        for width in [72, WIDE_LAYOUT_MIN_WIDTH] {
+            let backend = TestBackend::new(width, 16);
+            let mut terminal = Terminal::new(backend).expect("test terminal");
+            terminal
+                .draw(|frame| render_selector(frame, &model))
+                .expect("render homepage");
+            let buffer = terminal.backend().buffer();
+            let (x, y) = (0..buffer.area.height)
+                .flat_map(|y| (0..buffer.area.width.saturating_sub(1)).map(move |x| (x, y)))
+                .find(|(x, y)| {
+                    buffer
+                        .cell((*x, *y))
+                        .is_some_and(|cell| cell.symbol() == "N")
+                        && buffer
+                            .cell((x.saturating_add(1), *y))
+                            .is_some_and(|cell| cell.symbol() == "X")
+                })
+                .expect("NX badge");
+            for badge_x in [x, x + 1] {
+                let cell = buffer.cell((badge_x, y)).expect("badge cell");
+                assert_eq!(cell.fg, Color::White, "width {width}");
+                assert_eq!(cell.bg, Color::LightGreen, "width {width}");
+            }
+            let text = rendered_text(width, &model);
+            assert!(text.contains("NX worker-zeta"), "width {width}");
+            assert!(text.contains("Filter agents / Projects"), "width {width}");
+        }
     }
 
     #[test]
@@ -11530,6 +11859,7 @@ mod tests {
             &CodezConfig::default(),
             &[],
             &activity_states,
+            &HashMap::new(),
         );
 
         assert_eq!(

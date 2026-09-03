@@ -550,7 +550,7 @@ fn lifecycle_label(value: ProjectMemberLifecycle) -> &'static str {
     }
 }
 
-fn palette_color(value: ProjectPaletteColor) -> Color {
+pub(super) fn palette_color(value: ProjectPaletteColor) -> Color {
     match value {
         ProjectPaletteColor::Cyan => Color::Cyan,
         ProjectPaletteColor::Blue => Color::LightBlue,
