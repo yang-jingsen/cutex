@@ -162,14 +162,14 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex.native".to_string(),
             Some("019e-native".to_string()),
-            "host-b".to_string(),
-            "D:\\Projects\\example-project".to_string(),
+            "EVA-02".to_string(),
+            "E:\\Projects (Aemeath)\\waveline-backend".to_string(),
             Some("aemeath".to_string()),
             "2026-07-02T00:00:00Z".to_string(),
         )
         .expect("record");
         record.runtime_backend = CutexSessionRuntimeBackend::HostForeground;
-        record.managed_cwd = Some("D:\\Projects\\example-project".to_string());
+        record.managed_cwd = Some("E:\\Projects (Aemeath)\\waveline-backend".to_string());
         record
     }
 

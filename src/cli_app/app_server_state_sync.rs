@@ -214,7 +214,7 @@ mod tests {
         let mut record = cutex::session::model::CutexSessionRecord::new_at(
             "cutex.state-sync".to_string(),
             Some("thread-state-sync".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/state-sync".to_string(),
             None,
             "2026-08-10T00:00:00Z".to_string(),

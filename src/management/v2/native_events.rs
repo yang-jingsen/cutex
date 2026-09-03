@@ -182,7 +182,7 @@ mod tests {
         NativeEventContext {
             cutex_session_id: "cutex.session-1".to_string(),
             thread_id: "thread-1".to_string(),
-            host_id: "host-a".to_string(),
+            host_id: "tethys".to_string(),
             runtime_generation: 9,
             runtime_backend: "cute_alden".to_string(),
             schema: AppServerSchema {

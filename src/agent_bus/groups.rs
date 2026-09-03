@@ -151,7 +151,7 @@ mod tests {
                 profile: "aemeath".to_string(),
                 cwd: "/tmp/work".to_string(),
                 pid: 42,
-                host_id: Some(" host-a ".to_string()),
+                host_id: Some(" tethys ".to_string()),
                 groups: vec!["waveline".to_string()],
                 registration_class: crate::agent_bus::model::AgentRegistrationClass::Persistent,
             },
@@ -163,7 +163,7 @@ mod tests {
         assert_eq!(agent.thread_name.as_deref(), Some("thread"));
         assert_eq!(agent.path_key.as_deref(), Some("pathkey"));
         assert_eq!(agent.session_id.as_deref(), Some("session-id"));
-        assert_eq!(agent.host_id.as_deref(), Some("host-a"));
+        assert_eq!(agent.host_id.as_deref(), Some("tethys"));
         assert_eq!(agent.last_seen_epoch_secs, 123);
         assert!(agent.groups.iter().any(|group| group == "waveline"));
         assert!(agent.groups.iter().any(|group| group == "project:pathkey"));

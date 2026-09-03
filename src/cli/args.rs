@@ -10,7 +10,7 @@ use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
     version,
     subcommand_required = false,
     arg_required_else_help = false,
-    after_help = "CLI selection order: CUTEX_CODEX_BIN / CODEZ_CODEX_BIN override, then cute-codex, then cutex-codex, then codex."
+    after_help = "CLI selection order: CUTEX_CODEX_BIN override, then cute-codex, then cutex-codex, then codex."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -904,7 +904,7 @@ pub enum AgentCommand {
 
     /// Legacy: point this machine at another host's bus through Bridgeboard
     RemoteUp {
-        /// Bus owner host, such as host-a
+        /// Bus owner host, such as tethys
         host: String,
         /// Bridgeboard service id to use; defaults to cutex-agent-bus
         #[arg(long)]
@@ -1126,7 +1126,7 @@ pub enum ManagementCommand {
 
     /// Connect this machine to another host's management API through Bridgeboard
     RemoteUp {
-        /// Management API owner host, such as host-b
+        /// Management API owner host, such as EVA-02
         host: String,
         /// Bridgeboard service id to use; defaults to cutex-management-api
         #[arg(long)]

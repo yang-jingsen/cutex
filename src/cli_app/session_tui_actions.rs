@@ -235,7 +235,7 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex.actions".to_string(),
             Some("019e-actions".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/actions".to_string(),
             Some("aemeath".to_string()),
             "2026-08-05T00:00:00Z".to_string(),

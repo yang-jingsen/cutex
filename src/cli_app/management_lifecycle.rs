@@ -1969,7 +1969,7 @@ mod profile_tests {
         CutexSessionRecord::new_at(
             "cutex.profile-resolution".to_string(),
             Some("thread-profile-resolution".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/project".to_string(),
             profile.map(str::to_string),
             "2026-08-07T00:00:00Z".to_string(),
@@ -2315,7 +2315,7 @@ mod profile_tests {
             profile: profile.to_string(),
             cwd: "/tmp/project".to_string(),
             pid,
-            host_id: Some("host-a".to_string()),
+            host_id: Some("tethys".to_string()),
             groups: Vec::new(),
             registration_class: cutex::agent_bus::model::AgentRegistrationClass::Persistent,
             last_seen_epoch_secs: 42,

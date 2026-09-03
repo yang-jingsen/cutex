@@ -171,11 +171,11 @@ mod tests {
             let mut locked = state.lock().expect("state lock should not be poisoned");
             locked.agents.insert(
                 "remote".to_string(),
-                sample_agent("remote", Some("host-b"), 4242, 1_000),
+                sample_agent("remote", Some("eva-02"), 4242, 1_000),
             );
         }
 
-        let changed = prune_stale_agents_with_checker(&state, 1_010, "host-a", |_| false).unwrap();
+        let changed = prune_stale_agents_with_checker(&state, 1_010, "tethys", |_| false).unwrap();
 
         assert!(!changed);
         assert!(state
@@ -192,14 +192,14 @@ mod tests {
             let mut locked = state.lock().expect("state lock should not be poisoned");
             locked.agents.insert(
                 "local".to_string(),
-                sample_agent("local", Some("host-a"), 4242, 1_000),
+                sample_agent("local", Some("tethys"), 4242, 1_000),
             );
         }
 
         let changed = prune_stale_agents_with_checker(
             &state,
             1_000 + AGENT_BUS_PID_PRUNE_GRACE_SECS + 1,
-            "host-a",
+            "tethys",
             |_| false,
         )
         .unwrap();
@@ -219,11 +219,11 @@ mod tests {
             let mut locked = state.lock().expect("state lock should not be poisoned");
             locked.agents.insert(
                 "local".to_string(),
-                sample_agent("local", Some("host-a"), 4242, 1_000),
+                sample_agent("local", Some("tethys"), 4242, 1_000),
             );
         }
 
-        let changed = prune_stale_agents_with_checker(&state, 1_001, "host-a", |_| false).unwrap();
+        let changed = prune_stale_agents_with_checker(&state, 1_001, "tethys", |_| false).unwrap();
 
         assert!(!changed);
         assert!(state

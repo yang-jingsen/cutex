@@ -4,19 +4,19 @@ use super::*;
 fn cutex_session_reconcile_creates_record_from_live_agent() {
     let mut store = CutexSessionStore::default();
     let mut agent = sample_bus_agent(
-        "cutex.aemeath.example-project.runtime1",
+        "cutex.aemeath.scgpt.runtime1",
         "aria-data.abcdef0",
         Some("aria-data"),
         Some("abcdef0"),
     );
     agent.session_id = Some("019e-alpha".to_string());
     agent.thread_name = Some("aria-data".to_string());
-    agent.groups = vec!["project:example-project".to_string(), "aria".to_string()];
+    agent.groups = vec!["project:scgpt".to_string(), "aria".to_string()];
 
     let outcome = reconcile_cutex_session_store_from_agent(
         &mut store,
         &agent,
-        "host-a",
+        "tethys",
         "2026-06-25T00:00:00Z",
     )
     .expect("reconcile should succeed")
@@ -33,10 +33,10 @@ fn cutex_session_reconcile_creates_record_from_live_agent() {
     assert_eq!(record.codex_session_id.as_deref(), Some("019e-alpha"));
     assert_eq!(
         record.current_runtime_agent_id.as_deref(),
-        Some("cutex.aemeath.example-project.runtime1")
+        Some("cutex.aemeath.scgpt.runtime1")
     );
     assert_eq!(record.thread_name.as_deref(), Some("aria-data"));
-    assert_eq!(record.host_id, "host-a");
+    assert_eq!(record.host_id, "tethys");
     assert_eq!(record.profile, None);
     assert!(record.agent_enabled);
     assert_eq!(record.agent_groups, agent.groups);
@@ -49,7 +49,7 @@ fn runtime_and_im_reconciliation_preserve_session_profile_inheritance_and_overri
     let mut inherited = CutexSessionRecord::new_at(
         "cutex.019e-inherited".to_string(),
         Some("019e-inherited".to_string()),
-        "host-a".to_string(),
+        "tethys".to_string(),
         "/tmp/inherited".to_string(),
         None,
         "2026-08-07T00:00:00Z".to_string(),
@@ -59,7 +59,7 @@ fn runtime_and_im_reconciliation_preserve_session_profile_inheritance_and_overri
     let mut explicit = CutexSessionRecord::new_at(
         "cutex.019e-explicit".to_string(),
         Some("019e-explicit".to_string()),
-        "host-a".to_string(),
+        "tethys".to_string(),
         "/tmp/explicit".to_string(),
         Some("colab".to_string()),
         "2026-08-07T00:00:00Z".to_string(),
@@ -85,7 +85,7 @@ fn runtime_and_im_reconciliation_preserve_session_profile_inheritance_and_overri
         reconcile_cutex_session_store_from_agent(
             &mut store,
             &agent,
-            "host-a",
+            "tethys",
             "2026-08-07T00:01:00Z",
         )
         .expect("agent reconcile");
@@ -116,7 +116,7 @@ fn cutex_session_reconcile_preserves_persistent_registration_class() {
         .expect("IM reconcile should succeed");
 
     let mut agent = sample_bus_agent(
-        "cutex.aemeath.example-project.runtime1",
+        "cutex.aemeath.scgpt.runtime1",
         "aria-data.abcdef0",
         Some("aria-data"),
         Some("abcdef0"),
@@ -124,7 +124,7 @@ fn cutex_session_reconcile_preserves_persistent_registration_class() {
     agent.session_id = Some("019e-alpha".to_string());
     agent.registration_class = AgentRegistrationClass::LocalOnly;
 
-    reconcile_cutex_session_store_from_agent(&mut store, &agent, "host-a", "2026-06-25T00:01:00Z")
+    reconcile_cutex_session_store_from_agent(&mut store, &agent, "tethys", "2026-06-25T00:01:00Z")
         .expect("agent reconcile should succeed")
         .expect("agent with session id should reconcile");
 
@@ -138,7 +138,7 @@ fn cutex_session_reconcile_preserves_persistent_registration_class() {
     );
     assert_eq!(
         record.current_runtime_agent_id.as_deref(),
-        Some("cutex.aemeath.example-project.runtime1")
+        Some("cutex.aemeath.scgpt.runtime1")
     );
 }
 
@@ -171,19 +171,19 @@ fn im_reconcile_preserves_explicit_managed_runtime_backend() {
 fn cutex_session_reconcile_refreshes_same_endpoint_without_event() {
     let mut store = CutexSessionStore::default();
     let mut agent = sample_bus_agent(
-        "cutex.aemeath.example-project.runtime1",
+        "cutex.aemeath.scgpt.runtime1",
         "aria-data.abcdef0",
         Some("aria-data"),
         Some("abcdef0"),
     );
     agent.session_id = Some("019e-alpha".to_string());
 
-    reconcile_cutex_session_store_from_agent(&mut store, &agent, "host-a", "2026-06-25T00:00:00Z")
+    reconcile_cutex_session_store_from_agent(&mut store, &agent, "tethys", "2026-06-25T00:00:00Z")
         .expect("initial reconcile should succeed");
     let outcome = reconcile_cutex_session_store_from_agent(
         &mut store,
         &agent,
-        "host-a",
+        "tethys",
         "2026-06-25T00:01:00Z",
     )
     .expect("refresh should succeed")
@@ -203,7 +203,7 @@ fn cutex_session_reconcile_refreshes_same_endpoint_without_event() {
 fn agent_reconcile_revisions_only_effective_durable_changes() {
     let mut store = CutexSessionStore::default();
     let mut agent = sample_bus_agent(
-        "cutex.aemeath.example-project.runtime1",
+        "cutex.aemeath.scgpt.runtime1",
         "aria-data.abcdef0",
         Some("aria-data"),
         Some("abcdef0"),
@@ -211,21 +211,21 @@ fn agent_reconcile_revisions_only_effective_durable_changes() {
     agent.session_id = Some("019e-revision".to_string());
     agent.groups = vec!["aria".to_string()];
 
-    reconcile_cutex_session_store_from_agent(&mut store, &agent, "host-a", "2026-06-25T00:00:00Z")
+    reconcile_cutex_session_store_from_agent(&mut store, &agent, "tethys", "2026-06-25T00:00:00Z")
         .expect("initial reconcile");
     assert_eq!(store.sessions["cutex.019e-revision"].durable_revision(), 1);
 
-    reconcile_cutex_session_store_from_agent(&mut store, &agent, "host-a", "2026-06-25T00:01:00Z")
+    reconcile_cutex_session_store_from_agent(&mut store, &agent, "tethys", "2026-06-25T00:01:00Z")
         .expect("heartbeat reconcile");
     assert_eq!(store.sessions["cutex.019e-revision"].durable_revision(), 1);
 
     agent.groups.push("waveline".to_string());
-    reconcile_cutex_session_store_from_agent(&mut store, &agent, "host-a", "2026-06-25T00:02:00Z")
+    reconcile_cutex_session_store_from_agent(&mut store, &agent, "tethys", "2026-06-25T00:02:00Z")
         .expect("durable groups reconcile");
     assert_eq!(store.sessions["cutex.019e-revision"].durable_revision(), 2);
 
-    agent.id = "cutex.aemeath.example-project.runtime2".to_string();
-    reconcile_cutex_session_store_from_agent(&mut store, &agent, "host-a", "2026-06-25T00:03:00Z")
+    agent.id = "cutex.aemeath.scgpt.runtime2".to_string();
+    reconcile_cutex_session_store_from_agent(&mut store, &agent, "tethys", "2026-06-25T00:03:00Z")
         .expect("runtime endpoint reconcile");
     let record = &store.sessions["cutex.019e-revision"];
     assert_eq!(record.durable_revision(), 2);
@@ -236,13 +236,13 @@ fn agent_reconcile_revisions_only_effective_durable_changes() {
 fn retired_session_ignores_agent_reconciliation() {
     let mut store = CutexSessionStore::default();
     let mut agent = sample_bus_agent(
-        "cutex.aemeath.example-project.runtime1",
+        "cutex.aemeath.scgpt.runtime1",
         "aria-data.abcdef0",
         Some("aria-data"),
         Some("abcdef0"),
     );
     agent.session_id = Some("019e-retired".to_string());
-    reconcile_cutex_session_store_from_agent(&mut store, &agent, "host-a", "2026-06-25T00:00:00Z")
+    reconcile_cutex_session_store_from_agent(&mut store, &agent, "tethys", "2026-06-25T00:00:00Z")
         .expect("initial reconcile");
     let record = store
         .sessions
@@ -252,12 +252,12 @@ fn retired_session_ignores_agent_reconciliation() {
     record.retired_at = Some("2026-06-25T00:01:00Z".to_string());
     let original = record.clone();
 
-    agent.id = "cutex.aemeath.example-project.runtime2".to_string();
+    agent.id = "cutex.aemeath.scgpt.runtime2".to_string();
     agent.groups.push("must-not-apply".to_string());
     assert!(reconcile_cutex_session_store_from_agent(
         &mut store,
         &agent,
-        "host-a",
+        "tethys",
         "2026-06-25T00:02:00Z",
     )
     .expect("retired reconcile")
@@ -269,14 +269,14 @@ fn retired_session_ignores_agent_reconciliation() {
 fn cutex_session_reconcile_rebinds_runtime_endpoint_after_internal_resume() {
     let mut store = CutexSessionStore::default();
     let mut agent = sample_bus_agent(
-        "cutex.aemeath.example-project.runtime1",
+        "cutex.aemeath.scgpt.runtime1",
         "aria-data.abcdef0",
         Some("aria-data"),
         Some("abcdef0"),
     );
     agent.session_id = Some("019e-alpha".to_string());
 
-    reconcile_cutex_session_store_from_agent(&mut store, &agent, "host-a", "2026-06-25T00:00:00Z")
+    reconcile_cutex_session_store_from_agent(&mut store, &agent, "tethys", "2026-06-25T00:00:00Z")
         .expect("initial reconcile should succeed");
 
     agent.session_id = Some("019e-beta".to_string());
@@ -284,7 +284,7 @@ fn cutex_session_reconcile_rebinds_runtime_endpoint_after_internal_resume() {
     let outcome = reconcile_cutex_session_store_from_agent(
         &mut store,
         &agent,
-        "host-a",
+        "tethys",
         "2026-06-25T00:02:00Z",
     )
     .expect("resume reconcile should succeed")
@@ -307,7 +307,7 @@ fn cutex_session_reconcile_rebinds_runtime_endpoint_after_internal_resume() {
     assert!(old_record.current_runtime_agent_id.is_none());
     assert_eq!(
         old_record.last_runtime_agent_id.as_deref(),
-        Some("cutex.aemeath.example-project.runtime1")
+        Some("cutex.aemeath.scgpt.runtime1")
     );
 
     let new_record = store
@@ -316,7 +316,7 @@ fn cutex_session_reconcile_rebinds_runtime_endpoint_after_internal_resume() {
         .expect("new session should exist");
     assert_eq!(
         new_record.current_runtime_agent_id.as_deref(),
-        Some("cutex.aemeath.example-project.runtime1")
+        Some("cutex.aemeath.scgpt.runtime1")
     );
     assert_eq!(new_record.thread_name.as_deref(), Some("aria-eval"));
     assert_eq!(new_record.runtime_generation, 1);
@@ -352,13 +352,13 @@ fn cutex_session_reconcile_marks_im_registration_exposure() {
 fn cutex_session_im_reconcile_hides_without_removing_runtime_endpoint() {
     let mut store = CutexSessionStore::default();
     let mut agent = sample_bus_agent(
-        "cutex.aemeath.example-project.runtime1",
+        "cutex.aemeath.scgpt.runtime1",
         "aria-data.abcdef0",
         Some("aria-data"),
         Some("abcdef0"),
     );
     agent.session_id = Some("019e-alpha".to_string());
-    reconcile_cutex_session_store_from_agent(&mut store, &agent, "host-a", "2026-06-25T00:00:00Z")
+    reconcile_cutex_session_store_from_agent(&mut store, &agent, "tethys", "2026-06-25T00:00:00Z")
         .expect("agent reconcile should succeed");
 
     let mut entry = sample_im_registration("019e-alpha");
@@ -373,7 +373,7 @@ fn cutex_session_im_reconcile_hides_without_removing_runtime_endpoint() {
     assert!(!record.exposed_to_backend);
     assert_eq!(
         record.current_runtime_agent_id.as_deref(),
-        Some("cutex.aemeath.example-project.runtime1")
+        Some("cutex.aemeath.scgpt.runtime1")
     );
     assert!(record.agent_enabled);
 }
@@ -384,7 +384,7 @@ fn agent_reconcile_preserves_original_cwd_when_managed_cwd_is_set() {
     let mut record = CutexSessionRecord::new_at(
         "cutex.019e-alpha".to_string(),
         Some("019e-alpha".to_string()),
-        "host-a".to_string(),
+        "tethys".to_string(),
         "/tmp/session-original".to_string(),
         Some("aemeath".to_string()),
         "2026-06-25T00:00:00Z".to_string(),
@@ -404,7 +404,7 @@ fn agent_reconcile_preserves_original_cwd_when_managed_cwd_is_set() {
     agent.session_id = Some("019e-alpha".to_string());
     agent.cwd = "/tmp/session-managed".to_string();
 
-    reconcile_cutex_session_store_from_agent(&mut store, &agent, "host-a", "2026-06-25T00:03:00Z")
+    reconcile_cutex_session_store_from_agent(&mut store, &agent, "tethys", "2026-06-25T00:03:00Z")
         .expect("agent reconcile should succeed");
 
     let record = store

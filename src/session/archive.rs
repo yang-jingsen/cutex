@@ -359,7 +359,7 @@ mod tests {
         CutexSessionRecord::new_at(
             "cutex.archive-test".to_string(),
             Some("thread.archive-test".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/archive-test".to_string(),
             Some("default".to_string()),
             "2026-08-10T00:00:00Z".to_string(),

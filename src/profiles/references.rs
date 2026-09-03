@@ -133,7 +133,7 @@ mod tests {
         CutexSessionRecord::new_at(
             key.to_string(),
             None,
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp".to_string(),
             Some(profile.to_string()),
             "2026-08-05T00:00:00Z".to_string(),

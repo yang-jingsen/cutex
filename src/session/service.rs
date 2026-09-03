@@ -388,7 +388,7 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex.retired-settings".to_string(),
             Some("thread-retired-settings".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/retired-settings".to_string(),
             Some("alpha".to_string()),
             "2026-08-10T00:00:00Z".to_string(),
@@ -432,7 +432,7 @@ mod tests {
         let record = CutexSessionRecord::new_at(
             "cutex-profile-fence".to_string(),
             Some("thread-profile-fence".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/profile-fence".to_string(),
             Some("alpha".to_string()),
             "2026-08-15T00:00:00Z".to_string(),

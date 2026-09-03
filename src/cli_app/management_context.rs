@@ -1663,7 +1663,7 @@ while True:
         let mut record = CutexSessionRecord::new_at(
             "cutex-1".to_string(),
             Some("019f0000-0000-7000-8000-000000000001".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/project".to_string(),
             None,
             "2026-08-07T00:00:00Z".to_string(),

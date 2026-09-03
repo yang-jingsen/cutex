@@ -4,6 +4,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::role_revision::{CutexSessionId, Sha256};
+use crate::seat::{DirectorSeatTransferRequest, SeatAuthorityError, SeatOccupancyStore};
+use crate::task_service::ActionId;
+use sha2::{Digest as _, Sha256 as Sha256Digest};
 
 use super::store::{now, request_sha256, AgentManagementSnapshot};
 use super::*;
@@ -213,9 +216,12 @@ impl AgentManagementPhaseObserver for NoopPhaseObserver {
 
 pub struct AgentManagementProvider {
     store: AgentManagementStore,
+    director_seats: SeatOccupancyStore,
     phase_observer: Arc<dyn AgentManagementPhaseObserver>,
     #[cfg(test)]
     fail_after_predecessor_close_once: Arc<AtomicBool>,
+    #[cfg(test)]
+    fail_after_director_seat_transfer_once: Arc<AtomicBool>,
 }
 
 fn provider_execution_lock() -> &'static Mutex<()> {
@@ -225,20 +231,28 @@ fn provider_execution_lock() -> &'static Mutex<()> {
 
 impl AgentManagementProvider {
     pub fn open(root: impl Into<std::path::PathBuf>) -> Result<Self, AgentManagementError> {
+        let root = root.into();
         Ok(Self {
-            store: AgentManagementStore::open(root)?,
+            store: AgentManagementStore::open(&root)?,
+            director_seats: SeatOccupancyStore::open(root.join("task-service-seat-authority-v1"))
+                .map_err(seat_authority_error)?,
             phase_observer: Arc::new(NoopPhaseObserver),
             #[cfg(test)]
             fail_after_predecessor_close_once: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_after_director_seat_transfer_once: Arc::new(AtomicBool::new(false)),
         })
     }
 
     pub fn open_default() -> anyhow::Result<Self> {
         Ok(Self {
             store: AgentManagementStore::open_default()?,
+            director_seats: SeatOccupancyStore::open_default()?,
             phase_observer: Arc::new(NoopPhaseObserver),
             #[cfg(test)]
             fail_after_predecessor_close_once: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_after_director_seat_transfer_once: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -250,6 +264,13 @@ impl AgentManagementProvider {
     #[cfg(test)]
     fn with_fail_after_predecessor_close_once(self) -> Self {
         self.fail_after_predecessor_close_once
+            .store(true, Ordering::SeqCst);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_fail_after_director_seat_transfer_once(self) -> Self {
+        self.fail_after_director_seat_transfer_once
             .store(true, Ordering::SeqCst);
         self
     }
@@ -272,6 +293,30 @@ impl AgentManagementProvider {
 
     #[cfg(not(test))]
     fn inject_process_loss_after_predecessor_close(
+        &self,
+        _request: &AuthorizedAgentManagementRequest<'_>,
+    ) -> Option<AgentManagementResponse> {
+        None
+    }
+
+    #[cfg(test)]
+    fn inject_process_loss_after_director_seat_transfer(
+        &self,
+        request: &AuthorizedAgentManagementRequest<'_>,
+    ) -> Option<AgentManagementResponse> {
+        self.fail_after_director_seat_transfer_once
+            .swap(false, Ordering::SeqCst)
+            .then(|| {
+                no_write(
+                    &request.action_id,
+                    "injected_process_loss",
+                    "test-only process loss after Task Service Director seat transfer",
+                )
+            })
+    }
+
+    #[cfg(not(test))]
+    fn inject_process_loss_after_director_seat_transfer(
         &self,
         _request: &AuthorizedAgentManagementRequest<'_>,
     ) -> Option<AgentManagementResponse> {
@@ -527,7 +572,12 @@ impl AgentManagementProvider {
             };
         let action = match self.begin_action(invocation, &request, &digest, historical_continuation)
         {
-            Ok(BeginAction::Replay(response)) => return response,
+            Ok(BeginAction::Replay(response)) => {
+                if let Err(error) = self.reconcile_completed_rotation(&request, &response) {
+                    return error_response(&request.action_id, error);
+                }
+                return response;
+            }
             Ok(BeginAction::Execute(action)) => action,
             Err(error) => return error_response(&request.action_id, error),
         };
@@ -1121,6 +1171,24 @@ impl AgentManagementProvider {
                     *expected_authority_epoch,
                 )?;
                 let mut action = action;
+                let transfer_action_id = director_seat_transfer_action_id(&request.action_id)?;
+                let replay_transfer =
+                    action
+                        .known_successor_cutex_session
+                        .as_ref()
+                        .map(|successor| DirectorSeatTransferRequest {
+                            action_id: transfer_action_id.clone(),
+                            expected_predecessor_cutex_session: expected_predecessor_cutex_session
+                                .clone(),
+                            successor_cutex_session: successor.clone(),
+                        });
+                self.director_seats
+                    .preflight_director_transfer(
+                        &transfer_action_id,
+                        expected_predecessor_cutex_session,
+                        replay_transfer.as_ref(),
+                    )
+                    .map_err(seat_authority_error)?;
                 if action.phase == AgentActionPhase::Prepared {
                     self.active_agent(&request.project_id, expected_predecessor_cutex_session)?;
                     self.reject_active_collision_except(
@@ -2014,6 +2082,17 @@ impl AgentManagementProvider {
         expected_epoch: u64,
         created: CreatedAgent,
     ) -> Result<AgentManagementResponse, AgentManagementError> {
+        let seat_transfer = DirectorSeatTransferRequest {
+            action_id: director_seat_transfer_action_id(&request.action_id)?,
+            expected_predecessor_cutex_session: predecessor.clone(),
+            successor_cutex_session: created.agent.cutex_session_id.clone(),
+        };
+        self.director_seats
+            .transfer_director(&seat_transfer)
+            .map_err(seat_authority_error)?;
+        if let Some(response) = self.inject_process_loss_after_director_seat_transfer(request) {
+            return Ok(response);
+        }
         let (response, events) = self.store.with_state(true, |mut state| {
             let current = state
                 .projects
@@ -2083,7 +2162,64 @@ impl AgentManagementProvider {
         for event in &events {
             self.notify_phase(event);
         }
+        self.director_seats
+            .finish_director_transfer(&seat_transfer)
+            .map_err(seat_authority_error)?;
+        self.director_seats
+            .verify_director_transfer(&seat_transfer)
+            .map_err(seat_authority_error)?;
         Ok(response)
+    }
+
+    fn reconcile_completed_rotation(
+        &self,
+        request: &AuthorizedAgentManagementRequest<'_>,
+        response: &AgentManagementResponse,
+    ) -> Result<(), AgentManagementError> {
+        let (
+            AgentOperation::DirectorRotate {
+                expected_predecessor_cutex_session,
+                ..
+            },
+            AgentManagementOutcome::Complete { receipt },
+        ) = (&request.operation, &response.outcome)
+        else {
+            return Ok(());
+        };
+        let AgentManagementResult::DirectorRotated {
+            successor,
+            authority,
+            ..
+        } = &receipt.result
+        else {
+            return Err(AgentManagementError::InvalidStore);
+        };
+        let project_authority = self
+            .store
+            .snapshot()?
+            .projects
+            .get(&request.project_id)
+            .cloned()
+            .ok_or(AgentManagementError::InvalidStore)?;
+        if &project_authority != authority
+            || authority.authorized_director_session != successor.cutex_session_id
+        {
+            return Err(AgentManagementError::Conflict(
+                "director_authority_surfaces_disagree",
+            ));
+        }
+        let transfer = DirectorSeatTransferRequest {
+            action_id: director_seat_transfer_action_id(&request.action_id)?,
+            expected_predecessor_cutex_session: expected_predecessor_cutex_session.clone(),
+            successor_cutex_session: successor.cutex_session_id.clone(),
+        };
+        self.director_seats
+            .finish_director_transfer(&transfer)
+            .map_err(seat_authority_error)?;
+        self.director_seats
+            .verify_director_transfer(&transfer)
+            .map_err(seat_authority_error)?;
+        Ok(())
     }
 
     fn owner_action_required(
@@ -2228,6 +2364,28 @@ struct CreatedAgent {
     agent: ManagedAgentRecord,
     observation: AgentRuntimeObservation,
     message_id: Option<String>,
+}
+
+fn director_seat_transfer_action_id(
+    action_id: &AgentActionId,
+) -> Result<ActionId, AgentManagementError> {
+    let digest = Sha256Digest::digest(action_id.as_str().as_bytes());
+    ActionId::new(format!("agent-management/director-rotate-seat/{digest:x}"))
+        .map_err(|_| AgentManagementError::InvalidStore)
+}
+
+fn seat_authority_error(error: SeatAuthorityError) -> AgentManagementError {
+    match error {
+        SeatAuthorityError::InvalidRequest(reason) => AgentManagementError::InvalidRequest(reason),
+        SeatAuthorityError::Conflict(reason) => AgentManagementError::Conflict(reason),
+        SeatAuthorityError::Unauthorized => {
+            AgentManagementError::Conflict("task_service_director_seat_unauthorized")
+        }
+        SeatAuthorityError::PersistenceUnavailable | SeatAuthorityError::Io(_) => {
+            AgentManagementError::PersistenceUnavailable
+        }
+        SeatAuthorityError::InvalidStore => AgentManagementError::InvalidStore,
+    }
 }
 
 /// Identifies the narrow historical receipt that is eligible for authoritative
@@ -3354,6 +3512,27 @@ mod tests {
     }
 
     fn bind_project(
+        provider: &AgentManagementProvider,
+        action_id: &str,
+        project_id: &str,
+        director: &str,
+        expected: Option<(&str, u64)>,
+    ) -> ProjectAuthorityReceipt {
+        let receipt = bind_project_only(provider, action_id, project_id, director, expected);
+        let fixture_digest = Sha256Digest::digest(action_id.as_bytes());
+        provider
+            .director_seats
+            .bind(&crate::seat::SeatOccupancyBindRequest {
+                schema: crate::seat::SeatOccupancyCommandSchema::V1,
+                action_id: ActionId::new(format!("test-director-seat/{fixture_digest:x}")).unwrap(),
+                seat_id: crate::task_service::SeatId::new("cutex-director").unwrap(),
+                occupant_cutex_session: session(director),
+            })
+            .unwrap();
+        receipt
+    }
+
+    fn bind_project_only(
         provider: &AgentManagementProvider,
         action_id: &str,
         project_id: &str,
@@ -5473,6 +5652,265 @@ mod tests {
             }
             other => panic!("unexpected query: {other:?}"),
         }
+        let seat_snapshot = provider.director_seats.query().unwrap();
+        assert_eq!(
+            seat_snapshot
+                .occupancies
+                .get(&crate::task_service::SeatId::new("cutex-director").unwrap())
+                .unwrap()
+                .occupant_cutex_session,
+            successor.cutex_session_id
+        );
+        assert!(seat_snapshot.active_director_transfer.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn director_rotation_preflight_rejects_missing_or_stale_task_service_seat_before_launch() {
+        for (label, stale_occupant, expected_reason) in [
+            ("missing", None, "director_seat_not_bound"),
+            (
+                "stale",
+                Some("cutex.unrelated-director"),
+                "stale_director_seat_occupancy",
+            ),
+        ] {
+            let root = root(&format!("director-seat-preflight-{label}"));
+            let provider = AgentManagementProvider::open(&root).unwrap();
+            bind_project_only(
+                &provider,
+                "bind-bootstrap",
+                project().as_str(),
+                "cutex.bootstrap",
+                None,
+            );
+            let lifecycle = FakeLifecycle::default();
+            let predecessor = created_agent(&completed(provider.execute(
+                &invocation("cutex.bootstrap"),
+                &create_request(
+                    "create-director",
+                    "director-r1",
+                    AgentStartMode::BootstrapOnly,
+                ),
+                &lifecycle,
+            )));
+            bind_project_only(
+                &provider,
+                "bind-director",
+                project().as_str(),
+                predecessor.cutex_session_id.as_str(),
+                Some(("cutex.bootstrap", 1)),
+            );
+            if let Some(occupant) = stale_occupant {
+                provider
+                    .director_seats
+                    .bind(&crate::seat::SeatOccupancyBindRequest {
+                        schema: crate::seat::SeatOccupancyCommandSchema::V1,
+                        action_id: ActionId::new("stale-seat-fixture").unwrap(),
+                        seat_id: crate::task_service::SeatId::new("cutex-director").unwrap(),
+                        occupant_cutex_session: session(occupant),
+                    })
+                    .unwrap();
+            }
+            let rotate = AgentManagementRequest {
+                schema: AgentManagementSchema::V1,
+                action_id: action("rotate-preflight"),
+                project_id: Some(project()),
+                operation: AgentOperation::DirectorRotate {
+                    expected_predecessor_cutex_session: predecessor.cutex_session_id.clone(),
+                    expected_authority_epoch: 2,
+                    mode: DirectorRotateMode::ClosePredecessorThenCreateWithMessage,
+                    successor: spec("director-r2"),
+                    frozen_message: Some("Do not deliver.".to_string()),
+                },
+            };
+            let response = provider.execute(
+                &invocation(predecessor.cutex_session_id.as_str()),
+                &rotate,
+                &lifecycle,
+            );
+            assert!(matches!(
+                response.outcome,
+                AgentManagementOutcome::NoWrite { ref detail, .. }
+                    if detail.contains(expected_reason)
+            ));
+            assert_eq!(lifecycle.bootstrap_count(), 1);
+            assert_eq!(lifecycle.message_count(), 0);
+            assert!(
+                lifecycle
+                    .observe(&predecessor.cutex_session_id)
+                    .unwrap()
+                    .active
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn director_rotation_recovers_process_loss_between_seat_and_project_authority() {
+        let root = root("director-seat-project-boundary-loss");
+        let provider = AgentManagementProvider::open(&root)
+            .unwrap()
+            .with_fail_after_director_seat_transfer_once();
+        bind(&provider, "bind-bootstrap", "cutex.bootstrap", None);
+        let lifecycle = FakeLifecycle::default();
+        let predecessor = created_agent(&completed(provider.execute(
+            &invocation("cutex.bootstrap"),
+            &create_request(
+                "create-director",
+                "director-r1",
+                AgentStartMode::BootstrapOnly,
+            ),
+            &lifecycle,
+        )));
+        bind(
+            &provider,
+            "bind-director",
+            predecessor.cutex_session_id.as_str(),
+            Some(("cutex.bootstrap", 1)),
+        );
+        let rotate = AgentManagementRequest {
+            schema: AgentManagementSchema::V1,
+            action_id: action("rotate-boundary-loss"),
+            project_id: Some(project()),
+            operation: AgentOperation::DirectorRotate {
+                expected_predecessor_cutex_session: predecessor.cutex_session_id.clone(),
+                expected_authority_epoch: 2,
+                mode: DirectorRotateMode::RetainPredecessorBootstrapOnly,
+                successor: spec("director-r2"),
+                frozen_message: None,
+            },
+        };
+        let interrupted = provider.execute(
+            &invocation(predecessor.cutex_session_id.as_str()),
+            &rotate,
+            &lifecycle,
+        );
+        assert!(matches!(
+            interrupted.outcome,
+            AgentManagementOutcome::NoWrite { ref code, .. } if code == "injected_process_loss"
+        ));
+        let management = provider.store().snapshot().unwrap();
+        let successor = management.actions[&rotate.action_id]
+            .known_successor_cutex_session
+            .clone()
+            .unwrap();
+        assert_eq!(
+            management.projects[&project()].authorized_director_session,
+            predecessor.cutex_session_id
+        );
+        assert_eq!(
+            management.actions[&rotate.action_id].phase,
+            AgentActionPhase::AuthorityTransferPending
+        );
+        let seats = provider.director_seats.query().unwrap();
+        assert_eq!(
+            seats.occupancies[&crate::task_service::SeatId::new("cutex-director").unwrap()]
+                .occupant_cutex_session,
+            successor
+        );
+        assert_eq!(
+            seats.active_director_transfer,
+            Some(director_seat_transfer_action_id(&rotate.action_id).unwrap())
+        );
+        assert_eq!(lifecycle.bootstrap_count(), 2);
+
+        drop(provider);
+        let reopened = AgentManagementProvider::open(&root).unwrap();
+        let completed_response = reopened.execute(
+            &invocation(predecessor.cutex_session_id.as_str()),
+            &rotate,
+            &lifecycle,
+        );
+        let replay = reopened.execute(
+            &invocation(predecessor.cutex_session_id.as_str()),
+            &rotate,
+            &lifecycle,
+        );
+        assert_eq!(completed_response, replay);
+        let receipt = completed(completed_response);
+        let AgentManagementResult::DirectorRotated {
+            successor: completed_successor,
+            authority,
+            ..
+        } = receipt.result
+        else {
+            panic!("expected completed Director rotation")
+        };
+        assert_eq!(completed_successor.cutex_session_id, successor);
+        assert_eq!(authority.authorized_director_session, successor);
+        assert_eq!(
+            reopened.store().snapshot().unwrap().projects[&project()],
+            authority
+        );
+        let seats = reopened.director_seats.query().unwrap();
+        assert_eq!(
+            seats.occupancies[&crate::task_service::SeatId::new("cutex-director").unwrap()]
+                .occupant_cutex_session,
+            successor
+        );
+        assert!(seats.active_director_transfer.is_none());
+        assert_eq!(lifecycle.bootstrap_count(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn completed_director_rotation_replay_fails_closed_after_unrelated_seat_rebind() {
+        let root = root("director-complete-seat-divergence");
+        let provider = AgentManagementProvider::open(&root).unwrap();
+        bind(&provider, "bind-bootstrap", "cutex.bootstrap", None);
+        let lifecycle = FakeLifecycle::default();
+        let predecessor = created_agent(&completed(provider.execute(
+            &invocation("cutex.bootstrap"),
+            &create_request(
+                "create-director",
+                "director-r1",
+                AgentStartMode::BootstrapOnly,
+            ),
+            &lifecycle,
+        )));
+        bind(
+            &provider,
+            "bind-director",
+            predecessor.cutex_session_id.as_str(),
+            Some(("cutex.bootstrap", 1)),
+        );
+        let rotate = AgentManagementRequest {
+            schema: AgentManagementSchema::V1,
+            action_id: action("rotate-then-diverge"),
+            project_id: Some(project()),
+            operation: AgentOperation::DirectorRotate {
+                expected_predecessor_cutex_session: predecessor.cutex_session_id.clone(),
+                expected_authority_epoch: 2,
+                mode: DirectorRotateMode::RetainPredecessorBootstrapOnly,
+                successor: spec("director-r2"),
+                frozen_message: None,
+            },
+        };
+        completed(provider.execute(
+            &invocation(predecessor.cutex_session_id.as_str()),
+            &rotate,
+            &lifecycle,
+        ));
+        provider
+            .director_seats
+            .bind(&crate::seat::SeatOccupancyBindRequest {
+                schema: crate::seat::SeatOccupancyCommandSchema::V1,
+                action_id: ActionId::new("unrelated-admin-rebind").unwrap(),
+                seat_id: crate::task_service::SeatId::new("cutex-director").unwrap(),
+                occupant_cutex_session: session("cutex.unrelated-director"),
+            })
+            .unwrap();
+        let replay = provider.execute(
+            &invocation(predecessor.cutex_session_id.as_str()),
+            &rotate,
+            &lifecycle,
+        );
+        assert!(matches!(
+            replay.outcome,
+            AgentManagementOutcome::NoWrite { ref detail, .. }
+                if detail.contains("director_seat_changed_after_transfer")
+        ));
         std::fs::remove_dir_all(root).unwrap();
     }
 

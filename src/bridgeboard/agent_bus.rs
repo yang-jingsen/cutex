@@ -112,15 +112,15 @@ mod tests {
     fn bridgeboard_ports_parser_discovers_peer_agent_bus() {
         let text = "\
 PORT   ID                 OWNER        MODE      LIFE       RESTART    DESIRED  STATUS          URL\n\
-24260  cutex-agent-bus    host-a       external  manual     never      -        running         http://127.0.0.1:24260/\n\
-24261  cutex-agent-bus    host-b       external  manual     never      -        remote-record   http://127.0.0.1:24261/\n";
+24260  cutex-agent-bus    tethys       external  manual     never      -        running         http://127.0.0.1:24260/\n\
+24261  cutex-agent-bus    eva-02       external  manual     never      -        remote-record   http://127.0.0.1:24261/\n";
 
-        let peers = parse_bridgeboard_ports_agent_bus_peers(text, "host-a");
+        let peers = parse_bridgeboard_ports_agent_bus_peers(text, "tethys");
 
         assert_eq!(
             peers,
             vec![AgentBusPeerEndpoint {
-                host: "host-b".to_string(),
+                host: "eva-02".to_string(),
                 port: 24261,
                 base_url: "http://127.0.0.1:24261".to_string(),
             }]
@@ -131,15 +131,15 @@ PORT   ID                 OWNER        MODE      LIFE       RESTART    DESIRED  
     fn bridgeboard_ports_parser_uses_tunnel_url_port_for_peer_agent_bus() {
         let text = "\
 PORT   ID                 OWNER        MODE      LIFE       RESTART    DESIRED  STATUS                 URL\n\
-24260  cutex-agent-bus    host-a       external  manual     never      -        external-running:123   http://127.0.0.1:24260/\n\
-24260  cutex-agent-bus    host-b       external  manual     never      -        remote-record          http://127.0.0.1:24660/\n";
+24260  cutex-agent-bus    tethys       external  manual     never      -        external-running:123   http://127.0.0.1:24260/\n\
+24260  cutex-agent-bus    eva-02       external  manual     never      -        remote-record          http://127.0.0.1:24660/\n";
 
-        let peers = parse_bridgeboard_ports_agent_bus_peers(text, "host-a");
+        let peers = parse_bridgeboard_ports_agent_bus_peers(text, "tethys");
 
         assert_eq!(
             peers,
             vec![AgentBusPeerEndpoint {
-                host: "host-b".to_string(),
+                host: "eva-02".to_string(),
                 port: 24660,
                 base_url: "http://127.0.0.1:24660".to_string(),
             }]
@@ -150,14 +150,14 @@ PORT   ID                 OWNER        MODE      LIFE       RESTART    DESIRED  
     fn bridgeboard_ports_parser_maps_default_peer_port_to_tunnel() {
         let text = "\
 PORT   ID                 OWNER        MODE      LIFE       RESTART    DESIRED  STATUS          URL\n\
-24260  cutex-agent-bus    host-b       external  manual     never      -        remote-record   http://127.0.0.1:24260/\n";
+24260  cutex-agent-bus    eva-02       external  manual     never      -        remote-record   http://127.0.0.1:24260/\n";
 
-        let peers = parse_bridgeboard_ports_agent_bus_peers(text, "host-a");
+        let peers = parse_bridgeboard_ports_agent_bus_peers(text, "tethys");
 
         assert_eq!(
             peers,
             vec![AgentBusPeerEndpoint {
-                host: "host-b".to_string(),
+                host: "eva-02".to_string(),
                 port: 24660,
                 base_url: "http://127.0.0.1:24660".to_string(),
             }]
@@ -169,19 +169,19 @@ PORT   ID                 OWNER        MODE      LIFE       RESTART    DESIRED  
         let peer = agent_bus_peer_endpoint_from_bridgeboard_record(
             BridgeboardServiceRecord {
                 id: AGENT_BUS_BRIDGE_ID.to_string(),
-                owner_host: "host-a".to_string(),
+                owner_host: "tethys".to_string(),
                 port: DEFAULT_AGENT_BUS_PORT,
                 local_url: Some("http://127.0.0.1:24260/".to_string()),
                 url: Some("http://127.0.0.1:24260/".to_string()),
             },
-            "host-b",
+            "eva-02",
         )
         .expect("peer record should produce endpoint");
 
         assert_eq!(
             peer,
             AgentBusPeerEndpoint {
-                host: "host-a".to_string(),
+                host: "tethys".to_string(),
                 port: DEFAULT_AGENT_BUS_PEER_TUNNEL_PORT,
                 base_url: "http://127.0.0.1:24660".to_string(),
             }

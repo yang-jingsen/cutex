@@ -5,7 +5,7 @@
 Current model:
 
 - `cutex` launches the selected CLI directly.
-- Selection order is `CUTEX_CODEX_BIN` / `CODEZ_CODEX_BIN`, then `cute-codex`, then `cutex-codex`, then `codex`.
+- Selection order is `CUTEX_CODEX_BIN`, then `cute-codex`, then `cutex-codex`, then `codex`.
 - `cutex` prints `CLI binary: ...` before each launch.
 - Native status-line rendering lives inside `cute-codex`.
 - Reusable custom item definitions live in `~/.cutex/config.json`.

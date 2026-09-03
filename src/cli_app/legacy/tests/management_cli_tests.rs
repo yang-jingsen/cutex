@@ -32,7 +32,7 @@ fn management_remote_up_command_parses() {
         "cutex",
         "management",
         "remote-up",
-        "host-b",
+        "eva-02",
         "--local-port",
         "24670",
         "--remote-port",
@@ -53,7 +53,7 @@ fn management_remote_up_command_parses() {
                 token: Some(token),
                 show_ssh_fallback: true,
             }
-        }) if host == "host-b" && token == "secret"
+        }) if host == "eva-02" && token == "secret"
     ));
 }
 

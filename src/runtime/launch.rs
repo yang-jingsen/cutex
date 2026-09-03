@@ -88,7 +88,7 @@ mod tests {
         let mut record = CutexSessionRecord::new(
             "cutex.019e-target".to_string(),
             Some("019e-target".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/home/example/Projects/cutex".to_string(),
             Some("aemeath".to_string()),
         )
@@ -127,7 +127,7 @@ mod tests {
         let mut record = CutexSessionRecord::new(
             "cutex.019e-target".to_string(),
             Some("019e-target".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/home/example/Projects/cutex".to_string(),
             Some("aemeath".to_string()),
         )
@@ -217,7 +217,7 @@ mod tests {
         let mut record = CutexSessionRecord::new(
             "cutex.019e-target".to_string(),
             Some("019e-target".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/home/example/Projects/cutex".to_string(),
             Some("record-profile".to_string()),
         )
@@ -231,7 +231,7 @@ mod tests {
                 fallback_called.set(true);
                 Some("active-profile".to_string())
             },
-            "host-a",
+            "tethys",
         )
         .expect("foreground resume plan should be built");
 
@@ -251,14 +251,14 @@ mod tests {
         let mut record = CutexSessionRecord::new(
             "cutex.019e-target".to_string(),
             Some("019e-target".to_string()),
-            "host-b".to_string(),
-            "D:\\Projects\\example-project".to_string(),
+            "eva-02".to_string(),
+            "E:\\Projects (Aemeath)\\waveline-backend".to_string(),
             Some("aemeath".to_string()),
         )
         .expect("record should be created");
         record.runtime_backend = CutexSessionRuntimeBackend::HostForeground;
 
-        let plan = foreground_resume_plan(&record, || None, "host-b")
+        let plan = foreground_resume_plan(&record, || None, "eva-02")
             .expect("foreground resume plan should be built");
 
         assert!(plan.groups.is_empty());
@@ -273,13 +273,13 @@ mod tests {
         let record = CutexSessionRecord::new(
             "cutex.019e-target".to_string(),
             Some("019e-target".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/home/example/Projects/cutex".to_string(),
             None,
         )
         .expect("record should be created");
 
-        let plan = foreground_resume_plan(&record, || Some("global-profile".to_string()), "host-b")
+        let plan = foreground_resume_plan(&record, || Some("global-profile".to_string()), "eva-02")
             .expect("foreground resume plan should be built");
 
         assert_eq!(plan.profile, "global-profile");
@@ -287,8 +287,8 @@ mod tests {
         assert_eq!(
             plan.host_warning,
             Some(ForegroundResumeHostWarning {
-                session_host: "host-a".to_string(),
-                current_host: "host-b".to_string(),
+                session_host: "tethys".to_string(),
+                current_host: "eva-02".to_string(),
             })
         );
     }
@@ -298,13 +298,13 @@ mod tests {
         let no_session_id = CutexSessionRecord::new(
             "cutex.no-session".to_string(),
             None,
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/home/example/Projects/cutex".to_string(),
             Some("record-profile".to_string()),
         )
         .expect("record should be created");
         assert_eq!(
-            foreground_resume_plan(&no_session_id, || None, "host-a")
+            foreground_resume_plan(&no_session_id, || None, "tethys")
                 .expect_err("missing Codex session id should fail")
                 .to_string(),
             "cutex session has no Codex session id"
@@ -313,13 +313,13 @@ mod tests {
         let no_profile = CutexSessionRecord::new(
             "cutex.019e-target".to_string(),
             Some("019e-target".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/home/example/Projects/cutex".to_string(),
             None,
         )
         .expect("record should be created");
         assert_eq!(
-            foreground_resume_plan(&no_profile, || None, "host-a")
+            foreground_resume_plan(&no_profile, || None, "tethys")
                 .expect_err("missing profile should fail")
                 .to_string(),
             "cutex session follows the global default, but no global default profile is set"

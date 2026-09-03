@@ -8,6 +8,7 @@ pub mod agent_bus;
 pub mod agent_management;
 pub mod app_server;
 pub mod bridgeboard;
+pub mod catalog;
 pub mod cli;
 pub mod compat;
 pub mod config;

@@ -8,7 +8,7 @@ fn session_list_default_hides_historical_local_sessions() {
     let mut persistent = CutexSessionRecord::new_at(
         "cutex.persistent".to_string(),
         Some("019e-persistent".to_string()),
-        "host-a".to_string(),
+        "tethys".to_string(),
         "/tmp/persistent".to_string(),
         Some("aemeath".to_string()),
         timestamp.clone(),
@@ -25,7 +25,7 @@ fn session_list_default_hides_historical_local_sessions() {
     let mut historical = CutexSessionRecord::new_at(
         "cutex.historical".to_string(),
         Some("019e-historical".to_string()),
-        "host-a".to_string(),
+        "tethys".to_string(),
         "/tmp/historical".to_string(),
         Some("aemeath".to_string()),
         timestamp.clone(),
@@ -39,7 +39,7 @@ fn session_list_default_hides_historical_local_sessions() {
     let mut attachable = CutexSessionRecord::new_at(
         "cutex.attachable".to_string(),
         Some("019e-attachable".to_string()),
-        "host-a".to_string(),
+        "tethys".to_string(),
         "/tmp/attachable".to_string(),
         Some("aemeath".to_string()),
         timestamp,
@@ -107,7 +107,7 @@ fn start_quick_actions_use_user_selection_not_heartbeat_recency() {
     let mut pinned = CutexSessionRecord::new_at(
         "cutex.pinned".to_string(),
         Some("019e-pinned".to_string()),
-        "host-a".to_string(),
+        "tethys".to_string(),
         "/tmp/elsewhere".to_string(),
         Some("aemeath".to_string()),
         timestamp.clone(),
@@ -122,7 +122,7 @@ fn start_quick_actions_use_user_selection_not_heartbeat_recency() {
     let mut cwd_match = CutexSessionRecord::new_at(
         "cutex.cwd".to_string(),
         Some("019e-cwd".to_string()),
-        "host-a".to_string(),
+        "tethys".to_string(),
         "/home/example/Projects/cutex".to_string(),
         Some("aemeath".to_string()),
         timestamp.clone(),
@@ -137,7 +137,7 @@ fn start_quick_actions_use_user_selection_not_heartbeat_recency() {
     let mut local_cwd = CutexSessionRecord::new_at(
         "cutex.local-cwd".to_string(),
         Some("019e-local-cwd".to_string()),
-        "host-a".to_string(),
+        "tethys".to_string(),
         "/home/example/Projects/cutex".to_string(),
         Some("aemeath".to_string()),
         timestamp.clone(),
@@ -151,7 +151,7 @@ fn start_quick_actions_use_user_selection_not_heartbeat_recency() {
     let mut heartbeat_only = CutexSessionRecord::new_at(
         "cutex.heartbeat".to_string(),
         Some("019e-heartbeat".to_string()),
-        "host-a".to_string(),
+        "tethys".to_string(),
         "/tmp/heartbeat".to_string(),
         Some("aemeath".to_string()),
         timestamp.clone(),
@@ -166,7 +166,7 @@ fn start_quick_actions_use_user_selection_not_heartbeat_recency() {
     let mut child_cwd = CutexSessionRecord::new_at(
         "cutex.child".to_string(),
         Some("019e-child".to_string()),
-        "host-a".to_string(),
+        "tethys".to_string(),
         "/home/example/Projects/cutex/scripts".to_string(),
         Some("aemeath".to_string()),
         timestamp.clone(),
@@ -183,7 +183,7 @@ fn start_quick_actions_use_user_selection_not_heartbeat_recency() {
     let mut hidden = CutexSessionRecord::new_at(
         "cutex.hidden".to_string(),
         Some("019e-hidden".to_string()),
-        "host-a".to_string(),
+        "tethys".to_string(),
         "/home/example/Projects/cutex".to_string(),
         Some("aemeath".to_string()),
         timestamp,

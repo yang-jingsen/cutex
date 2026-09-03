@@ -29,7 +29,7 @@ docker run --rm -it \
 
 Current behavior:
 
-- The selected CLI name follows the same host-side resolution order as normal launches: `CUTEX_CODEX_BIN` / `CODEZ_CODEX_BIN`, then `cute-codex`, then `cutex-codex`, then `codex`.
+- The selected CLI name follows the same host-side resolution order as normal launches: `CUTEX_CODEX_BIN`, then `cute-codex`, then `cutex-codex`, then `codex`.
 - `cutex` prints `CLI binary: ...` before launch so you can see which name it resolved.
 - The current project directory is mounted into the container at the exact same absolute path.
 - The container working directory is that same path.

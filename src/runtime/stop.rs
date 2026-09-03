@@ -84,7 +84,7 @@ mod tests {
         CutexSessionRecord::new_at(
             "cutex.runtime-stop".to_string(),
             Some("019f-runtime-stop".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/runtime-stop".to_string(),
             None,
             "2026-08-08T00:00:00Z".to_string(),
@@ -97,7 +97,7 @@ mod tests {
         let mut record = offline_record();
         record.pending_launch_id = Some("legacy-heartbeat-launch".to_string());
 
-        let target = session_runtime_stop_target(&record, &[], None, "host-a");
+        let target = session_runtime_stop_target(&record, &[], None, "tethys");
 
         assert!(!target.had_runtime);
         assert!(target.pids.is_empty());
@@ -108,7 +108,7 @@ mod tests {
         let mut record = offline_record();
         record.app_server_launch_claim_id = Some("app-server-launch-1".to_string());
 
-        let target = session_runtime_stop_target(&record, &[], None, "host-a");
+        let target = session_runtime_stop_target(&record, &[], None, "tethys");
 
         assert!(target.had_runtime);
         assert!(target.pids.is_empty());

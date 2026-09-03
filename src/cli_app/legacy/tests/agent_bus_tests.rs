@@ -214,7 +214,7 @@ fn agent_groups_update_can_bridge_live_agents() {
 #[test]
 fn agent_sender_label_prefers_current_thread_base_name() {
     let agent = sample_bus_agent(
-        "cutex.aemeath.example-project.421708310f",
+        "cutex.aemeath.scgpt.421708310f",
         "msgbot-1.8de58c1",
         Some("msgbot-1"),
         Some("8de58c1"),
@@ -370,7 +370,7 @@ fn agent_prune_uses_heartbeat_not_local_pid() {
                 profile: "aemeath".to_string(),
                 cwd: "E:\\Projects\\agent".to_string(),
                 pid: u32::MAX,
-                host_id: Some("host-b".to_string()),
+                host_id: Some("eva-02".to_string()),
                 groups: vec!["project:1234567".to_string()],
                 registration_class: AgentRegistrationClass::LocalOnly,
                 last_seen_epoch_secs: now_epoch_secs(),

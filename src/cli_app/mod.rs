@@ -47,7 +47,13 @@ mod session_tui;
 mod session_tui_actions;
 mod session_tui_dispatch;
 mod session_tui_profile_settings;
+mod session_tui_projects;
+mod session_tui_recent;
 mod session_tui_settings;
+mod session_tui_workspace;
+mod session_tui_workspace_events;
+mod session_tui_workspace_loading;
+mod session_tui_workspace_render;
 mod session_wizard;
 mod settings;
 #[cfg(test)]

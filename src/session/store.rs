@@ -130,7 +130,7 @@ mod tests {
         CutexSessionRecord::new_at(
             format!("cutex.{name}"),
             Some(format!("thread-{name}")),
-            "host-a".to_string(),
+            "tethys".to_string(),
             format!("/tmp/{name}"),
             None,
             "2026-08-10T00:00:00Z".to_string(),

@@ -3949,7 +3949,7 @@ mod tests {
         let project = crate::agent_management::ProjectId::new("project-alpha").unwrap();
         let credential = crate::task_service::OwnerTaskReadCredential {
             principal_id: "owner-reader".to_string(),
-            audience: "host-a-backend".to_string(),
+            audience: "tethys-backend".to_string(),
             token: crate::task_service::OwnerTaskReadToken::new("owner-reader-token-0123456789"),
             project_ids: vec![project.clone()],
             expires_at: Some("2099-01-01T00:00:00Z".to_string()),
@@ -3995,7 +3995,7 @@ mod tests {
         let body = response_json(&response);
         assert_eq!(body["schema"], "cutex/owner-task-read/v1");
         assert_eq!(body["project_id"], "project-alpha");
-        assert_eq!(body["audience"], "host-a-backend");
+        assert_eq!(body["audience"], "tethys-backend");
         assert_eq!(body["items"], serde_json::json!([]));
         assert!(!response.contains("owner-reader-token"));
         assert!(!response.contains("opaque_contract"));
@@ -4018,7 +4018,7 @@ mod tests {
         let project = crate::agent_management::ProjectId::new("project-alpha").unwrap();
         let credential = crate::task_service::OwnerTaskReadCredential {
             principal_id: "owner-reader".to_string(),
-            audience: "host-a-backend".to_string(),
+            audience: "tethys-backend".to_string(),
             token: crate::task_service::OwnerTaskReadToken::new("owner-reader-token-0123456789"),
             project_ids: vec![project.clone()],
             expires_at: Some("2099-01-01T00:00:00Z".to_string()),
@@ -4108,7 +4108,7 @@ mod tests {
     #[test]
     fn sse_stream_change_frame_matches_frozen_error_contract_and_has_no_cursor() {
         let mut bytes = Vec::new();
-        write_sse_stream_changed(&mut bytes, "host-a", "old-stream", "new-stream")
+        write_sse_stream_changed(&mut bytes, "tethys", "old-stream", "new-stream")
             .expect("write stream change frame");
         let frame = String::from_utf8(bytes).expect("utf8 SSE frame");
         assert!(frame.starts_with("event: cutex_management_stream_error\n"));
@@ -4119,7 +4119,7 @@ mod tests {
             .expect("SSE data line");
         let body: Value = serde_json::from_str(data).expect("parse SSE error body");
         assert_eq!(body["error"]["code"], "stream_changed");
-        assert_eq!(body["error"]["details"]["hostId"], "host-a");
+        assert_eq!(body["error"]["details"]["hostId"], "tethys");
         assert_eq!(body["error"]["details"]["requestedStreamId"], "old-stream");
         assert_eq!(body["error"]["details"]["currentStreamId"], "new-stream");
         assert_eq!(body["error"]["details"]["resyncRequired"], true);

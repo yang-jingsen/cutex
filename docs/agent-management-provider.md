@@ -77,6 +77,39 @@ cross-project, authority-changed, or externally unknowable state fails closed.
 For `close_after_ready`, replay validates and reuses the already-created exact
 successor. It does not bootstrap again or resend the idempotent handoff.
 
+## Coupled Director authority rotation
+
+`director_rotate` owns both Director authority surfaces: the Agent Management
+project authority and the Task Service `cutex-director` seat. Before closing a
+predecessor or creating a successor, the provider reads the durable seat store
+and requires its current occupant to be the request's exact expected
+predecessor. A missing seat, a different occupant, or a transfer-action identity
+already used for another payload fails closed before launch. This preflight does
+not infer authority from Agent Bus groups, chat identity, or ambient state.
+
+After the successor is ready and any frozen handoff message has been delivered,
+Agent Management transfers the seat with an internal compare-and-swap request.
+Its action identity is a domain-separated SHA-256 derivation of the immutable
+`director_rotate` action ID. The seat operation accepts only the expected
+predecessor or an exact durable replay already naming that action's exact
+successor; the general administrative seat bind is not used as the rotation
+primitive. While the project-authority boundary is pending, the seat store
+durably fences unrelated administrative rebinds. Agent Management then commits
+the project-authority CAS and releases that fence. Close-predecessor and both
+retained-predecessor modes preserve their existing lifecycle and message
+behavior around these authority steps.
+
+If the process stops after the seat CAS but before project authority commits,
+the original action remains at `authority_transfer_pending` with its exact
+successor identity, while the seat store retains the transfer receipt and active
+boundary fence. Exact replay verifies that evidence, reuses the successor
+without another bootstrap or message, commits project authority once, and
+finishes the fence. A completed response is returned or replayed only after the
+stored project authority and current Task Service seat both name the receipt's
+exact successor. Pre-existing or later unrelated mismatches are reported
+without rebinding either surface; recovery never falls back to administrative
+bind or silently heals a different action.
+
 ## Minimal downstream change
 
 The cute-codex 0.150 handler should remove ambient-project discovery and all
@@ -110,10 +143,10 @@ project-authority CAS:
 ```json
 {
   "schema": "cutex/agent-management/legacy-director-ownership-import/v1",
-  "action_id": "legacy-director-import-host-a-r2-01",
+  "action_id": "legacy-director-import-tethys-r2-01",
   "project_id": "tethysune",
-  "director_cutex_session_id": "cutex.host-a-director-r2",
-  "expected_authorized_director_session": "cutex.host-a-director-r2",
+  "director_cutex_session_id": "cutex.tethys-director-r2",
+  "expected_authorized_director_session": "cutex.tethys-director-r2",
   "expected_authority_epoch": 1
 }
 ```

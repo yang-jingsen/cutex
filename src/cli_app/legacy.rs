@@ -233,10 +233,10 @@ mod tests {
         CodingSessionRegistration {
             session_id: session_id.to_string(),
             display_name: "aria-data".to_string(),
-            host_id: "host-a".to_string(),
-            cwd: "/home/example/Projects/example-project".to_string(),
+            host_id: "tethys".to_string(),
+            cwd: "/home/example/Projects/scgpt".to_string(),
             profile: Some("aemeath".to_string()),
-            groups: vec!["aria".to_string(), "project:example-project".to_string()],
+            groups: vec!["aria".to_string(), "project:scgpt".to_string()],
             registration_class: AgentRegistrationClass::Persistent,
             visible: true,
             created_at: "2026-06-24T00:00:00Z".to_string(),
@@ -348,7 +348,7 @@ mod tests {
         let mut record = CutexSessionRecord::new(
             "cutex.019e-target".to_string(),
             Some("019e-target".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/home/example/Projects/cutex".to_string(),
             Some("aemeath".to_string()),
         )
@@ -417,7 +417,7 @@ mod tests {
         let mut record = CutexSessionRecord::new(
             "cutex.019e-session".to_string(),
             Some("019e-session".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/home/example/Projects/cutex".to_string(),
             Some("aemeath".to_string()),
         )
@@ -478,7 +478,7 @@ mod tests {
         let mut first = CutexSessionRecord::new(
             "cutex.019e-first".to_string(),
             Some("019e-first".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/first".to_string(),
             Some("aemeath".to_string()),
         )
@@ -489,7 +489,7 @@ mod tests {
         let mut second = CutexSessionRecord::new(
             "cutex.019e-second".to_string(),
             Some("019e-second".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/second".to_string(),
             Some("aemeath".to_string()),
         )
@@ -522,7 +522,7 @@ mod tests {
             let mut record = CutexSessionRecord::new(
                 format!("cutex.019e-{suffix}"),
                 Some(format!("019e-{suffix}")),
-                "host-a".to_string(),
+                "tethys".to_string(),
                 format!("/tmp/{suffix}"),
                 Some("aemeath".to_string()),
             )
@@ -626,7 +626,7 @@ mod tests {
             let mut record = CutexSessionRecord::new(
                 format!("cutex.{session_id}"),
                 Some(session_id),
-                "host-a".to_string(),
+                "tethys".to_string(),
                 "/home/example/Projects/cutex".to_string(),
                 Some("aemeath".to_string()),
             )
@@ -680,7 +680,7 @@ mod tests {
         let record = CutexSessionRecord::new_at(
             "cutex.019e-alpha".to_string(),
             Some("019e-alpha".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/session-original".to_string(),
             Some("aemeath".to_string()),
             "2026-06-25T00:00:00Z".to_string(),
@@ -747,7 +747,7 @@ mod tests {
         let record = CutexSessionRecord::new_at(
             "cutex.019e-alpha".to_string(),
             Some("019e-alpha".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/session-original".to_string(),
             Some("aemeath".to_string()),
             "2026-06-25T00:00:00Z".to_string(),
@@ -833,7 +833,7 @@ mod tests {
         let record = CutexSessionRecord::new_at(
             "cutex.019e-alpha".to_string(),
             Some("019e-alpha".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/session-original".to_string(),
             Some("aemeath".to_string()),
             "2026-06-25T00:00:00Z".to_string(),
@@ -885,8 +885,8 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex.019e-alpha".to_string(),
             Some("019e-alpha".to_string()),
-            "host-a".to_string(),
-            "/home/example/Projects/example-project".to_string(),
+            "tethys".to_string(),
+            "/home/example/Projects/scgpt".to_string(),
             Some("aemeath".to_string()),
             "2026-06-25T00:00:00Z".to_string(),
         )
@@ -1585,7 +1585,7 @@ status_line = ["launch-profile", "current-dir"]
         let record = CutexSessionRecord::new_at(
             "cutex.profile-ref".to_string(),
             Some(codex_session_id.clone()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/project".to_string(),
             Some("alpha".to_string()),
             "2026-08-06T00:00:00Z".to_string(),
@@ -2723,12 +2723,10 @@ base_url = "https://api.deepseek.com/"
         let temp_home = std::env::temp_dir().join(format!("codez-home-{}", Uuid::new_v4()));
         let old_home = std::env::var_os("HOME");
         let old_cutex_codex_bin = std::env::var_os(CUTEX_CODEX_BIN_ENV_VAR);
-        let old_codez_codex_bin = std::env::var_os(CODEZ_CODEX_BIN_ENV_VAR);
         fs::create_dir_all(&temp_home).expect("temp home should be created");
         unsafe {
             std::env::set_var("HOME", &temp_home);
             std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, "/tmp/custom-codex");
-            std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR);
         }
 
         let account = sample_account("demo");
@@ -2758,10 +2756,6 @@ base_url = "https://api.deepseek.com/"
             Some(value) => unsafe { std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, value) },
             None => unsafe { std::env::remove_var(CUTEX_CODEX_BIN_ENV_VAR) },
         }
-        match old_codez_codex_bin {
-            Some(value) => unsafe { std::env::set_var(CODEZ_CODEX_BIN_ENV_VAR, value) },
-            None => unsafe { std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR) },
-        }
         match old_home {
             Some(value) => unsafe { std::env::set_var("HOME", value) },
             None => unsafe { std::env::remove_var("HOME") },
@@ -2775,7 +2769,6 @@ base_url = "https://api.deepseek.com/"
         let temp_home = std::env::temp_dir().join(format!("cutex-home-{}", Uuid::new_v4()));
         let old_home = std::env::var_os("HOME");
         let old_cutex_codex_bin = std::env::var_os(CUTEX_CODEX_BIN_ENV_VAR);
-        let old_codez_codex_bin = std::env::var_os(CODEZ_CODEX_BIN_ENV_VAR);
         let old_notify_idle = std::env::var_os(CODEX_NOTIFY_IDLE_TIMEOUT_ENV_VAR);
         let old_notify_composer = std::env::var_os(CODEX_NOTIFY_COMPOSER_IDLE_TIMEOUT_ENV_VAR);
         let old_notify_approval = std::env::var_os(CODEX_NOTIFY_APPROVAL_TIMEOUT_ENV_VAR);
@@ -2790,7 +2783,6 @@ base_url = "https://api.deepseek.com/"
         unsafe {
             std::env::set_var("HOME", &temp_home);
             std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, "/tmp/cute-codex");
-            std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR);
             std::env::remove_var(CODEX_NOTIFY_IDLE_TIMEOUT_ENV_VAR);
             std::env::remove_var(CODEX_NOTIFY_COMPOSER_IDLE_TIMEOUT_ENV_VAR);
             std::env::remove_var(CODEX_NOTIFY_APPROVAL_TIMEOUT_ENV_VAR);
@@ -2866,10 +2858,6 @@ base_url = "https://api.deepseek.com/"
         match old_cutex_codex_bin {
             Some(value) => unsafe { std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, value) },
             None => unsafe { std::env::remove_var(CUTEX_CODEX_BIN_ENV_VAR) },
-        }
-        match old_codez_codex_bin {
-            Some(value) => unsafe { std::env::set_var(CODEZ_CODEX_BIN_ENV_VAR, value) },
-            None => unsafe { std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR) },
         }
         match old_notify_idle {
             Some(value) => unsafe { std::env::set_var(CODEX_NOTIFY_IDLE_TIMEOUT_ENV_VAR, value) },
@@ -2980,7 +2968,6 @@ base_url = "https://api.deepseek.com/"
         let temp_home = std::env::temp_dir().join(format!("cutex-home-{}", Uuid::new_v4()));
         let old_home = std::env::var_os("HOME");
         let old_cutex_codex_bin = std::env::var_os(CUTEX_CODEX_BIN_ENV_VAR);
-        let old_codez_codex_bin = std::env::var_os(CODEZ_CODEX_BIN_ENV_VAR);
         let old_notify_idle = std::env::var_os(CODEX_NOTIFY_IDLE_TIMEOUT_ENV_VAR);
         let old_notify_composer = std::env::var_os(CODEX_NOTIFY_COMPOSER_IDLE_TIMEOUT_ENV_VAR);
         let old_notify_approval = std::env::var_os(CODEX_NOTIFY_APPROVAL_TIMEOUT_ENV_VAR);
@@ -2995,7 +2982,6 @@ base_url = "https://api.deepseek.com/"
         unsafe {
             std::env::set_var("HOME", &temp_home);
             std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, "/tmp/cute-codex");
-            std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR);
             std::env::set_var(CODEX_NOTIFY_IDLE_TIMEOUT_ENV_VAR, "20");
             std::env::set_var(CODEX_NOTIFY_COMPOSER_IDLE_TIMEOUT_ENV_VAR, "5");
             std::env::set_var(CODEX_NOTIFY_APPROVAL_TIMEOUT_ENV_VAR, "30");
@@ -3066,10 +3052,6 @@ base_url = "https://api.deepseek.com/"
         match old_cutex_codex_bin {
             Some(value) => unsafe { std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, value) },
             None => unsafe { std::env::remove_var(CUTEX_CODEX_BIN_ENV_VAR) },
-        }
-        match old_codez_codex_bin {
-            Some(value) => unsafe { std::env::set_var(CODEZ_CODEX_BIN_ENV_VAR, value) },
-            None => unsafe { std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR) },
         }
         match old_notify_idle {
             Some(value) => unsafe { std::env::set_var(CODEX_NOTIFY_IDLE_TIMEOUT_ENV_VAR, value) },
@@ -3190,10 +3172,8 @@ base_url = "https://api.deepseek.com/"
     fn docker_runtime_skips_sandbox_bypass_for_non_codex_binary() {
         let _guard = env_lock().lock().expect("env lock should not be poisoned");
         let old_cutex_codex_bin = std::env::var_os(CUTEX_CODEX_BIN_ENV_VAR);
-        let old_codez_codex_bin = std::env::var_os(CODEZ_CODEX_BIN_ENV_VAR);
         unsafe {
             std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, "/tmp/sh");
-            std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR);
         }
 
         let mut account = sample_account("docker");
@@ -3208,10 +3188,6 @@ base_url = "https://api.deepseek.com/"
         match old_cutex_codex_bin {
             Some(value) => unsafe { std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, value) },
             None => unsafe { std::env::remove_var(CUTEX_CODEX_BIN_ENV_VAR) },
-        }
-        match old_codez_codex_bin {
-            Some(value) => unsafe { std::env::set_var(CODEZ_CODEX_BIN_ENV_VAR, value) },
-            None => unsafe { std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR) },
         }
     }
 
@@ -3248,12 +3224,10 @@ base_url = "https://api.deepseek.com/"
         let temp_home = std::env::temp_dir().join(format!("codez-home-{}", Uuid::new_v4()));
         let old_home = std::env::var_os("HOME");
         let old_cutex_codex_bin = std::env::var_os(CUTEX_CODEX_BIN_ENV_VAR);
-        let old_codez_codex_bin = std::env::var_os(CODEZ_CODEX_BIN_ENV_VAR);
         fs::create_dir_all(&temp_home).expect("temp home should be created");
         unsafe {
             std::env::set_var("HOME", &temp_home);
             std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, "/tmp/cute-codex");
-            std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR);
         }
 
         let mut account = sample_account("test-profile");
@@ -3292,10 +3266,6 @@ base_url = "https://api.deepseek.com/"
             Some(value) => unsafe { std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, value) },
             None => unsafe { std::env::remove_var(CUTEX_CODEX_BIN_ENV_VAR) },
         }
-        match old_codez_codex_bin {
-            Some(value) => unsafe { std::env::set_var(CODEZ_CODEX_BIN_ENV_VAR, value) },
-            None => unsafe { std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR) },
-        }
         let _ = fs::remove_dir_all(temp_home);
     }
 
@@ -3305,12 +3275,10 @@ base_url = "https://api.deepseek.com/"
         let temp_home = std::env::temp_dir().join(format!("cutex-home-{}", Uuid::new_v4()));
         let old_home = std::env::var_os("HOME");
         let old_cutex_codex_bin = std::env::var_os(CUTEX_CODEX_BIN_ENV_VAR);
-        let old_codez_codex_bin = std::env::var_os(CODEZ_CODEX_BIN_ENV_VAR);
         fs::create_dir_all(temp_home.join(".cutex")).expect("temp cutex home should be created");
         unsafe {
             std::env::set_var("HOME", &temp_home);
             std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, "/tmp/cute-codex");
-            std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR);
         }
 
         let mut config = CodezConfig::default();
@@ -3344,10 +3312,6 @@ base_url = "https://api.deepseek.com/"
             Some(value) => unsafe { std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, value) },
             None => unsafe { std::env::remove_var(CUTEX_CODEX_BIN_ENV_VAR) },
         }
-        match old_codez_codex_bin {
-            Some(value) => unsafe { std::env::set_var(CODEZ_CODEX_BIN_ENV_VAR, value) },
-            None => unsafe { std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR) },
-        }
         let _ = fs::remove_dir_all(temp_home);
     }
 
@@ -3357,12 +3321,10 @@ base_url = "https://api.deepseek.com/"
         let temp_home = std::env::temp_dir().join(format!("cutex-home-{}", Uuid::new_v4()));
         let old_home = std::env::var_os("HOME");
         let old_cutex_codex_bin = std::env::var_os(CUTEX_CODEX_BIN_ENV_VAR);
-        let old_codez_codex_bin = std::env::var_os(CODEZ_CODEX_BIN_ENV_VAR);
         fs::create_dir_all(temp_home.join(".cutex")).expect("temp cutex home should be created");
         unsafe {
             std::env::set_var("HOME", &temp_home);
             std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, "/tmp/cute-codex");
-            std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR);
         }
 
         let mut config = CodezConfig::default();
@@ -3380,7 +3342,7 @@ base_url = "https://api.deepseek.com/"
             &account,
             &["resume".to_string()],
             true,
-            &["aria".to_string(), "example-project".to_string()],
+            &["aria".to_string(), "scGPT".to_string()],
         )
         .expect("launch should build");
 
@@ -3408,7 +3370,7 @@ base_url = "https://api.deepseek.com/"
             .expect("agent groups should be exported");
         assert!(groups.contains("project:"));
         assert!(groups.contains("aria"));
-        assert!(groups.contains("example-project"));
+        assert!(groups.contains("scgpt"));
         assert!(launch.envs.iter().any(|(key, value)| {
             key == CUTEX_AGENT_HINT_ENV_VAR && value.contains("cutex agent send")
         }));
@@ -3421,10 +3383,6 @@ base_url = "https://api.deepseek.com/"
             Some(value) => unsafe { std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, value) },
             None => unsafe { std::env::remove_var(CUTEX_CODEX_BIN_ENV_VAR) },
         }
-        match old_codez_codex_bin {
-            Some(value) => unsafe { std::env::set_var(CODEZ_CODEX_BIN_ENV_VAR, value) },
-            None => unsafe { std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR) },
-        }
         let _ = fs::remove_dir_all(temp_home);
     }
 
@@ -3434,12 +3392,10 @@ base_url = "https://api.deepseek.com/"
         let temp_home = std::env::temp_dir().join(format!("cutex-home-{}", Uuid::new_v4()));
         let old_home = std::env::var_os("HOME");
         let old_cutex_codex_bin = std::env::var_os(CUTEX_CODEX_BIN_ENV_VAR);
-        let old_codez_codex_bin = std::env::var_os(CODEZ_CODEX_BIN_ENV_VAR);
         fs::create_dir_all(temp_home.join(".cutex")).expect("temp cutex home should be created");
         unsafe {
             std::env::set_var("HOME", &temp_home);
             std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, "cute-codex");
-            std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR);
         }
 
         let mut config = CodezConfig::default();
@@ -3475,10 +3431,6 @@ base_url = "https://api.deepseek.com/"
             Some(value) => unsafe { std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, value) },
             None => unsafe { std::env::remove_var(CUTEX_CODEX_BIN_ENV_VAR) },
         }
-        match old_codez_codex_bin {
-            Some(value) => unsafe { std::env::set_var(CODEZ_CODEX_BIN_ENV_VAR, value) },
-            None => unsafe { std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR) },
-        }
         let _ = fs::remove_dir_all(temp_home);
     }
 
@@ -3488,12 +3440,10 @@ base_url = "https://api.deepseek.com/"
         let temp_home = std::env::temp_dir().join(format!("cutex-home-{}", Uuid::new_v4()));
         let old_home = std::env::var_os("HOME");
         let old_cutex_codex_bin = std::env::var_os(CUTEX_CODEX_BIN_ENV_VAR);
-        let old_codez_codex_bin = std::env::var_os(CODEZ_CODEX_BIN_ENV_VAR);
         fs::create_dir_all(temp_home.join(".cutex")).expect("temp cutex home should be created");
         unsafe {
             std::env::set_var("HOME", &temp_home);
             std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, "/tmp/cute-codex");
-            std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR);
         }
 
         let mut account = sample_account("api-key-host");
@@ -3549,10 +3499,6 @@ requires_openai_auth = false
             Some(value) => unsafe { std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, value) },
             None => unsafe { std::env::remove_var(CUTEX_CODEX_BIN_ENV_VAR) },
         }
-        match old_codez_codex_bin {
-            Some(value) => unsafe { std::env::set_var(CODEZ_CODEX_BIN_ENV_VAR, value) },
-            None => unsafe { std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR) },
-        }
         let _ = fs::remove_dir_all(temp_home);
     }
 
@@ -3562,12 +3508,10 @@ requires_openai_auth = false
         let temp_home = std::env::temp_dir().join(format!("cutex-home-{}", Uuid::new_v4()));
         let old_home = std::env::var_os("HOME");
         let old_cutex_codex_bin = std::env::var_os(CUTEX_CODEX_BIN_ENV_VAR);
-        let old_codez_codex_bin = std::env::var_os(CODEZ_CODEX_BIN_ENV_VAR);
         fs::create_dir_all(temp_home.join(".cutex")).expect("temp cutex home should be created");
         unsafe {
             std::env::set_var("HOME", &temp_home);
             std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, "cute-codex");
-            std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR);
         }
 
         let mut account = sample_account("api-key-docker");
@@ -3607,10 +3551,6 @@ requires_openai_auth = false
             Some(value) => unsafe { std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, value) },
             None => unsafe { std::env::remove_var(CUTEX_CODEX_BIN_ENV_VAR) },
         }
-        match old_codez_codex_bin {
-            Some(value) => unsafe { std::env::set_var(CODEZ_CODEX_BIN_ENV_VAR, value) },
-            None => unsafe { std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR) },
-        }
         let _ = fs::remove_dir_all(temp_home);
     }
 
@@ -3620,7 +3560,6 @@ requires_openai_auth = false
         let temp_home = std::env::temp_dir().join(format!("cutex-home-{}", Uuid::new_v4()));
         let old_home = std::env::var_os("HOME");
         let old_cutex_codex_bin = std::env::var_os(CUTEX_CODEX_BIN_ENV_VAR);
-        let old_codez_codex_bin = std::env::var_os(CODEZ_CODEX_BIN_ENV_VAR);
         let old_cutex_alden_bin = std::env::var_os(CUTEX_ALDEN_BIN_ENV_VAR);
         let old_cute_alden_active = std::env::var_os("CUTE_ALDEN_SESSION_ACTIVE");
         let old_alden_active = std::env::var_os("ALDEN_SESSION_ACTIVE");
@@ -3628,7 +3567,6 @@ requires_openai_auth = false
         unsafe {
             std::env::set_var("HOME", &temp_home);
             std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, "/tmp/cute-codex");
-            std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR);
             std::env::set_var(CUTEX_ALDEN_BIN_ENV_VAR, "/tmp/cute-alden");
             std::env::remove_var("CUTE_ALDEN_SESSION_ACTIVE");
             std::env::remove_var("ALDEN_SESSION_ACTIVE");
@@ -3660,10 +3598,6 @@ requires_openai_auth = false
             Some(value) => unsafe { std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, value) },
             None => unsafe { std::env::remove_var(CUTEX_CODEX_BIN_ENV_VAR) },
         }
-        match old_codez_codex_bin {
-            Some(value) => unsafe { std::env::set_var(CODEZ_CODEX_BIN_ENV_VAR, value) },
-            None => unsafe { std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR) },
-        }
         match old_cutex_alden_bin {
             Some(value) => unsafe { std::env::set_var(CUTEX_ALDEN_BIN_ENV_VAR, value) },
             None => unsafe { std::env::remove_var(CUTEX_ALDEN_BIN_ENV_VAR) },
@@ -3680,7 +3614,6 @@ requires_openai_auth = false
         let temp_home = std::env::temp_dir().join(format!("ch-{}", &temp_key[..8]));
         let old_home = std::env::var_os("HOME");
         let old_cutex_codex_bin = std::env::var_os(CUTEX_CODEX_BIN_ENV_VAR);
-        let old_codez_codex_bin = std::env::var_os(CODEZ_CODEX_BIN_ENV_VAR);
         let old_cutex_alden_bin = std::env::var_os(CUTEX_ALDEN_BIN_ENV_VAR);
         let old_thread_id = std::env::var_os("CODEX_THREAD_ID");
         let old_agent_id = std::env::var_os(CUTEX_AGENT_ID_ENV_VAR);
@@ -3699,7 +3632,6 @@ requires_openai_auth = false
         unsafe {
             std::env::set_var("HOME", &temp_home);
             std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, "/tmp/cute-codex");
-            std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR);
             std::env::set_var(CUTEX_ALDEN_BIN_ENV_VAR, "/tmp/cute-alden");
             std::env::set_var("CODEX_THREAD_ID", "wrong-current-thread");
             std::env::set_var(CUTEX_AGENT_ID_ENV_VAR, "cutex.wrong.current");
@@ -3737,8 +3669,8 @@ requires_openai_auth = false
         let mut record = CutexSessionRecord::new_at(
             "cutex.019e-alpha".to_string(),
             Some("019e-alpha".to_string()),
-            "host-a".to_string(),
-            "/home/example/Projects/example-project".to_string(),
+            "tethys".to_string(),
+            "/home/example/Projects/scgpt".to_string(),
             Some("aemeath".to_string()),
             "2026-06-25T00:00:00Z".to_string(),
         )
@@ -3761,7 +3693,7 @@ requires_openai_auth = false
 
         assert_eq!(launch.program, "/tmp/cute-alden");
         assert_eq!(planned.backend, CutexSessionRuntimeBackend::CuteAlden);
-        assert!(alden_name.contains("cutex.aemeath.host.example-project"));
+        assert!(alden_name.contains("cutex.aemeath.host.scgpt"));
         assert!(shell_command.contains("'--server-only'"));
         assert!(shell_command.contains("'--history-bytes'"));
         assert!(shell_command.contains("'262144'"));
@@ -3776,7 +3708,7 @@ requires_openai_auth = false
         assert!(shell_command.contains("'model_reasoning_effort=xhigh'"));
         assert!(shell_command.contains("'--no-alt-screen'"));
         assert!(shell_command.contains("'--cd'"));
-        assert!(shell_command.contains("'/home/example/Projects/example-project'"));
+        assert!(shell_command.contains("'/home/example/Projects/scgpt'"));
         assert!(shell_command.contains("'resume'"));
         assert!(shell_command.contains("'--cwd-policy'"));
         assert!(shell_command.contains("'current'"));
@@ -3841,7 +3773,7 @@ requires_openai_auth = false
         let agent_id = last_launch_env(&launch, CUTEX_AGENT_ID_ENV_VAR)
             .expect("session-specific agent id should be exported");
         assert!(
-            agent_id.starts_with("cutex.observer-smoke.example-project."),
+            agent_id.starts_with("cutex.observer-smoke.scgpt."),
             "unexpected session-specific agent id: {agent_id}"
         );
         assert_ne!(agent_id, "cutex.wrong.current");
@@ -4032,10 +3964,6 @@ requires_openai_auth = false
             Some(value) => unsafe { std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, value) },
             None => unsafe { std::env::remove_var(CUTEX_CODEX_BIN_ENV_VAR) },
         }
-        match old_codez_codex_bin {
-            Some(value) => unsafe { std::env::set_var(CODEZ_CODEX_BIN_ENV_VAR, value) },
-            None => unsafe { std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR) },
-        }
         match old_cutex_alden_bin {
             Some(value) => unsafe { std::env::set_var(CUTEX_ALDEN_BIN_ENV_VAR, value) },
             None => unsafe { std::env::remove_var(CUTEX_ALDEN_BIN_ENV_VAR) },
@@ -4053,7 +3981,6 @@ requires_openai_auth = false
         let temp_home = std::env::temp_dir().join(format!("cutex-home-{}", Uuid::new_v4()));
         let old_home = std::env::var_os("HOME");
         let old_cutex_codex_bin = std::env::var_os(CUTEX_CODEX_BIN_ENV_VAR);
-        let old_codez_codex_bin = std::env::var_os(CODEZ_CODEX_BIN_ENV_VAR);
         let old_cutex_alden_bin = std::env::var_os(CUTEX_ALDEN_BIN_ENV_VAR);
         let old_thread_id = std::env::var_os("CODEX_THREAD_ID");
         let old_agent_id = std::env::var_os(CUTEX_AGENT_ID_ENV_VAR);
@@ -4072,7 +3999,6 @@ requires_openai_auth = false
         unsafe {
             std::env::set_var("HOME", &temp_home);
             std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, "/tmp/cute-codex");
-            std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR);
             std::env::remove_var(CUTEX_ALDEN_BIN_ENV_VAR);
             std::env::set_var("CODEX_THREAD_ID", "wrong-current-thread");
             std::env::set_var(CUTEX_AGENT_ID_ENV_VAR, "cutex.wrong.current");
@@ -4109,14 +4035,14 @@ requires_openai_auth = false
         let mut record = CutexSessionRecord::new_at(
             "cutex.019e-alpha".to_string(),
             Some("019e-alpha".to_string()),
-            "host-a".to_string(),
-            "/home/example/Projects/example-project".to_string(),
+            "tethys".to_string(),
+            "/home/example/Projects/scgpt".to_string(),
             Some("aemeath".to_string()),
             "2026-06-25T00:00:00Z".to_string(),
         )
         .expect("record should be created");
         record.thread_name = Some("observer-smoke-host".to_string());
-        record.managed_cwd = Some("/home/example/Projects/example-project-managed".to_string());
+        record.managed_cwd = Some("/home/example/Projects/scgpt-managed".to_string());
         record.agent_groups = vec!["waveline".to_string()];
 
         let planned = management_lifecycle::session_online_launch_command(&record, &account)
@@ -4124,11 +4050,8 @@ requires_openai_auth = false
         let shell_command = planned.launch.to_shell_command();
 
         assert_eq!(planned.backend, CutexSessionRuntimeBackend::Host);
-        assert_eq!(
-            planned.cwd,
-            "/home/example/Projects/example-project-managed"
-        );
-        assert_eq!(record.cwd, "/home/example/Projects/example-project");
+        assert_eq!(planned.cwd, "/home/example/Projects/scgpt-managed");
+        assert_eq!(record.cwd, "/home/example/Projects/scgpt");
         assert_eq!(planned.launch.program, "/tmp/cute-codex");
         assert!(planned.alden_session_name.is_none());
         assert!(!shell_command.contains("--server-only"));
@@ -4181,7 +4104,7 @@ requires_openai_auth = false
         let agent_id = last_launch_env(&planned.launch, CUTEX_AGENT_ID_ENV_VAR)
             .expect("session-specific agent id should be exported");
         assert!(
-            agent_id.starts_with("cutex.observer-smoke-host.example-project-managed."),
+            agent_id.starts_with("cutex.observer-smoke-host.scgpt-managed."),
             "unexpected session-specific agent id: {agent_id}"
         );
         assert_ne!(agent_id, "cutex.wrong.current");
@@ -4239,10 +4162,6 @@ requires_openai_auth = false
             Some(value) => unsafe { std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, value) },
             None => unsafe { std::env::remove_var(CUTEX_CODEX_BIN_ENV_VAR) },
         }
-        match old_codez_codex_bin {
-            Some(value) => unsafe { std::env::set_var(CODEZ_CODEX_BIN_ENV_VAR, value) },
-            None => unsafe { std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR) },
-        }
         match old_cutex_alden_bin {
             Some(value) => unsafe { std::env::set_var(CUTEX_ALDEN_BIN_ENV_VAR, value) },
             None => unsafe { std::env::remove_var(CUTEX_ALDEN_BIN_ENV_VAR) },
@@ -4260,7 +4179,7 @@ requires_openai_auth = false
         let mut record = CutexSessionRecord::new_at(
             "cutex.019e-alpha".to_string(),
             Some("019e-alpha".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/home/example/Projects/cutex".to_string(),
             Some("aemeath".to_string()),
             "2026-06-25T00:00:00Z".to_string(),
@@ -4285,7 +4204,7 @@ requires_openai_auth = false
             Some("cutex.aemeath.host.cutex.cutex.019e-alpha"),
             CutexSessionRuntimeBackend::CuteAlden,
             4242,
-            "host-a",
+            "tethys",
             "2026-06-25T00:01:00Z",
         )
         .expect("runtime observation should apply")
@@ -4330,15 +4249,15 @@ requires_openai_auth = false
         let mut record = CutexSessionRecord::new_at(
             "cutex.019e-alpha".to_string(),
             Some("019e-alpha".to_string()),
-            "host-a".to_string(),
-            "/home/example/Projects/example-project".to_string(),
+            "tethys".to_string(),
+            "/home/example/Projects/scgpt".to_string(),
             Some("aemeath".to_string()),
             "2026-06-25T00:00:00Z".to_string(),
         )
         .expect("record should be created");
         record.runtime_backend = CutexSessionRuntimeBackend::CuteAlden;
         record.alden_pid = Some(u32::MAX);
-        record.current_runtime_agent_id = Some("cutex.aemeath.example-project.dead".to_string());
+        record.current_runtime_agent_id = Some("cutex.aemeath.scgpt.dead".to_string());
         record.last_runtime_agent_id = record.current_runtime_agent_id.clone();
         record.exposed_to_backend = true;
         let mut store = CutexSessionStore::default();
@@ -4387,7 +4306,7 @@ requires_openai_auth = false
             "cutex.019e-alpha".to_string(),
             Some("019e-alpha".to_string()),
             current_host_name(),
-            "/home/example/Projects/example-project".to_string(),
+            "/home/example/Projects/scgpt".to_string(),
             Some("aemeath".to_string()),
             "2026-06-25T00:00:00Z".to_string(),
         )
@@ -4395,7 +4314,7 @@ requires_openai_auth = false
         record.runtime_backend = CutexSessionRuntimeBackend::CuteAlden;
         record.pending_launch_id = Some("legacy-heartbeat-launch".to_string());
         record.app_server_launch_claim_id = Some("failed-app-server-launch".to_string());
-        record.current_runtime_agent_id = Some("cutex.aemeath.example-project.failed".to_string());
+        record.current_runtime_agent_id = Some("cutex.aemeath.scgpt.failed".to_string());
         record.runtime_generation = 3;
         let mut store = CutexSessionStore::default();
         store
@@ -4439,16 +4358,16 @@ requires_openai_auth = false
         fs::create_dir_all(temp_home.join(".cutex")).expect("temp cutex home should be created");
         unsafe {
             std::env::set_var("HOME", &temp_home);
-            std::env::set_var("HOSTNAME", "host-a");
+            std::env::set_var("HOSTNAME", "tethys");
         }
 
         let mut entry = sample_im_registration("019e-alpha");
-        entry.host_id = "host-b".to_string();
+        entry.host_id = "eva-02".to_string();
         let mut record = CutexSessionRecord::new_at(
             "cutex.019e-alpha".to_string(),
             Some("019e-alpha".to_string()),
-            "host-b".to_string(),
-            "E:\\Projects (Aemeath)\\example-project".to_string(),
+            "eva-02".to_string(),
+            "E:\\Projects (Aemeath)\\scgpt".to_string(),
             Some("aemeath".to_string()),
             "2026-06-25T00:00:00Z".to_string(),
         )
@@ -4487,7 +4406,7 @@ requires_openai_auth = false
 
         let entry = sample_im_registration("019e-alpha");
         let mut agent = sample_bus_agent(
-            "cutex.aemeath.example-project.live",
+            "cutex.aemeath.scgpt.live",
             "aria-data.abcdef0",
             Some("aria-data"),
             Some("abcdef0"),
@@ -4514,13 +4433,11 @@ requires_openai_auth = false
         let temp_home = std::env::temp_dir().join(format!("cutex-home-{}", Uuid::new_v4()));
         let old_home = std::env::var_os("HOME");
         let old_cutex_codex_bin = std::env::var_os(CUTEX_CODEX_BIN_ENV_VAR);
-        let old_codez_codex_bin = std::env::var_os(CODEZ_CODEX_BIN_ENV_VAR);
         let old_cutex_alden_bin = std::env::var_os(CUTEX_ALDEN_BIN_ENV_VAR);
         fs::create_dir_all(temp_home.join(".cutex")).expect("temp cutex home should be created");
         unsafe {
             std::env::set_var("HOME", &temp_home);
             std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, "/tmp/cute-codex");
-            std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR);
             std::env::set_var(CUTEX_ALDEN_BIN_ENV_VAR, "/tmp/cute-alden");
         }
 
@@ -4545,10 +4462,6 @@ requires_openai_auth = false
             Some(value) => unsafe { std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, value) },
             None => unsafe { std::env::remove_var(CUTEX_CODEX_BIN_ENV_VAR) },
         }
-        match old_codez_codex_bin {
-            Some(value) => unsafe { std::env::set_var(CODEZ_CODEX_BIN_ENV_VAR, value) },
-            None => unsafe { std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR) },
-        }
         match old_cutex_alden_bin {
             Some(value) => unsafe { std::env::set_var(CUTEX_ALDEN_BIN_ENV_VAR, value) },
             None => unsafe { std::env::remove_var(CUTEX_ALDEN_BIN_ENV_VAR) },
@@ -4562,12 +4475,10 @@ requires_openai_auth = false
         let temp_home = std::env::temp_dir().join(format!("codez-home-{}", Uuid::new_v4()));
         let old_home = std::env::var_os("HOME");
         let old_cutex_codex_bin = std::env::var_os(CUTEX_CODEX_BIN_ENV_VAR);
-        let old_codez_codex_bin = std::env::var_os(CODEZ_CODEX_BIN_ENV_VAR);
         fs::create_dir_all(&temp_home).expect("temp home should be created");
         unsafe {
             std::env::set_var("HOME", &temp_home);
             std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, "/tmp/cute-codex");
-            std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR);
         }
 
         let mut account = sample_account("test-profile");
@@ -4594,10 +4505,6 @@ requires_openai_auth = false
         match old_cutex_codex_bin {
             Some(value) => unsafe { std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, value) },
             None => unsafe { std::env::remove_var(CUTEX_CODEX_BIN_ENV_VAR) },
-        }
-        match old_codez_codex_bin {
-            Some(value) => unsafe { std::env::set_var(CODEZ_CODEX_BIN_ENV_VAR, value) },
-            None => unsafe { std::env::remove_var(CODEZ_CODEX_BIN_ENV_VAR) },
         }
         let _ = fs::remove_dir_all(temp_home);
     }

@@ -2,14 +2,12 @@
 
 use std::path::Path;
 
-use crate::config::env::{
-    env_var_first, CODEZ_CODEX_BIN_ENV_VAR, CUTEX_CLAUDE_BIN_ENV_VAR, CUTEX_CODEX_BIN_ENV_VAR,
-};
+use crate::config::env::{env_var_first, CUTEX_CLAUDE_BIN_ENV_VAR, CUTEX_CODEX_BIN_ENV_VAR};
 use crate::platform::command::command_exists_in_path;
 use crate::profiles::model::CliKind;
 
 pub fn codex_program() -> String {
-    env_var_first(&[CUTEX_CODEX_BIN_ENV_VAR, CODEZ_CODEX_BIN_ENV_VAR])
+    env_var_first(&[CUTEX_CODEX_BIN_ENV_VAR])
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| {

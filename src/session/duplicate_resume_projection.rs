@@ -70,7 +70,7 @@ mod tests {
         let mut record = CutexSessionRecord::new(
             "cutex.019e-target".to_string(),
             Some("019e-target".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/home/example/Projects/cutex".to_string(),
             Some("aemeath".to_string()),
         )

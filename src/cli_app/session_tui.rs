@@ -26,6 +26,7 @@ use cutex::config::store::load_codez_config_checked;
 use cutex::config::store::save_codez_config;
 use cutex::management::v2::activity::load_session_activity_states;
 use cutex::management::v2::activity::SessionActivityState;
+use cutex::platform::host::current_host_name;
 use cutex::profiles::model::CodezConfig;
 use cutex::runtime::alden::{cute_alden_sessions, CuteAldenSession};
 use cutex::session::model::{CutexSessionQuickActionMode, CutexSessionRecord, CutexSessionStore};
@@ -66,12 +67,19 @@ use super::session_tui_actions::{
 use super::session_tui_profile_settings::{
     ProfileSettingsDraft, ProfileSettingsField, ProfileSettingsSnapshot,
 };
+use super::session_tui_recent::{
+    RecentAdoptionRequest, RecentCatalog, RecentCommand, RecentLoadState, RecentSessionsWorkspace,
+};
 use super::session_tui_settings::{
     GlobalSettingsDraft, GlobalSettingsField, GlobalSettingsSnapshot, SecretSettingsAction,
     SessionSettingsChoice, SessionSettingsCommand, SessionSettingsDraft, SessionSettingsEditorKind,
     SessionSettingsField, SessionSettingsSnapshot, SessionTuiSettingCategory,
     SessionTuiSettingOption,
 };
+use super::session_tui_workspace::{SessionTuiWorkspace, WorkspaceSelection};
+use super::session_tui_workspace_events::{workspace_event_from_key, WorkspaceEvent};
+use super::session_tui_workspace_loading::{WorkspaceLoad, WorkspaceLoadPoll};
+use super::session_tui_workspace_render::{render_workspace, WorkspaceRenderer};
 
 const WIDE_LAYOUT_MIN_WIDTH: u16 = 96;
 const EXTRA_WIDE_LAYOUT_MIN_WIDTH: u16 = 136;
@@ -85,21 +93,42 @@ type CutexTerminal = Terminal<CrosstermBackend<Stdout>>;
 enum SelectorTarget {
     Agent(String),
     RetiredAgent(String),
+    RecentSessions,
     RetiredSessions,
+    Projects,
     Profiles,
     GlobalSettings,
 }
 
 impl SelectorTarget {
+    fn workspace(&self) -> SessionTuiWorkspace {
+        match self {
+            Self::Agent(_) => SessionTuiWorkspace::Agents,
+            Self::RecentSessions => SessionTuiWorkspace::RecentSessions,
+            Self::RetiredAgent(_) | Self::RetiredSessions => SessionTuiWorkspace::RetiredSessions,
+            Self::Projects => SessionTuiWorkspace::Projects,
+            Self::Profiles => SessionTuiWorkspace::Profiles,
+            Self::GlobalSettings => SessionTuiWorkspace::GlobalSettings,
+        }
+    }
+
     fn agent_key(&self) -> Option<&str> {
         match self {
             Self::Agent(key) | Self::RetiredAgent(key) => Some(key),
-            Self::RetiredSessions | Self::Profiles | Self::GlobalSettings => None,
+            Self::RecentSessions
+            | Self::RetiredSessions
+            | Self::Projects
+            | Self::Profiles
+            | Self::GlobalSettings => None,
         }
     }
 
     fn is_profiles(&self) -> bool {
         matches!(self, Self::Profiles)
+    }
+
+    fn is_projects(&self) -> bool {
+        matches!(self, Self::Projects)
     }
 
     fn is_retired_sessions(&self) -> bool {
@@ -113,7 +142,11 @@ impl SelectorTarget {
     fn is_system(&self) -> bool {
         matches!(
             self,
-            Self::RetiredSessions | Self::Profiles | Self::GlobalSettings
+            Self::RecentSessions
+                | Self::RetiredSessions
+                | Self::Projects
+                | Self::Profiles
+                | Self::GlobalSettings
         )
     }
 
@@ -256,23 +289,7 @@ enum RuntimeCloseWorkerResult {
     Failed(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SelectorEvent {
-    Up,
-    Down,
-    First,
-    Last,
-    Insert(char),
-    Backspace,
-    Delete,
-    ClearInput,
-    OpenActions,
-    OpenSettings,
-    Activate,
-    Back,
-    Escape,
-    Exit,
-}
+type SelectorEvent = WorkspaceEvent;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SelectorControl {
@@ -280,7 +297,11 @@ enum SelectorControl {
     Exit,
     Selected(SessionTuiIntent),
     OpenRetiredSessions,
+    OpenRecentSessions,
+    Recent(RecentCommand),
+    AdoptRecent(RecentAdoptionRequest),
     OpenProfileManager,
+    OpenProjects,
     ApplySettings(SessionSettingsApplyRequest),
     ApplyGlobalSettings(GlobalSettingsApplyRequest),
     ApplyProfileSettings(ProfileSettingsApplyRequest),
@@ -345,6 +366,12 @@ struct SessionManagementResult {
     warning: Option<String>,
 }
 
+#[derive(Debug)]
+struct RecentAdoptionResult {
+    store: CutexSessionStore,
+    snapshot: Result<SelectorSnapshot, String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProfileManagementCommand {
     Activate,
@@ -370,6 +397,7 @@ enum SessionTuiCycleOutcome {
     Exit,
     Selected(SessionTuiIntent),
     LoginProfile,
+    Projects,
 }
 
 #[derive(Debug)]
@@ -419,6 +447,7 @@ struct PendingProfileRefreshOverride {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SelectorMode {
     Agents,
+    RecentSessions,
     RetiredSessions {
         selected: usize,
     },
@@ -605,9 +634,9 @@ impl SettingsView {
 struct SelectorModel {
     rows: Vec<SelectorRow>,
     retired_rows: Vec<SelectorRow>,
+    recent: RecentSessionsWorkspace,
     query: Input,
-    selected_target: Option<SelectorTarget>,
-    recently_closed_target: Option<SelectorTarget>,
+    workspace_selection: WorkspaceSelection<SelectorTarget>,
     mode: SelectorMode,
     enhanced_keyboard: bool,
     refreshing: bool,
@@ -627,13 +656,16 @@ struct SelectorModel {
 
 impl SelectorModel {
     fn new(mut rows: Vec<SelectorRow>, refreshing: bool, enhanced_keyboard: bool) -> Self {
+        debug_assert!(rows
+            .iter()
+            .all(|row| { SessionTuiWorkspace::PRODUCTION.contains(&row.target.workspace()) }));
         sort_rows(&mut rows);
         let mut model = Self {
             rows,
             retired_rows: Vec::new(),
+            recent: RecentSessionsWorkspace::default(),
             query: Input::default(),
-            selected_target: None,
-            recently_closed_target: None,
+            workspace_selection: WorkspaceSelection::default(),
             mode: SelectorMode::Agents,
             enhanced_keyboard,
             refreshing,
@@ -666,7 +698,7 @@ impl SelectorModel {
                         || row.lifecycle == Some(CutexSessionLifecycleState::Online)
                         || row.attachable
                         || row.pinned
-                        || self.recently_closed_target.as_ref() == Some(&row.target))
+                        || self.workspace_selection.is_transiently_visible(&row.target))
                     .then_some(index)
                 })
                 .collect();
@@ -702,21 +734,26 @@ impl SelectorModel {
                     && row.lifecycle != Some(CutexSessionLifecycleState::Online)
                     && !row.attachable
                     && !row.pinned
-                    && self.recently_closed_target.as_ref() != Some(&row.target)
+                    && !self.workspace_selection.is_transiently_visible(&row.target)
             })
             .count()
     }
 
     fn selected_visible_index(&self) -> Option<usize> {
-        let selected_target = self.selected_target.as_ref()?;
+        let selected_target = self.workspace_selection.selected()?;
         self.visible_indices()
             .into_iter()
             .position(|index| self.rows[index].target == *selected_target)
     }
 
     fn selected_row(&self) -> Option<&SelectorRow> {
-        let selected_target = self.selected_target.as_ref()?;
+        let selected_target = self.workspace_selection.selected()?;
         self.rows.iter().find(|row| row.target == *selected_target)
+    }
+
+    #[cfg(test)]
+    fn selected_target(&self) -> Option<SelectorTarget> {
+        self.workspace_selection.selected().cloned()
     }
 
     fn active_row(&self) -> Option<&SelectorRow> {
@@ -731,6 +768,7 @@ impl SelectorModel {
             SelectorMode::ProfileManager { .. } => {
                 self.rows.iter().find(|row| row.target.is_profiles())
             }
+            SelectorMode::RecentSessions => None,
             SelectorMode::RetiredSessions { selected } => self.retired_rows.get(*selected),
         }
     }
@@ -959,6 +997,7 @@ impl SelectorModel {
         }
         match self.mode.clone() {
             SelectorMode::Agents => self.handle_agent_event(event),
+            SelectorMode::RecentSessions => self.handle_recent_sessions_event(event),
             SelectorMode::RetiredSessions { selected } => {
                 self.handle_retired_sessions_event(event, selected)
             }
@@ -1021,28 +1060,66 @@ impl SelectorModel {
                 self.ensure_selection();
             }
             SelectorEvent::OpenActions
-                if self.selected_target == Some(SelectorTarget::RetiredSessions) =>
+                if self
+                    .workspace_selection
+                    .is_selected(&SelectorTarget::RecentSessions) =>
+            {
+                return SelectorControl::OpenRecentSessions;
+            }
+            SelectorEvent::Activate
+                if self
+                    .workspace_selection
+                    .is_selected(&SelectorTarget::RecentSessions) =>
+            {
+                return SelectorControl::OpenRecentSessions;
+            }
+            SelectorEvent::OpenSettings
+                if self
+                    .workspace_selection
+                    .is_selected(&SelectorTarget::RecentSessions) =>
+            {
+                return SelectorControl::OpenRecentSessions;
+            }
+            SelectorEvent::OpenActions
+                if self
+                    .workspace_selection
+                    .is_selected(&SelectorTarget::RetiredSessions) =>
             {
                 return SelectorControl::OpenRetiredSessions;
             }
             SelectorEvent::Activate
-                if self.selected_target == Some(SelectorTarget::RetiredSessions) =>
+                if self
+                    .workspace_selection
+                    .is_selected(&SelectorTarget::RetiredSessions) =>
             {
                 return SelectorControl::OpenRetiredSessions;
             }
             SelectorEvent::OpenSettings
-                if self.selected_target == Some(SelectorTarget::RetiredSessions) =>
+                if self
+                    .workspace_selection
+                    .is_selected(&SelectorTarget::RetiredSessions) =>
             {
                 return SelectorControl::OpenRetiredSessions;
             }
             SelectorEvent::OpenActions
-                if self.selected_target == Some(SelectorTarget::Profiles) =>
+                if self
+                    .workspace_selection
+                    .is_selected(&SelectorTarget::Profiles) =>
             {
                 return SelectorControl::OpenProfileManager;
             }
+            SelectorEvent::OpenActions | SelectorEvent::OpenSettings | SelectorEvent::Activate
+                if self
+                    .workspace_selection
+                    .is_selected(&SelectorTarget::Projects) =>
+            {
+                return SelectorControl::OpenProjects;
+            }
             SelectorEvent::OpenActions => self.open_action_menu(),
             SelectorEvent::OpenSettings
-                if self.selected_target == Some(SelectorTarget::Profiles) =>
+                if self
+                    .workspace_selection
+                    .is_selected(&SelectorTarget::Profiles) =>
             {
                 return SelectorControl::OpenProfileManager;
             }
@@ -1052,6 +1129,115 @@ impl SelectorModel {
             SelectorEvent::Escape | SelectorEvent::Exit => return SelectorControl::Exit,
         }
         SelectorControl::Continue
+    }
+
+    fn handle_recent_sessions_event(&mut self, event: SelectorEvent) -> SelectorControl {
+        if self.recent.review().is_some() {
+            match event {
+                SelectorEvent::Up | SelectorEvent::First | SelectorEvent::Back => {
+                    self.recent.set_review_confirmed(false)
+                }
+                SelectorEvent::Down | SelectorEvent::Last | SelectorEvent::OpenActions => {
+                    self.recent.set_review_confirmed(true)
+                }
+                SelectorEvent::Activate if self.recent.review_confirmed() => {
+                    if let Some(request) = self.recent.adoption_request() {
+                        return SelectorControl::AdoptRecent(request);
+                    }
+                }
+                SelectorEvent::Activate | SelectorEvent::Escape => self.recent.cancel_review(),
+                SelectorEvent::Exit => return SelectorControl::Exit,
+                SelectorEvent::Insert(_)
+                | SelectorEvent::Backspace
+                | SelectorEvent::Delete
+                | SelectorEvent::ClearInput
+                | SelectorEvent::OpenSettings => {}
+            }
+            return SelectorControl::Continue;
+        }
+        match event {
+            SelectorEvent::Up => self.recent.move_selection(-1),
+            SelectorEvent::Down => self.recent.move_selection(1),
+            SelectorEvent::First => self.recent.select_edge(false),
+            SelectorEvent::Last => self.recent.select_edge(true),
+            SelectorEvent::Activate => {
+                let retry = matches!(
+                    self.recent.load_state(),
+                    RecentLoadState::Failed(_) | RecentLoadState::ProviderIncompatible(_)
+                );
+                if retry && !self.recent.loading() {
+                    return SelectorControl::Recent(RecentCommand::Retry);
+                }
+                self.recent.begin_review();
+            }
+            SelectorEvent::OpenActions
+                if self.recent.next_cursor().is_some() && !self.recent.loading() =>
+            {
+                return SelectorControl::Recent(RecentCommand::LoadMore);
+            }
+            SelectorEvent::OpenActions
+                if matches!(self.recent.load_state(), RecentLoadState::Failed(_))
+                    && !self.recent.loading() =>
+            {
+                return SelectorControl::Recent(RecentCommand::Retry);
+            }
+            SelectorEvent::OpenActions => {}
+            SelectorEvent::Back | SelectorEvent::Escape | SelectorEvent::OpenSettings => {
+                self.mode = SelectorMode::Agents;
+                self.ensure_selection();
+            }
+            SelectorEvent::Exit => return SelectorControl::Exit,
+            SelectorEvent::Insert(_)
+            | SelectorEvent::Backspace
+            | SelectorEvent::Delete
+            | SelectorEvent::ClearInput => {}
+        }
+        SelectorControl::Continue
+    }
+
+    fn recent_catalog_reply(&mut self, reply: super::session_tui_recent::CatalogReply) {
+        match load_cutex_session_store() {
+            Ok(store) => self.recent.receive(reply, &store),
+            Err(error) => {
+                self.recent.reconciliation_failed(
+                    reply,
+                    format!("recent session reconciliation unavailable: {error:#}"),
+                );
+            }
+        }
+    }
+
+    fn recent_loading_started(&mut self) {
+        self.recent.mark_loading();
+    }
+
+    fn recent_adoption_succeeded(
+        &mut self,
+        request: &RecentAdoptionRequest,
+        result: RecentAdoptionResult,
+    ) {
+        let selected = self.workspace_selection.selected().cloned();
+        self.recent.adoption_succeeded(&result.store);
+        self.workspace_selection.select(selected.clone());
+        self.ensure_selection();
+        self.notice = Some(format!("Adopted native thread {}", request.title));
+        match result.snapshot {
+            Ok(snapshot) => {
+                self.rows = snapshot.rows;
+                self.workspace_selection.select(selected);
+                self.ensure_selection();
+                self.warning = snapshot.warning;
+            }
+            Err(error) => {
+                self.warning = Some(format!(
+                    "Native thread was adopted, but agent refresh failed: {error}"
+                ));
+            }
+        }
+    }
+
+    fn recent_adoption_failed(&mut self, message: String) {
+        self.warning = Some(format!("recent session adoption failed: {message}"));
     }
 
     fn handle_retired_sessions_event(
@@ -1604,7 +1790,8 @@ impl SelectorModel {
     }
 
     fn open_profile_manager(&mut self, profiles: Vec<ProfileCatalogEntry>) {
-        self.selected_target = Some(SelectorTarget::Profiles);
+        self.workspace_selection
+            .select(Some(SelectorTarget::Profiles));
         self.global_settings_draft = GlobalSettingsDraft::default();
         self.profile_settings_draft = ProfileSettingsDraft::default();
         self.settings_overlay = None;
@@ -2770,6 +2957,9 @@ impl SelectorModel {
         if row.target.is_profiles() {
             return SelectorControl::OpenProfileManager;
         }
+        if row.target.is_projects() {
+            return SelectorControl::OpenProjects;
+        }
         let Some(action) = row
             .actions
             .iter()
@@ -2869,7 +3059,8 @@ impl SelectorModel {
             .row_for_action_key(&intent.key)
             .map(|row| row.agent.clone())
             .unwrap_or_else(|| intent.key.clone());
-        self.selected_target = Some(SelectorTarget::Agent(intent.key.clone()));
+        self.workspace_selection
+            .select(Some(SelectorTarget::Agent(intent.key.clone())));
         self.mode = SelectorMode::ClosingRuntime {
             agent_key: intent.key.clone(),
             agent_name,
@@ -2889,12 +3080,14 @@ impl SelectorModel {
             SelectorTarget::Agent(agent_key)
         };
         self.mode = SelectorMode::Agents;
-        self.selected_target = Some(target.clone());
-        self.recently_closed_target = matches!(
-            action,
-            SessionTuiAction::CloseRuntime | SessionTuiAction::RestoreSession
-        )
-        .then_some(target);
+        self.workspace_selection.select(Some(target.clone()));
+        self.workspace_selection.mark_transiently_visible(
+            matches!(
+                action,
+                SessionTuiAction::CloseRuntime | SessionTuiAction::RestoreSession
+            )
+            .then_some(target),
+        );
         self.replace_snapshot(snapshot);
         self.notice = Some(match action {
             SessionTuiAction::CloseRuntime => format!("Runtime closed: {agent_name}"),
@@ -2924,8 +3117,9 @@ impl SelectorModel {
             row.actions.clear();
         }
         self.mode = SelectorMode::Agents;
-        self.selected_target = Some(target.clone());
-        self.recently_closed_target = Some(target);
+        self.workspace_selection.select(Some(target.clone()));
+        self.workspace_selection
+            .mark_transiently_visible(Some(target));
         self.ensure_selection();
         self.notice = Some(format!("Runtime closed: {agent_name}"));
         self.warning = Some(format!(
@@ -3315,22 +3509,24 @@ impl SelectorModel {
     fn ensure_selection(&mut self) {
         let visible = self.visible_indices();
         if visible.is_empty() {
-            self.selected_target = None;
+            self.workspace_selection.select(None);
             return;
         }
-        let selection_still_visible = self.selected_target.as_ref().is_some_and(|target| {
+        let selection_still_visible = self.workspace_selection.selected().is_some_and(|target| {
             visible
                 .iter()
                 .any(|index| self.rows[*index].target == *target)
         });
         if !selection_still_visible {
-            self.selected_target = Some(self.rows[visible[0]].target.clone());
+            self.workspace_selection
+                .select(Some(self.rows[visible[0]].target.clone()));
         }
     }
 
     fn normalize_mode_after_snapshot(&mut self) {
         match self.mode.clone() {
             SelectorMode::Agents => {}
+            SelectorMode::RecentSessions => {}
             SelectorMode::RetiredSessions { selected } => {
                 self.mode = SelectorMode::RetiredSessions {
                     selected: selected.min(self.retired_rows.len().saturating_sub(1)),
@@ -3460,12 +3656,13 @@ impl SelectorModel {
     fn move_selection(&mut self, direction: isize) {
         let visible = self.visible_indices();
         if visible.is_empty() {
-            self.selected_target = None;
+            self.workspace_selection.select(None);
             return;
         }
         let current = self.selected_visible_index().unwrap_or(0);
         let next = wrapped_index(current, direction, visible.len());
-        self.selected_target = Some(self.rows[visible[next]].target.clone());
+        self.workspace_selection
+            .select(Some(self.rows[visible[next]].target.clone()));
     }
 
     fn select_edge(&mut self, last: bool) {
@@ -3475,7 +3672,8 @@ impl SelectorModel {
         } else {
             visible.first()
         };
-        self.selected_target = index.map(|index| self.rows[*index].target.clone());
+        self.workspace_selection
+            .select(index.map(|index| self.rows[*index].target.clone()));
     }
 }
 
@@ -3568,6 +3766,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
             SessionTuiCycleOutcome::LoginProfile => {
                 startup = Some(profile_login_startup(super::auth::login_interactive()));
             }
+            SessionTuiCycleOutcome::Projects => super::session_tui_projects::run()?,
         }
     }
 }
@@ -3581,10 +3780,11 @@ fn run_terminal_cycle(
     let (activity_states, activity_warning) = activity_states_with_warning();
     let initial_rows =
         selector_rows_from_store(&store, &[], &[], &config, &profile_names, &activity_states);
-    let refresh = spawn_snapshot_refresh()?;
+    let mut refresh = spawn_snapshot_refresh()?;
+    let recent_catalog = RecentCatalog::spawn()?;
     let startup_profiles = startup.as_ref().map(|_| load_profile_catalog_read_only());
     let (mut terminal, restore, enhanced_keyboard) = open_terminal()?;
-    let mut model = SelectorModel::new(initial_rows, true, enhanced_keyboard);
+    let mut model = SelectorModel::new(initial_rows, refresh.is_loading(), enhanced_keyboard);
     model.warning = combine_warnings(profile_warning, activity_warning);
     if let Some(startup) = startup {
         match startup_profiles.expect("profile startup catalog should exist") {
@@ -3596,7 +3796,7 @@ fn run_terminal_cycle(
         model.warning = combine_warnings(model.warning.take(), startup.warning);
     }
 
-    let result = run_event_loop(&mut terminal, &mut model, &refresh);
+    let result = run_event_loop(&mut terminal, &mut model, &mut refresh, &recent_catalog);
     drop(terminal);
     drop(restore);
     result
@@ -3626,7 +3826,7 @@ fn require_interactive_terminal(
     }
 }
 
-fn spawn_snapshot_refresh() -> anyhow::Result<Receiver<Result<SelectorSnapshot, String>>> {
+fn spawn_snapshot_refresh() -> anyhow::Result<WorkspaceLoad<SelectorSnapshot>> {
     let (sender, receiver) = mpsc::channel();
     thread::Builder::new()
         .name("cutex-tui-refresh".to_string())
@@ -3636,7 +3836,7 @@ fn spawn_snapshot_refresh() -> anyhow::Result<Receiver<Result<SelectorSnapshot, 
             let _ = sender.send(snapshot);
         })
         .context("Failed to start Cutex TUI refresh worker")?;
-    Ok(receiver)
+    Ok(WorkspaceLoad::new(receiver))
 }
 
 fn spawn_runtime_close(
@@ -3771,6 +3971,8 @@ fn selector_rows_from_store(
             .filter(|record| record.is_retired() && cutex_session_is_managed(record))
             .count(),
     ));
+    rows.push(recent_sessions_row());
+    rows.push(projects_row());
     rows.push(profiles_row(config, profile_names));
     rows.push(global_settings_row_with_profiles(config, profile_names));
     rows
@@ -3874,6 +4076,52 @@ fn retired_sessions_row(retired_count: usize) -> SelectorRow {
         lifecycle: None,
         host: "-".to_string(),
         backend: "archive".to_string(),
+        managed_path: "-".to_string(),
+        retired_at: None,
+        revision: 0,
+        activity_session_id: None,
+        last_output_at: None,
+        actions: Vec::new(),
+        settings: Vec::new(),
+        settings_snapshot: None,
+        global_settings_snapshot: None,
+        attachable: false,
+        pinned: false,
+        managed: false,
+    }
+}
+
+fn projects_row() -> SelectorRow {
+    SelectorRow {
+        target: SelectorTarget::Projects,
+        agent: "Projects".to_string(),
+        configured_profile: None,
+        lifecycle: None,
+        host: "-".to_string(),
+        backend: "native catalog".to_string(),
+        managed_path: "paired app-server".to_string(),
+        retired_at: None,
+        revision: 0,
+        activity_session_id: None,
+        last_output_at: None,
+        actions: Vec::new(),
+        settings: Vec::new(),
+        settings_snapshot: None,
+        global_settings_snapshot: None,
+        attachable: false,
+        pinned: false,
+        managed: false,
+    }
+}
+
+fn recent_sessions_row() -> SelectorRow {
+    SelectorRow {
+        target: SelectorTarget::RecentSessions,
+        agent: "Recent sessions".to_string(),
+        configured_profile: None,
+        lifecycle: None,
+        host: "-".to_string(),
+        backend: "native catalog".to_string(),
         managed_path: "-".to_string(),
         retired_at: None,
         revision: 0,
@@ -3997,9 +4245,11 @@ fn sort_rows(rows: &mut [SelectorRow]) {
 fn system_row_rank(target: &SelectorTarget) -> Option<u8> {
     match target {
         SelectorTarget::Agent(_) | SelectorTarget::RetiredAgent(_) => None,
-        SelectorTarget::RetiredSessions => Some(0),
-        SelectorTarget::Profiles => Some(1),
-        SelectorTarget::GlobalSettings => Some(2),
+        SelectorTarget::RecentSessions => Some(0),
+        SelectorTarget::RetiredSessions => Some(1),
+        SelectorTarget::Projects => Some(2),
+        SelectorTarget::Profiles => Some(3),
+        SelectorTarget::GlobalSettings => Some(4),
     }
 }
 
@@ -4082,7 +4332,8 @@ impl Drop for TerminalRestore {
 fn run_event_loop(
     terminal: &mut CutexTerminal,
     model: &mut SelectorModel,
-    refresh: &Receiver<Result<SelectorSnapshot, String>>,
+    refresh: &mut WorkspaceLoad<SelectorSnapshot>,
+    recent_catalog: &RecentCatalog,
 ) -> anyhow::Result<SessionTuiCycleOutcome> {
     let mut runtime_close = None;
     let mut next_activity_refresh = Instant::now() + ACTIVITY_REFRESH_INTERVAL;
@@ -4095,6 +4346,9 @@ fn run_event_loop(
             next_activity_refresh = now + ACTIVITY_REFRESH_INTERVAL;
         }
         receive_refresh(model, refresh);
+        if let Some(reply) = recent_catalog.poll() {
+            model.recent_catalog_reply(reply);
+        }
         if receive_runtime_close(model, &mut runtime_close) {
             terminal.clear()?;
         }
@@ -4134,11 +4388,35 @@ fn run_event_loop(
                                 }
                             }
                         }
+                        SelectorControl::OpenRecentSessions => {
+                            model.mode = SelectorMode::RecentSessions;
+                            model.notice = None;
+                        }
+                        SelectorControl::Recent(command) => {
+                            let cursor = model.recent.cursor_for(command);
+                            if !recent_catalog.request(command, cursor) {
+                                model.warning = Some(
+                                    "recent catalog worker stopped; retry by reopening the TUI"
+                                        .to_string(),
+                                );
+                            } else {
+                                model.recent_loading_started();
+                            }
+                        }
+                        SelectorControl::AdoptRecent(request) => {
+                            match adopt_recent_thread(&request) {
+                                Ok(result) => model.recent_adoption_succeeded(&request, result),
+                                Err(error) => model.recent_adoption_failed(format!("{error:#}")),
+                            }
+                        }
                         SelectorControl::OpenProfileManager => {
                             match load_profile_catalog_read_only() {
                                 Ok(profiles) => model.open_profile_manager(profiles),
                                 Err(error) => model.profile_manager_failed(format!("{error:#}")),
                             }
+                        }
+                        SelectorControl::OpenProjects => {
+                            return Ok(SessionTuiCycleOutcome::Projects);
                         }
                         SelectorControl::ApplySettings(request) => {
                             match apply_session_settings(&request) {
@@ -4282,6 +4560,40 @@ fn apply_session_management(
         record,
         profile_names: request.profile_names.clone(),
         warning,
+    })
+}
+
+/// Adopting a catalog thread goes only through the durable session service.
+/// The fresh store read makes a second adoption (including a retired identity)
+/// fail safely if another Cutex client changed state during the review.
+fn adopt_recent_thread(request: &RecentAdoptionRequest) -> anyhow::Result<RecentAdoptionResult> {
+    let mut store = load_cutex_session_store()?;
+    if store.sessions.values().any(|record| {
+        record.codex_session_id.as_deref() == Some(request.thread_id.as_str())
+            && (record.is_retired() || cutex_session_is_managed(record))
+    }) {
+        anyhow::bail!("native thread is already managed or retired");
+    }
+    let outcome = adopt_cutex_session(
+        &mut store,
+        &request.thread_id,
+        CutexSessionEnsureSeed {
+            host_id: current_host_name(),
+            cwd: request.cwd.clone(),
+            profile: None,
+        },
+        CutexSessionAdoptOptions {
+            display_name: Some(&request.title),
+            managed_cwd: None,
+            groups: Vec::new(),
+            expose_to_im: false,
+            pin: false,
+        },
+    )?;
+    persist_cutex_session_store_and_im_record(&store, &outcome.key)?;
+    Ok(RecentAdoptionResult {
+        store,
+        snapshot: load_live_snapshot().map_err(|error| format!("{error:#}")),
     })
 }
 
@@ -4487,22 +4799,11 @@ fn live_management_group_propagation_warning(
         .map(|error| format!("Adopted agent; live group update failed: {error:#}"))
 }
 
-fn receive_refresh(
-    model: &mut SelectorModel,
-    refresh: &Receiver<Result<SelectorSnapshot, String>>,
-) {
-    loop {
-        match refresh.try_recv() {
-            Ok(Ok(snapshot)) => model.replace_snapshot(snapshot),
-            Ok(Err(message)) => model.mark_refresh_failed(message),
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => {
-                if model.refreshing {
-                    model.mark_refresh_failed("live refresh worker stopped".to_string());
-                }
-                return;
-            }
-        }
+fn receive_refresh(model: &mut SelectorModel, refresh: &mut WorkspaceLoad<SelectorSnapshot>) {
+    match refresh.poll() {
+        WorkspaceLoadPoll::Pending => {}
+        WorkspaceLoadPoll::Ready(snapshot) => model.replace_snapshot(snapshot),
+        WorkspaceLoadPoll::Failed(message) => model.mark_refresh_failed(message),
     }
 }
 
@@ -4544,44 +4845,22 @@ fn close_runtime_shortcut_from_key(key: KeyEvent) -> bool {
 }
 
 fn selector_event_from_key(key: KeyEvent, enhanced_keyboard: bool) -> Option<SelectorEvent> {
-    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-        return None;
-    }
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
-    {
-        return Some(SelectorEvent::Exit);
-    }
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('u' | 'U'))
-    {
-        return Some(SelectorEvent::ClearInput);
-    }
-    if key
-        .modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-    {
-        return None;
-    }
-    if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT) {
-        return enhanced_keyboard.then_some(SelectorEvent::OpenActions);
-    }
-    match key.code {
-        KeyCode::Up => Some(SelectorEvent::Up),
-        KeyCode::Down => Some(SelectorEvent::Down),
-        KeyCode::Home => Some(SelectorEvent::First),
-        KeyCode::End => Some(SelectorEvent::Last),
-        KeyCode::Right => Some(SelectorEvent::OpenActions),
-        KeyCode::Left => Some(SelectorEvent::Back),
-        KeyCode::Tab => Some(SelectorEvent::OpenSettings),
-        KeyCode::Enter => Some(SelectorEvent::Activate),
-        KeyCode::Char(character) => Some(SelectorEvent::Insert(character)),
-        KeyCode::Backspace => Some(SelectorEvent::Backspace),
-        KeyCode::Delete => Some(SelectorEvent::Delete),
-        KeyCode::Esc => Some(SelectorEvent::Escape),
-        _ => None,
-    }
+    workspace_event_from_key(key, enhanced_keyboard)
 }
 
 fn render_selector(frame: &mut Frame<'_>, model: &SelectorModel) {
+    render_workspace(frame, model, &SelectorWorkspaceRenderer);
+}
+
+struct SelectorWorkspaceRenderer;
+
+impl WorkspaceRenderer<SelectorModel> for SelectorWorkspaceRenderer {
+    fn render(&self, frame: &mut Frame<'_>, model: &SelectorModel) {
+        render_selector_contents(frame, model);
+    }
+}
+
+fn render_selector_contents(frame: &mut Frame<'_>, model: &SelectorModel) {
     let area = frame.area();
     let chunks = Layout::vertical([
         Constraint::Length(1),
@@ -4595,6 +4874,10 @@ fn render_selector(frame: &mut Frame<'_>, model: &SelectorModel) {
         SelectorMode::Agents => {
             render_filter(frame, chunks[1], model);
             render_table(frame, chunks[2], model);
+        }
+        SelectorMode::RecentSessions => {
+            render_recent_context(frame, chunks[1], model);
+            render_recent_workspace(frame, chunks[2], model);
         }
         SelectorMode::RetiredSessions { .. } => {
             render_retired_context(frame, chunks[1], model);
@@ -4631,6 +4914,7 @@ fn render_selector(frame: &mut Frame<'_>, model: &SelectorModel) {
 fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
     let (view, count) = match &model.mode {
         SelectorMode::Agents => ("agents", model.visible_indices().len()),
+        SelectorMode::RecentSessions => ("recent sessions", model.recent.rows().len()),
         SelectorMode::RetiredSessions { .. } => ("retired sessions", model.retired_rows.len()),
         SelectorMode::Actions { .. } => (
             "actions",
@@ -4755,7 +5039,9 @@ fn render_item_context(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel)
         ));
     }
     let title = match &row.target {
+        SelectorTarget::RecentSessions => " Recent sessions ",
         SelectorTarget::RetiredSessions => " Retired sessions ",
+        SelectorTarget::Projects => " Projects ",
         SelectorTarget::Profiles => " Profiles ",
         SelectorTarget::GlobalSettings => " Global settings ",
         SelectorTarget::Agent(_) | SelectorTarget::RetiredAgent(_) => " Agent ",
@@ -4790,6 +5076,185 @@ fn render_retired_context(frame: &mut Frame<'_>, area: Rect, model: &SelectorMod
         .block(Block::bordered().title(" Archive ")),
         area,
     );
+}
+
+fn render_recent_context(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
+    if model.recent.review().is_some() {
+        let status = if model.recent.review_confirmed() {
+            "[Adopt]  Cancel"
+        } else {
+            "Adopt  [Cancel]"
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "Adopt native thread",
+                    Style::new().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  {status}"), Style::new().fg(Color::Yellow)),
+            ]))
+            .block(Block::bordered().title(" Adoption review ")),
+            area,
+        );
+        return;
+    }
+    let text = match model.recent.load_state() {
+        RecentLoadState::Loading => "Loading native app-server threads…".to_string(),
+        RecentLoadState::Ready => format!(
+            "Native threads, newest first  {}",
+            if model.recent.next_cursor().is_some() {
+                "more available"
+            } else {
+                "end of catalog"
+            }
+        ),
+        RecentLoadState::Empty => {
+            "No native threads were returned by the paired app-server".to_string()
+        }
+        RecentLoadState::ProviderIncompatible(message) => {
+            format!("Provider incompatible: {message}")
+        }
+        RecentLoadState::Failed(message) => format!("Catalog unavailable: {message}"),
+    };
+    frame.render_widget(
+        Paragraph::new(text).block(Block::bordered().title(" Recent sessions ")),
+        area,
+    );
+}
+
+fn render_recent_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
+    if let Some(row) = model.recent.review() {
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("Name / preview: ", Style::new().fg(Color::DarkGray)),
+                Span::raw(row.title.clone()),
+            ]),
+            Line::from(vec![
+                Span::styled("Native thread id: ", Style::new().fg(Color::DarkGray)),
+                Span::raw(row.thread_id.clone()),
+            ]),
+            Line::from(vec![
+                Span::styled("Cwd: ", Style::new().fg(Color::DarkGray)),
+                Span::raw(
+                    row.cwd
+                        .as_deref()
+                        .map(truncate_recent_display)
+                        .unwrap_or_else(|| "unavailable".to_string()),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Provider / source: ", Style::new().fg(Color::DarkGray)),
+                Span::raw(format!("{} / {}", row.provider, row.source)),
+            ]),
+            Line::from(vec![
+                Span::styled("Project assignment: ", Style::new().fg(Color::DarkGray)),
+                Span::raw(
+                    row.project_id
+                        .clone()
+                        .unwrap_or_else(|| "unassigned".to_string()),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Cutex defaults: persistent management; native title as display name; default runtime; no groups; IM hidden; unpinned.",
+                Style::new().fg(Color::Cyan),
+            )),
+            Line::from(""),
+            Line::from(if model.recent.review_confirmed() {
+                Span::styled(
+                    "Confirm adoption?  [Adopt]  Cancel",
+                    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(
+                    "Confirm adoption?  Adopt  [Cancel]",
+                    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                )
+            }),
+        ];
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: true })
+                .block(Block::bordered().title(" Review native thread ")),
+            area,
+        );
+        return;
+    }
+    match model.recent.load_state() {
+        RecentLoadState::Loading
+        | RecentLoadState::Empty
+        | RecentLoadState::ProviderIncompatible(_)
+        | RecentLoadState::Failed(_)
+            if model.recent.rows().is_empty() =>
+        {
+            frame.render_widget(
+                Paragraph::new("The catalog loads asynchronously. Press Enter to retry a failure.")
+                    .block(Block::bordered()),
+                area,
+            );
+        }
+        _ => {
+            let rows = model.recent.rows().iter().map(|row| {
+                Row::new([
+                    Cell::from(row.title.clone()),
+                    Cell::from(
+                        row.cwd
+                            .as_deref()
+                            .map(truncate_recent_display)
+                            .unwrap_or_else(|| "-".to_string()),
+                    ),
+                    Cell::from(format!("{} / {}", row.provider, row.source)),
+                    Cell::from(row.project_id.clone().unwrap_or_else(|| "-".to_string())),
+                    Cell::from(row.state.label()),
+                ])
+            });
+            let table = Table::new(
+                rows,
+                [
+                    Constraint::Min(22),
+                    Constraint::Min(22),
+                    Constraint::Length(18),
+                    Constraint::Length(16),
+                    Constraint::Length(16),
+                ],
+            )
+            .header(
+                Row::new([
+                    "NAME / PREVIEW",
+                    "CWD",
+                    "PROVIDER / SOURCE",
+                    "PROJECT",
+                    "CUTEX STATE",
+                ])
+                .style(Style::new().fg(Color::Gray).add_modifier(Modifier::BOLD))
+                .bottom_margin(1),
+            )
+            .column_spacing(1)
+            .row_highlight_style(
+                Style::new()
+                    .fg(Color::White)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("> ");
+            let mut state = TableState::default().with_selected(
+                (!model.recent.rows().is_empty()).then_some(model.recent.selected()),
+            );
+            frame.render_stateful_widget(table, area, &mut state);
+        }
+    }
+}
+
+fn truncate_recent_display(value: &str) -> String {
+    const MAX_RECENT_DISPLAY_CHARS: usize = 160;
+    let mut output = value
+        .chars()
+        .take(MAX_RECENT_DISPLAY_CHARS)
+        .collect::<String>();
+    if value.chars().count() > MAX_RECENT_DISPLAY_CHARS {
+        output.push('…');
+    }
+    output
 }
 
 fn render_retired_table(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
@@ -6119,6 +6584,8 @@ fn selector_table_row<'a>(
         Cell::from("accounts").style(Style::new().fg(Color::Cyan))
     } else if row.target.is_retired_sessions() {
         Cell::from("archive").style(Style::new().fg(Color::Cyan))
+    } else if row.target.is_projects() {
+        Cell::from("catalog").style(Style::new().fg(Color::Cyan))
     } else {
         Cell::from("global").style(Style::new().fg(Color::Cyan))
     };
@@ -6126,6 +6593,8 @@ fn selector_table_row<'a>(
         "browse"
     } else if row.target.is_profiles() {
         "manage"
+    } else if row.target.is_projects() {
+        "open"
     } else if row.target.is_global_settings() {
         "settings"
     } else {
@@ -6206,6 +6675,7 @@ fn selector_state_label(row: &SelectorRow) -> &'static str {
         Some(lifecycle) => lifecycle.label(),
         None if row.target.is_profiles() => "accounts",
         None if row.target.is_retired_sessions() => "archive",
+        None if row.target.is_projects() => "catalog",
         None => "global",
     }
 }
@@ -6393,6 +6863,22 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
                 spans.extend(footer_hints(&[("Esc", "clear/exit")]));
                 spans
             }
+            SelectorMode::RecentSessions if model.recent.review().is_some() => footer_hints(&[
+                ("Up/Down", "choose"),
+                ("Enter", "confirm"),
+                ("Esc", "cancel"),
+            ]),
+            SelectorMode::RecentSessions
+                if matches!(model.recent.load_state(), RecentLoadState::Failed(_)) =>
+            {
+                footer_hints(&[("Enter", "retry"), ("Left/Esc", "back")])
+            }
+            SelectorMode::RecentSessions => footer_hints(&[
+                ("Up/Down", "move"),
+                ("Enter", "review adoption"),
+                ("Right", "load more"),
+                ("Left/Esc", "back"),
+            ]),
             SelectorMode::RetiredSessions { .. } if very_narrow => {
                 footer_hints(&[("Up/Down", ""), ("Enter", ""), ("Left/Esc", "")])
             }
@@ -6676,6 +7162,8 @@ mod tests {
     use cutex::session::model::CutexSessionRuntimeBackend;
     use ratatui::backend::TestBackend;
 
+    use super::super::test_home::IsolatedTestHome;
+
     fn row(
         key: &str,
         agent: &str,
@@ -6712,7 +7200,7 @@ mod tests {
             agent: agent.to_string(),
             configured_profile: Some("aemeath".to_string()),
             lifecycle: Some(lifecycle),
-            host: "host-a".to_string(),
+            host: "tethys".to_string(),
             backend: "alden".to_string(),
             managed_path: "~/Projects/cutex".to_string(),
             retired_at: None,
@@ -6735,7 +7223,7 @@ mod tests {
                         },
                         SessionTuiSettingOption {
                             label: "Host",
-                            value: "host-a".to_string(),
+                            value: "tethys".to_string(),
                             field: None,
                             global_field: None,
                             profile_field: None,
@@ -6799,7 +7287,7 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             EDITABLE_AGENT_KEY.to_string(),
             Some("019e-editable".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/editable".to_string(),
             None,
             "2026-08-05T00:00:00Z".to_string(),
@@ -6955,7 +7443,9 @@ mod tests {
             sort_rows(&mut model.rows);
         }
         model.mode = SelectorMode::Agents;
-        model.selected_target = Some(SelectorTarget::Profiles);
+        model
+            .workspace_selection
+            .select(Some(SelectorTarget::Profiles));
         assert_eq!(
             model.handle(SelectorEvent::Activate),
             SelectorControl::OpenProfileManager
@@ -7002,7 +7492,7 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex.alden-row".to_string(),
             Some("019e-alden-row".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/alden-row".to_string(),
             Some("aemeath".to_string()),
             "2026-08-05T00:00:00Z".to_string(),
@@ -7023,7 +7513,7 @@ mod tests {
         assert_eq!(row.agent, "alden-row");
         assert_eq!(row.lifecycle, Some(CutexSessionLifecycleState::Online));
         assert!(row.attachable);
-        assert_eq!(row.host, "host-a");
+        assert_eq!(row.host, "tethys");
         assert_eq!(row.backend, "alden");
         assert_eq!(row.managed_path, "/tmp/managed");
         assert_eq!(row.actions[0].action, SessionTuiAction::ResumeAttach);
@@ -7042,7 +7532,7 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex.detached-row".to_string(),
             Some("019e-detached-row".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/detached-row".to_string(),
             Some("aemeath".to_string()),
             "2026-08-08T00:00:00Z".to_string(),
@@ -7139,7 +7629,9 @@ mod tests {
             .iter()
             .map(|row| match &row.target {
                 SelectorTarget::Agent(key) | SelectorTarget::RetiredAgent(key) => key.as_str(),
+                SelectorTarget::RecentSessions => "recent",
                 SelectorTarget::RetiredSessions => "retired",
+                SelectorTarget::Projects => "projects",
                 SelectorTarget::Profiles => "profiles",
                 SelectorTarget::GlobalSettings => "global",
             })
@@ -7155,7 +7647,9 @@ mod tests {
             .iter()
             .map(|row| match &row.target {
                 SelectorTarget::Agent(key) | SelectorTarget::RetiredAgent(key) => key.as_str(),
+                SelectorTarget::RecentSessions => "recent",
                 SelectorTarget::RetiredSessions => "retired",
+                SelectorTarget::Projects => "projects",
                 SelectorTarget::Profiles => "profiles",
                 SelectorTarget::GlobalSettings => "global",
             })
@@ -7171,7 +7665,9 @@ mod tests {
                 .iter()
                 .map(|row| match &row.target {
                     SelectorTarget::Agent(key) | SelectorTarget::RetiredAgent(key) => key.as_str(),
+                    SelectorTarget::RecentSessions => "recent",
                     SelectorTarget::RetiredSessions => "retired",
+                    SelectorTarget::Projects => "projects",
                     SelectorTarget::Profiles => "profiles",
                     SelectorTarget::GlobalSettings => "global",
                 })
@@ -7271,21 +7767,27 @@ mod tests {
         );
 
         assert_eq!(
-            model.selected_target,
+            model.selected_target(),
             Some(SelectorTarget::Agent("alpha".to_string()))
         );
         model.handle(SelectorEvent::Up);
-        assert_eq!(model.selected_target, Some(SelectorTarget::GlobalSettings));
+        assert_eq!(
+            model.selected_target(),
+            Some(SelectorTarget::GlobalSettings)
+        );
         model.handle(SelectorEvent::Down);
         assert_eq!(
-            model.selected_target,
+            model.selected_target(),
             Some(SelectorTarget::Agent("alpha".to_string()))
         );
         model.handle(SelectorEvent::Last);
-        assert_eq!(model.selected_target, Some(SelectorTarget::GlobalSettings));
+        assert_eq!(
+            model.selected_target(),
+            Some(SelectorTarget::GlobalSettings)
+        );
         model.handle(SelectorEvent::Down);
         assert_eq!(
-            model.selected_target,
+            model.selected_target(),
             Some(SelectorTarget::Agent("alpha".to_string()))
         );
     }
@@ -7360,7 +7862,7 @@ mod tests {
         model.handle(SelectorEvent::OpenSettings);
         assert_eq!(model.mode, SelectorMode::Agents);
         assert_eq!(
-            model.selected_target,
+            model.selected_target(),
             Some(SelectorTarget::Agent("agent".to_string()))
         );
     }
@@ -7487,7 +7989,7 @@ mod tests {
         let untouched = CutexSessionRecord::new_at(
             "cutex.untouched".to_string(),
             Some("019e-untouched".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/untouched".to_string(),
             None,
             "2026-08-05T00:00:00Z".to_string(),
@@ -7656,7 +8158,7 @@ mod tests {
         let untouched = CutexSessionRecord::new_at(
             "cutex.untouched".to_string(),
             None,
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/untouched".to_string(),
             Some("alpha".to_string()),
             "2026-08-05T00:00:00Z".to_string(),
@@ -7852,7 +8354,7 @@ mod tests {
         let untouched = CutexSessionRecord::new_at(
             "cutex.untouched.routing".to_string(),
             None,
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/untouched".to_string(),
             None,
             "2026-08-06T00:00:00Z".to_string(),
@@ -7924,7 +8426,7 @@ mod tests {
         let untouched = CutexSessionRecord::new_at(
             "cutex.untouched.launch".to_string(),
             None,
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/untouched".to_string(),
             None,
             "2026-08-06T00:00:00Z".to_string(),
@@ -8090,7 +8592,10 @@ mod tests {
         );
 
         model.handle(SelectorEvent::Escape);
-        assert_eq!(model.selected_target, Some(SelectorTarget::GlobalSettings));
+        assert_eq!(
+            model.selected_target(),
+            Some(SelectorTarget::GlobalSettings)
+        );
     }
 
     #[test]
@@ -8707,7 +9212,7 @@ mod tests {
             SelectorControl::Continue
         );
         assert!(matches!(model.mode, SelectorMode::Agents));
-        assert_eq!(model.selected_target, Some(SelectorTarget::Profiles));
+        assert_eq!(model.selected_target(), Some(SelectorTarget::Profiles));
     }
 
     #[test]
@@ -10122,7 +10627,7 @@ mod tests {
         assert_eq!(model.mode, SelectorMode::Agents);
         assert_eq!(model.query.value(), "a");
         assert_eq!(
-            model.selected_target,
+            model.selected_target(),
             Some(SelectorTarget::Agent("agent".to_string()))
         );
         assert_eq!(model.visible_rows().len(), 1);
@@ -10533,7 +11038,7 @@ mod tests {
         );
         model.handle(SelectorEvent::Down);
         assert_eq!(
-            model.selected_target,
+            model.selected_target(),
             Some(SelectorTarget::Agent("beta".to_string()))
         );
 
@@ -10558,7 +11063,7 @@ mod tests {
         });
 
         assert_eq!(
-            model.selected_target,
+            model.selected_target(),
             Some(SelectorTarget::Agent("beta".to_string()))
         );
         assert!(!model.refreshing);
@@ -10705,12 +11210,20 @@ mod tests {
             rows[0].last_output_at.as_deref(),
             Some("2026-08-13T06:00:00Z")
         );
-        assert!(rows[1].target.is_retired_sessions());
-        assert!(rows[1].last_output_at.is_none());
-        assert!(rows[2].target.is_profiles());
-        assert!(rows[2].last_output_at.is_none());
-        assert!(rows[3].target.is_global_settings());
-        assert!(rows[3].last_output_at.is_none());
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.target.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                SelectorTarget::Agent("store-key".to_string()),
+                SelectorTarget::RetiredSessions,
+                SelectorTarget::RecentSessions,
+                SelectorTarget::Projects,
+                SelectorTarget::Profiles,
+                SelectorTarget::GlobalSettings,
+            ]
+        );
+        assert!(rows[1..].iter().all(|row| row.last_output_at.is_none()));
 
         let mut model = SelectorModel::new(rows, false, false);
         let mut refreshed_activity = SessionActivityState::default();
@@ -10724,8 +11237,9 @@ mod tests {
             model.rows[0].last_output_at.as_deref(),
             Some("2026-08-13T06:00:01Z")
         );
-        assert!(model.rows[1].last_output_at.is_none());
-        assert!(model.rows[2].last_output_at.is_none());
+        assert!(model.rows[1..]
+            .iter()
+            .all(|row| row.last_output_at.is_none()));
 
         model.refresh_activity_states(&HashMap::new());
         assert!(model.rows[0].last_output_at.is_none());
@@ -10840,7 +11354,7 @@ mod tests {
         let value = categorized.find("Current value").expect("value pane");
         assert!(categories < options && options < value);
         assert!(categorized.contains("Host"));
-        assert!(categorized.contains("host-a"));
+        assert!(categorized.contains("tethys"));
 
         let mut global_model = SelectorModel::new(vec![global_row()], false, false);
         global_model.handle(SelectorEvent::Activate);
@@ -11024,5 +11538,55 @@ mod tests {
             None,
             false
         ));
+    }
+
+    #[test]
+    fn successful_recent_adoption_persists_native_thread_identity_and_refreshes_projection() {
+        let _home = IsolatedTestHome::new("cutex-recent-adopt").expect("isolated home");
+        let request = RecentAdoptionRequest {
+            thread_id: "native-thread-123".to_string(),
+            title: "Native preview".to_string(),
+            cwd: "/native/work".to_string(),
+        };
+
+        let result = adopt_recent_thread(&request).expect("adopt native thread");
+        let snapshot = result.snapshot.expect("agent projection");
+        let record = result
+            .store
+            .sessions
+            .values()
+            .find(|record| record.codex_session_id.as_deref() == Some("native-thread-123"))
+            .expect("adopted record");
+        assert!(cutex_session_is_managed(record));
+        assert!(snapshot.rows.iter().any(|row| {
+            row.target
+                .agent_key()
+                .is_some_and(|key| key == record.cutex_session_id)
+        }));
+    }
+
+    #[test]
+    fn persisted_recent_adoption_stays_successful_when_agent_projection_fails() {
+        let request = RecentAdoptionRequest {
+            thread_id: "native-thread-123".to_string(),
+            title: "Native preview".to_string(),
+            cwd: "/native/work".to_string(),
+        };
+        let mut model = SelectorModel::new(vec![recent_sessions_row()], false, false);
+        model.recent_adoption_succeeded(
+            &request,
+            RecentAdoptionResult {
+                store: CutexSessionStore::default(),
+                snapshot: Err("projection unavailable".to_string()),
+            },
+        );
+
+        assert_eq!(
+            model.notice.as_deref(),
+            Some("Adopted native thread Native preview")
+        );
+        assert!(model.warning.as_deref().is_some_and(|warning| {
+            warning.starts_with("Native thread was adopted, but agent refresh failed:")
+        }));
     }
 }

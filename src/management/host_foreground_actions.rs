@@ -126,12 +126,12 @@ mod tests {
     fn desktop_terminal_script_without_profile_is_frozen() {
         assert_eq!(
             host_foreground_powershell_script(
-                r"C:\Tools\cutex\cutex.exe",
+                r"D:\Programs\cutex\cutex.exe",
                 r"D:\Work\project",
                 "session-1",
                 None,
             ),
-            "Set-Location -LiteralPath 'D:\\Work\\project'; & 'C:\\Tools\\cutex\\cutex.exe' session foreground 'session-1'"
+            "Set-Location -LiteralPath 'D:\\Work\\project'; & 'D:\\Programs\\cutex\\cutex.exe' session foreground 'session-1'"
         );
     }
 
@@ -139,12 +139,12 @@ mod tests {
     fn desktop_terminal_script_quotes_one_launch_profile() {
         assert_eq!(
             host_foreground_powershell_script(
-                r"C:\Tools\cutex\cutex.exe",
+                r"D:\Programs\cutex\cutex.exe",
                 r"D:\Owner's Work",
                 "session-1",
                 Some("owner's profile"),
             ),
-            "Set-Location -LiteralPath 'D:\\Owner''s Work'; & 'C:\\Tools\\cutex\\cutex.exe' session foreground 'session-1' --profile 'owner''s profile'"
+            "Set-Location -LiteralPath 'D:\\Owner''s Work'; & 'D:\\Programs\\cutex\\cutex.exe' session foreground 'session-1' --profile 'owner''s profile'"
         );
     }
 }

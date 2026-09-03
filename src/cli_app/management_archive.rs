@@ -599,7 +599,7 @@ mod tests {
         CutexSessionRecord::new_at(
             "cutex.claim-free-live-agent".to_string(),
             Some("thread-claim-free-live-agent".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/claim-free-live-agent".to_string(),
             None,
             "2026-08-10T00:00:00Z".to_string(),

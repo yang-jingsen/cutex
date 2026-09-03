@@ -265,7 +265,7 @@ mod tests {
             session_id: Some(session_id.to_string()),
             cutex_session_id: None,
             profile: "aemeath".to_string(),
-            cwd: "D:\\Projects\\example-project".to_string(),
+            cwd: "E:\\Projects (Aemeath)\\waveline-backend".to_string(),
             pid: std::process::id(),
             host_id: None,
             groups: vec!["waveline".to_string()],
@@ -279,8 +279,8 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex.native".to_string(),
             Some("019e-native".to_string()),
-            "host-b".to_string(),
-            "D:\\Projects\\example-project".to_string(),
+            "EVA-02".to_string(),
+            "E:\\Projects (Aemeath)\\waveline-backend".to_string(),
             Some("aemeath".to_string()),
             "2026-06-30T00:00:00Z".to_string(),
         )
@@ -288,7 +288,7 @@ mod tests {
         record.display_name_hint = Some("native".to_string());
         record.runtime_backend = CutexSessionRuntimeBackend::HostForeground;
         record.current_runtime_agent_id = Some("cutex.native.runtime".to_string());
-        record.managed_cwd = Some("D:\\Projects\\example-project".to_string());
+        record.managed_cwd = Some("E:\\Projects (Aemeath)\\waveline-backend".to_string());
         record.exposed_to_backend = true;
 
         assert_eq!(
@@ -304,7 +304,7 @@ mod tests {
             &store,
             &[],
             &[],
-            "D:\\Projects\\example-project",
+            "E:\\Projects (Aemeath)\\waveline-backend",
         );
 
         let action = actions
@@ -322,7 +322,7 @@ mod tests {
         let mut pinned = CutexSessionRecord::new_at(
             "cutex.pinned".to_string(),
             Some("019e-pinned".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/elsewhere".to_string(),
             Some("aemeath".to_string()),
             timestamp.clone(),
@@ -337,7 +337,7 @@ mod tests {
         let mut cwd_match = CutexSessionRecord::new_at(
             "cutex.cwd".to_string(),
             Some("019e-cwd".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/home/example/Projects/cutex".to_string(),
             Some("aemeath".to_string()),
             timestamp.clone(),
@@ -352,7 +352,7 @@ mod tests {
         let mut local_cwd = CutexSessionRecord::new_at(
             "cutex.local-cwd".to_string(),
             Some("019e-local-cwd".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/home/example/Projects/cutex".to_string(),
             Some("aemeath".to_string()),
             timestamp.clone(),
@@ -366,7 +366,7 @@ mod tests {
         let mut heartbeat_only = CutexSessionRecord::new_at(
             "cutex.heartbeat".to_string(),
             Some("019e-heartbeat".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/heartbeat".to_string(),
             Some("aemeath".to_string()),
             timestamp.clone(),
@@ -381,7 +381,7 @@ mod tests {
         let mut child_cwd = CutexSessionRecord::new_at(
             "cutex.child".to_string(),
             Some("019e-child".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/home/example/Projects/cutex/scripts".to_string(),
             Some("aemeath".to_string()),
             timestamp.clone(),
@@ -398,7 +398,7 @@ mod tests {
         let mut hidden = CutexSessionRecord::new_at(
             "cutex.hidden".to_string(),
             Some("019e-hidden".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/home/example/Projects/cutex".to_string(),
             Some("aemeath".to_string()),
             timestamp,
@@ -472,7 +472,7 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex.alden".to_string(),
             Some("019e-alden".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/home/example/Projects/cutex".to_string(),
             Some("aemeath".to_string()),
             "2026-06-30T00:00:00Z".to_string(),
@@ -501,8 +501,8 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex.native".to_string(),
             Some("019e-native".to_string()),
-            "host-b".to_string(),
-            "D:\\Projects\\example-project".to_string(),
+            "EVA-02".to_string(),
+            "E:\\Projects (Aemeath)\\waveline-backend".to_string(),
             Some("aemeath".to_string()),
             "2026-06-30T00:00:00Z".to_string(),
         )
@@ -519,7 +519,7 @@ mod tests {
             &store,
             &[],
             &[live_native_agent("cutex.native.runtime", "019e-native")],
-            "D:\\Projects\\example-project",
+            "E:\\Projects (Aemeath)\\waveline-backend",
         );
 
         let action = actions
@@ -545,7 +545,7 @@ mod tests {
         let mut alden = CutexSessionRecord::new_at(
             "cutex.alden-primary".to_string(),
             Some("019e-alden-primary".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/alden".to_string(),
             Some("aemeath".to_string()),
             "2026-08-05T00:00:00Z".to_string(),

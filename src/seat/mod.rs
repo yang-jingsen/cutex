@@ -60,6 +60,16 @@ pub struct SeatOccupancyBindRequest {
     pub occupant_cutex_session: CutexSessionId,
 }
 
+/// Internal Agent Management boundary for transferring the one Director seat.
+/// Unlike the administrative bind command, this request names and fences both
+/// sides of the handoff.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct DirectorSeatTransferRequest {
+    pub action_id: ActionId,
+    pub expected_predecessor_cutex_session: CutexSessionId,
+    pub successor_cutex_session: CutexSessionId,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SeatOccupancy {
@@ -97,6 +107,11 @@ pub struct SeatOccupancySnapshot {
     pub store_revision: u64,
     pub occupancies: BTreeMap<SeatId, SeatOccupancy>,
     pub receipts: BTreeMap<ActionId, SeatOccupancyReceipt>,
+    /// A Director transfer has changed seat authority but Agent Management has
+    /// not yet acknowledged its project-authority commit. Administrative binds
+    /// are fenced across that two-store boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_director_transfer: Option<ActionId>,
     #[serde(default)]
     pub rotating_vacancies: BTreeMap<SeatId, SeatRotatingVacancy>,
     #[serde(default)]
@@ -112,6 +127,7 @@ impl SeatOccupancySnapshot {
             store_revision: 0,
             occupancies: BTreeMap::new(),
             receipts: BTreeMap::new(),
+            active_director_transfer: None,
             rotating_vacancies: BTreeMap::new(),
             release_rotations: BTreeMap::new(),
             active_release_rotation: None,
@@ -193,6 +209,8 @@ impl SeatOccupancyStore {
                 ));
             }
             if state.rotating_vacancies.contains_key(&request.seat_id)
+                || (request.seat_id.as_str() == "cutex-director"
+                    && state.active_director_transfer.is_some())
                 || (request.seat_id.as_str() == "cutex-release"
                     && state.active_release_rotation.is_some())
             {
@@ -232,6 +250,141 @@ impl SeatOccupancyStore {
                 .receipts
                 .insert(request.action_id.clone(), receipt.clone());
             Ok((state, receipt, true))
+        })
+    }
+
+    /// Fail-closed preflight for Agent Management Director rotation. Before a
+    /// successor exists, the seat must still name the exact predecessor. On
+    /// recovery, only the exact durable transfer receipt may explain why it
+    /// already names the known successor.
+    pub(crate) fn preflight_director_transfer(
+        &self,
+        action_id: &ActionId,
+        expected_predecessor: &CutexSessionId,
+        replay: Option<&DirectorSeatTransferRequest>,
+    ) -> Result<(), SeatAuthorityError> {
+        self.with_locked_state(false, |state| {
+            if let Some(receipt) = state.receipts.get(action_id) {
+                let request = replay.ok_or(SeatAuthorityError::Conflict(
+                    "director_seat_transfer_action_id_already_used",
+                ))?;
+                verify_director_transfer_receipt(&state, request, receipt)?;
+                return Ok((state, (), false));
+            }
+            let current = director_occupancy(&state)?;
+            if &current.occupant_cutex_session != expected_predecessor {
+                return Err(SeatAuthorityError::Conflict(
+                    "stale_director_seat_occupancy",
+                ));
+            }
+            Ok((state, (), false))
+        })
+    }
+
+    /// CAS-transfer the Task Service `cutex-director` seat. Exact replay is
+    /// accepted only while the authoritative occupancy still names the same
+    /// successor; an unrelated administrative rebind is never auto-healed.
+    pub(crate) fn transfer_director(
+        &self,
+        request: &DirectorSeatTransferRequest,
+    ) -> Result<SeatOccupancyReceipt, SeatAuthorityError> {
+        if request.expected_predecessor_cutex_session == request.successor_cutex_session {
+            return Err(SeatAuthorityError::InvalidRequest(
+                "director_transfer_requires_distinct_successor",
+            ));
+        }
+        let digest = request_digest(request)?;
+        self.with_locked_state(true, |mut state| {
+            if let Some(receipt) = state.receipts.get(&request.action_id).cloned() {
+                verify_director_transfer_receipt(&state, request, &receipt)?;
+                return Ok((state, receipt, false));
+            }
+            if state.active_director_transfer.is_some() {
+                return Err(SeatAuthorityError::Conflict(
+                    "director_seat_rotation_in_progress",
+                ));
+            }
+            if state.occupancies.iter().any(|(seat, occupancy)| {
+                seat.as_str() != "cutex-director"
+                    && occupancy.occupant_cutex_session == request.successor_cutex_session
+            }) {
+                return Err(SeatAuthorityError::Conflict(
+                    "session_already_occupies_another_seat",
+                ));
+            }
+            let current = director_occupancy(&state)?.clone();
+            if current.occupant_cutex_session != request.expected_predecessor_cutex_session {
+                return Err(SeatAuthorityError::Conflict(
+                    "stale_director_seat_occupancy",
+                ));
+            }
+            let epoch = current
+                .epoch
+                .checked_add(1)
+                .filter(|value| *value <= MAX_JSON_SAFE_INTEGER)
+                .ok_or(SeatAuthorityError::Conflict("seat_epoch_overflow"))?;
+            let revision = next_revision(state.store_revision)?;
+            let seat_id =
+                SeatId::new("cutex-director").map_err(|_| SeatAuthorityError::InvalidStore)?;
+            let occupancy = SeatOccupancy {
+                seat_id: seat_id.clone(),
+                occupant_cutex_session: request.successor_cutex_session.clone(),
+                epoch,
+                bound_at: now(),
+            };
+            let receipt = SeatOccupancyReceipt {
+                schema: SeatOccupancyReceiptSchema::V1,
+                action_id: request.action_id.clone(),
+                request_sha256: digest,
+                store_revision: revision,
+                occupancy: occupancy.clone(),
+            };
+            state.store_revision = revision;
+            state.occupancies.insert(seat_id, occupancy);
+            state
+                .receipts
+                .insert(request.action_id.clone(), receipt.clone());
+            state.active_director_transfer = Some(request.action_id.clone());
+            Ok((state, receipt, true))
+        })
+    }
+
+    /// Release the administrative-bind fence after Agent Management has
+    /// durably committed project authority. This is itself exact and
+    /// idempotent, so recovery can safely finish either side of a crash.
+    pub(crate) fn finish_director_transfer(
+        &self,
+        request: &DirectorSeatTransferRequest,
+    ) -> Result<SeatOccupancyReceipt, SeatAuthorityError> {
+        self.with_locked_state(true, |mut state| {
+            let receipt = state.receipts.get(&request.action_id).cloned().ok_or(
+                SeatAuthorityError::Conflict("director_seat_transfer_not_found"),
+            )?;
+            verify_director_transfer_receipt(&state, request, &receipt)?;
+            match state.active_director_transfer.as_ref() {
+                Some(active) if active == &request.action_id => {
+                    state.active_director_transfer = None;
+                    state.store_revision = next_revision(state.store_revision)?;
+                    Ok((state, receipt, true))
+                }
+                None => Ok((state, receipt, false)),
+                Some(_) => Err(SeatAuthorityError::Conflict(
+                    "director_seat_rotation_in_progress",
+                )),
+            }
+        })
+    }
+
+    pub(crate) fn verify_director_transfer(
+        &self,
+        request: &DirectorSeatTransferRequest,
+    ) -> Result<SeatOccupancyReceipt, SeatAuthorityError> {
+        self.with_locked_state(false, |state| {
+            let receipt = state.receipts.get(&request.action_id).cloned().ok_or(
+                SeatAuthorityError::Conflict("director_seat_transfer_not_found"),
+            )?;
+            verify_director_transfer_receipt(&state, request, &receipt)?;
+            Ok((state, receipt, false))
         })
     }
 
@@ -779,7 +932,35 @@ fn write_snapshot(root: &Path, snapshot: &SeatOccupancySnapshot) -> Result<(), S
     Ok(())
 }
 
-fn request_digest(request: &SeatOccupancyBindRequest) -> Result<String, SeatAuthorityError> {
+fn director_occupancy(state: &SeatOccupancySnapshot) -> Result<&SeatOccupancy, SeatAuthorityError> {
+    let seat = SeatId::new("cutex-director").map_err(|_| SeatAuthorityError::InvalidStore)?;
+    state
+        .occupancies
+        .get(&seat)
+        .ok_or(SeatAuthorityError::Conflict("director_seat_not_bound"))
+}
+
+fn verify_director_transfer_receipt(
+    state: &SeatOccupancySnapshot,
+    request: &DirectorSeatTransferRequest,
+    receipt: &SeatOccupancyReceipt,
+) -> Result<(), SeatAuthorityError> {
+    if receipt.request_sha256 != request_digest(request)? {
+        return Err(SeatAuthorityError::Conflict("action_id_payload_conflict"));
+    }
+    let current = director_occupancy(state)?;
+    if receipt.occupancy.seat_id.as_str() != "cutex-director"
+        || receipt.occupancy.occupant_cutex_session != request.successor_cutex_session
+        || current != &receipt.occupancy
+    {
+        return Err(SeatAuthorityError::Conflict(
+            "director_seat_changed_after_transfer",
+        ));
+    }
+    Ok(())
+}
+
+fn request_digest<T: Serialize>(request: &T) -> Result<String, SeatAuthorityError> {
     let bytes = serde_json::to_vec(request)
         .map_err(|_| SeatAuthorityError::InvalidRequest("invalid_request"))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
@@ -830,6 +1011,19 @@ mod tests {
         }
     }
 
+    fn director_transfer(
+        action: &str,
+        predecessor: &str,
+        successor: &str,
+    ) -> DirectorSeatTransferRequest {
+        DirectorSeatTransferRequest {
+            action_id: ActionId::new(action).expect("action"),
+            expected_predecessor_cutex_session: CutexSessionId::new(predecessor)
+                .expect("predecessor"),
+            successor_cutex_session: CutexSessionId::new(successor).expect("successor"),
+        }
+    }
+
     #[test]
     fn restart_preserves_occupancy_and_exact_replay() {
         let root = root("restart");
@@ -840,6 +1034,79 @@ mod tests {
         let reopened = SeatOccupancyStore::open(&root).expect("reopen");
         assert_eq!(reopened.bind(&request).expect("replay"), first);
         assert_eq!(reopened.query().expect("query").occupancies.len(), 1);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn director_transfer_is_strict_cas_with_exact_replay_and_payload_conflict() {
+        let root = root("director-transfer-cas");
+        let store = SeatOccupancyStore::open(&root).expect("open");
+        let transfer = director_transfer("rotate-seat-1", "director-old", "director-new");
+        assert_eq!(
+            store.transfer_director(&transfer),
+            Err(SeatAuthorityError::Conflict("director_seat_not_bound"))
+        );
+
+        store
+            .bind(&bind("bind-director-old", "cutex-director", "director-old"))
+            .expect("bind predecessor");
+        let stale = director_transfer("rotate-seat-stale", "director-other", "director-new");
+        assert_eq!(
+            store.transfer_director(&stale),
+            Err(SeatAuthorityError::Conflict(
+                "stale_director_seat_occupancy"
+            ))
+        );
+
+        store
+            .preflight_director_transfer(
+                &transfer.action_id,
+                &transfer.expected_predecessor_cutex_session,
+                None,
+            )
+            .expect("preflight predecessor");
+        let first = store.transfer_director(&transfer).expect("transfer");
+        assert_eq!(
+            first.occupancy.occupant_cutex_session.as_str(),
+            "director-new"
+        );
+        assert_eq!(first.occupancy.epoch, 2);
+        assert_eq!(
+            store.transfer_director(&transfer).expect("exact replay"),
+            first
+        );
+        store
+            .preflight_director_transfer(
+                &transfer.action_id,
+                &transfer.expected_predecessor_cutex_session,
+                Some(&transfer),
+            )
+            .expect("recovery preflight");
+
+        let changed = director_transfer("rotate-seat-1", "director-old", "director-changed");
+        assert_eq!(
+            store.transfer_director(&changed),
+            Err(SeatAuthorityError::Conflict("action_id_payload_conflict"))
+        );
+        assert_eq!(
+            store.bind(&bind(
+                "admin-during-transfer",
+                "cutex-director",
+                "director-admin",
+            )),
+            Err(SeatAuthorityError::Conflict("seat_rotation_in_progress"))
+        );
+        store
+            .finish_director_transfer(&transfer)
+            .expect("finish transfer");
+        store
+            .verify_director_transfer(&transfer)
+            .expect("verify transfer");
+        assert!(store
+            .query()
+            .expect("snapshot")
+            .active_director_transfer
+            .is_none());
         fs::remove_dir_all(root).expect("cleanup");
     }
 

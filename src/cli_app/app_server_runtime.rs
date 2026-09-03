@@ -987,7 +987,7 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex-1".to_string(),
             Some("019f0000-0000-7000-8000-000000000001".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/project".to_string(),
             Some("profile".to_string()),
             "2026-07-10T00:00:00Z".to_string(),
@@ -1136,7 +1136,7 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex-1".to_string(),
             Some("019f0000-0000-7000-8000-000000000001".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/project".to_string(),
             Some("profile".to_string()),
             "2026-07-10T00:00:00Z".to_string(),
@@ -1174,7 +1174,7 @@ mod tests {
         let record = CutexSessionRecord::new_at(
             "cutex-1".to_string(),
             Some("019f0000-0000-7000-8000-000000000001".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/project".to_string(),
             None,
             "2026-08-07T00:00:00Z".to_string(),
@@ -1194,7 +1194,7 @@ mod tests {
         let record = CutexSessionRecord::new_at(
             "cutex-1".to_string(),
             Some("019f0000-0000-7000-8000-000000000001".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/project".to_string(),
             None,
             "2026-08-07T00:00:00Z".to_string(),
@@ -1213,7 +1213,7 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex-1".to_string(),
             Some("019f0000-0000-7000-8000-000000000001".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/project".to_string(),
             None,
             "2026-07-10T00:00:00Z".to_string(),
@@ -1224,13 +1224,13 @@ mod tests {
         record.runtime_pid = Some(4242);
 
         assert_eq!(
-            classify_persisted_runtime_adoption(&record, "host-a", |_| true),
+            classify_persisted_runtime_adoption(&record, "tethys", |_| true),
             PersistedRuntimeAdoptionAction::Recover(PersistedRuntimeRecoveryAction::Reconnect {
                 runtime_agent_id: "runtime-1".to_string(),
             })
         );
         assert_eq!(
-            classify_persisted_runtime_adoption(&record, "host-a", |_| false),
+            classify_persisted_runtime_adoption(&record, "tethys", |_| false),
             PersistedRuntimeAdoptionAction::Recover(
                 PersistedRuntimeRecoveryAction::ClearStaleAndLaunch
             )
@@ -1238,7 +1238,7 @@ mod tests {
 
         record.alden_pid = Some(5151);
         assert_eq!(
-            classify_persisted_runtime_adoption(&record, "host-a", |pid| pid == 5151),
+            classify_persisted_runtime_adoption(&record, "tethys", |pid| pid == 5151),
             PersistedRuntimeAdoptionAction::Recover(
                 PersistedRuntimeRecoveryAction::CutoverRequired {
                     reason: "stale_binding_has_live_child",
@@ -1247,9 +1247,9 @@ mod tests {
             )
         );
 
-        record.host_id = "host-b".to_string();
+        record.host_id = "eva-02".to_string();
         assert_eq!(
-            classify_persisted_runtime_adoption(&record, "host-a", |_| {
+            classify_persisted_runtime_adoption(&record, "tethys", |_| {
                 panic!("remote PIDs must not be probed locally")
             }),
             PersistedRuntimeAdoptionAction::Remote
@@ -1261,7 +1261,7 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex-retired".to_string(),
             Some("019f0000-0000-7000-8000-000000000099".to_string()),
-            "host-b".to_string(),
+            "eva-02".to_string(),
             "/tmp/project".to_string(),
             None,
             "2026-07-10T00:00:00Z".to_string(),
@@ -1273,7 +1273,7 @@ mod tests {
         record.runtime_pid = Some(4242);
 
         assert_eq!(
-            classify_persisted_runtime_adoption(&record, "host-a", |_| {
+            classify_persisted_runtime_adoption(&record, "tethys", |_| {
                 panic!("retired PIDs must not be probed")
             }),
             PersistedRuntimeAdoptionAction::Retired
@@ -1285,7 +1285,7 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex-1".to_string(),
             Some("019f0000-0000-7000-8000-000000000001".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/project".to_string(),
             None,
             "2026-07-10T00:00:00Z".to_string(),
@@ -1311,7 +1311,7 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex-1".to_string(),
             Some("019f0000-0000-7000-8000-000000000001".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/project".to_string(),
             None,
             "2026-07-10T00:00:00Z".to_string(),
@@ -1334,7 +1334,7 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex-1".to_string(),
             Some("019f0000-0000-7000-8000-000000000001".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/project".to_string(),
             None,
             "2026-07-10T00:00:00Z".to_string(),
@@ -1367,7 +1367,7 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex-1".to_string(),
             Some("019f0000-0000-7000-8000-000000000001".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/project".to_string(),
             None,
             "2026-07-10T00:00:00Z".to_string(),
@@ -1389,7 +1389,7 @@ mod tests {
         let mut expected = CutexSessionRecord::new_at(
             "cutex-1".to_string(),
             Some("019f0000-0000-7000-8000-000000000001".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/project".to_string(),
             None,
             "2026-07-10T00:00:00Z".to_string(),
@@ -1436,7 +1436,7 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex-1".to_string(),
             Some("019f0000-0000-7000-8000-000000000001".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/project".to_string(),
             None,
             "2026-08-07T00:00:00Z".to_string(),
@@ -1455,7 +1455,7 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex-1".to_string(),
             Some("019f0000-0000-7000-8000-000000000001".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/project".to_string(),
             None,
             "2026-08-07T00:00:00Z".to_string(),

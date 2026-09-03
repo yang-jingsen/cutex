@@ -320,7 +320,7 @@ mod tests {
         let mut persistent = CutexSessionRecord::new_at(
             "cutex.persistent".to_string(),
             Some("019e-persistent".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/persistent".to_string(),
             Some("aemeath".to_string()),
             timestamp.clone(),
@@ -337,7 +337,7 @@ mod tests {
         let mut historical = CutexSessionRecord::new_at(
             "cutex.historical".to_string(),
             Some("019e-historical".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/historical".to_string(),
             Some("aemeath".to_string()),
             timestamp.clone(),
@@ -351,7 +351,7 @@ mod tests {
         let mut attachable = CutexSessionRecord::new_at(
             "cutex.attachable".to_string(),
             Some("019e-attachable".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/attachable".to_string(),
             Some("aemeath".to_string()),
             timestamp,
@@ -433,7 +433,7 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex.retired".to_string(),
             Some("019e-retired".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/retired".to_string(),
             Some("aemeath".to_string()),
             "2026-08-10T00:00:00Z".to_string(),
@@ -469,7 +469,7 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex.row".to_string(),
             Some("019e-row".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/original".to_string(),
             Some("aemeath".to_string()),
             "2026-06-28T00:00:00Z".to_string(),
@@ -507,7 +507,7 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex.choice".to_string(),
             Some("019e-choice".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/original".to_string(),
             Some("aemeath".to_string()),
             "2026-06-28T00:00:00Z".to_string(),

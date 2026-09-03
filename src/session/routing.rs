@@ -87,7 +87,7 @@ mod tests {
         CutexSessionRecord::new_at(
             "cutex.routing".to_string(),
             Some("019e-routing".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/routing".to_string(),
             Some("alpha".to_string()),
             "2026-08-06T00:00:00Z".to_string(),

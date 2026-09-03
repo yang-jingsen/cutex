@@ -263,7 +263,7 @@ mod tests {
             sequence: 1,
             received_at: "2026-07-13T00:00:00Z".to_string(),
             cutex_session_id: "cutex.session-1".to_string(),
-            host_id: "host-a".to_string(),
+            host_id: "tethys".to_string(),
             source: EventSource::AppServer,
             sensitivity: "owner".to_string(),
             schema: Some(AppServerSchema {
@@ -303,7 +303,7 @@ mod tests {
     fn source_payloads_are_mutually_exclusive() {
         let pending = PendingEvent {
             cutex_session_id: "cutex.session-1".to_string(),
-            host_id: "host-a".to_string(),
+            host_id: "tethys".to_string(),
             source: EventSource::Cutex,
             schema: None,
             correlation: EventCorrelation::default(),
@@ -317,7 +317,7 @@ mod tests {
     fn runtime_generation_correlation_matches_event_source() {
         let cutex = PendingEvent {
             cutex_session_id: "cutex.session-1".to_string(),
-            host_id: "host-a".to_string(),
+            host_id: "tethys".to_string(),
             source: EventSource::Cutex,
             schema: None,
             correlation: EventCorrelation {
@@ -334,7 +334,7 @@ mod tests {
 
         let mut native = PendingEvent {
             cutex_session_id: "cutex.session-1".to_string(),
-            host_id: "host-a".to_string(),
+            host_id: "tethys".to_string(),
             source: EventSource::AppServer,
             schema: Some(AppServerSchema {
                 protocol: "codex-app-server".to_string(),

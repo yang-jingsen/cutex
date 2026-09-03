@@ -107,7 +107,7 @@ fn session_record() -> CutexSessionRecord {
     let mut record = CutexSessionRecord::new_at(
         SESSION_ID.to_string(),
         Some("codex-session-pilot".to_string()),
-        "host-a".to_string(),
+        "tethys".to_string(),
         "/tmp/pilot-worker".to_string(),
         Some("aemeath".to_string()),
         "2026-08-22T00:00:00Z".to_string(),

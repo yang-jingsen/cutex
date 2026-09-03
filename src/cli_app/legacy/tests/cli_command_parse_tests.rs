@@ -103,7 +103,7 @@ fn run_group_command_parses_multiple_values_before_passthrough_args() {
         "--agent",
         "--group",
         "aria",
-        "example-project",
+        "scgpt",
         "--",
         "--sandbox",
         "danger-full-access",
@@ -118,7 +118,7 @@ fn run_group_command_parses_multiple_values_before_passthrough_args() {
             codex_args,
             ..
         }) if profile == "aemeath"
-            && groups == vec!["aria".to_string(), "example-project".to_string()]
+            && groups == vec!["aria".to_string(), "scgpt".to_string()]
             && codex_args == vec!["--sandbox".to_string(), "danger-full-access".to_string()]
     ));
 }
@@ -140,7 +140,7 @@ fn im_register_command_parses_session_groups() {
         "aria-data",
         "--group",
         "aria",
-        "example-project",
+        "scgpt",
     ])
     .expect("im register should parse");
     assert!(matches!(
@@ -154,7 +154,7 @@ fn im_register_command_parses_session_groups() {
             }
         }) if session_id == "019e-session"
             && name == "aria-data"
-            && groups == vec!["aria".to_string(), "example-project".to_string()]
+            && groups == vec!["aria".to_string(), "scgpt".to_string()]
     ));
 }
 
@@ -182,7 +182,7 @@ fn agent_remote_up_command_parses() {
         "cutex",
         "agent",
         "remote-up",
-        "host-a",
+        "tethys",
         "--local-port",
         "24261",
         "--remote-port",
@@ -204,7 +204,7 @@ fn agent_remote_up_command_parses() {
                 show_ssh_fallback: true,
                 no_config: false,
             }
-        }) if host == "host-a" && token == "secret"
+        }) if host == "tethys" && token == "secret"
     ));
 }
 

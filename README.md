@@ -1,422 +1,388 @@
 # cutex
 
-`cutex` is a profile launcher and configuration wizard for `cute-codex`.
-It keeps account credentials, profile configuration, runtime options, proxy
-settings, notification settings, and status-line preferences in one local store,
-then starts the selected CLI with the right environment.
+`cutex` is a local-first session manager and profile launcher for
+[`cute-codex`](https://github.com/yang-jingsen/cute-codex). It keeps Codex
+profiles separate, tracks durable sessions across terminal and process
+lifetimes, and provides the runtime services used by collaborating agents,
+workbench clients, Agent Management, and Task Service.
 
-## Features
+Running `cutex` with no arguments opens the interactive session TUI. Direct
+profile launches and the complete management surface remain available through
+the CLI.
 
-- Multiple profiles for official ChatGPT auth or API-key providers.
-- Interactive profile and global configuration wizards.
-- Host or Docker runtime per profile, with one-shot `--host` overrides.
-- Per-profile startup arguments, such as a default sandbox mode.
-- Optional proxy injection for auth and model-provider traffic.
-- Shared local desktop notification bridge for Linux/Kubuntu.
-- Optional managed detachable sessions through `cute-alden`.
-- Per-profile `cute-codex` status-line configuration.
-- Opt-in agent-to-agent messaging: one `cute-codex` session can discover and
-  message another local `cutex --agent` session.
+## What it provides
+
+- A continuous TUI for live, offline, unmanaged, and retired Codex sessions.
+- Durable session identity, metadata, launch defaults, runtime state, and
+  duplicate-resume protection.
+- Host, Docker, visible foreground, and detachable `cute-alden` runtime paths.
+- A manager-owned `cute-codex app-server` runtime that can remain online while
+  its visible TUI is detached.
+- Multiple isolated ChatGPT/API profiles, with per-profile provider, proxy,
+  runtime, status-line, and CLI settings.
+- A local Management v2 API for session/workbench state, runtime lifecycle,
+  events, and native app-server requests.
+- Opt-in Agent Bus discovery and messaging, including cross-host discovery
+  through Bridgeboard.
+- Project-scoped Agent Management with authenticated Director authority.
+- A durable Task Service for assignments, attempts, receipts, logical seats,
+  progress, completion, and stale-work reminders.
+- Per-agent/profile/model usage reporting derived from locally observed native
+  usage events.
+
+## Runtime model
+
+The main pieces have deliberately different responsibilities:
+
+| Component | Responsibility |
+| --- | --- |
+| `cute-codex` | Native Codex TUI, app-server protocol, and model/tool execution |
+| Cutex profile store | Authentication/config isolation and launch policy |
+| Durable session store | Stable Cutex identity, Codex thread identity, cwd, groups, profile intent, and lifecycle metadata |
+| Managed app-server | Long-lived native runtime for one durable session |
+| Visible TUI peer | An attachable terminal client; it may come and go without ending the managed app-server |
+| Management host | Local HTTP control plane, runtime recovery, events, Task Service, and administrative routes |
+| Agent Bus | Live agent discovery and authenticated message delivery |
+
+`online`, `offline`, and `close` apply to the managed runtime. Closing a
+terminal client is not the same operation. Likewise, `retire` archives a
+durable session record; it is not an alias for closing a runtime or deleting
+Codex history.
+
+A durable session records its owning runtime host. Lifecycle mutations are
+performed by that host. Another machine can reach the host through the
+Management API/Bridgeboard path, but should not pretend that a remote PID or
+runtime endpoint is local.
 
 ## Install
+
+Requirements:
+
+- a Rust toolchain supported by this workspace;
+- a compatible `cute-codex` (preferred) or Codex-compatible CLI;
+- `cute-alden` when detachable/reattachable terminal sessions are required;
+- Docker and Bridgeboard only for the corresponding optional features.
 
 Build from source:
 
 ```sh
-cargo build --release
+cargo build --release --locked
 ```
 
-The binary is written to:
+The result is `target/release/cutex` on Unix-like systems and
+`target/release/cutex.exe` on Windows. Put it on `PATH` together with the
+runtime dependencies you intend to use.
 
-```sh
-target/release/cutex
-```
-
-Put that binary on `PATH`. `cutex` resolves the Codex-compatible CLI in this
-order:
+Cutex resolves the Codex-compatible binary in this order:
 
 1. `CUTEX_CODEX_BIN`
-2. `CODEZ_CODEX_BIN`
-3. `cute-codex`
-4. `cutex-codex`
-5. `codex`
+2. `cute-codex`
+3. `cutex-codex`
+4. `codex`
 
-For normal use, install `cute-codex` on `PATH` or set `CUTEX_CODEX_BIN` to its
-absolute path.
+Set `CUTEX_CODEX_BIN` when the preferred CLI is not available on `PATH`.
 
-## Quick Start
+## Quick start
 
-Create a profile:
+Create the first profile and review global settings:
 
 ```sh
 cutex login
-```
-
-Open the main wizard:
-
-```sh
 cutex wizard
 ```
 
-`cutex config` is an alias for `cutex wizard`.
-
-List and inspect profiles:
+Open the main TUI:
 
 ```sh
-cutex profile list
-cutex profile show
-cutex profile show <profile>
+cutex
+# equivalent explicit entry points
+cutex tui
+cutex start
 ```
 
-Run a profile:
+Launch the default profile without opening the selector:
+
+```sh
+cutex --quick
+```
+
+Launch a named profile without changing the stored active profile:
 
 ```sh
 cutex run <profile>
 ```
 
-Pass arguments to `cute-codex`:
+Arguments after `--` are passed to the selected Codex-compatible CLI:
 
 ```sh
+cutex --quick -- --help
 cutex run <profile> -- --help
-cutex -- --help
 ```
 
-Set a global default profile:
+Use `cutex --help` and `cutex <command> --help` for the exact command surface
+of the installed build.
+
+## Session TUI
+
+The TUI merges durable Cutex records, workbench registration, `cute-alden`
+attachments, Agent Bus presence, and locally projected activity. It continues
+refreshing while open and uses responsive columns for narrow and wide
+terminals.
+
+The main list also contains entry rows for Profiles, Global settings, and the
+retired-session archive. From an agent row you can:
+
+- run the primary lifecycle action with `Enter`;
+- open the complete action list with `Right` (or `Shift+Enter` where enhanced
+  keyboard reporting is available);
+- open session settings with `Tab`;
+- close a known runtime with `Ctrl+X`, after confirmation;
+- search by typing, clear the search with `Ctrl+U`, and exit with `Ctrl+C`.
+
+Available actions depend on the selected record and current lifecycle state.
+They include attaching or taking over an existing terminal, opening a TUI for
+an online app-server, bringing a managed runtime online, resuming in the
+current or managed cwd, closing/restarting a runtime, and retiring/restoring a
+session. Close/restart and archive operations require confirmation.
+
+Session settings cover durable profile intent, display name, groups,
+workbench visibility, quick-action policy, managed cwd, runtime backend,
+permissions, approval policy, sandbox, model, reasoning effort, and extra CLI
+arguments. The Profiles workspace can add, activate, rename, remove, and edit
+profiles; staged edits are applied explicitly.
+
+For scripted or filtered selection, the compatibility picker remains useful:
 
 ```sh
-cutex global set --default-profile <profile>
-cutex global set --default-profile-direct-launch true
+cutex session list --sort recent
+cutex start --offline
+cutex start --project <text> --group <group>
 ```
 
-## Agent Messaging
+## Durable sessions
 
-`cutex` can run a shared local agent bus so multiple `cute-codex` sessions can
-talk to each other. This is opt-in per launch; plain `cutex` keeps the native
-solo behavior and does not expose agent tools to the model.
-
-Start a collaborating session:
+A native Codex thread can exist before Cutex manages it. Adoption adds Cutex
+metadata and future lifecycle intent; it does not copy or delete the native
+history:
 
 ```sh
-cutex --agent
-cutex run <profile> --agent
-cutex run <profile> --agent --group aria example-project -- --sandbox danger-full-access
+cutex session adopt <session-id> --current-cwd --pin
+cutex session adopt <session-id> --name <name> --group <group> --im
 ```
 
-`--group` scopes collaboration visibility. It accepts multiple values after one
-flag and can also be repeated. When no explicit group is supplied, cutex adds a
-project-local default group so agents in the same project can see each other
-without cluttering unrelated projects.
-
-List peers and send a message:
+Common inspection and lifecycle commands:
 
 ```sh
-cutex agent list
-cutex agent send <agent-name-or-id> "please report status"
-cutex agent groups add <agent-name-or-session-id> shared-review
-cutex agent groups set <agent-name-or-session-id> aria example-project
+cutex session list
+cutex session show <session-id>
+cutex session online <session-id>
+cutex session foreground <session-id>
+cutex session offline <session-id>
+cutex session close <session-id>
+cutex session retire <session-id>
+cutex session retired
+cutex session restore <session-id>
 ```
 
-Normal sends use `delivery_mode=after_turn`: the recipient sees the message in
-its TUI immediately, but the model processes it after the current turn/action
-finishes. If the recipient is idle, it can process the message immediately.
+Important boundaries:
 
-For urgent follow-up, use `--soon`. For FYI or heartbeat messages that should
-be shown but not start a model turn, use `--queue-only`, which maps to
-`delivery_mode=passive`:
+- `online` starts or reconnects the manager-owned runtime according to the
+  durable session defaults.
+- `foreground` resumes visibly in the invoking terminal.
+- `offline` and `close` stop runtime state while preserving the durable record
+  and native history.
+- `unmanage` removes Cutex management metadata without deleting history or
+  killing an independently running runtime.
+- `hide` only removes workbench/IM visibility.
+- `retire` requires the managed runtime to be safely offline and moves the
+  record to the archive; `restore` returns it as active and offline.
+- `duplicate-check` and takeover commands help avoid opening a second runtime
+  for the same native thread.
+
+Use `cutex session --help` for profile, group, cwd, quick-action, and runtime
+default subcommands.
+
+## Profiles and launch policy
+
+Profiles live under `~/.cutex/profiles/<profile-id>/` and keep their own auth
+and Codex configuration. A profile can select a host or Docker runtime, proxy
+behavior, provider configuration, display metadata, status line, and default
+CLI arguments.
 
 ```sh
-cutex agent send <agent-name-or-id> "please check this now" --soon
-cutex agent send <agent-name-or-id> "FYI: transfer is still running" --queue-only
-```
-
-`--interrupt` is reserved for explicit interruption semantics and should not be
-used as the default.
-
-In collaboration mode, patched `cute-codex` also exposes native model tools
-(`cutex_agent_list` and `cutex_agent_send`), so agents can message peers without
-shelling out. Native tool sends default to `after_turn` and accept
-`delivery_mode` values `after_turn`, `soon`, `passive`, and `interrupt`.
-Incoming messages are shown in the target TUI history and are injected into
-model context once through mailbox delivery.
-
-The bus persists live agent registrations to
-`~/.cutex/runtime/agent-bus-registry.json`. If the bus process is restarted, it
-restores the known registrations before accepting requests. Agents that are
-truly gone are still removed by the normal stale heartbeat/poll pruning; message
-queues are intentionally not persisted across bus restarts.
-
-### IM/Workbench Registration
-
-Agent-bus collaboration and IM/workbench registration are separate. A temporary
-agent can join the bus without becoming a durable contact. Register coding
-sessions by Codex session id, not by thread display name:
-
-```sh
-cutex im register <session-id> --name aria-data --group aria example-project
-cutex im register-current --group aria example-project
-cutex im status-current
-cutex im groups add <session-id> shared-review
-cutex im unregister <session-id>
-cutex im unregister-current
-cutex im list
-```
-
-Inside patched `cute-codex`, `/im-reg [name]` calls
-`cutex im register-current` and `/im-unreg` calls
-`cutex im unregister-current`. These commands only update cutex IM metadata;
-they do not enter model context.
-
-The naming layers are intentionally separate:
-
-- `session_id` is the durable canonical key used by the backend and IM routing.
-- `thread_name` is the Codex/TUI thread title and can change through `/rename`
-  or the `thread_name.set` management action.
-- `display_name` is the IM/workbench contact name stored in the cutex registry.
-
-`unregister` only hides/unmanages the session from IM/workbench. It does not
-delete Codex history and does not stop a running process. Group changes update
-the persistent registration and, when the session is currently live on the bus,
-also patch the live agent groups.
-
-### Management API
-
-`cutex management serve` exposes a backend-facing localhost HTTP API for IM
-clients and workbench services. It is separate from the model-visible agent bus:
-registered sessions are durable contacts, while live bus agents are transient
-runtime processes.
-
-Start the API on a fixed Bridgeboard-friendly port:
-
-```sh
-cutex management serve --port 24270 --token '<management-token>'
-```
-
-For a trusted backend on Tailscale, bind only the host's Tailscale IP instead
-of all interfaces:
-
-```sh
-cutex management serve --bind <tailscale-ip> --port 24270 --token '<management-token>'
-```
-
-The service registers a `cutex-management-api` Bridgeboard handoff when
-Bridgeboard is available. `/` is an unauthenticated health check; `/v1/*`
-endpoints require `Authorization: Bearer <management-token>`. If no management
-token is provided, the current agent-bus token is reused.
-
-List IM-registered sessions merged with live presence:
-
-```http
-GET /v1/sessions
-Authorization: Bearer <management-token>
-```
-
-Records include `session_id`, `display_name`, optional `thread_name`, `host_id`,
-`host_label`, `cwd`, `project_label`, `profile`, `groups`, `visible`,
-`presence`, and `run_status`.
-`presence.runtime_agent_id` is set only when the registered session is currently
-online on the local/forwarded agent bus.
-
-Read or change the live Codex thread title through management actions:
-
-```http
-POST /v1/sessions/<session-id>/actions
-Authorization: Bearer <management-token>
-Content-Type: application/json
-
-{ "type": "thread_name.get", "payload": {} }
-```
-
-```http
-POST /v1/sessions/<session-id>/actions
-Authorization: Bearer <management-token>
-Content-Type: application/json
-
-{ "type": "thread_name.set", "payload": { "thread_name": "aria-ceo" } }
-```
-
-Thread-name observer events use `type=thread_name_updated` and
-`payload.client_visibility=metadata`; they are not chat messages.
-
-Send a user message to a session:
-
-```http
-POST /v1/sessions/<session-id>/messages
-Authorization: Bearer <management-token>
-Content-Type: application/json
-
-{
-  "sender_type": "user",
-  "text": "hello from Android",
-  "source": "waveline-android",
-  "external_message_id": "android-local-...",
-  "conversation_id": "aemeath-direct"
-}
-```
-
-Messages are queued to the live runtime with `delivery_mode=after_turn`. The
-response separates bus queueing from model receipt:
-
-```json
-{
-  "delivered": false,
-  "queued": true,
-  "received": false,
-  "session_id": "...",
-  "runtime_agent_id": "...",
-  "message_id": "...",
-  "visible_in_im": true,
-  "error": null
-}
-```
-
-Read safe session events with a cursor:
-
-```http
-GET /v1/sessions/<session-id>/events?after=<cursor>
-Authorization: Bearer <management-token>
-```
-
-The event stream merges management delivery summaries with mechanical
-cute-codex observer events. Events have stable monotonically sortable cursors so
-polling clients can pass the previous `next_cursor` and avoid duplicates.
-
-Event records include:
-
-- `event_id`
-- `cursor`
-- `session_id`
-- `type`: `message_received`, `message_injected`, `state_changed`,
-  `progress`, `tool_started`, `tool_progress`, `tool_finished`,
-  `command_started`, `command_finished`, `approval_requested`,
-  `approval_resolved`, `final_reply`, `error`, or `cancelled`
-- `run_status`: `idle`, `queued`, `running`, `waiting`, `blocked`,
-  `completed`, `failed`, `cancelled`, or `unknown`
-- `phase`, `title`, `summary`
-- `timestamp`
-- optional `message_id`
-- optional `final_reply`
-- optional `detail_if_safe`
-
-`cute-codex` observer events are mechanical runtime events and are not injected
-into model context. They are emitted from TUI-visible lifecycle points: message
-receipt, turn start/completion/failure/interruption, approval wait/resolution,
-safe tool and command lifecycle, context compaction/rate-limit UI changes, and
-visible final replies. Observer payloads deliberately exclude raw bus envelopes,
-tokens, provider secrets, prompts, unfiltered terminal output, tool arguments,
-environment dumps, file contents, and hidden reasoning.
-
-For a local diagnostic event without running cute-codex:
-
-```sh
-cutex management observer-test --session-id <session-id> --type progress --summary "observer smoke"
-```
-
-### Cross-Host Agent Messaging
-
-The agent bus is still a localhost-only HTTP service. To let agents on another
-machine join it, forward the remote bus over SSH instead of exposing the port
-directly.
-
-On the bus owner, for example `host-a`, choose a shared token and start or
-register the bus:
-
-```sh
-cutex global set --agent-bus-enable true --agent-bus-port 24260 --agent-bus-token '<shared-token>'
-cutex agent list
-bridgeboard handoff --id cutex-agent-bus --title "cutex agent bus" --port 24260 --owner-host host-a --pid-from-port --health-url http://127.0.0.1:24260/ --tunnel-mode local_forward --require-healthy
-```
-
-On the peer machine, for example host-b, create a local tunnel to the host-a
-bus. If Bridgeboard peer tunneling is configured, use the cutex wrapper:
-
-```sh
-cutex agent remote-up host-a --token '<shared-token>'
-```
-
-The wrapper runs `bridgeboard up --peer host-a --local-port 24660
-cutex-agent-bus`, then configures local cutex to use port `24660`. The explicit
-peer selector avoids local/remote id shadowing, and the separate local port
-avoids colliding with a local agent bus already listening on `24260`.
-
-Raw SSH works as a fallback. Keep the tunnel process running in another
-terminal and use a free local `24xxx` port if `24260` is already in use:
-
-```sh
-ssh -N -L 24660:127.0.0.1:24260 host-a
-cutex global set --agent-bus-enable true --agent-bus-port 24660 --agent-bus-token '<shared-token>'
-cutex run <profile> --agent
-```
-
-The peer agent will register through the tunnel into the owner bus. From either
-side, use the normal commands:
-
-```sh
-cutex agent list
-cutex agent send <agent-name-or-id> "hello from another host"
-```
-
-The bus keeps using `last_seen` heartbeats for liveness, so remote Windows or
-Linux process ids are not interpreted as local host-a process ids.
-
-## Profiles
-
-Profiles are stored under `~/.cutex/profiles/<profile-id>/`. Each profile can
-have its own auth file, config file, runtime, proxy behavior, display metadata,
-status line, and default CLI arguments.
-
-Common commands:
-
-```sh
-cutex profile edit
-cutex profile edit <profile>
+cutex profile list
+cutex profile show [<profile>]
+cutex profile edit [<profile>]
 cutex profile use <profile>
-cutex profile set <profile> --default-cli-args='--sandbox danger-full-access'
-cutex profile set <profile> --clear-default-cli-args
-cutex profile set <profile> --host
-cutex profile set <profile> --docker-image <image> --docker-user-name <name>
-```
-
-Copy a profile and optionally change its provider:
-
-```sh
 cutex profile copy <profile> --name <new-name>
-cutex profile copy <profile> --name <new-name> --provider <provider>
-cutex profile copy <profile> --name <new-name> --provider-base-url <url>
+cutex profile set <profile> --host
+cutex profile set <profile> --default-cli-args='--sandbox workspace-write'
 ```
 
-## Global Settings
+`cutex run <profile>` selects a profile for one invocation. It does not rewrite
+the active profile. A durable session may also store a profile for future
+managed launches, while `session online --profile <profile>` and
+`session foreground --profile <profile>` apply a one-launch override.
 
-Show or edit global settings:
+Global settings are available through both CLI and TUI:
 
 ```sh
 cutex global show
 cutex global edit
+cutex global set --default-profile <profile>
+cutex global set --default-profile-direct-launch true
 ```
 
-Useful non-interactive settings:
+`cutex config` remains an alias for `cutex wizard`.
+
+## Managed runtime and Management v2
+
+Managed launches normally ensure that the local Management service is
+available. To run it explicitly in the foreground:
 
 ```sh
-cutex global set --session-enable false
-cutex global set --docker-use-sudo false
-cutex global set --proxy-url <url>
-cutex global set --proxy-clear
-cutex global set --notify-idle-timeout <seconds>
-cutex global set --notify-composer-idle-timeout <seconds>
-cutex global set --notify-approval-timeout <seconds>
-cutex global set --notify-events <csv>
-cutex global set --rate-limit-threshold-warning-mode off|daily|always
-cutex global set --rate-limit-model-nudge-mode off|daily|always
+cutex management serve --port 24270
 ```
 
-Some sensitive values, including external notification service URL/token, are
-edited through the interactive global wizard rather than documented as command
-line examples.
+The service binds to loopback by default, ensures the Agent Bus is available,
+and adopts valid persisted app-server runtimes on startup. The unauthenticated
+health check is `GET /`; Management resources and actions use `/v2/*` and a
+bearer credential when configured.
 
-## Desktop Notifications
+Management v2 exposes durable session projections, per-session bootstrap and
+event state, lifecycle/settings mutations, user input, safe native app-server
+request forwarding, host events, Task Service project views, Agent Management,
+seat administration, and Release rotation routes. Clients should follow the
+current versioned contracts rather than assume an older `/v1` payload.
 
-`cutex` can run a shared local bridge that receives `cute-codex` notification
-payloads and forwards them to the native Linux desktop notification system.
-This is separate from any external notification service.
+For a trusted cross-host deployment, bind only an explicitly selected private
+interface and use a dedicated token:
+
+```sh
+cutex management serve --bind <private-ip> --port 24270 --token '<token>'
+```
+
+Bridgeboard can create a local forward to another runtime host:
+
+```sh
+cutex management remote-up <host>
+```
+
+Do not expose the Management or Agent Bus ports directly to an untrusted
+network. Privileged administration requires a dedicated Management root token;
+it must be distinct from the Agent Bus token. Secrets should be stored in the
+private config, not embedded in shell history or committed request documents.
+
+## Agent collaboration
+
+Agent collaboration is opt-in for ordinary direct launches:
+
+```sh
+cutex --agent
+cutex run <profile> --agent --group <group>
+```
+
+Without `--agent`, a direct launch does not expose Cutex Agent Bus tools to the
+model. With collaboration enabled, agents can discover and message permitted
+peers through the CLI or the native `cutex_agent_list` and `cutex_agent_send`
+tools supplied by compatible `cute-codex` builds.
+
+```sh
+cutex agent list
+cutex agent send <agent-id-or-name> "please report status"
+cutex agent send <agent-id-or-name> "FYI only" --queue-only
+cutex agent send <agent-id-or-name> "please check now" --soon
+```
+
+Normal delivery is `after_turn`; `--soon` requests prompt handling and
+`--queue-only` is passive. Explicit interruption is available but is not the
+default delivery mode. Durable session identity, mutable thread name, and
+workbench display name are separate naming layers.
+
+Cross-host discovery uses Bridgeboard-backed host queries. The legacy
+`cutex agent remote-up` bus-forwarding command remains available, but new
+control-plane integrations should prefer the Management host connection.
+
+## Agent Management
+
+Agent Management is a project-scoped, authenticated lifecycle service for
+durable Cutex agents. It supports create, query, online, offline, restart,
+close, replace, and Director rotation operations:
+
+```sh
+cutex agent manage query-managed --request-file <private-json-file>
+cutex agent manage create --request-file <private-json-file>
+```
+
+The caller's current durable session and authenticated live runtime determine
+authority. Collaboration groups, cwd labels, request prose, and model-supplied
+identity fields do not grant project authority. A caller authorized for more
+than one project must provide an explicit project selector.
+
+Requests use the strict `cutex/agent-management/v1` document contract and a
+stable `action_id`. Exact replay is idempotent; changed-payload reuse conflicts.
+Administrative project-authority repair and legacy ownership import are
+separate root-only Management commands, not general Agent operations.
+
+See [docs/agent-management-provider.md](docs/agent-management-provider.md) for
+the provider boundary, authority rules, and recovery behavior.
+
+## Task Service
+
+Task Service is the durable coordination layer used for project assignments.
+It records task and attempt revisions, authenticated assignment delivery,
+idempotent action receipts, Worker progress and terminal outcomes, logical-seat
+occupancy, and watchdog reminders without treating chat text as authority.
+
+Compatible agent runtimes expose the typed `cutex_task_service` tool. The CLI
+transport for a strict local action or query is:
+
+```sh
+cutex agent task-action --request-file <private-json-file>
+```
+
+Seat binding/query and other owner-only operations are deliberately separate
+Management commands:
+
+```sh
+cutex management seat query
+cutex management seat bind --help
+```
+
+Task Service state is authoritative and durable; Agent Bus delivery and TUI
+presentation are transport/projection layers. Retrying an action therefore
+reuses its stable action identity instead of inventing a second semantic
+operation.
+
+## Usage reporting
+
+```sh
+cutex usage
+cutex usage --last 7d --period day --group-by agent
+cutex usage --period reset --reset-window primary
+cutex usage --group-by model --json
+```
+
+The local ledger contains identifiers, timestamps, attribution labels, token
+counts, and derived pricing coverage. It does not store prompts, responses,
+credentials, or hidden reasoning. API-equivalent cost values are estimates;
+unknown providers/models remain explicitly unpriced.
+
+## Optional integrations
+
+Docker profiles preserve a stable project path while selecting a container
+runtime:
+
+```sh
+cutex profile set <profile> --docker-image <image> --docker-user-name <name>
+cutex run <profile>
+cutex run <profile> --host  # one-launch host override
+```
+
+See [docs/docker-image-notes.md](docs/docker-image-notes.md) for image and
+environment requirements.
+
+On Linux desktops, the optional native notification bridge can be enabled with:
 
 ```sh
 cutex notify desktop enable --port 24250
@@ -424,74 +390,34 @@ cutex notify desktop status
 cutex notify desktop test "cutex desktop test"
 ```
 
-For Ubuntu/Kubuntu systemd user service installation:
+Ubuntu/Kubuntu user-service installation is available through
+`cutex notify desktop install-ubuntu`. Desktop notification support is separate
+from any external notification endpoint.
 
-```sh
-cutex notify desktop install-ubuntu --port 24250
-systemctl --user status cutex-desktop-notify.service
-```
+## Local data and security
 
-Disable desktop notification injection:
+Primary state lives under `~/.cutex/`:
 
-```sh
-cutex notify desktop disable
-```
+- `accounts.json`: lightweight profile index and display metadata;
+- `config.json`: global settings and shared status-line catalog;
+- `profiles/<profile-id>/auth.json`: private profile authentication;
+- `profiles/<profile-id>/config.toml`: private profile Codex configuration;
+- `cutex-sessions.json`: durable session records;
+- `codex-home/`: aggregate host-side Codex home and native session index;
+- `runtime/`: local runtime endpoints, projections, journals, and service logs.
 
-Remove the systemd user service:
-
-```sh
-cutex notify desktop uninstall-ubuntu
-```
-
-Ports must be in the Bridgeboard `24xxx` range. The default is `24250`.
-
-## Docker Runtime
-
-Profiles can launch inside Docker while keeping the current project path stable:
-
-```sh
-cutex profile set <profile> --docker-image <image> --docker-user-name <name>
-cutex run <profile>
-```
-
-Force a Docker-configured profile onto the host for one invocation:
-
-```sh
-cutex run <profile> --host
-cutex --host
-```
-
-See `docs/docker-image-notes.md` for image requirements and environment details.
-
-## Configuration Files
-
-Primary files:
-
-- `~/.cutex/accounts.json`: profile index and metadata.
-- `~/.cutex/config.json`: global settings and shared status-line catalog.
-- `~/.cutex/profiles/<profile-id>/auth.json`: per-profile Codex auth.
-- `~/.cutex/profiles/<profile-id>/config.toml`: per-profile Codex config.
-
-These files may contain credentials or account metadata. Do not publish them.
+These files can contain credentials, account metadata, private project paths,
+session identifiers, and operational records. Do not publish the directory or
+copy it into a release tree. Cutex state is distinct from the user's default
+`~/.codex` home unless a launch is intentionally configured otherwise.
 
 ## Development
 
-Run tests:
-
 ```sh
-cargo test -- --test-threads=1
+cargo fmt --check
+cargo test --locked -- --test-threads=1
+cargo clippy --all-targets --locked
+cargo build --release --locked
 ```
 
-Format:
-
-```sh
-cargo fmt
-```
-
-Build:
-
-```sh
-cargo build --release
-```
-
-More command details are in `docs/commands.md`.
+Additional command notes and implementation contracts are under [`docs/`](docs/).

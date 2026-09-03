@@ -79,7 +79,7 @@ fn session_expose_command_parses_groups() {
         "aria-data",
         "--group",
         "aria",
-        "example-project",
+        "scgpt",
     ])
     .expect("session expose should parse");
     assert!(matches!(
@@ -92,7 +92,7 @@ fn session_expose_command_parses_groups() {
             }
         }) if id == "019e-session"
             && name == "aria-data"
-            && groups == vec!["aria".to_string(), "example-project".to_string()]
+            && groups == vec!["aria".to_string(), "scgpt".to_string()]
     ));
 }
 
@@ -207,7 +207,7 @@ fn session_cwd_commands_parse() {
         "cwd",
         "set",
         "019e-session",
-        "~/Projects/example-project",
+        "~/Projects/scgpt",
     ])
     .expect("session cwd set should parse");
     assert!(matches!(
@@ -216,7 +216,7 @@ fn session_cwd_commands_parse() {
             command: SessionCommand::Cwd {
                 command: SessionCwdCommand::Set { id, path }
             }
-        }) if id == "019e-session" && path == "~/Projects/example-project"
+        }) if id == "019e-session" && path == "~/Projects/scgpt"
     ));
 
     let current = Cli::try_parse_from(["cutex", "session", "cwd", "current", "019e-session"])
@@ -361,7 +361,7 @@ fn session_list_filter_commands_parse() {
         "--group",
         "aria",
         "--project",
-        "example-project",
+        "scgpt",
         "--sort",
         "recent",
     ])
@@ -381,7 +381,7 @@ fn session_list_filter_commands_parse() {
                         },
                 }
         }) if groups == vec!["aria".to_string()]
-            && projects == vec!["example-project".to_string()]
+            && projects == vec!["scgpt".to_string()]
     ));
 
     let wizard = Cli::try_parse_from([

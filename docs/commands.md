@@ -113,7 +113,7 @@ Runtime behavior:
 - `cutex` now launches the selected CLI directly. It no longer wraps launches in `tmux` or `zellij`.
 - plain interactive launches can be wrapped in `cute-alden` when managed sessions are enabled so `cute-codex` can be detached and reattached
 - plain `cutex` can launch directly into the configured fallback profile when `default-profile-direct-launch` is enabled
-- Selection order is `CUTEX_CODEX_BIN` / `CODEZ_CODEX_BIN`, then `cute-codex`, then `cutex-codex`, then `codex`.
+- Selection order is `CUTEX_CODEX_BIN`, then `cute-codex`, then `cutex-codex`, then `codex`.
 - `cutex` prints `CLI binary: ...` before each launch so fallback is obvious.
 - `cutex` also prints a launch summary (`profile/runtime/proxy/session/agent/provider/api/tool_proxy`) before starting the selected CLI.
 - `cutex run <profile>` starts that profile for this invocation only. It does not change the active profile and does not rewrite the shared active `CODEX_HOME/auth.json` or `config.toml`; use `cutex profile use <profile>` when you intentionally want to switch the active/default profile.
@@ -240,6 +240,6 @@ Status-line customization:
 
 Compatibility:
 
-- The old environment variable names `CODEZ_CODEX_BIN` and `CODEZ_DOCKER_USE_SUDO` are still accepted.
+- The legacy environment variable `CODEZ_DOCKER_USE_SUDO` is still accepted.
 - `cutex config` is a convenience alias for `cutex wizard`.
 - Hidden legacy CLI commands remain accepted for old shell habits, but they are not the preferred command surface.

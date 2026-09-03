@@ -2009,7 +2009,7 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex.settings".to_string(),
             Some("019e-settings".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/original".to_string(),
             Some("aemeath".to_string()),
             "2026-08-05T00:00:00Z".to_string(),
@@ -2058,7 +2058,7 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex.management".to_string(),
             Some("019e-management".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp".to_string(),
             None,
             "2026-08-06T00:00:00Z".to_string(),
@@ -2102,7 +2102,7 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex.draft".to_string(),
             Some("019e-draft".to_string()),
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/draft".to_string(),
             None,
             "2026-08-05T00:00:00Z".to_string(),
@@ -2204,7 +2204,7 @@ mod tests {
         let record = CutexSessionRecord::new_at(
             "cutex.choices".to_string(),
             None,
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp".to_string(),
             None,
             "2026-08-05T00:00:00Z".to_string(),
@@ -2249,7 +2249,7 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex.launch.draft".to_string(),
             None,
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/original".to_string(),
             None,
             "2026-08-06T00:00:00Z".to_string(),
@@ -2280,7 +2280,7 @@ mod tests {
             .stage(
                 &snapshot,
                 SessionSettingsField::ManagedCwd,
-                Some(r"  D:\Projects\example-project  ".to_string()),
+                Some(r"  E:\Projects (Aemeath)\waveline-backend  ".to_string()),
             )
             .expect("stage Windows cwd");
         draft
@@ -2295,11 +2295,11 @@ mod tests {
         assert_eq!(draft.agent_name(), Some("renamed agent"));
         assert_eq!(
             draft.value(&snapshot, SessionSettingsField::ManagedCwd),
-            Some(r"D:\Projects\example-project")
+            Some(r"E:\Projects (Aemeath)\waveline-backend")
         );
         assert_eq!(
             draft.effective_working_directory(&snapshot),
-            r"D:\Projects\example-project"
+            r"E:\Projects (Aemeath)\waveline-backend"
         );
         assert_eq!(
             draft.value(&snapshot, SessionSettingsField::ExtraCliArgs),
@@ -2312,7 +2312,7 @@ mod tests {
         );
         assert_eq!(
             patch.managed_cwd,
-            CutexSessionValueUpdate::Set(r"D:\Projects\example-project".to_string())
+            CutexSessionValueUpdate::Set(r"E:\Projects (Aemeath)\waveline-backend".to_string())
         );
         assert_eq!(
             patch.default_cli_args,
@@ -2330,7 +2330,7 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex.launch.validation".to_string(),
             None,
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp/original".to_string(),
             None,
             "2026-08-06T00:00:00Z".to_string(),
@@ -2394,7 +2394,7 @@ mod tests {
         let mut local = CutexSessionRecord::new_at(
             "cutex.routing.local".to_string(),
             None,
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp".to_string(),
             None,
             "2026-08-06T00:00:00Z".to_string(),
@@ -2447,7 +2447,7 @@ mod tests {
         let mut record = CutexSessionRecord::new_at(
             "cutex.routing.draft".to_string(),
             None,
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp".to_string(),
             None,
             "2026-08-06T00:00:00Z".to_string(),
@@ -2512,7 +2512,7 @@ mod tests {
         let record = CutexSessionRecord::new_at(
             "cutex.profile".to_string(),
             None,
-            "host-a".to_string(),
+            "tethys".to_string(),
             "/tmp".to_string(),
             Some("alpha".to_string()),
             "2026-08-05T00:00:00Z".to_string(),

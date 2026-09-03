@@ -1853,7 +1853,7 @@ mod tests {
     fn pending(session: &str, value: usize) -> PendingEvent {
         PendingEvent {
             cutex_session_id: session.to_string(),
-            host_id: "host-a".to_string(),
+            host_id: "tethys".to_string(),
             source: EventSource::Cutex,
             schema: None,
             correlation: EventCorrelation::default(),
@@ -1929,7 +1929,7 @@ mod tests {
     #[test]
     fn append_replay_and_zero_match_scans_are_monotonic() {
         let root = test_root("replay");
-        let repository = EventRepository::open(&root, "host-a").expect("open repository");
+        let repository = EventRepository::open(&root, "tethys").expect("open repository");
         for value in 0..5 {
             repository
                 .append(pending("cutex.session-a", value))
@@ -1965,7 +1965,7 @@ mod tests {
         let root = test_root("bounded-page-equivalence");
         let repository = EventRepository::open_with_options(
             &root,
-            "host-a",
+            "tethys",
             RepositoryOptions {
                 rotate_bytes: 1_400,
                 retained_files: 3,
@@ -2019,7 +2019,7 @@ mod tests {
     #[test]
     fn bounded_page_discards_a_stale_cursor_location_and_rebuilds() {
         let root = test_root("bounded-page-stale-index");
-        let repository = EventRepository::open(&root, "host-a").expect("open repository");
+        let repository = EventRepository::open(&root, "tethys").expect("open repository");
         for value in 0..5 {
             repository
                 .append(pending("cutex.session-a", value))
@@ -2058,7 +2058,7 @@ mod tests {
     #[test]
     fn bounded_page_discards_a_plausible_wrong_cursor_location_and_rebuilds() {
         let root = test_root("bounded-page-wrong-index");
-        let repository = EventRepository::open(&root, "host-a").expect("open repository");
+        let repository = EventRepository::open(&root, "tethys").expect("open repository");
         for value in 0..5 {
             repository
                 .append(pending("cutex.session-a", value))
@@ -2102,9 +2102,9 @@ mod tests {
             rotate_bytes: 1_400,
             retained_files: 3,
         };
-        let reader = EventRepository::open_with_options(&root, "host-a", options)
+        let reader = EventRepository::open_with_options(&root, "tethys", options)
             .expect("open reader repository");
-        let writer = EventRepository::open_with_options(&root, "host-a", options)
+        let writer = EventRepository::open_with_options(&root, "tethys", options)
             .expect("open writer repository");
         for value in 0..6 {
             writer
@@ -2163,7 +2163,7 @@ mod tests {
         let root = test_root("metadata-rotation");
         let repository = EventRepository::open_with_options(
             &root,
-            "host-a",
+            "tethys",
             RepositoryOptions {
                 rotate_bytes: 700,
                 retained_files: 2,
@@ -2213,9 +2213,9 @@ mod tests {
             rotate_bytes: 700,
             retained_files: 2,
         };
-        let reader = EventRepository::open_with_options(&root, "host-a", options)
+        let reader = EventRepository::open_with_options(&root, "tethys", options)
             .expect("open reader repository");
-        let writer = EventRepository::open_with_options(&root, "host-a", options)
+        let writer = EventRepository::open_with_options(&root, "tethys", options)
             .expect("open writer repository");
 
         let mut latest = None;
@@ -2247,7 +2247,7 @@ mod tests {
     #[test]
     fn metadata_recovers_stale_state_before_returning_a_checkpoint() {
         let root = test_root("metadata-stale-state");
-        let repository = EventRepository::open(&root, "host-a").expect("open repository");
+        let repository = EventRepository::open(&root, "tethys").expect("open repository");
         let latest = repository
             .append(pending("cutex.session-a", 1))
             .expect("append event");
@@ -2278,7 +2278,7 @@ mod tests {
     #[test]
     fn metadata_detects_a_partial_current_tail_immediately() {
         let root = test_root("metadata-partial-tail");
-        let repository = EventRepository::open(&root, "host-a").expect("open repository");
+        let repository = EventRepository::open(&root, "tethys").expect("open repository");
         let previous = repository
             .append(pending("cutex.session-a", 1))
             .expect("append event");
@@ -2308,7 +2308,7 @@ mod tests {
     #[test]
     fn old_middle_corruption_is_repaired_when_full_replay_reaches_it() {
         let root = test_root("metadata-middle-corruption");
-        let repository = EventRepository::open(&root, "host-a").expect("open repository");
+        let repository = EventRepository::open(&root, "tethys").expect("open repository");
         for value in 0..5 {
             repository
                 .append(pending("cutex.session-a", value))
@@ -2346,12 +2346,12 @@ mod tests {
     #[test]
     fn lost_state_write_recovers_from_committed_tail_without_duplicate_sequence() {
         let root = test_root("recover-state");
-        let repository = EventRepository::open(&root, "host-a").expect("open repository");
+        let repository = EventRepository::open(&root, "tethys").expect("open repository");
         let first = repository
             .append(pending("cutex.session-a", 1))
             .expect("append first event");
         fs::remove_file(root.join(STATE_FILE_NAME)).expect("remove state");
-        let reopened = EventRepository::open(&root, "host-a").expect("reopen repository");
+        let reopened = EventRepository::open(&root, "tethys").expect("reopen repository");
         let second = reopened
             .append(pending("cutex.session-a", 2))
             .expect("append second event");
@@ -2364,9 +2364,9 @@ mod tests {
     fn separate_repository_instances_observe_the_latest_committed_tail() {
         let root = test_root("separate-instances");
         let first_repository =
-            EventRepository::open(&root, "host-a").expect("open first repository");
+            EventRepository::open(&root, "tethys").expect("open first repository");
         let second_repository =
-            EventRepository::open(&root, "host-a").expect("open second repository");
+            EventRepository::open(&root, "tethys").expect("open second repository");
 
         let first = first_repository
             .append(pending("cutex.session-a", 1))
@@ -2387,7 +2387,7 @@ mod tests {
     #[test]
     fn stale_state_falls_back_to_full_tail_recovery_before_append() {
         let root = test_root("stale-state-append");
-        let repository = EventRepository::open(&root, "host-a").expect("open repository");
+        let repository = EventRepository::open(&root, "tethys").expect("open repository");
         let first = repository
             .append(pending("cutex.session-a", 1))
             .expect("append first event");
@@ -2414,7 +2414,7 @@ mod tests {
     #[test]
     fn partial_tail_during_append_uses_the_existing_stream_reset_path() {
         let root = test_root("partial-tail-append");
-        let repository = EventRepository::open(&root, "host-a").expect("open repository");
+        let repository = EventRepository::open(&root, "tethys").expect("open repository");
         let first = repository
             .append(pending("cutex.session-a", 1))
             .expect("append first event");
@@ -2446,7 +2446,7 @@ mod tests {
     #[test]
     fn partial_tail_rotates_to_a_new_stream_and_reports_reset() {
         let root = test_root("partial-tail");
-        let repository = EventRepository::open(&root, "host-a").expect("open repository");
+        let repository = EventRepository::open(&root, "tethys").expect("open repository");
         let first = repository
             .append(pending("cutex.session-a", 1))
             .expect("append first event");
@@ -2457,7 +2457,7 @@ mod tests {
         file.write_all(b"{\"partial\":true}")
             .expect("write partial tail");
         file.sync_all().expect("sync partial tail");
-        let reopened = EventRepository::open(&root, "host-a").expect("reopen repository");
+        let reopened = EventRepository::open(&root, "tethys").expect("reopen repository");
         let reset = reopened
             .recovery_reset()
             .expect("read reset")
@@ -2496,7 +2496,7 @@ mod tests {
     #[test]
     fn pending_reset_survives_reopen_until_all_active_sessions_are_materialized() {
         let root = test_root("pending-reset-reopen");
-        let repository = EventRepository::open(&root, "host-a").expect("open repository");
+        let repository = EventRepository::open(&root, "tethys").expect("open repository");
         repository
             .append(pending("cutex.session-a", 1))
             .expect("append prior event");
@@ -2508,14 +2508,14 @@ mod tests {
             .expect("write partial tail");
         file.sync_all().expect("sync partial tail");
 
-        let recovered = EventRepository::open(&root, "host-a").expect("recover repository");
+        let recovered = EventRepository::open(&root, "tethys").expect("recover repository");
         let event_a = recovered
             .append(pending("cutex.session-a", 2))
             .expect("append session a after reset");
         assert_eq!(event_a.sequence, 2);
         drop(recovered);
 
-        let reopened = EventRepository::open(&root, "host-a").expect("reopen reset stream");
+        let reopened = EventRepository::open(&root, "tethys").expect("reopen reset stream");
         let reset_events = reopened
             .materialize_recovery_reset(
                 &["cutex.session-a".to_string(), "cutex.session-b".to_string()],
@@ -2558,7 +2558,7 @@ mod tests {
         let repository = Arc::new(
             EventRepository::open_with_options(
                 &root,
-                "host-a",
+                "tethys",
                 RepositoryOptions {
                     rotate_bytes: 1024 * 1024,
                     retained_files: 3,
@@ -2603,7 +2603,7 @@ mod tests {
         let root = test_root("rotation");
         let repository = EventRepository::open_with_options(
             &root,
-            "host-a",
+            "tethys",
             RepositoryOptions {
                 rotate_bytes: 700,
                 retained_files: 1,
@@ -2666,7 +2666,7 @@ mod tests {
     #[test]
     fn page_and_subscription_have_no_local_replay_live_gap() {
         let root = test_root("subscription");
-        let repository = EventRepository::open(&root, "host-a").expect("open repository");
+        let repository = EventRepository::open(&root, "tethys").expect("open repository");
         repository
             .append(pending("cutex.session-a", 1))
             .expect("append replay event");
@@ -2695,8 +2695,8 @@ mod tests {
     #[test]
     fn external_append_requires_replay_for_an_existing_subscription() {
         let root = test_root("external-subscription-replay");
-        let reader = EventRepository::open(&root, "host-a").expect("open reader repository");
-        let writer = EventRepository::open(&root, "host-a").expect("open writer repository");
+        let reader = EventRepository::open(&root, "tethys").expect("open reader repository");
+        let writer = EventRepository::open(&root, "tethys").expect("open writer repository");
         reader
             .append(pending("cutex.session-a", 1))
             .expect("append replay event");
@@ -2735,12 +2735,12 @@ mod tests {
     #[test]
     fn corrupt_state_rotates_instead_of_guessing_continuity() {
         let root = test_root("corrupt-state");
-        let repository = EventRepository::open(&root, "host-a").expect("open repository");
+        let repository = EventRepository::open(&root, "tethys").expect("open repository");
         let first = repository
             .append(pending("cutex.session-a", 1))
             .expect("append first event");
         fs::write(root.join(STATE_FILE_NAME), b"{not-json\n").expect("corrupt state");
-        let reopened = EventRepository::open(&root, "host-a").expect("reopen repository");
+        let reopened = EventRepository::open(&root, "tethys").expect("reopen repository");
         let reset = reopened
             .recovery_reset()
             .expect("read reset")
@@ -2759,7 +2759,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let root = test_root("permissions");
-        let repository = EventRepository::open(&root, "host-a").expect("open repository");
+        let repository = EventRepository::open(&root, "tethys").expect("open repository");
         repository
             .append(pending("cutex.session-a", 1))
             .expect("append event");

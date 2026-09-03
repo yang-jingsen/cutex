@@ -667,7 +667,7 @@ mod tests {
     fn credential(project_ids: Vec<ProjectId>) -> OwnerTaskReadCredential {
         OwnerTaskReadCredential {
             principal_id: "owner-reader".to_string(),
-            audience: "host-a-backend".to_string(),
+            audience: "tethys-backend".to_string(),
             token: OwnerTaskReadToken::new("owner-reader-token-0123456789"),
             project_ids,
             expires_at: Some("2099-01-01T00:00:00Z".to_string()),
