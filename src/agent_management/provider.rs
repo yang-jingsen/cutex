@@ -338,6 +338,7 @@ impl AgentManagementProvider {
         let _execution = provider_execution_lock()
             .lock()
             .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
+        let _mutation = self.store.lock_mutations()?;
         if request.expected_authority_epoch == Some(0)
             || request.expected_authorized_director_session.is_some()
                 != request.expected_authority_epoch.is_some()
@@ -351,6 +352,9 @@ impl AgentManagementProvider {
             if state.actions.contains_key(&request.action_id)
                 || state
                     .legacy_director_ownership_import_receipts
+                    .contains_key(&request.action_id)
+                || state
+                    .reservation_reconciliation_receipts
                     .contains_key(&request.action_id)
             {
                 return Err(AgentManagementError::Conflict("action_id_domain_conflict"));
@@ -391,6 +395,15 @@ impl AgentManagementProvider {
                 authority_epoch: epoch,
                 updated_at: now(),
             };
+            if state
+                .operator_grants
+                .get(&request.project_id)
+                .is_some_and(|grants| grants.contains_key(&request.authorized_director_session))
+            {
+                return Err(AgentManagementError::Conflict(
+                    "primary_director_cannot_be_operator",
+                ));
+            }
             let receipt = ProjectAuthorityReceipt {
                 schema: AgentManagementReceiptSchema::V1,
                 action_id: request.action_id.clone(),
@@ -419,6 +432,7 @@ impl AgentManagementProvider {
         let _execution = provider_execution_lock()
             .lock()
             .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
+        let _mutation = self.store.lock_mutations()?;
         if request.expected_authority_epoch == 0
             || request.expected_authority_epoch > crate::role_revision::MAX_JSON_SAFE_INTEGER
         {
@@ -435,6 +449,9 @@ impl AgentManagementProvider {
         self.store.with_state(true, |mut state| {
             if state.actions.contains_key(&request.action_id)
                 || state.authority_receipts.contains_key(&request.action_id)
+                || state
+                    .reservation_reconciliation_receipts
+                    .contains_key(&request.action_id)
             {
                 return Err(AgentManagementError::Conflict("action_id_domain_conflict"));
             }
@@ -513,6 +530,7 @@ impl AgentManagementProvider {
             let agent = ManagedAgentRecord {
                 project_id: request.project_id.clone(),
                 created_by_director_session: request.director_cutex_session_id.clone(),
+                created_by_operator_session: None,
                 cutex_session_id: request.director_cutex_session_id.clone(),
                 native_session_id: evidence.native_session_id,
                 spec: evidence.spec,
@@ -538,6 +556,195 @@ impl AgentManagementProvider {
         })
     }
 
+    /// Root-only recovery for one legacy reservation whose immutable failure
+    /// and every provider-owned successor source prove that no effect occurred.
+    /// The evidence callback is invoked while both the provider execution lock
+    /// and durable store lock are held.
+    pub fn reconcile_agent_reservation<F>(
+        &self,
+        request: &AgentReservationReconciliationRequest,
+        reconcile: F,
+    ) -> Result<(AgentReservationReconciliationReceipt, bool), AgentManagementError>
+    where
+        F: FnOnce(
+            &str,
+            &str,
+            &crate::role_revision::Rfc3339,
+            &crate::role_revision::Rfc3339,
+        ) -> AgentReservationReconciliationEvidence,
+    {
+        let _execution = provider_execution_lock()
+            .lock()
+            .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
+        validate_reservation_reconciliation_request(request)?;
+        let digest = request_sha256(request)?;
+        let (receipt, replayed, phase_event) =
+            self.store.with_state(true, |mut state| {
+                if state.actions.contains_key(&request.action_id)
+                    || state.authority_receipts.contains_key(&request.action_id)
+                    || state
+                        .legacy_director_ownership_import_receipts
+                        .contains_key(&request.action_id)
+                {
+                    return Err(AgentManagementError::Conflict("action_id_domain_conflict"));
+                }
+                if let Some(receipt) = state
+                    .reservation_reconciliation_receipts
+                    .get(&request.action_id)
+                    .cloned()
+                {
+                    return if receipt.request_sha256 == digest {
+                        Ok((state, (receipt, true, None), false))
+                    } else {
+                        Err(AgentManagementError::Conflict("action_id_payload_conflict"))
+                    };
+                }
+
+                let authority = state.projects.get(&request.project_id).ok_or(
+                    AgentManagementError::Conflict("project_authority_not_initialized"),
+                )?;
+                if authority.authorized_director_session
+                    != request.expected_authorized_director_session
+                    || authority.authority_epoch != request.expected_authority_epoch
+                {
+                    return Err(AgentManagementError::Conflict("stale_project_authority"));
+                }
+
+                let target = state
+                    .actions
+                    .get(&request.target_action_id)
+                    .cloned()
+                    .ok_or(AgentManagementError::NotFound("target_action_not_found"))?;
+                validate_reconciliation_target(&state, request, &target)?;
+                if state.agents.values().any(|agent| {
+                    agent.spec.name == request.expected_reserved_agent_name
+                        || agent.spec.cwd == request.expected_reserved_agent_cwd
+                }) {
+                    return Err(AgentManagementError::ReconciliationPresent(
+                    "a durable Agent Management ownership record matches the reserved name or cwd"
+                        .to_string(),
+                ));
+                }
+                let absence_evidence = match reconcile(
+                    &request.expected_reserved_agent_name,
+                    &request.expected_reserved_agent_cwd,
+                    &target.created_at,
+                    &target.updated_at,
+                ) {
+                    AgentReservationReconciliationEvidence::ProvenAbsent { reason } => reason,
+                    AgentReservationReconciliationEvidence::Present { reason } => {
+                        return Err(AgentManagementError::ReconciliationPresent(reason))
+                    }
+                    AgentReservationReconciliationEvidence::Ambiguous { reason } => {
+                        return Err(AgentManagementError::ReconciliationAmbiguous(reason))
+                    }
+                    AgentReservationReconciliationEvidence::Unavailable { reason } => {
+                        return Err(AgentManagementError::ReconciliationUnavailable(reason))
+                    }
+                };
+
+                let committed_at = now();
+                let target_response = no_write(
+                    &request.target_action_id,
+                    "reservation_reconciled_no_write",
+                    &format!(
+                        "root reconciliation {} proved the legacy pre-effect reservation absent",
+                        request.action_id
+                    ),
+                );
+                let target = state
+                    .actions
+                    .get_mut(&request.target_action_id)
+                    .ok_or(AgentManagementError::InvalidStore)?;
+                target.phase_sequence = target
+                    .phase_sequence
+                    .checked_add(1)
+                    .filter(|value| *value <= crate::role_revision::MAX_JSON_SAFE_INTEGER)
+                    .ok_or(AgentManagementError::Conflict("phase_sequence_overflow"))?;
+                target.phase = AgentActionPhase::NoWrite;
+                target.response = Some(target_response.clone());
+                target.updated_at = committed_at.clone();
+                let target = target.clone();
+
+                let phase_event_id = format!(
+                    "agent-management:{}:phase:{}",
+                    target.action_id, target.phase_sequence
+                );
+                let phase_event = AgentManagementPhaseEvent {
+                    event_id: phase_event_id.clone(),
+                    action_id: target.action_id.clone(),
+                    project_id: target.project_id.clone(),
+                    operation: target.operation,
+                    phase: AgentActionPhase::NoWrite,
+                    phase_sequence: target.phase_sequence,
+                    committed_at: committed_at.clone(),
+                    presentation_owner_cutex_session_id: target.caller_cutex_session.clone(),
+                    subject_cutex_session_id: None,
+                    subject_agent_name: target.reserved_agent_name.clone(),
+                    predecessor_cutex_session_id: None,
+                    successor_cutex_session_id: None,
+                    replace_policy: None,
+                    rotation_mode: None,
+                    authority_epoch: (target.operation == AgentOperationKind::DirectorRotate)
+                        .then_some(request.expected_authority_epoch),
+                };
+                if state
+                    .phase_events
+                    .insert(phase_event_id, phase_event.clone())
+                    .is_some()
+                {
+                    return Err(AgentManagementError::InvalidStore);
+                }
+
+                let reconciliation_event_id = format!(
+                    "agent-management:{}:reservation-reconciliation",
+                    request.action_id
+                );
+                let reconciliation_event = AgentReservationReconciliationEvent {
+                    event_id: reconciliation_event_id.clone(),
+                    action_id: request.action_id.clone(),
+                    request_sha256: digest.clone(),
+                    project_id: request.project_id.clone(),
+                    target_action_id: request.target_action_id.clone(),
+                    target_request_sha256: target.request_sha256.clone(),
+                    reserved_agent_name: request.expected_reserved_agent_name.clone(),
+                    reserved_agent_cwd: request.expected_reserved_agent_cwd.clone(),
+                    previous_phase: AgentActionPhase::OwnerActionRequired,
+                    terminal_phase: AgentActionPhase::NoWrite,
+                    absence_evidence,
+                    committed_at: committed_at.clone(),
+                };
+                if state
+                    .reservation_reconciliation_events
+                    .insert(reconciliation_event_id.clone(), reconciliation_event)
+                    .is_some()
+                {
+                    return Err(AgentManagementError::InvalidStore);
+                }
+                let receipt = AgentReservationReconciliationReceipt {
+                    schema: AgentReservationReconciliationReceiptSchema::V1,
+                    action_id: request.action_id.clone(),
+                    request_sha256: digest.clone(),
+                    project_id: request.project_id.clone(),
+                    target_action_id: request.target_action_id.clone(),
+                    target_request_sha256: target.request_sha256,
+                    reserved_agent_name: request.expected_reserved_agent_name.clone(),
+                    reserved_agent_cwd: request.expected_reserved_agent_cwd.clone(),
+                    reconciled_at: committed_at,
+                    reconciliation_event_id,
+                    target_response,
+                };
+                state
+                    .reservation_reconciliation_receipts
+                    .insert(request.action_id.clone(), receipt.clone());
+                Ok((state, (receipt, false, Some(phase_event)), true))
+            })?;
+        if let Some(event) = phase_event.as_ref() {
+            self.notify_phase(event);
+        }
+        Ok((receipt, replayed))
+    }
+
     pub fn execute(
         &self,
         invocation: &AgentManagementInvocation,
@@ -553,6 +760,10 @@ impl AgentManagementProvider {
                     "Agent Management execution lock is unavailable",
                 )
             }
+        };
+        let _mutation = match self.store.lock_mutations() {
+            Ok(mutation) => mutation,
+            Err(error) => return error_response(&request.action_id, error),
         };
         if let Err(error) = request.validate() {
             return error_response(&request.action_id, error);
@@ -756,16 +967,28 @@ impl AgentManagementProvider {
                 || legacy_ambiguous_sid_recovery_candidate(existing)
                 || legacy_offline_revision_conflict_candidate(existing)
             {
-                let authority = snapshot
-                    .projects
-                    .get(&existing.project_id)
-                    .ok_or(AgentManagementError::NotAuthorizedDirector)?;
-                if authority.authorized_director_session != invocation.caller_cutex_session {
-                    return Err(AgentManagementError::NotAuthorizedDirector);
-                }
+                let role = authorize_operation(
+                    &snapshot,
+                    &invocation.caller_cutex_session,
+                    &existing.project_id,
+                    &request.operation,
+                )
+                .map_err(|error| {
+                    if error == AgentManagementError::ProjectNotAuthorized {
+                        AgentManagementError::NotAuthorizedDirector
+                    } else {
+                        error
+                    }
+                })?;
+                return Ok(AuthorizedAgentManagementRequest {
+                    project_id: existing.project_id.clone(),
+                    role,
+                    request,
+                });
             }
             return Ok(AuthorizedAgentManagementRequest {
                 project_id: existing.project_id.clone(),
+                role: AgentManagementRole::ReceiptReplay,
                 request,
             });
         }
@@ -773,7 +996,12 @@ impl AgentManagementProvider {
             .projects
             .values()
             .filter(|authority| {
-                authority.authorized_director_session == invocation.caller_cutex_session
+                project_management_role(
+                    &snapshot,
+                    &invocation.caller_cutex_session,
+                    &authority.project_id,
+                )
+                .is_ok()
             })
             .map(|authority| authority.project_id.clone())
             .collect::<Vec<_>>();
@@ -790,6 +1018,12 @@ impl AgentManagementProvider {
             },
         };
         Ok(AuthorizedAgentManagementRequest {
+            role: authorize_operation(
+                &snapshot,
+                &invocation.caller_cutex_session,
+                &project_id,
+                &request.operation,
+            )?,
             project_id,
             request,
         })
@@ -807,6 +1041,9 @@ impl AgentManagementProvider {
                 if state.authority_receipts.contains_key(&request.action_id)
                     || state
                         .legacy_director_ownership_import_receipts
+                        .contains_key(&request.action_id)
+                    || state
+                        .reservation_reconciliation_receipts
                         .contains_key(&request.action_id)
                 {
                     return Err(AgentManagementError::Conflict("action_id_domain_conflict"));
@@ -891,8 +1128,40 @@ impl AgentManagementProvider {
                     .projects
                     .get(&request.project_id)
                     .ok_or(AgentManagementError::Unauthorized)?;
-                if authority.authorized_director_session != invocation.caller_cutex_session {
+                let role = authorize_operation(
+                    &state,
+                    &invocation.caller_cutex_session,
+                    &request.project_id,
+                    &request.operation,
+                )?;
+                if role != request.role || authority.project_id != request.project_id {
                     return Err(AgentManagementError::Unauthorized);
+                }
+                if let AgentOperation::DirectorRotate {
+                    expected_predecessor_cutex_session,
+                    expected_authority_epoch,
+                    ..
+                } = &request.operation
+                {
+                    if expected_predecessor_cutex_session == &invocation.caller_cutex_session
+                        && *expected_authority_epoch == authority.authority_epoch
+                    {
+                        let predecessor = state
+                            .agents
+                            .get(expected_predecessor_cutex_session)
+                            .ok_or(AgentManagementError::OwnerActionRequired(
+                                "Agent has no explicit Agent Management ownership record"
+                                    .to_string(),
+                            ))?;
+                        if predecessor.project_id != request.project_id
+                            || predecessor.retired_at.is_some()
+                        {
+                            return Err(AgentManagementError::OwnerActionRequired(
+                                "Director predecessor does not have active project ownership"
+                                    .to_string(),
+                            ));
+                        }
+                    }
                 }
                 let reservation = operation_reservation(request);
                 if let Some(spec) = reservation {
@@ -998,10 +1267,15 @@ impl AgentManagementProvider {
                     })
                     .cloned()
                     .collect();
+                let operators = operator_roster(&snapshot, &request.project_id);
                 self.complete(
                     request,
                     digest,
-                    AgentManagementResult::QueryManaged { authority, agents },
+                    AgentManagementResult::QueryManaged {
+                        authority,
+                        agents,
+                        operators,
+                    },
                 )
             }
             AgentOperation::Online { cutex_session_id } => {
@@ -1155,6 +1429,26 @@ impl AgentManagementProvider {
                     },
                 )
             }
+            AgentOperation::GrantOperator {
+                operator_cutex_session_id,
+                expected_grant_revision,
+            } => self.complete_operator_grant(
+                invocation,
+                request,
+                digest,
+                operator_cutex_session_id,
+                *expected_grant_revision,
+            ),
+            AgentOperation::RevokeOperator {
+                operator_cutex_session_id,
+                expected_grant_revision,
+            } => self.complete_operator_revoke(
+                invocation,
+                request,
+                digest,
+                operator_cutex_session_id,
+                *expected_grant_revision,
+            ),
             AgentOperation::DirectorRotate {
                 expected_predecessor_cutex_session,
                 expected_authority_epoch,
@@ -1374,9 +1668,18 @@ impl AgentManagementProvider {
                 action = self.set_phase(request, AgentActionPhase::MessagePending)?;
             }
             if action.phase == AgentActionPhase::MessagePending {
+                let primary_director = self
+                    .store
+                    .snapshot()?
+                    .projects
+                    .get(&request.project_id)
+                    .map(|authority| authority.authorized_director_session.clone())
+                    .ok_or(AgentManagementError::ProjectNotAuthorized)?;
                 let metadata = AgentManagementMessageMetadata {
                     schema: AgentManagementSchema::V1,
-                    requested_by_director: invocation.caller_cutex_session.clone(),
+                    requested_by_director: primary_director,
+                    requested_by_operator: (request.role == AgentManagementRole::Operator)
+                        .then(|| invocation.caller_cutex_session.clone()),
                 };
                 let system = crate::agent_bus::identity::agent_management_system_principal();
                 let message_id = lifecycle
@@ -1544,6 +1847,35 @@ impl AgentManagementProvider {
                 record.retired_at = Some(now());
             }
             let retired = record.clone();
+            if request.role == AgentManagementRole::PrimaryDirector
+                && state
+                    .operator_grants
+                    .get_mut(&request.project_id)
+                    .and_then(|grants| grants.remove(cutex_session_id))
+                    .is_some()
+            {
+                let current_revision = operator_grant_revision(&state, &request.project_id);
+                let revision = next_operator_grant_revision(current_revision)?;
+                let primary = state
+                    .projects
+                    .get(&request.project_id)
+                    .map(|authority| authority.authorized_director_session.clone())
+                    .ok_or(AgentManagementError::InvalidStore)?;
+                let committed_at = now();
+                state
+                    .operator_grant_revisions
+                    .insert(request.project_id.clone(), revision);
+                insert_operator_audit_event(
+                    &mut state,
+                    request,
+                    cutex_session_id,
+                    AgentOperatorAuditKind::RemovedForPrimaryDirector,
+                    current_revision,
+                    revision,
+                    &primary,
+                    committed_at,
+                )?;
+            }
             Ok((state, retired, true))
         })?;
         debug_assert_eq!(retired.project_id, agent.project_id);
@@ -1662,6 +1994,35 @@ impl AgentManagementProvider {
                 ));
             }
             record.retired_at = Some(now());
+            if request.role == AgentManagementRole::PrimaryDirector
+                && state
+                    .operator_grants
+                    .get_mut(&request.project_id)
+                    .and_then(|grants| grants.remove(&expected.cutex_session_id))
+                    .is_some()
+            {
+                let current_revision = operator_grant_revision(&state, &request.project_id);
+                let revision = next_operator_grant_revision(current_revision)?;
+                let primary = state
+                    .projects
+                    .get(&request.project_id)
+                    .map(|authority| authority.authorized_director_session.clone())
+                    .ok_or(AgentManagementError::InvalidStore)?;
+                let committed_at = now();
+                state
+                    .operator_grant_revisions
+                    .insert(request.project_id.clone(), revision);
+                insert_operator_audit_event(
+                    &mut state,
+                    request,
+                    &expected.cutex_session_id,
+                    AgentOperatorAuditKind::RemovedForPrimaryDirector,
+                    current_revision,
+                    revision,
+                    &primary,
+                    committed_at,
+                )?;
+            }
             Ok((state, (), true))
         })
     }
@@ -1852,11 +2213,19 @@ impl AgentManagementProvider {
                     ));
                 }
             } else {
+                let primary_director = state
+                    .projects
+                    .get(&request.project_id)
+                    .map(|authority| authority.authorized_director_session.clone())
+                    .ok_or(AgentManagementError::InvalidStore)?;
                 state.agents.insert(
                     cutex_session_id.clone(),
                     ManagedAgentRecord {
                         project_id: request.project_id.clone(),
-                        created_by_director_session: invocation.caller_cutex_session.clone(),
+                        created_by_director_session: primary_director,
+                        created_by_operator_session: (request.role
+                            == AgentManagementRole::Operator)
+                            .then(|| invocation.caller_cutex_session.clone()),
                         cutex_session_id: cutex_session_id.clone(),
                         native_session_id: native_session_id.to_string(),
                         spec: spec.clone(),
@@ -1957,6 +2326,14 @@ impl AgentManagementProvider {
         let (subject_cutex_session_id, subject_agent_name) = match &request.operation {
             AgentOperation::Create { spec, .. } => (successor.clone(), Some(spec.name.clone())),
             AgentOperation::QueryManaged => (None, None),
+            AgentOperation::GrantOperator {
+                operator_cutex_session_id,
+                ..
+            }
+            | AgentOperation::RevokeOperator {
+                operator_cutex_session_id,
+                ..
+            } => (Some(operator_cutex_session_id.clone()), None),
             AgentOperation::Online { cutex_session_id }
             | AgentOperation::Offline { cutex_session_id }
             | AgentOperation::Restart { cutex_session_id }
@@ -2074,6 +2451,175 @@ impl AgentManagementProvider {
         Ok(response)
     }
 
+    fn complete_operator_grant(
+        &self,
+        invocation: &AgentManagementInvocation,
+        request: &AuthorizedAgentManagementRequest<'_>,
+        digest: &Sha256,
+        operator: &CutexSessionId,
+        expected_revision: u64,
+    ) -> Result<AgentManagementResponse, AgentManagementError> {
+        if request.role != AgentManagementRole::PrimaryDirector {
+            return Err(AgentManagementError::NotAuthorizedDirector);
+        }
+        let (response, event) = self.store.with_state(true, |mut state| {
+            let authority = state
+                .projects
+                .get(&request.project_id)
+                .cloned()
+                .ok_or(AgentManagementError::ProjectNotAuthorized)?;
+            if authority.authorized_director_session != invocation.caller_cutex_session {
+                return Err(AgentManagementError::NotAuthorizedDirector);
+            }
+            if operator == &authority.authorized_director_session {
+                return Err(AgentManagementError::Conflict(
+                    "primary_director_cannot_be_operator",
+                ));
+            }
+            let agent = state
+                .agents
+                .get(operator)
+                .filter(|agent| {
+                    agent.project_id == request.project_id && agent.retired_at.is_none()
+                })
+                .ok_or(AgentManagementError::Conflict(
+                    "operator_must_be_active_managed_agent",
+                ))?;
+            if &agent.cutex_session_id != operator {
+                return Err(AgentManagementError::InvalidStore);
+            }
+            let current_revision = operator_grant_revision(&state, &request.project_id);
+            if current_revision != expected_revision {
+                return Err(AgentManagementError::Conflict(
+                    "operator_grant_revision_conflict",
+                ));
+            }
+            if state
+                .operator_grants
+                .get(&request.project_id)
+                .is_some_and(|grants| grants.contains_key(operator))
+            {
+                return Err(AgentManagementError::Conflict("operator_already_granted"));
+            }
+            let revision = next_operator_grant_revision(current_revision)?;
+            let committed_at = now();
+            let grant = AgentOperatorGrant {
+                project_id: request.project_id.clone(),
+                operator_cutex_session_id: operator.clone(),
+                grant_revision: revision,
+                granted_at: committed_at.clone(),
+                granted_by_primary_director_session: invocation.caller_cutex_session.clone(),
+            };
+            state
+                .operator_grants
+                .entry(request.project_id.clone())
+                .or_default()
+                .insert(operator.clone(), grant.clone());
+            state
+                .operator_grant_revisions
+                .insert(request.project_id.clone(), revision);
+            insert_operator_audit_event(
+                &mut state,
+                request,
+                operator,
+                AgentOperatorAuditKind::Granted,
+                current_revision,
+                revision,
+                &invocation.caller_cutex_session,
+                committed_at,
+            )?;
+            let roster = operator_roster(&state, &request.project_id);
+            let response = complete_response(
+                request,
+                digest,
+                AgentManagementResult::OperatorGranted { grant, roster },
+            );
+            state
+                .actions
+                .get_mut(&request.action_id)
+                .ok_or(AgentManagementError::InvalidStore)?
+                .response = Some(response.clone());
+            let (_, event) =
+                Self::record_phase_event(&mut state, request, AgentActionPhase::Complete, true)?;
+            Ok((state, (response, event), true))
+        })?;
+        self.notify_phase(&event);
+        Ok(response)
+    }
+
+    fn complete_operator_revoke(
+        &self,
+        invocation: &AgentManagementInvocation,
+        request: &AuthorizedAgentManagementRequest<'_>,
+        digest: &Sha256,
+        operator: &CutexSessionId,
+        expected_revision: u64,
+    ) -> Result<AgentManagementResponse, AgentManagementError> {
+        if request.role != AgentManagementRole::PrimaryDirector {
+            return Err(AgentManagementError::NotAuthorizedDirector);
+        }
+        let (response, event) = self.store.with_state(true, |mut state| {
+            let authority = state
+                .projects
+                .get(&request.project_id)
+                .cloned()
+                .ok_or(AgentManagementError::ProjectNotAuthorized)?;
+            if authority.authorized_director_session != invocation.caller_cutex_session {
+                return Err(AgentManagementError::NotAuthorizedDirector);
+            }
+            let current_revision = operator_grant_revision(&state, &request.project_id);
+            if current_revision != expected_revision {
+                return Err(AgentManagementError::Conflict(
+                    "operator_grant_revision_conflict",
+                ));
+            }
+            let removed = state
+                .operator_grants
+                .get_mut(&request.project_id)
+                .and_then(|grants| grants.remove(operator))
+                .ok_or(AgentManagementError::Conflict("operator_not_granted"))?;
+            if removed.project_id != request.project_id
+                || removed.operator_cutex_session_id != *operator
+            {
+                return Err(AgentManagementError::InvalidStore);
+            }
+            let revision = next_operator_grant_revision(current_revision)?;
+            let committed_at = now();
+            state
+                .operator_grant_revisions
+                .insert(request.project_id.clone(), revision);
+            insert_operator_audit_event(
+                &mut state,
+                request,
+                operator,
+                AgentOperatorAuditKind::Revoked,
+                current_revision,
+                revision,
+                &invocation.caller_cutex_session,
+                committed_at,
+            )?;
+            let roster = operator_roster(&state, &request.project_id);
+            let response = complete_response(
+                request,
+                digest,
+                AgentManagementResult::OperatorRevoked {
+                    operator_cutex_session_id: operator.clone(),
+                    roster,
+                },
+            );
+            state
+                .actions
+                .get_mut(&request.action_id)
+                .ok_or(AgentManagementError::InvalidStore)?
+                .response = Some(response.clone());
+            let (_, event) =
+                Self::record_phase_event(&mut state, request, AgentActionPhase::Complete, true)?;
+            Ok((state, (response, event), true))
+        })?;
+        self.notify_phase(&event);
+        Ok(response)
+    }
+
     fn complete_rotation(
         &self,
         request: &AuthorizedAgentManagementRequest<'_>,
@@ -2114,6 +2660,85 @@ impl AgentManagementProvider {
                 authority_epoch: next_epoch,
                 updated_at: now(),
             };
+            let rotation_mode = match &request.operation {
+                AgentOperation::DirectorRotate { mode, .. } => *mode,
+                _ => return Err(AgentManagementError::InvalidStore),
+            };
+            if state
+                .operator_grants
+                .get(&request.project_id)
+                .is_some_and(|grants| grants.contains_key(&created.agent.cutex_session_id))
+            {
+                return Err(AgentManagementError::Conflict(
+                    "successor_primary_director_is_operator",
+                ));
+            }
+            let current_grant_revision = operator_grant_revision(&state, &request.project_id);
+            match rotation_mode {
+                DirectorRotateMode::RetainPredecessorWithMessage
+                | DirectorRotateMode::RetainPredecessorBootstrapOnly => {
+                    if !state
+                        .operator_grants
+                        .get(&request.project_id)
+                        .is_some_and(|grants| grants.contains_key(predecessor))
+                    {
+                        let revision = next_operator_grant_revision(current_grant_revision)?;
+                        let committed_at = now();
+                        let grant = AgentOperatorGrant {
+                            project_id: request.project_id.clone(),
+                            operator_cutex_session_id: predecessor.clone(),
+                            grant_revision: revision,
+                            granted_at: committed_at.clone(),
+                            granted_by_primary_director_session: created
+                                .agent
+                                .cutex_session_id
+                                .clone(),
+                        };
+                        state
+                            .operator_grants
+                            .entry(request.project_id.clone())
+                            .or_default()
+                            .insert(predecessor.clone(), grant);
+                        state
+                            .operator_grant_revisions
+                            .insert(request.project_id.clone(), revision);
+                        insert_operator_audit_event(
+                            &mut state,
+                            request,
+                            predecessor,
+                            AgentOperatorAuditKind::RetainedAfterDirectorRotation,
+                            current_grant_revision,
+                            revision,
+                            &created.agent.cutex_session_id,
+                            committed_at,
+                        )?;
+                    }
+                }
+                DirectorRotateMode::ClosePredecessorThenCreateWithMessage => {
+                    if state
+                        .operator_grants
+                        .get_mut(&request.project_id)
+                        .and_then(|grants| grants.remove(predecessor))
+                        .is_some()
+                    {
+                        let revision = next_operator_grant_revision(current_grant_revision)?;
+                        let committed_at = now();
+                        state
+                            .operator_grant_revisions
+                            .insert(request.project_id.clone(), revision);
+                        insert_operator_audit_event(
+                            &mut state,
+                            request,
+                            predecessor,
+                            AgentOperatorAuditKind::RemovedByDirectorRotation,
+                            current_grant_revision,
+                            revision,
+                            &created.agent.cutex_session_id,
+                            committed_at,
+                        )?;
+                    }
+                }
+            }
             let receipt = AgentManagementReceipt {
                 schema: AgentManagementReceiptSchema::V1,
                 action_id: request.action_id.clone(),
@@ -2179,6 +2804,7 @@ impl AgentManagementProvider {
         let (
             AgentOperation::DirectorRotate {
                 expected_predecessor_cutex_session,
+                mode,
                 ..
             },
             AgentManagementOutcome::Complete { receipt },
@@ -2194,9 +2820,8 @@ impl AgentManagementProvider {
         else {
             return Err(AgentManagementError::InvalidStore);
         };
-        let project_authority = self
-            .store
-            .snapshot()?
+        let snapshot = self.store.snapshot()?;
+        let project_authority = snapshot
             .projects
             .get(&request.project_id)
             .cloned()
@@ -2206,6 +2831,25 @@ impl AgentManagementProvider {
         {
             return Err(AgentManagementError::Conflict(
                 "director_authority_surfaces_disagree",
+            ));
+        }
+        let predecessor_is_operator = snapshot
+            .operator_grants
+            .get(&request.project_id)
+            .is_some_and(|grants| grants.contains_key(expected_predecessor_cutex_session));
+        let should_retain = matches!(
+            mode,
+            DirectorRotateMode::RetainPredecessorWithMessage
+                | DirectorRotateMode::RetainPredecessorBootstrapOnly
+        );
+        if predecessor_is_operator != should_retain
+            || snapshot
+                .operator_grants
+                .get(&request.project_id)
+                .is_some_and(|grants| grants.contains_key(&successor.cutex_session_id))
+        {
+            return Err(AgentManagementError::Conflict(
+                "director_operator_authority_surfaces_disagree",
             ));
         }
         let transfer = DirectorSeatTransferRequest {
@@ -2250,6 +2894,8 @@ impl AgentManagementProvider {
                 AgentOperation::Create { .. }
                 | AgentOperation::QueryManaged
                 | AgentOperation::Replace { .. }
+                | AgentOperation::GrantOperator { .. }
+                | AgentOperation::RevokeOperator { .. }
                 | AgentOperation::DirectorRotate { .. } => None,
             };
             let failure = AgentManagementFailureEvent {
@@ -2301,7 +2947,111 @@ impl AgentManagementProvider {
 
 struct AuthorizedAgentManagementRequest<'a> {
     project_id: ProjectId,
+    role: AgentManagementRole,
     request: &'a AgentManagementRequest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgentManagementRole {
+    PrimaryDirector,
+    Operator,
+    /// Exact terminal receipts remain replayable by their original caller.
+    ReceiptReplay,
+}
+
+fn authorize_operation(
+    snapshot: &AgentManagementSnapshot,
+    caller: &CutexSessionId,
+    project_id: &ProjectId,
+    operation: &AgentOperation,
+) -> Result<AgentManagementRole, AgentManagementError> {
+    let role = project_management_role(snapshot, caller, project_id)?;
+    let authority = snapshot
+        .projects
+        .get(project_id)
+        .ok_or(AgentManagementError::ProjectNotAuthorized)?;
+    if role == AgentManagementRole::PrimaryDirector {
+        return Ok(role);
+    }
+    if matches!(
+        operation,
+        AgentOperation::DirectorRotate { .. }
+            | AgentOperation::GrantOperator { .. }
+            | AgentOperation::RevokeOperator { .. }
+    ) {
+        return Err(AgentManagementError::NotAuthorizedDirector);
+    }
+    if let Some(target) = operation_target(operation) {
+        if target == &authority.authorized_director_session {
+            return Err(AgentManagementError::Conflict(
+                "operator_cannot_target_primary_director",
+            ));
+        }
+        if operation_disables_target(operation)
+            && snapshot
+                .operator_grants
+                .get(project_id)
+                .is_some_and(|grants| grants.contains_key(target))
+        {
+            return Err(AgentManagementError::Conflict(
+                "operator_cannot_disable_privileged_operator",
+            ));
+        }
+    }
+    Ok(role)
+}
+
+fn project_management_role(
+    snapshot: &AgentManagementSnapshot,
+    caller: &CutexSessionId,
+    project_id: &ProjectId,
+) -> Result<AgentManagementRole, AgentManagementError> {
+    let authority = snapshot
+        .projects
+        .get(project_id)
+        .ok_or(AgentManagementError::ProjectNotAuthorized)?;
+    if &authority.authorized_director_session == caller {
+        return Ok(AgentManagementRole::PrimaryDirector);
+    }
+    let grant = snapshot
+        .operator_grants
+        .get(project_id)
+        .and_then(|grants| grants.get(caller))
+        .ok_or(AgentManagementError::ProjectNotAuthorized)?;
+    if &grant.project_id != project_id || &grant.operator_cutex_session_id != caller {
+        return Err(AgentManagementError::InvalidStore);
+    }
+    let agent = snapshot
+        .agents
+        .get(caller)
+        .filter(|agent| &agent.project_id == project_id && agent.retired_at.is_none())
+        .ok_or(AgentManagementError::ProjectNotAuthorized)?;
+    debug_assert_eq!(&agent.cutex_session_id, caller);
+    Ok(AgentManagementRole::Operator)
+}
+
+fn operation_target(operation: &AgentOperation) -> Option<&CutexSessionId> {
+    match operation {
+        AgentOperation::Online { cutex_session_id }
+        | AgentOperation::Offline { cutex_session_id }
+        | AgentOperation::Restart { cutex_session_id }
+        | AgentOperation::Close { cutex_session_id } => Some(cutex_session_id),
+        AgentOperation::Replace {
+            predecessor_cutex_session_id,
+            ..
+        } => Some(predecessor_cutex_session_id),
+        _ => None,
+    }
+}
+
+fn operation_disables_target(operation: &AgentOperation) -> bool {
+    matches!(
+        operation,
+        AgentOperation::Offline { .. }
+            | AgentOperation::Restart { .. }
+            | AgentOperation::Close { .. }
+            | AgentOperation::Replace { .. }
+    )
 }
 
 impl std::ops::Deref for AuthorizedAgentManagementRequest<'_> {
@@ -2386,6 +3136,162 @@ fn seat_authority_error(error: SeatAuthorityError) -> AgentManagementError {
         }
         SeatAuthorityError::InvalidStore => AgentManagementError::InvalidStore,
     }
+}
+
+fn validate_reservation_reconciliation_request(
+    request: &AgentReservationReconciliationRequest,
+) -> Result<(), AgentManagementError> {
+    if request.action_id == request.target_action_id {
+        return Err(AgentManagementError::InvalidRequest(
+            "reconciliation_action_must_be_fresh",
+        ));
+    }
+    if request.expected_phase != AgentActionPhase::OwnerActionRequired {
+        return Err(AgentManagementError::InvalidRequest(
+            "expected_phase_must_be_owner_action_required",
+        ));
+    }
+    if request.expected_authority_epoch == 0
+        || request.expected_authority_epoch > crate::role_revision::MAX_JSON_SAFE_INTEGER
+    {
+        return Err(AgentManagementError::InvalidRequest(
+            "invalid_authority_epoch",
+        ));
+    }
+    if request.expected_reserved_agent_name.trim().is_empty()
+        || request.expected_reserved_agent_name.trim() != request.expected_reserved_agent_name
+    {
+        return Err(AgentManagementError::InvalidRequest(
+            "invalid_reserved_agent_name",
+        ));
+    }
+    let cwd = std::path::Path::new(&request.expected_reserved_agent_cwd);
+    if request.expected_reserved_agent_cwd.trim() != request.expected_reserved_agent_cwd
+        || !cwd.is_absolute()
+        || cwd.parent().is_none()
+    {
+        return Err(AgentManagementError::InvalidRequest(
+            "invalid_reserved_agent_cwd",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_reconciliation_target(
+    state: &AgentManagementSnapshot,
+    request: &AgentReservationReconciliationRequest,
+    target: &AgentActionRecord,
+) -> Result<(), AgentManagementError> {
+    if target.project_id != request.project_id
+        || target.caller_cutex_session != request.expected_authorized_director_session
+        || target.request_sha256 != request.expected_target_request_sha256
+        || target.phase != request.expected_phase
+        || target.reserved_agent_name.as_deref()
+            != Some(request.expected_reserved_agent_name.as_str())
+        || target.reserved_agent_cwd.as_deref()
+            != Some(request.expected_reserved_agent_cwd.as_str())
+    {
+        return Err(AgentManagementError::Conflict(
+            "reservation_reconciliation_cas_mismatch",
+        ));
+    }
+    if !matches!(
+        target.operation,
+        AgentOperationKind::Create
+            | AgentOperationKind::Replace
+            | AgentOperationKind::DirectorRotate
+    ) {
+        return Err(AgentManagementError::Conflict(
+            "target_is_not_a_create_like_reservation",
+        ));
+    }
+    if target.known_successor_cutex_session.is_some()
+        || target.known_native_session_id.is_some()
+        || target.native_bootstrap_retryable
+        || target.historical_runtime_occurrence_fence.is_some()
+    {
+        return Err(AgentManagementError::Conflict(
+            "target_has_post_reservation_continuation_evidence",
+        ));
+    }
+    let failure = match target.response.as_ref() {
+        Some(AgentManagementResponse {
+            schema: AgentManagementSchema::V1,
+            action_id,
+            outcome: AgentManagementOutcome::OwnerActionRequired { failure },
+        }) if action_id == &target.action_id
+            && failure.action_id == target.action_id
+            && failure.project_id == target.project_id
+            && failure.operation == target.operation
+            && failure.code == "owner_action_required" =>
+        {
+            failure
+        }
+        _ => {
+            return Err(AgentManagementError::Conflict(
+                "target_has_no_exact_owner_action_required_receipt",
+            ))
+        }
+    };
+    if failure.routing_status != FailureRoutingStatus::Routable
+        || failure.route_to_director_session.as_ref()
+            != Some(&request.expected_authorized_director_session)
+        || failure.target_cutex_session_id.is_some()
+    {
+        return Err(AgentManagementError::Conflict(
+            "target_failure_identity_is_not_exact",
+        ));
+    }
+    if !legacy_missing_predecessor_ownership_failure(&failure.detail) {
+        return Err(AgentManagementError::Conflict(
+            "target_failure_class_not_allowlisted",
+        ));
+    }
+    if state.failure_events.get(&failure.event_id) != Some(failure) {
+        return Err(AgentManagementError::Conflict(
+            "target_failure_journal_is_missing_or_malformed",
+        ));
+    }
+    let phases = state
+        .phase_events
+        .values()
+        .filter(|event| event.action_id == target.action_id)
+        .collect::<Vec<_>>();
+    let distinct_sequences = phases
+        .iter()
+        .map(|event| event.phase_sequence)
+        .collect::<std::collections::BTreeSet<_>>();
+    let phase_journal_valid = phases.iter().all(|event| {
+        event.project_id == target.project_id
+            && event.operation == target.operation
+            && event.phase_sequence > 0
+            && event.phase_sequence <= target.phase_sequence
+            && matches!(
+                event.phase,
+                AgentActionPhase::Prepared | AgentActionPhase::OwnerActionRequired
+            )
+    }) && distinct_sequences.len() == phases.len()
+        && phases.iter().any(|event| {
+            event.phase == AgentActionPhase::Prepared
+                && event.phase_sequence < target.phase_sequence
+        })
+        && phases.iter().any(|event| {
+            event.phase == AgentActionPhase::OwnerActionRequired
+                && event.phase_sequence == target.phase_sequence
+        });
+    if !phase_journal_valid {
+        return Err(AgentManagementError::Conflict(
+            "target_phase_journal_is_missing_malformed_or_post_effect",
+        ));
+    }
+    Ok(())
+}
+
+fn legacy_missing_predecessor_ownership_failure(detail: &str) -> bool {
+    detail
+        .strip_prefix("owner_action_required: ")
+        .unwrap_or(detail)
+        == "Agent has no explicit Agent Management ownership record"
 }
 
 /// Identifies the narrow historical receipt that is eligible for authoritative
@@ -2531,7 +3437,9 @@ fn operation_reservation<'a>(
         | AgentOperation::Online { .. }
         | AgentOperation::Offline { .. }
         | AgentOperation::Restart { .. }
-        | AgentOperation::Close { .. } => None,
+        | AgentOperation::Close { .. }
+        | AgentOperation::GrantOperator { .. }
+        | AgentOperation::RevokeOperator { .. } => None,
     }
 }
 
@@ -2564,6 +3472,101 @@ fn lifecycle_error(error: LifecycleFailure) -> AgentManagementError {
         "{}: {}{}",
         error.code, error.detail, ambiguity
     ))
+}
+
+fn operator_grant_revision(state: &AgentManagementSnapshot, project_id: &ProjectId) -> u64 {
+    state
+        .operator_grant_revisions
+        .get(project_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn next_operator_grant_revision(current: u64) -> Result<u64, AgentManagementError> {
+    current
+        .checked_add(1)
+        .filter(|revision| *revision <= crate::role_revision::MAX_JSON_SAFE_INTEGER)
+        .ok_or(AgentManagementError::Conflict(
+            "operator_grant_revision_overflow",
+        ))
+}
+
+fn operator_roster(
+    state: &AgentManagementSnapshot,
+    project_id: &ProjectId,
+) -> AgentOperatorRosterProjection {
+    let mut operators = state
+        .operator_grants
+        .get(project_id)
+        .into_iter()
+        .flat_map(|grants| grants.values().cloned())
+        .collect::<Vec<_>>();
+    operators.sort_by(|left, right| {
+        left.operator_cutex_session_id
+            .cmp(&right.operator_cutex_session_id)
+    });
+    AgentOperatorRosterProjection {
+        grant_revision: operator_grant_revision(state, project_id),
+        operators,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_operator_audit_event(
+    state: &mut AgentManagementSnapshot,
+    request: &AuthorizedAgentManagementRequest<'_>,
+    operator: &CutexSessionId,
+    kind: AgentOperatorAuditKind,
+    previous_revision: u64,
+    revision: u64,
+    primary_director: &CutexSessionId,
+    committed_at: crate::role_revision::Rfc3339,
+) -> Result<(), AgentManagementError> {
+    let event_id = format!(
+        "agent-management:{}:operator-grant:{}",
+        request.action_id.as_str(),
+        revision
+    );
+    let event = AgentOperatorAuditEvent {
+        event_id: event_id.clone(),
+        action_id: request.action_id.clone(),
+        project_id: request.project_id.clone(),
+        operator_cutex_session_id: operator.clone(),
+        kind,
+        previous_grant_revision: previous_revision,
+        grant_revision: revision,
+        primary_director_cutex_session_id: primary_director.clone(),
+        committed_at,
+    };
+    if state
+        .operator_audit_events
+        .insert(event_id, event)
+        .is_some()
+    {
+        return Err(AgentManagementError::InvalidStore);
+    }
+    Ok(())
+}
+
+fn complete_response(
+    request: &AuthorizedAgentManagementRequest<'_>,
+    digest: &Sha256,
+    result: AgentManagementResult,
+) -> AgentManagementResponse {
+    let receipt = AgentManagementReceipt {
+        schema: AgentManagementReceiptSchema::V1,
+        action_id: request.action_id.clone(),
+        request_sha256: digest.clone(),
+        operation: request.operation.kind(),
+        project_id: request.project_id.clone(),
+        completed_at: now(),
+        result,
+    };
+    AgentManagementResponse {
+        schema: AgentManagementSchema::V1,
+        action_id: request.action_id.clone(),
+        outcome: AgentManagementOutcome::Complete { receipt },
+    }
 }
 
 fn recover_runtime_for_agent(
@@ -3576,6 +4579,168 @@ mod tests {
         }
     }
 
+    fn rotation_request(action_id: &str, successor_name: &str) -> AgentManagementRequest {
+        AgentManagementRequest {
+            schema: AgentManagementSchema::V1,
+            action_id: action(action_id),
+            project_id: Some(project()),
+            operation: AgentOperation::DirectorRotate {
+                expected_predecessor_cutex_session: session("cutex.director"),
+                expected_authority_epoch: 1,
+                mode: DirectorRotateMode::RetainPredecessorWithMessage,
+                successor: spec(successor_name),
+                frozen_message: Some("Frozen rotation assignment.".to_string()),
+            },
+        }
+    }
+
+    fn operator_request(
+        action_id: &str,
+        operation: &str,
+        operator: &CutexSessionId,
+        expected_grant_revision: u64,
+    ) -> AgentManagementRequest {
+        AgentManagementRequest {
+            schema: AgentManagementSchema::V1,
+            action_id: action(action_id),
+            project_id: Some(project()),
+            operation: match operation {
+                "grant" => AgentOperation::GrantOperator {
+                    operator_cutex_session_id: operator.clone(),
+                    expected_grant_revision,
+                },
+                "revoke" => AgentOperation::RevokeOperator {
+                    operator_cutex_session_id: operator.clone(),
+                    expected_grant_revision,
+                },
+                _ => panic!("unknown operator fixture operation"),
+            },
+        }
+    }
+
+    fn seed_missing_ownership_reservation(
+        provider: &AgentManagementProvider,
+        request: &AgentManagementRequest,
+    ) {
+        let digest = request_sha256(request).unwrap();
+        let timestamp = now();
+        let (reserved_name, reserved_cwd) = match &request.operation {
+            AgentOperation::Create { spec, .. } => (spec.name.clone(), spec.cwd.clone()),
+            AgentOperation::Replace { successor, .. }
+            | AgentOperation::DirectorRotate { successor, .. } => {
+                (successor.name.clone(), successor.cwd.clone())
+            }
+            _ => panic!("fixture requires a create-like operation"),
+        };
+        let failure = AgentManagementFailureEvent {
+            schema: AgentManagementFailureSchema::V1,
+            event_id: format!("agent-management:{}:failure", request.action_id),
+            action_id: request.action_id.clone(),
+            project_id: project(),
+            operation: request.operation.kind(),
+            code: "owner_action_required".to_string(),
+            detail:
+                "owner_action_required: Agent has no explicit Agent Management ownership record"
+                    .to_string(),
+            routing_status: FailureRoutingStatus::Routable,
+            route_to_director_session: Some(session("cutex.director")),
+            target_cutex_session_id: None,
+            created_at: timestamp.clone(),
+        };
+        let response = AgentManagementResponse {
+            schema: AgentManagementSchema::V1,
+            action_id: request.action_id.clone(),
+            outcome: AgentManagementOutcome::OwnerActionRequired {
+                failure: failure.clone(),
+            },
+        };
+        provider
+            .store()
+            .with_state(true, |mut state| {
+                state
+                    .failure_events
+                    .insert(failure.event_id.clone(), failure);
+                state.actions.insert(
+                    request.action_id.clone(),
+                    AgentActionRecord {
+                        action_id: request.action_id.clone(),
+                        request_sha256: digest,
+                        operation: request.operation.kind(),
+                        project_id: project(),
+                        caller_cutex_session: session("cutex.director"),
+                        phase: AgentActionPhase::OwnerActionRequired,
+                        phase_sequence: 2,
+                        reserved_agent_name: Some(reserved_name.clone()),
+                        reserved_agent_cwd: Some(reserved_cwd),
+                        known_successor_cutex_session: None,
+                        known_native_session_id: None,
+                        native_bootstrap_retryable: false,
+                        historical_runtime_occurrence_fence: None,
+                        external_message_id: Some(format!(
+                            "agent-management:{}:start",
+                            request.action_id
+                        )),
+                        response: Some(response),
+                        created_at: timestamp.clone(),
+                        updated_at: timestamp.clone(),
+                    },
+                );
+                for (sequence, phase) in [
+                    (1, AgentActionPhase::Prepared),
+                    (2, AgentActionPhase::OwnerActionRequired),
+                ] {
+                    let event_id =
+                        format!("agent-management:{}:phase:{sequence}", request.action_id);
+                    state.phase_events.insert(
+                        event_id.clone(),
+                        AgentManagementPhaseEvent {
+                            event_id,
+                            action_id: request.action_id.clone(),
+                            project_id: project(),
+                            operation: request.operation.kind(),
+                            phase,
+                            phase_sequence: sequence,
+                            committed_at: timestamp.clone(),
+                            presentation_owner_cutex_session_id: session("cutex.director"),
+                            subject_cutex_session_id: None,
+                            subject_agent_name: Some(reserved_name.clone()),
+                            predecessor_cutex_session_id: None,
+                            successor_cutex_session_id: None,
+                            replace_policy: None,
+                            rotation_mode: None,
+                            authority_epoch: Some(1),
+                        },
+                    );
+                }
+                Ok((state, (), true))
+            })
+            .unwrap();
+    }
+
+    fn reservation_reconciliation_request(
+        admin_action_id: &str,
+        target: &AgentManagementRequest,
+    ) -> AgentReservationReconciliationRequest {
+        let (name, cwd) = match &target.operation {
+            AgentOperation::Create { spec, .. } => (&spec.name, &spec.cwd),
+            AgentOperation::Replace { successor, .. }
+            | AgentOperation::DirectorRotate { successor, .. } => (&successor.name, &successor.cwd),
+            _ => panic!("fixture requires a create-like operation"),
+        };
+        AgentReservationReconciliationRequest {
+            schema: AgentReservationReconciliationSchema::V1,
+            action_id: action(admin_action_id),
+            project_id: project(),
+            target_action_id: target.action_id.clone(),
+            expected_target_request_sha256: request_sha256(target).unwrap(),
+            expected_phase: AgentActionPhase::OwnerActionRequired,
+            expected_reserved_agent_name: name.clone(),
+            expected_reserved_agent_cwd: cwd.clone(),
+            expected_authorized_director_session: session("cutex.director"),
+            expected_authority_epoch: 1,
+        }
+    }
+
     fn seed_legacy_no_sid_receipt(
         provider: &AgentManagementProvider,
         request: &AgentManagementRequest,
@@ -3857,7 +5022,10 @@ mod tests {
             },
             &lifecycle,
         ));
-        let AgentManagementResult::QueryManaged { authority, agents } = query.result else {
+        let AgentManagementResult::QueryManaged {
+            authority, agents, ..
+        } = query.result
+        else {
             panic!("expected managed query result")
         };
         assert_eq!(authority.authority_epoch, 1);
@@ -4048,6 +5216,7 @@ mod tests {
                         ManagedAgentRecord {
                             project_id: ProjectId::new(owned_project).unwrap(),
                             created_by_director_session: session("cutex.director"),
+                            created_by_operator_session: None,
                             cutex_session_id: session("cutex.director"),
                             native_session_id: evidence.native_session_id.clone(),
                             spec: evidence.spec.clone(),
@@ -4073,6 +5242,7 @@ mod tests {
         let agent = ManagedAgentRecord {
             project_id: project(),
             created_by_director_session: session("cutex.director"),
+            created_by_operator_session: None,
             cutex_session_id: session("cutex.worker"),
             native_session_id: "native-worker".to_string(),
             spec: spec("worker"),
@@ -4096,6 +5266,7 @@ mod tests {
         let agent = ManagedAgentRecord {
             project_id: project(),
             created_by_director_session: session("cutex.director"),
+            created_by_operator_session: None,
             cutex_session_id: session("cutex.worker"),
             native_session_id: "native-worker".to_string(),
             spec: spec("worker"),
@@ -4426,7 +5597,9 @@ mod tests {
         let receipt =
             completed(provider.execute(&invocation("cutex.director-new"), &query, &lifecycle));
         match receipt.result {
-            AgentManagementResult::QueryManaged { authority, agents } => {
+            AgentManagementResult::QueryManaged {
+                authority, agents, ..
+            } => {
                 assert_eq!(authority.authority_epoch, 2);
                 assert_eq!(agents.len(), 1);
                 assert_eq!(agents[0].project_id, project());
@@ -5367,10 +6540,12 @@ mod tests {
         assert_eq!(lifecycle.bootstrap_count(), 2);
         assert_eq!(lifecycle.message_count(), 1);
         assert_eq!(lifecycle.retire_count(&predecessor.cutex_session_id), 1);
-        assert_eq!(
-            reopened.store().snapshot().unwrap().projects[&project()],
-            authority
-        );
+        let final_snapshot = reopened.store().snapshot().unwrap();
+        assert_eq!(final_snapshot.projects[&project()], authority);
+        assert!(!final_snapshot
+            .operator_grants
+            .get(&project())
+            .is_some_and(|grants| grants.contains_key(&predecessor.cutex_session_id)));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -5803,6 +6978,7 @@ mod tests {
             management.actions[&rotate.action_id].phase,
             AgentActionPhase::AuthorityTransferPending
         );
+        assert!(management.operator_grants.is_empty());
         let seats = provider.director_seats.query().unwrap();
         assert_eq!(
             seats.occupancies[&crate::task_service::SeatId::new("cutex-director").unwrap()]
@@ -5839,10 +7015,11 @@ mod tests {
         };
         assert_eq!(completed_successor.cutex_session_id, successor);
         assert_eq!(authority.authorized_director_session, successor);
-        assert_eq!(
-            reopened.store().snapshot().unwrap().projects[&project()],
-            authority
-        );
+        let recovered = reopened.store().snapshot().unwrap();
+        assert_eq!(recovered.projects[&project()], authority);
+        assert_eq!(recovered.operator_grant_revisions[&project()], 1);
+        assert_eq!(recovered.operator_audit_events.len(), 1);
+        assert!(recovered.operator_grants[&project()].contains_key(&predecessor.cutex_session_id));
         let seats = reopened.director_seats.query().unwrap();
         assert_eq!(
             seats.occupancies[&crate::task_service::SeatId::new("cutex-director").unwrap()]
@@ -5973,6 +7150,11 @@ mod tests {
             assert!(snapshot.agents[&predecessor.cutex_session_id]
                 .retired_at
                 .is_none());
+            assert_eq!(snapshot.operator_grant_revisions[&project()], 1);
+            assert_eq!(snapshot.operator_audit_events.len(), 1);
+            assert!(
+                snapshot.operator_grants[&project()].contains_key(&predecessor.cutex_session_id)
+            );
             let phases = snapshot
                 .phase_events
                 .values()
@@ -7007,6 +8189,893 @@ mod tests {
             AgentManagementOutcome::NoWrite { ref code, .. } if code == "conflict"
         ));
         assert_eq!(lifecycle.bootstrap_count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn root_reconciliation_terminalizes_exact_live_legacy_shape_and_releases_reservation() {
+        let root = root("reservation-reconcile-live-shape");
+        let provider = AgentManagementProvider::open(&root).unwrap();
+        bind(&provider, "bind", "cutex.director", None);
+        let target = rotation_request("legacy-rotation", "example-director-v2");
+        seed_missing_ownership_reservation(&provider, &target);
+        let request = reservation_reconciliation_request("root-reconcile", &target);
+        let before = provider.store().snapshot().unwrap();
+        let before_authority = before.projects.clone();
+        let before_agents = before.agents.clone();
+        let before_failures = before.failure_events.clone();
+        let before_seats = provider.director_seats.query().unwrap();
+
+        let (receipt, replayed) = provider
+            .reconcile_agent_reservation(&request, |name, cwd, _, _| {
+                assert_eq!(name, "example-director-v2");
+                assert_eq!(cwd, spec("example-director-v2").cwd);
+                AgentReservationReconciliationEvidence::ProvenAbsent {
+                    reason: "every authoritative fake source is absent".to_string(),
+                }
+            })
+            .unwrap();
+        assert!(!replayed);
+        assert!(matches!(
+            receipt.target_response.outcome,
+            AgentManagementOutcome::NoWrite { ref code, .. }
+                if code == "reservation_reconciled_no_write"
+        ));
+        let after = provider.store().snapshot().unwrap();
+        assert_eq!(after.projects, before_authority);
+        assert_eq!(after.agents, before_agents);
+        assert_eq!(after.failure_events, before_failures);
+        assert_eq!(provider.director_seats.query().unwrap(), before_seats);
+        assert_eq!(
+            after.actions[&target.action_id].external_message_id,
+            before.actions[&target.action_id].external_message_id,
+            "reconciliation must not enqueue or replace a message identity"
+        );
+        assert_eq!(
+            after.actions[&target.action_id].phase,
+            AgentActionPhase::NoWrite
+        );
+        assert_eq!(after.reservation_reconciliation_receipts.len(), 1);
+        assert_eq!(after.reservation_reconciliation_events.len(), 1);
+        assert!(after.phase_events.values().any(|event| {
+            event.action_id == target.action_id && event.phase == AgentActionPhase::NoWrite
+        }));
+
+        let (replayed_receipt, replayed) = provider
+            .reconcile_agent_reservation(&request, |_, _, _, _| {
+                panic!("exact admin replay must not re-read external evidence")
+            })
+            .unwrap();
+        assert!(replayed);
+        assert_eq!(replayed_receipt, receipt);
+        let mut changed = request.clone();
+        changed.expected_reserved_agent_name.push_str("-changed");
+        assert!(matches!(
+            provider.reconcile_agent_reservation(&changed, |_, _, _, _| unreachable!()),
+            Err(AgentManagementError::Conflict("action_id_payload_conflict"))
+        ));
+
+        let lifecycle = FakeLifecycle::default();
+        let original_replay = provider.execute(&invocation("cutex.director"), &target, &lifecycle);
+        assert!(matches!(
+            original_replay.outcome,
+            AgentManagementOutcome::NoWrite { ref code, .. }
+                if code == "reservation_reconciled_no_write"
+        ));
+        assert!(lifecycle.log().is_empty());
+
+        let fresh = create_request(
+            "corrected-fresh-action",
+            "example-director-v2",
+            AgentStartMode::BootstrapOnly,
+        );
+        assert!(matches!(
+            provider
+                .execute(&invocation("cutex.director"), &fresh, &lifecycle)
+                .outcome,
+            AgentManagementOutcome::Complete { .. }
+        ));
+        assert_eq!(lifecycle.message_count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reconciliation_evidence_present_ambiguous_or_unavailable_fails_closed() {
+        let cases = [
+            AgentReservationReconciliationEvidence::Present {
+                reason: "matching durable successor".to_string(),
+            },
+            AgentReservationReconciliationEvidence::Ambiguous {
+                reason: "native index is ambiguous".to_string(),
+            },
+            AgentReservationReconciliationEvidence::Unavailable {
+                reason: "Agent Bus registry is unreadable".to_string(),
+            },
+        ];
+        for (index, evidence) in cases.into_iter().enumerate() {
+            let root = root(&format!("reservation-evidence-{index}"));
+            let provider = AgentManagementProvider::open(&root).unwrap();
+            bind(&provider, "bind", "cutex.director", None);
+            let target = rotation_request("legacy-rotation", "example-director-v2");
+            seed_missing_ownership_reservation(&provider, &target);
+            let request = reservation_reconciliation_request("root-reconcile", &target);
+            let before = provider.store().snapshot().unwrap();
+            let result = provider.reconcile_agent_reservation(&request, |_, _, _, _| evidence);
+            assert!(matches!(
+                result,
+                Err(AgentManagementError::ReconciliationPresent(_))
+                    | Err(AgentManagementError::ReconciliationAmbiguous(_))
+                    | Err(AgentManagementError::ReconciliationUnavailable(_))
+            ));
+            assert_eq!(provider.store().snapshot().unwrap(), before);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn reconciliation_cas_failure_class_and_post_effect_evidence_fail_closed() {
+        for case in [
+            "digest",
+            "name",
+            "authority",
+            "phase",
+            "failure",
+            "post-effect",
+            "retry",
+            "native",
+            "successor",
+            "fence",
+            "managed",
+            "operation",
+        ] {
+            let root = root(&format!("reservation-invalid-{case}"));
+            let provider = AgentManagementProvider::open(&root).unwrap();
+            bind(&provider, "bind", "cutex.director", None);
+            let target = rotation_request("legacy-rotation", "example-director-v2");
+            seed_missing_ownership_reservation(&provider, &target);
+            let mut request = reservation_reconciliation_request("root-reconcile", &target);
+            match case {
+                "digest" => {
+                    request.expected_target_request_sha256 = Sha256::new("0".repeat(64)).unwrap()
+                }
+                "name" => request.expected_reserved_agent_name.push_str("-wrong"),
+                "authority" => request.expected_authority_epoch = 2,
+                "phase" => request.expected_phase = AgentActionPhase::Prepared,
+                "failure" => {
+                    provider
+                        .store()
+                        .with_state(true, |mut state| {
+                            let action = state.actions.get_mut(&target.action_id).unwrap();
+                            let AgentManagementOutcome::OwnerActionRequired { failure } =
+                                &mut action.response.as_mut().unwrap().outcome
+                            else {
+                                unreachable!()
+                            };
+                            failure.detail = "owner_action_required: unrelated failure".to_string();
+                            Ok((state, (), true))
+                        })
+                        .unwrap();
+                }
+                "post-effect" => {
+                    provider
+                        .store()
+                        .with_state(true, |mut state| {
+                            let mut event = state
+                                .phase_events
+                                .values()
+                                .find(|event| event.action_id == target.action_id)
+                                .unwrap()
+                                .clone();
+                            event.event_id =
+                                format!("agent-management:{}:phase:99", target.action_id);
+                            event.phase = AgentActionPhase::NativeBootstrapPending;
+                            event.phase_sequence = 99;
+                            state.phase_events.insert(event.event_id.clone(), event);
+                            Ok((state, (), true))
+                        })
+                        .unwrap();
+                }
+                "retry" => {
+                    provider
+                        .store()
+                        .with_state(true, |mut state| {
+                            state
+                                .actions
+                                .get_mut(&target.action_id)
+                                .unwrap()
+                                .native_bootstrap_retryable = true;
+                            Ok((state, (), true))
+                        })
+                        .unwrap();
+                }
+                "native" => {
+                    provider
+                        .store()
+                        .with_state(true, |mut state| {
+                            state
+                                .actions
+                                .get_mut(&target.action_id)
+                                .unwrap()
+                                .known_native_session_id = Some("native-existing".to_string());
+                            Ok((state, (), true))
+                        })
+                        .unwrap();
+                }
+                "successor" => {
+                    provider
+                        .store()
+                        .with_state(true, |mut state| {
+                            state
+                                .actions
+                                .get_mut(&target.action_id)
+                                .unwrap()
+                                .known_successor_cutex_session = Some(session("cutex.existing-r5"));
+                            Ok((state, (), true))
+                        })
+                        .unwrap();
+                }
+                "fence" => {
+                    provider
+                        .store()
+                        .with_state(true, |mut state| {
+                            state
+                                .actions
+                                .get_mut(&target.action_id)
+                                .unwrap()
+                                .historical_runtime_occurrence_fence =
+                                Some(RuntimeOccurrenceFence {
+                                    runtime_generation: 0,
+                                    current_runtime_agent_id: None,
+                                    agent_bus_endpoint_ids: Vec::new(),
+                                    pending_launch_id: None,
+                                    app_server_launch_claim_id: None,
+                                    alden_session_name: None,
+                                    alden_pid: None,
+                                    runtime_pid: None,
+                                    app_server_pid: None,
+                                    app_server_endpoint: None,
+                                    app_server_connected: false,
+                                });
+                            Ok((state, (), true))
+                        })
+                        .unwrap();
+                }
+                "managed" => {
+                    provider
+                        .store()
+                        .with_state(true, |mut state| {
+                            let cutex_session_id = session("cutex.existing-r5");
+                            state.agents.insert(
+                                cutex_session_id.clone(),
+                                ManagedAgentRecord {
+                                    project_id: project(),
+                                    created_by_director_session: session("cutex.director"),
+                                    created_by_operator_session: None,
+                                    cutex_session_id,
+                                    native_session_id: "native-existing-r5".to_string(),
+                                    spec: spec("example-director-v2"),
+                                    created_at: now(),
+                                    retired_at: None,
+                                },
+                            );
+                            Ok((state, (), true))
+                        })
+                        .unwrap();
+                }
+                "operation" => {
+                    provider
+                        .store()
+                        .with_state(true, |mut state| {
+                            state.actions.get_mut(&target.action_id).unwrap().operation =
+                                AgentOperationKind::Online;
+                            for event in state
+                                .phase_events
+                                .values_mut()
+                                .filter(|event| event.action_id == target.action_id)
+                            {
+                                event.operation = AgentOperationKind::Online;
+                            }
+                            let failure = state
+                                .failure_events
+                                .values_mut()
+                                .find(|failure| failure.action_id == target.action_id)
+                                .unwrap();
+                            failure.operation = AgentOperationKind::Online;
+                            let AgentManagementOutcome::OwnerActionRequired { failure } =
+                                &mut state
+                                    .actions
+                                    .get_mut(&target.action_id)
+                                    .unwrap()
+                                    .response
+                                    .as_mut()
+                                    .unwrap()
+                                    .outcome
+                            else {
+                                unreachable!()
+                            };
+                            failure.operation = AgentOperationKind::Online;
+                            Ok((state, (), true))
+                        })
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = provider.store().snapshot().unwrap();
+            assert!(provider
+                .reconcile_agent_reservation(&request, |_, _, _, _| {
+                    AgentReservationReconciliationEvidence::ProvenAbsent {
+                        reason: "absent".to_string(),
+                    }
+                })
+                .is_err());
+            assert_eq!(provider.store().snapshot().unwrap(), before);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn new_missing_ownership_rotation_never_commits_a_blocking_reservation() {
+        let root = root("new-missing-ownership-preflight");
+        let provider = AgentManagementProvider::open(&root).unwrap();
+        bind(&provider, "bind", "cutex.director", None);
+        let lifecycle = FakeLifecycle::default();
+        let rotation = rotation_request("new-rotation", "example-director-v2");
+        let response = provider.execute(&invocation("cutex.director"), &rotation, &lifecycle);
+        assert!(matches!(
+            response.outcome,
+            AgentManagementOutcome::NoWrite { ref code, ref detail }
+                if code == "owner_action_required"
+                    && detail.contains("no explicit Agent Management ownership record")
+        ));
+        assert!(!provider
+            .store()
+            .snapshot()
+            .unwrap()
+            .actions
+            .contains_key(&rotation.action_id));
+        assert!(lifecycle.log().is_empty());
+
+        let create = create_request(
+            "fresh-after-missing-ownership",
+            "example-director-v2",
+            AgentStartMode::BootstrapOnly,
+        );
+        assert!(matches!(
+            provider
+                .execute(&invocation("cutex.director"), &create, &lifecycle)
+                .outcome,
+            AgentManagementOutcome::Complete { .. }
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_project_operator_can_query_and_run_each_ordinary_lifecycle_operation() {
+        let root = root("operator-positive-lifecycle");
+        let provider = AgentManagementProvider::open(&root).unwrap();
+        bind(&provider, "bind", "cutex.director", None);
+        let lifecycle = FakeLifecycle::default();
+        let operator = created_agent(&completed(provider.execute(
+            &invocation("cutex.director"),
+            &create_request("create-operator", "operator", AgentStartMode::BootstrapOnly),
+            &lifecycle,
+        )));
+        completed(provider.execute(
+            &invocation("cutex.director"),
+            &operator_request("grant-operator", "grant", &operator.cutex_session_id, 0),
+            &lifecycle,
+        ));
+
+        let query = AgentManagementRequest {
+            schema: AgentManagementSchema::V1,
+            action_id: action("operator-query"),
+            project_id: Some(project()),
+            operation: AgentOperation::QueryManaged,
+        };
+        let receipt = completed(provider.execute(
+            &invocation(operator.cutex_session_id.as_str()),
+            &query,
+            &lifecycle,
+        ));
+        let AgentManagementResult::QueryManaged { operators, .. } = receipt.result else {
+            panic!("expected query result")
+        };
+        assert_eq!(operators.grant_revision, 1);
+        assert_eq!(
+            operators.operators[0].operator_cutex_session_id,
+            operator.cutex_session_id
+        );
+
+        let managed = created_agent(&completed(provider.execute(
+            &invocation(operator.cutex_session_id.as_str()),
+            &create_request("operator-create", "managed", AgentStartMode::BootstrapOnly),
+            &lifecycle,
+        )));
+        assert_eq!(
+            managed.created_by_director_session,
+            session("cutex.director")
+        );
+        assert_eq!(
+            managed.created_by_operator_session,
+            Some(operator.cutex_session_id.clone())
+        );
+        for (action_id, operation) in [
+            (
+                "operator-offline",
+                AgentOperation::Offline {
+                    cutex_session_id: managed.cutex_session_id.clone(),
+                },
+            ),
+            (
+                "operator-online",
+                AgentOperation::Online {
+                    cutex_session_id: managed.cutex_session_id.clone(),
+                },
+            ),
+            (
+                "operator-restart",
+                AgentOperation::Restart {
+                    cutex_session_id: managed.cutex_session_id.clone(),
+                },
+            ),
+        ] {
+            completed(provider.execute(
+                &invocation(operator.cutex_session_id.as_str()),
+                &AgentManagementRequest {
+                    schema: AgentManagementSchema::V1,
+                    action_id: action(action_id),
+                    project_id: Some(project()),
+                    operation,
+                },
+                &lifecycle,
+            ));
+        }
+
+        let close_target = created_agent(&completed(provider.execute(
+            &invocation(operator.cutex_session_id.as_str()),
+            &create_request(
+                "operator-create-close",
+                "close-target",
+                AgentStartMode::BootstrapOnly,
+            ),
+            &lifecycle,
+        )));
+        completed(provider.execute(
+            &invocation(operator.cutex_session_id.as_str()),
+            &AgentManagementRequest {
+                schema: AgentManagementSchema::V1,
+                action_id: action("operator-close"),
+                project_id: Some(project()),
+                operation: AgentOperation::Close {
+                    cutex_session_id: close_target.cutex_session_id,
+                },
+            },
+            &lifecycle,
+        ));
+
+        let replace_target = created_agent(&completed(provider.execute(
+            &invocation(operator.cutex_session_id.as_str()),
+            &create_request(
+                "operator-create-replace",
+                "replace-target",
+                AgentStartMode::BootstrapOnly,
+            ),
+            &lifecycle,
+        )));
+        completed(provider.execute(
+            &invocation(operator.cutex_session_id.as_str()),
+            &AgentManagementRequest {
+                schema: AgentManagementSchema::V1,
+                action_id: action("operator-replace"),
+                project_id: Some(project()),
+                operation: AgentOperation::Replace {
+                    predecessor_cutex_session_id: replace_target.cutex_session_id,
+                    policy: AgentReplacePolicy::CloseBeforeCreate,
+                    successor: spec("replacement"),
+                    start_mode: AgentStartMode::BootstrapOnly,
+                    frozen_message: None,
+                },
+            },
+            &lifecycle,
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn operator_authority_denies_impersonation_privileged_targets_and_control_planes() {
+        let root = root("operator-denials");
+        let provider = AgentManagementProvider::open(&root).unwrap();
+        bind(&provider, "bind", "cutex.director", None);
+        let lifecycle = FakeLifecycle::default();
+        let first = created_agent(&completed(provider.execute(
+            &invocation("cutex.director"),
+            &create_request("create-op-1", "operator-one", AgentStartMode::BootstrapOnly),
+            &lifecycle,
+        )));
+        let second = created_agent(&completed(provider.execute(
+            &invocation("cutex.director"),
+            &create_request("create-op-2", "operator-two", AgentStartMode::BootstrapOnly),
+            &lifecycle,
+        )));
+        completed(provider.execute(
+            &invocation("cutex.director"),
+            &operator_request("grant-op-1", "grant", &first.cutex_session_id, 0),
+            &lifecycle,
+        ));
+        completed(provider.execute(
+            &invocation("cutex.director"),
+            &operator_request("grant-op-2", "grant", &second.cutex_session_id, 1),
+            &lifecycle,
+        ));
+
+        for (id, operation) in [
+            (
+                "operator-target-primary",
+                AgentOperation::Close {
+                    cutex_session_id: session("cutex.director"),
+                },
+            ),
+            (
+                "operator-target-operator",
+                AgentOperation::Offline {
+                    cutex_session_id: second.cutex_session_id.clone(),
+                },
+            ),
+            (
+                "operator-rotate",
+                AgentOperation::DirectorRotate {
+                    expected_predecessor_cutex_session: session("cutex.director"),
+                    expected_authority_epoch: 1,
+                    mode: DirectorRotateMode::RetainPredecessorBootstrapOnly,
+                    successor: spec("forbidden-director"),
+                    frozen_message: None,
+                },
+            ),
+            (
+                "operator-grant",
+                AgentOperation::GrantOperator {
+                    operator_cutex_session_id: second.cutex_session_id.clone(),
+                    expected_grant_revision: 2,
+                },
+            ),
+            (
+                "operator-revoke",
+                AgentOperation::RevokeOperator {
+                    operator_cutex_session_id: second.cutex_session_id.clone(),
+                    expected_grant_revision: 2,
+                },
+            ),
+        ] {
+            assert!(matches!(
+                provider
+                    .execute(
+                        &invocation(first.cutex_session_id.as_str()),
+                        &AgentManagementRequest {
+                            schema: AgentManagementSchema::V1,
+                            action_id: action(id),
+                            project_id: Some(project()),
+                            operation,
+                        },
+                        &lifecycle,
+                    )
+                    .outcome,
+                AgentManagementOutcome::NoWrite { .. }
+            ));
+        }
+
+        bind_project_only(
+            &provider,
+            "bind-other",
+            "other-project",
+            "cutex.other-director",
+            None,
+        );
+        let cross_project = AgentManagementRequest {
+            schema: AgentManagementSchema::V1,
+            action_id: action("operator-cross-project"),
+            project_id: Some(ProjectId::new("other-project").unwrap()),
+            operation: AgentOperation::QueryManaged,
+        };
+        assert!(matches!(
+            provider
+                .execute(
+                    &invocation(first.cutex_session_id.as_str()),
+                    &cross_project,
+                    &lifecycle
+                )
+                .outcome,
+            AgentManagementOutcome::NoWrite { ref code, .. } if code == "project_not_authorized"
+        ));
+        let impersonator = created_agent(&completed(provider.execute(
+            &invocation("cutex.director"),
+            &create_request(
+                "create-impersonator",
+                "operator-lookalike",
+                AgentStartMode::BootstrapOnly,
+            ),
+            &lifecycle,
+        )));
+        assert!(matches!(
+            provider
+                .execute(
+                    &invocation(impersonator.cutex_session_id.as_str()),
+                    &AgentManagementRequest {
+                        schema: AgentManagementSchema::V1,
+                        action_id: action("lookalike-query"),
+                        project_id: Some(project()),
+                        operation: AgentOperation::QueryManaged,
+                    },
+                    &lifecycle,
+                )
+                .outcome,
+            AgentManagementOutcome::NoWrite { .. }
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn revoke_is_cas_audited_and_blocks_fresh_effects_but_replays_completed_receipts() {
+        let root = root("operator-revoke-replay");
+        let provider = AgentManagementProvider::open(&root).unwrap();
+        bind(&provider, "bind", "cutex.director", None);
+        let lifecycle = FakeLifecycle::default();
+        let operator = created_agent(&completed(provider.execute(
+            &invocation("cutex.director"),
+            &create_request("create-op", "operator", AgentStartMode::BootstrapOnly),
+            &lifecycle,
+        )));
+        let grant = operator_request("grant", "grant", &operator.cutex_session_id, 0);
+        let grant_receipt =
+            completed(provider.execute(&invocation("cutex.director"), &grant, &lifecycle));
+        assert!(matches!(
+            grant_receipt.result,
+            AgentManagementResult::OperatorGranted { .. }
+        ));
+        assert_eq!(
+            provider.director_seats.query().unwrap().occupancies
+                [&crate::task_service::SeatId::new("cutex-director").unwrap()]
+                .occupant_cutex_session,
+            session("cutex.director"),
+            "an Operator grant never occupies the Task Service Director seat"
+        );
+        assert!(matches!(
+            provider
+                .director_seats
+                .resolve_principal(&operator.cutex_session_id),
+            Err(crate::seat::SeatAuthorityError::Unauthorized)
+        ));
+        assert_eq!(
+            completed(provider.execute(&invocation("cutex.director"), &grant, &lifecycle)),
+            grant_receipt
+        );
+        let query = AgentManagementRequest {
+            schema: AgentManagementSchema::V1,
+            action_id: action("completed-before-revoke"),
+            project_id: Some(project()),
+            operation: AgentOperation::QueryManaged,
+        };
+        let completed_query = provider.execute(
+            &invocation(operator.cutex_session_id.as_str()),
+            &query,
+            &lifecycle,
+        );
+        completed(completed_query.clone());
+        let pending = create_request(
+            "unfinished-before-revoke",
+            "never-started",
+            AgentStartMode::BootstrapOnly,
+        );
+        let pending_digest = request_sha256(&pending).unwrap();
+        let pending_timestamp = now();
+        provider
+            .store()
+            .with_state(true, |mut state| {
+                state.actions.insert(
+                    pending.action_id.clone(),
+                    AgentActionRecord {
+                        action_id: pending.action_id.clone(),
+                        request_sha256: pending_digest,
+                        operation: AgentOperationKind::Create,
+                        project_id: project(),
+                        caller_cutex_session: operator.cutex_session_id.clone(),
+                        phase: AgentActionPhase::Prepared,
+                        phase_sequence: 0,
+                        reserved_agent_name: Some("never-started".to_string()),
+                        reserved_agent_cwd: Some(spec("never-started").cwd),
+                        known_successor_cutex_session: None,
+                        known_native_session_id: None,
+                        native_bootstrap_retryable: false,
+                        historical_runtime_occurrence_fence: None,
+                        external_message_id: None,
+                        response: None,
+                        created_at: pending_timestamp.clone(),
+                        updated_at: pending_timestamp,
+                    },
+                );
+                Ok((state, (), true))
+            })
+            .unwrap();
+        completed(provider.execute(
+            &invocation("cutex.director"),
+            &operator_request("revoke", "revoke", &operator.cutex_session_id, 1),
+            &lifecycle,
+        ));
+        assert_eq!(
+            provider.execute(
+                &invocation(operator.cutex_session_id.as_str()),
+                &query,
+                &lifecycle,
+            ),
+            completed_query
+        );
+        let bootstraps_before = lifecycle.bootstrap_count();
+        assert!(matches!(
+            provider
+                .execute(
+                    &invocation(operator.cutex_session_id.as_str()),
+                    &pending,
+                    &lifecycle,
+                )
+                .outcome,
+            AgentManagementOutcome::NoWrite { .. }
+        ));
+        assert_eq!(lifecycle.bootstrap_count(), bootstraps_before);
+        let fresh = AgentManagementRequest {
+            schema: AgentManagementSchema::V1,
+            action_id: action("fresh-after-revoke"),
+            project_id: Some(project()),
+            operation: AgentOperation::QueryManaged,
+        };
+        assert!(matches!(
+            provider
+                .execute(
+                    &invocation(operator.cutex_session_id.as_str()),
+                    &fresh,
+                    &lifecycle,
+                )
+                .outcome,
+            AgentManagementOutcome::NoWrite { .. }
+        ));
+        let snapshot = provider.store().snapshot().unwrap();
+        assert_eq!(snapshot.operator_grant_revisions[&project()], 2);
+        assert_eq!(snapshot.operator_audit_events.len(), 2);
+        assert!(!snapshot.actions.contains_key(&fresh.action_id));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn grant_cas_rejects_primary_unmanaged_and_retired_grantees() {
+        let root = root("operator-grant-cas-denials");
+        let provider = AgentManagementProvider::open(&root).unwrap();
+        bind(&provider, "bind", "cutex.director", None);
+        let lifecycle = FakeLifecycle::default();
+        let candidate = created_agent(&completed(provider.execute(
+            &invocation("cutex.director"),
+            &create_request(
+                "create-candidate",
+                "candidate",
+                AgentStartMode::BootstrapOnly,
+            ),
+            &lifecycle,
+        )));
+        for request in [
+            operator_request("stale-grant", "grant", &candidate.cutex_session_id, 1),
+            operator_request("primary-grant", "grant", &session("cutex.director"), 0),
+            operator_request("unmanaged-grant", "grant", &session("cutex.unmanaged"), 0),
+        ] {
+            assert!(matches!(
+                provider.execute(&invocation("cutex.director"), &request, &lifecycle).outcome,
+                AgentManagementOutcome::NoWrite { ref code, .. } if code == "conflict"
+            ));
+        }
+        completed(provider.execute(
+            &invocation("cutex.director"),
+            &operator_request("grant-candidate", "grant", &candidate.cutex_session_id, 0),
+            &lifecycle,
+        ));
+        completed(provider.execute(
+            &invocation("cutex.director"),
+            &AgentManagementRequest {
+                schema: AgentManagementSchema::V1,
+                action_id: action("primary-close-operator"),
+                project_id: Some(project()),
+                operation: AgentOperation::Close {
+                    cutex_session_id: candidate.cutex_session_id.clone(),
+                },
+            },
+            &lifecycle,
+        ));
+        assert!(matches!(
+            provider
+                .execute(
+                    &invocation("cutex.director"),
+                    &operator_request(
+                        "retired-grant",
+                        "grant",
+                        &candidate.cutex_session_id,
+                        2,
+                    ),
+                    &lifecycle,
+                )
+                .outcome,
+            AgentManagementOutcome::NoWrite { ref code, .. } if code == "conflict"
+        ));
+        assert_eq!(
+            provider
+                .store()
+                .snapshot()
+                .unwrap()
+                .operator_audit_events
+                .len(),
+            2
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_revoke_and_operator_action_have_a_linearizable_outcome() {
+        let root = root("operator-concurrent-revoke");
+        let provider = AgentManagementProvider::open(&root).unwrap();
+        bind(&provider, "bind", "cutex.director", None);
+        let lifecycle = FakeLifecycle::default();
+        let operator = created_agent(&completed(provider.execute(
+            &invocation("cutex.director"),
+            &create_request("create-op", "operator", AgentStartMode::BootstrapOnly),
+            &lifecycle,
+        )));
+        completed(provider.execute(
+            &invocation("cutex.director"),
+            &operator_request("grant", "grant", &operator.cutex_session_id, 0),
+            &lifecycle,
+        ));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let revoke_root = root.clone();
+        let revoke_barrier = Arc::clone(&barrier);
+        let revoke_operator = operator.cutex_session_id.clone();
+        let revoke = std::thread::spawn(move || {
+            let provider = AgentManagementProvider::open(revoke_root).unwrap();
+            revoke_barrier.wait();
+            provider.execute(
+                &invocation("cutex.director"),
+                &operator_request("race-revoke", "revoke", &revoke_operator, 1),
+                &FakeLifecycle::default(),
+            )
+        });
+        let action_root = root.clone();
+        let action_barrier = Arc::clone(&barrier);
+        let action_operator = operator.cutex_session_id.clone();
+        let action_thread = std::thread::spawn(move || {
+            let provider = AgentManagementProvider::open(action_root).unwrap();
+            action_barrier.wait();
+            provider.execute(
+                &invocation(action_operator.as_str()),
+                &AgentManagementRequest {
+                    schema: AgentManagementSchema::V1,
+                    action_id: action("race-query"),
+                    project_id: Some(project()),
+                    operation: AgentOperation::QueryManaged,
+                },
+                &FakeLifecycle::default(),
+            )
+        });
+        barrier.wait();
+        assert!(matches!(
+            revoke.join().unwrap().outcome,
+            AgentManagementOutcome::Complete { .. }
+        ));
+        let action_response = action_thread.join().unwrap();
+        assert!(matches!(
+            action_response.outcome,
+            AgentManagementOutcome::Complete { .. } | AgentManagementOutcome::NoWrite { .. }
+        ));
+        let snapshot = provider.store().snapshot().unwrap();
+        assert!(!snapshot.operator_grants[&project()].contains_key(&operator.cutex_session_id));
+        if matches!(
+            action_response.outcome,
+            AgentManagementOutcome::NoWrite { .. }
+        ) {
+            assert!(!snapshot.actions.contains_key(&action("race-query")));
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }

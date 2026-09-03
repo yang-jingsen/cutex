@@ -4273,6 +4273,7 @@ mod tests {
             schema: AgentManagementSchema::V1,
             requested_by_director: crate::role_revision::CutexSessionId::new("cutex.director-r11")
                 .unwrap(),
+            requested_by_operator: None,
         };
         AgentBusMessage {
             id: "agent-management-message-1".to_string(),

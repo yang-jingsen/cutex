@@ -13,7 +13,8 @@ use cutex::agent_bus::client::{
     agent_bus_fetch_agents_scoped_with_hosts, agent_bus_fetch_task_service_worker_context,
     agent_bus_healthy, agent_bus_prepare_task_service_worker_action, agent_bus_send_agent_message,
     agent_bus_submit_agent_management, agent_bus_submit_release_rotation,
-    agent_bus_submit_task_service_coordinator_action, agent_bus_submit_task_service_query,
+    agent_bus_submit_task_service_coordinator_action,
+    agent_bus_submit_task_service_director_action, agent_bus_submit_task_service_query,
     agent_bus_submit_task_service_terminal_action, agent_bus_submit_task_service_worker_action,
     agent_bus_submit_task_worker_action, agent_bus_submit_task_worker_reconciliation,
     agent_bus_update_agent_groups,
@@ -126,6 +127,12 @@ fn cmd_agent_management(command: AgentManagementCliCommand) -> anyhow::Result<()
         AgentManagementCliCommand::Replace { request_file } => {
             (AgentOperationKind::Replace, request_file)
         }
+        AgentManagementCliCommand::GrantOperator { request_file } => {
+            (AgentOperationKind::GrantOperator, request_file)
+        }
+        AgentManagementCliCommand::RevokeOperator { request_file } => {
+            (AgentOperationKind::RevokeOperator, request_file)
+        }
         AgentManagementCliCommand::DirectorRotate { request_file } => {
             (AgentOperationKind::DirectorRotate, request_file)
         }
@@ -222,6 +229,13 @@ fn cmd_agent_task_action(request_file: Option<&str>) -> anyhow::Result<()> {
                 serde_json::from_value(value)
                     .context("Failed to parse strict Task Service query request")?;
             serde_json::to_value(agent_bus_submit_task_service_query(&config, &request)?)?
+        }
+        "cutex/task-service-director-action/v1" | "cutex/task-service-director-action/v2" => {
+            let request: cutex::task_service::DirectorActionRequest = serde_json::from_value(value)
+                .context("Failed to parse strict Task Service Director action request")?;
+            serde_json::to_value(agent_bus_submit_task_service_director_action(
+                &config, &request,
+            )?)?
         }
         _ => anyhow::bail!("unsupported task-action document schema"),
     };
@@ -766,6 +780,8 @@ mod task_action_tests {
             "cutex/task-service-coordinator/v2",
             "cutex/task-service-terminal/v2",
             "cutex/task-service-query/v2",
+            "cutex/task-service-director-action/v1",
+            "cutex/task-service-director-action/v2",
         ] {
             let value = serde_json::json!({ "schema": schema });
             assert_eq!(task_action_document_schema(&value), Some(schema));

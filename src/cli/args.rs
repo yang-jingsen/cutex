@@ -968,6 +968,14 @@ pub enum AgentManagementCliCommand {
         #[arg(long)]
         request_file: String,
     },
+    GrantOperator {
+        #[arg(long)]
+        request_file: String,
+    },
+    RevokeOperator {
+        #[arg(long)]
+        request_file: String,
+    },
     DirectorRotate {
         #[arg(long)]
         request_file: String,
@@ -1179,6 +1187,19 @@ pub enum ManagementCommand {
         #[arg(long)]
         port: Option<u16>,
         /// Dedicated Management bearer override
+        #[arg(long)]
+        token: Option<String>,
+    },
+
+    /// Reconcile one legacy pre-effect Agent reservation using root-owned evidence
+    AgentReservationReconcile {
+        /// Strict reservation reconciliation JSON request
+        #[arg(long)]
+        request_file: String,
+        /// Local Management API port
+        #[arg(long)]
+        port: Option<u16>,
+        /// Dedicated Management root bearer override
         #[arg(long)]
         token: Option<String>,
     },

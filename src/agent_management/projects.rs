@@ -13,7 +13,7 @@ use crate::role_revision::{CutexSessionId, Rfc3339};
 
 use super::{
     now, AgentManagementError, AgentManagementInvocation, AgentManagementProvider,
-    AgentRuntimeObservation, ManagedAgentRecord, ProjectAuthority, ProjectId,
+    AgentOperatorGrant, AgentRuntimeObservation, ManagedAgentRecord, ProjectAuthority, ProjectId,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -142,10 +142,26 @@ pub struct ProjectDirectorProjection {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct ProjectAgentOperatorProjection {
+    pub grant: AgentOperatorGrant,
+    pub member: ProjectMemberProjection,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectAccessRole {
+    PrimaryDirector,
+    AgentOperator,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CutexProjectSummary {
     pub project_id: ProjectId,
     pub authority_epoch: u64,
     pub director_cutex_session_id: CutexSessionId,
+    pub access_role: ProjectAccessRole,
+    pub operator_count: usize,
     pub presentation: EffectiveProjectPresentation,
     pub active_member_count: usize,
     pub retired_member_count: usize,
@@ -157,6 +173,9 @@ pub struct CutexProjectWorkspace {
     pub project_id: ProjectId,
     pub authority_epoch: u64,
     pub director: ProjectDirectorProjection,
+    pub access_role: ProjectAccessRole,
+    pub operator_grant_revision: u64,
+    pub agent_operators: Vec<ProjectAgentOperatorProjection>,
     pub presentation: EffectiveProjectPresentation,
     pub active_agents: Vec<ProjectMemberProjection>,
     pub retired_agents: Vec<ProjectMemberProjection>,
@@ -193,10 +212,11 @@ impl AgentManagementProvider {
         let mut projects = snapshot
             .projects
             .values()
-            .filter(|authority| {
-                authority.authorized_director_session == invocation.caller_cutex_session
+            .filter_map(|authority| {
+                project_access_role(&snapshot, invocation, &authority.project_id)
+                    .ok()
+                    .map(|role| summary(&snapshot, authority, role))
             })
-            .map(|authority| summary(&snapshot, authority))
             .collect::<Vec<_>>();
         projects.sort_by(|left, right| left.project_id.cmp(&right.project_id));
         if projects.is_empty() {
@@ -212,9 +232,10 @@ impl AgentManagementProvider {
         observer: &dyn ProjectRuntimeObserver,
     ) -> Result<CutexProjectWorkspace, AgentManagementError> {
         let snapshot = self.store().snapshot()?;
-        let authority = authorized_authority(&snapshot, invocation, project_id)?;
+        let (authority, access_role) = authorized_project(&snapshot, invocation, project_id)?;
         let mut active_agents = Vec::new();
         let mut retired_agents = Vec::new();
+        let mut agent_operators = Vec::new();
         let mut director_member = None;
         for agent in snapshot
             .agents
@@ -224,6 +245,15 @@ impl AgentManagementProvider {
             let member = project_member(agent.clone(), observer);
             if agent.cutex_session_id == authority.authorized_director_session {
                 director_member = Some(member);
+            } else if let Some(grant) = snapshot
+                .operator_grants
+                .get(project_id)
+                .and_then(|grants| grants.get(&agent.cutex_session_id))
+            {
+                agent_operators.push(ProjectAgentOperatorProjection {
+                    grant: grant.clone(),
+                    member,
+                });
             } else if agent.retired_at.is_some() {
                 retired_agents.push(member);
             } else {
@@ -240,6 +270,11 @@ impl AgentManagementProvider {
                 .cutex_session_id
                 .cmp(&right.agent.cutex_session_id)
         });
+        agent_operators.sort_by(|left, right| {
+            left.grant
+                .operator_cutex_session_id
+                .cmp(&right.grant.operator_cutex_session_id)
+        });
         Ok(CutexProjectWorkspace {
             project_id: project_id.clone(),
             authority_epoch: authority.authority_epoch,
@@ -247,6 +282,13 @@ impl AgentManagementProvider {
                 cutex_session_id: authority.authorized_director_session.clone(),
                 member: director_member,
             },
+            access_role,
+            operator_grant_revision: snapshot
+                .operator_grant_revisions
+                .get(project_id)
+                .copied()
+                .unwrap_or(0),
+            agent_operators,
             presentation: effective_presentation(
                 project_id,
                 snapshot.project_presentations.get(project_id),
@@ -263,7 +305,7 @@ impl AgentManagementProvider {
     ) -> Result<ProjectPresentationSettings, AgentManagementError> {
         request.presentation.validate()?;
         self.store().with_state(true, |mut state| {
-            authorized_authority(&state, invocation, &request.project_id)?;
+            authorized_primary_authority(&state, invocation, &request.project_id)?;
             let current_revision = state
                 .project_presentations
                 .get(&request.project_id)
@@ -311,7 +353,7 @@ impl AgentManagementProvider {
     }
 }
 
-fn authorized_authority<'a>(
+fn authorized_primary_authority<'a>(
     snapshot: &'a super::AgentManagementSnapshot,
     invocation: &AgentManagementInvocation,
     project_id: &ProjectId,
@@ -326,9 +368,50 @@ fn authorized_authority<'a>(
     Ok(authority)
 }
 
+fn authorized_project<'a>(
+    snapshot: &'a super::AgentManagementSnapshot,
+    invocation: &AgentManagementInvocation,
+    project_id: &ProjectId,
+) -> Result<(&'a ProjectAuthority, ProjectAccessRole), AgentManagementError> {
+    let authority = snapshot
+        .projects
+        .get(project_id)
+        .ok_or(AgentManagementError::ProjectNotAuthorized)?;
+    let role = project_access_role(snapshot, invocation, project_id)?;
+    Ok((authority, role))
+}
+
+fn project_access_role(
+    snapshot: &super::AgentManagementSnapshot,
+    invocation: &AgentManagementInvocation,
+    project_id: &ProjectId,
+) -> Result<ProjectAccessRole, AgentManagementError> {
+    let authority = snapshot
+        .projects
+        .get(project_id)
+        .ok_or(AgentManagementError::ProjectNotAuthorized)?;
+    if authority.authorized_director_session == invocation.caller_cutex_session {
+        return Ok(ProjectAccessRole::PrimaryDirector);
+    }
+    let has_grant = snapshot
+        .operator_grants
+        .get(project_id)
+        .is_some_and(|grants| grants.contains_key(&invocation.caller_cutex_session));
+    let active_owned = snapshot
+        .agents
+        .get(&invocation.caller_cutex_session)
+        .is_some_and(|agent| &agent.project_id == project_id && agent.retired_at.is_none());
+    if has_grant && active_owned {
+        Ok(ProjectAccessRole::AgentOperator)
+    } else {
+        Err(AgentManagementError::ProjectNotAuthorized)
+    }
+}
+
 fn summary(
     snapshot: &super::AgentManagementSnapshot,
     authority: &ProjectAuthority,
+    access_role: ProjectAccessRole,
 ) -> CutexProjectSummary {
     let mut active_member_count = 0;
     let mut retired_member_count = 0;
@@ -338,6 +421,13 @@ fn summary(
         .filter(|agent| agent.project_id == authority.project_id)
     {
         if agent.cutex_session_id == authority.authorized_director_session {
+            continue;
+        }
+        if snapshot
+            .operator_grants
+            .get(&authority.project_id)
+            .is_some_and(|grants| grants.contains_key(&agent.cutex_session_id))
+        {
             continue;
         }
         if agent.retired_at.is_some() {
@@ -350,6 +440,11 @@ fn summary(
         project_id: authority.project_id.clone(),
         authority_epoch: authority.authority_epoch,
         director_cutex_session_id: authority.authorized_director_session.clone(),
+        access_role,
+        operator_count: snapshot
+            .operator_grants
+            .get(&authority.project_id)
+            .map_or(0, BTreeMap::len),
         presentation: effective_presentation(
             &authority.project_id,
             snapshot.project_presentations.get(&authority.project_id),
@@ -472,6 +567,7 @@ mod tests {
         ManagedAgentRecord {
             project_id: project_id.clone(),
             created_by_director_session: session("cutex.director"),
+            created_by_operator_session: None,
             cutex_session_id: session(value),
             native_session_id: format!("native-{value}"),
             spec: ManagedAgentSpec {
@@ -732,6 +828,65 @@ mod tests {
             provider.list_cutex_projects(&invocation("cutex.director")),
             Err(AgentManagementError::NotAuthorizedDirector)
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn operator_projection_is_distinct_and_cannot_mutate_presentation() {
+        let (provider, root, project_id) = provider_with_project();
+        let operator = session("cutex.worker-online");
+        provider
+            .store()
+            .with_state(true, |mut state| {
+                state
+                    .operator_grants
+                    .entry(project_id.clone())
+                    .or_default()
+                    .insert(
+                        operator.clone(),
+                        AgentOperatorGrant {
+                            project_id: project_id.clone(),
+                            operator_cutex_session_id: operator.clone(),
+                            grant_revision: 1,
+                            granted_at: timestamp(),
+                            granted_by_primary_director_session: session("cutex.director"),
+                        },
+                    );
+                state.operator_grant_revisions.insert(project_id.clone(), 1);
+                Ok((state, (), true))
+            })
+            .unwrap();
+
+        let summaries = provider
+            .list_cutex_projects(&invocation(operator.as_str()))
+            .unwrap();
+        assert_eq!(summaries[0].access_role, ProjectAccessRole::AgentOperator);
+        assert_eq!(summaries[0].operator_count, 1);
+        let workspace = provider
+            .read_cutex_project(&invocation(operator.as_str()), &project_id, &observation)
+            .unwrap();
+        assert_eq!(workspace.access_role, ProjectAccessRole::AgentOperator);
+        assert_eq!(
+            workspace.director.cutex_session_id,
+            session("cutex.director")
+        );
+        assert_eq!(workspace.agent_operators.len(), 1);
+        assert!(workspace.active_agents.is_empty());
+        assert!(matches!(
+            provider.update_project_presentation(
+                &invocation(operator.as_str()),
+                &ProjectPresentationUpdateRequest {
+                    project_id: project_id.clone(),
+                    expected_presentation_revision: 0,
+                    presentation: ProjectPresentationInput {
+                        display_name: "Forbidden".to_string(),
+                        badge_label: "F".to_string(),
+                        color: ProjectPaletteColor::Red,
+                    },
+                }
+            ),
+            Err(AgentManagementError::ProjectNotAuthorized)
+        ));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

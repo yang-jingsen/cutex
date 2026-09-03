@@ -1326,13 +1326,29 @@ impl TaskWorkerActionHost {
         }
         match &request.action {
             Operation::Query { selector } => {
+                // A v2 Director query is deliberately project-scoped.  The
+                // caller's exact durable session identity comes from the
+                // authenticated route; no cwd, group, display name, or native
+                // workspace metadata participates in this authority lookup.
+                let project_scope =
+                    if request.schema == crate::task_service::DirectorActionSchema::V2 {
+                        match director_exact_project_scope(session_id) {
+                            Ok(scope) => Some(scope),
+                            Err(code) => {
+                                return director_no_write(request.action_id.clone(), "query", code)
+                            }
+                        }
+                    } else {
+                        None
+                    };
                 return self.director_query(
                     provider,
                     seat_snapshot,
                     seat_for_session_in_snapshot(seat_snapshot, session_id).as_ref(),
                     request.action_id.clone(),
                     selector,
-                )
+                    project_scope.as_ref(),
+                );
             }
             Operation::CreateRevision(create) => {
                 return self.director_create_revision(
@@ -1722,6 +1738,7 @@ impl TaskWorkerActionHost {
         caller_seat: Option<&crate::task_service::SeatId>,
         action_id: crate::task_service::ActionId,
         selector: &crate::task_service::DirectorQuerySelector,
+        exact_project_scope: Option<&BTreeSet<crate::agent_management::ProjectId>>,
     ) -> crate::task_service::DirectorActionReceipt {
         let Some(caller_seat) = caller_seat else {
             return director_no_write(action_id, "query", "unauthorized");
@@ -1735,6 +1752,14 @@ impl TaskWorkerActionHost {
         let mut tasks = Vec::new();
         for revisions in snapshot.task_revisions.values() {
             for task in revisions.values() {
+                if exact_project_scope.is_some_and(|scope| {
+                    !task
+                        .project_id
+                        .as_ref()
+                        .is_some_and(|project_id| scope.contains(project_id))
+                }) {
+                    continue;
+                }
                 let coordinator = snapshot
                     .workflows
                     .get(&task.workflow_id)
@@ -2250,6 +2275,43 @@ impl TaskWorkerActionHost {
             },
         }
     }
+}
+
+/// Returns only project IDs whose durable authority record names this exact
+/// authenticated Director session. It intentionally has no presentation or
+/// heuristic fallback: inability to read the authority store fails the v2
+/// query closed.
+fn director_exact_project_scope(
+    director_session: &crate::role_revision::CutexSessionId,
+) -> Result<BTreeSet<crate::agent_management::ProjectId>, &'static str> {
+    let snapshot = crate::agent_management::AgentManagementProvider::open_default()
+        .map_err(|_| "project_authority_unavailable")?
+        .store()
+        .snapshot()
+        .map_err(|_| "project_authority_unavailable")?;
+    let projects = exact_project_scope_from_authorities(snapshot.projects, director_session);
+    if projects.is_empty() {
+        Err("project_authority_absent")
+    } else {
+        Ok(projects)
+    }
+}
+
+fn exact_project_scope_from_authorities(
+    authorities: impl IntoIterator<
+        Item = (
+            crate::agent_management::ProjectId,
+            crate::agent_management::ProjectAuthority,
+        ),
+    >,
+    director_session: &crate::role_revision::CutexSessionId,
+) -> BTreeSet<crate::agent_management::ProjectId> {
+    authorities
+        .into_iter()
+        .filter_map(|(project_id, authority)| {
+            (authority.authorized_director_session == *director_session).then_some(project_id)
+        })
+        .collect()
 }
 
 fn reconciliation_required(prepared: &PreparedTaskWorkerAction) -> TaskWorkerActionOutcome {
@@ -4032,6 +4094,39 @@ mod tests {
         PilotDeliveryRequest, PilotOwnerSnapshot, PilotPublishRequest, PilotTaskSpecification,
         TaskDeliveryPilot,
     };
+
+    #[test]
+    fn v2_project_scope_uses_only_the_exact_director_session() {
+        let director = crate::role_revision::CutexSessionId::new("cutex.director").unwrap();
+        let other = crate::role_revision::CutexSessionId::new("cutex.other").unwrap();
+        let authority = |session: crate::role_revision::CutexSessionId| {
+            crate::agent_management::ProjectAuthority {
+                project_id: crate::agent_management::ProjectId::new(format!(
+                    "project-{}",
+                    session.as_str()
+                ))
+                .unwrap(),
+                authorized_director_session: session,
+                authority_epoch: 1,
+                updated_at: crate::role_revision::Rfc3339::new("2026-01-01T00:00:00Z").unwrap(),
+            }
+        };
+        let own = authority(director.clone());
+        let foreign = authority(other);
+        let scope = exact_project_scope_from_authorities(
+            vec![
+                (own.project_id.clone(), own),
+                (foreign.project_id.clone(), foreign),
+            ],
+            &director,
+        );
+        assert_eq!(scope.len(), 1);
+        assert!(scope
+            .contains(&crate::agent_management::ProjectId::new("project-cutex.director").unwrap()));
+        // Matching a presentation-like string is intentionally irrelevant.
+        assert!(!scope
+            .contains(&crate::agent_management::ProjectId::new("project-cutex.other").unwrap()));
+    }
 
     #[test]
     fn poll_wait_duration_is_optional_and_bounded() {
@@ -7126,6 +7221,7 @@ mod tests {
             Some(&director_seat),
             ActionId::new("semantic-query").unwrap(),
             &DirectorQuerySelector::All {},
+            None,
         );
         let encoded = serde_json::to_value(&query).unwrap();
         assert_eq!(query.status, DirectorActionStatus::CurrentState);
@@ -7159,6 +7255,7 @@ mod tests {
             None,
             ActionId::new("outsider-query").unwrap(),
             &DirectorQuerySelector::All {},
+            None,
         );
         assert_eq!(outsider_query.code.as_deref(), Some("unauthorized"));
         assert!(outsider_query.tasks.is_empty());

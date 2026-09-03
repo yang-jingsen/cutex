@@ -42,6 +42,8 @@ pub type ManagementProjectAuthorityHandler =
     fn(crate::agent_management::ProjectAuthorityRequest) -> serde_json::Value;
 pub type ManagementLegacyDirectorOwnershipImportHandler =
     fn(crate::agent_management::LegacyDirectorOwnershipImportRequest) -> serde_json::Value;
+pub type ManagementAgentReservationReconciliationHandler =
+    fn(crate::agent_management::AgentReservationReconciliationRequest) -> serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagementNativeForwardError {
@@ -65,6 +67,7 @@ pub struct ManagementRequestContext {
     pub request_release_rotation: ManagementReleaseRotationRequestHandler,
     pub bind_project_authority: ManagementProjectAuthorityHandler,
     pub import_legacy_director_ownership: ManagementLegacyDirectorOwnershipImportHandler,
+    pub reconcile_agent_reservation: ManagementAgentReservationReconciliationHandler,
 }
 
 pub fn run_management_server(

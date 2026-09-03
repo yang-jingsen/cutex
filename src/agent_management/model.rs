@@ -80,6 +80,18 @@ pub enum LegacyDirectorOwnershipImportReceiptSchema {
     V1,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum AgentReservationReconciliationSchema {
+    #[serde(rename = "cutex/agent-management/reservation-reconciliation/v1")]
+    V1,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum AgentReservationReconciliationReceiptSchema {
+    #[serde(rename = "cutex/agent-management/reservation-reconciliation-receipt/v1")]
+    V1,
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct ProjectId(String);
@@ -140,6 +152,48 @@ pub enum DirectorRotateMode {
     ClosePredecessorThenCreateWithMessage,
     RetainPredecessorWithMessage,
     RetainPredecessorBootstrapOnly,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentOperatorGrant {
+    pub project_id: ProjectId,
+    pub operator_cutex_session_id: CutexSessionId,
+    pub grant_revision: u64,
+    pub granted_at: Rfc3339,
+    pub granted_by_primary_director_session: CutexSessionId,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentOperatorRosterProjection {
+    pub grant_revision: u64,
+    #[serde(default)]
+    pub operators: Vec<AgentOperatorGrant>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentOperatorAuditKind {
+    Granted,
+    Revoked,
+    RetainedAfterDirectorRotation,
+    RemovedForPrimaryDirector,
+    RemovedByDirectorRotation,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentOperatorAuditEvent {
+    pub event_id: String,
+    pub action_id: AgentActionId,
+    pub project_id: ProjectId,
+    pub operator_cutex_session_id: CutexSessionId,
+    pub kind: AgentOperatorAuditKind,
+    pub previous_grant_revision: u64,
+    pub grant_revision: u64,
+    pub primary_director_cutex_session_id: CutexSessionId,
+    pub committed_at: Rfc3339,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -220,6 +274,14 @@ pub enum AgentOperation {
         #[serde(default)]
         frozen_message: Option<String>,
     },
+    GrantOperator {
+        operator_cutex_session_id: CutexSessionId,
+        expected_grant_revision: u64,
+    },
+    RevokeOperator {
+        operator_cutex_session_id: CutexSessionId,
+        expected_grant_revision: u64,
+    },
     DirectorRotate {
         expected_predecessor_cutex_session: CutexSessionId,
         expected_authority_epoch: u64,
@@ -240,6 +302,8 @@ impl AgentOperation {
             Self::Restart { .. } => AgentOperationKind::Restart,
             Self::Close { .. } => AgentOperationKind::Close,
             Self::Replace { .. } => AgentOperationKind::Replace,
+            Self::GrantOperator { .. } => AgentOperationKind::GrantOperator,
+            Self::RevokeOperator { .. } => AgentOperationKind::RevokeOperator,
             Self::DirectorRotate { .. } => AgentOperationKind::DirectorRotate,
         }
     }
@@ -255,6 +319,8 @@ pub enum AgentOperationKind {
     Restart,
     Close,
     Replace,
+    GrantOperator,
+    RevokeOperator,
     DirectorRotate,
 }
 
@@ -304,6 +370,9 @@ impl<'de> Deserialize<'de> for AgentManagementRequest {
                 "start_mode",
                 "frozen_message",
             ],
+            "grant_operator" | "revoke_operator" => {
+                &["operator_cutex_session_id", "expected_grant_revision"]
+            }
             "director_rotate" => &[
                 "expected_predecessor_cutex_session",
                 "expected_authority_epoch",
@@ -364,6 +433,21 @@ impl AgentManagementRequest {
                 successor.validate()?;
                 validate_start(*start_mode, frozen_message.as_deref())
             }
+            AgentOperation::GrantOperator {
+                expected_grant_revision,
+                ..
+            }
+            | AgentOperation::RevokeOperator {
+                expected_grant_revision,
+                ..
+            } => {
+                if *expected_grant_revision > crate::role_revision::MAX_JSON_SAFE_INTEGER {
+                    return Err(AgentManagementError::InvalidRequest(
+                        "invalid_operator_grant_revision",
+                    ));
+                }
+                Ok(())
+            }
             AgentOperation::DirectorRotate {
                 expected_authority_epoch,
                 mode,
@@ -418,7 +502,12 @@ pub struct AgentManagementInvocation {
 #[serde(deny_unknown_fields)]
 pub struct AgentManagementMessageMetadata {
     pub schema: AgentManagementSchema,
+    /// Backward-compatible provenance for the project's Primary Director.
     pub requested_by_director: CutexSessionId,
+    /// Present when an Agent Operator, rather than the Primary Director,
+    /// requested the lifecycle action that emitted this message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_by_operator: Option<CutexSessionId>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -460,6 +549,32 @@ pub struct LegacyDirectorOwnershipEvidence {
     pub spec: ManagedAgentSpec,
 }
 
+/// Root-only CAS request for terminalizing one legacy, provably pre-effect
+/// reservation. None of these selectors are evidence that the successor is
+/// absent; the provider obtains that proof independently.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentReservationReconciliationRequest {
+    pub schema: AgentReservationReconciliationSchema,
+    pub action_id: AgentActionId,
+    pub project_id: ProjectId,
+    pub target_action_id: AgentActionId,
+    pub expected_target_request_sha256: Sha256,
+    pub expected_phase: AgentActionPhase,
+    pub expected_reserved_agent_name: String,
+    pub expected_reserved_agent_cwd: String,
+    pub expected_authorized_director_session: CutexSessionId,
+    pub expected_authority_epoch: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AgentReservationReconciliationEvidence {
+    ProvenAbsent { reason: String },
+    Present { reason: String },
+    Ambiguous { reason: String },
+    Unavailable { reason: String },
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectAuthority {
@@ -473,7 +588,11 @@ pub struct ProjectAuthority {
 #[serde(deny_unknown_fields)]
 pub struct ManagedAgentRecord {
     pub project_id: ProjectId,
+    /// Backward-compatible Primary Director provenance.
     pub created_by_director_session: CutexSessionId,
+    /// Present when creation was requested by a delegated Agent Operator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by_operator_session: Option<CutexSessionId>,
     pub cutex_session_id: CutexSessionId,
     pub native_session_id: String,
     pub spec: ManagedAgentSpec,
@@ -657,6 +776,8 @@ pub enum AgentManagementResult {
     QueryManaged {
         authority: ProjectAuthority,
         agents: Vec<ManagedAgentRecord>,
+        #[serde(default)]
+        operators: AgentOperatorRosterProjection,
     },
     Lifecycle {
         agent: ManagedAgentRecord,
@@ -668,6 +789,14 @@ pub enum AgentManagementResult {
         observation: AgentRuntimeObservation,
         #[serde(default)]
         message_id: Option<String>,
+    },
+    OperatorGranted {
+        grant: AgentOperatorGrant,
+        roster: AgentOperatorRosterProjection,
+    },
+    OperatorRevoked {
+        operator_cutex_session_id: CutexSessionId,
+        roster: AgentOperatorRosterProjection,
     },
     DirectorRotated {
         predecessor_cutex_session_id: CutexSessionId,
@@ -717,6 +846,25 @@ pub struct AgentManagementFailureEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_cutex_session_id: Option<CutexSessionId>,
     pub created_at: Rfc3339,
+}
+
+/// Append-only audit evidence for one successful root reconciliation. The
+/// original failure event remains in the journal.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentReservationReconciliationEvent {
+    pub event_id: String,
+    pub action_id: AgentActionId,
+    pub request_sha256: Sha256,
+    pub project_id: ProjectId,
+    pub target_action_id: AgentActionId,
+    pub target_request_sha256: Sha256,
+    pub reserved_agent_name: String,
+    pub reserved_agent_cwd: String,
+    pub previous_phase: AgentActionPhase,
+    pub terminal_phase: AgentActionPhase,
+    pub absence_evidence: String,
+    pub committed_at: Rfc3339,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -799,6 +947,43 @@ pub struct LegacyDirectorOwnershipImportResponse {
     pub outcome: LegacyDirectorOwnershipImportOutcome,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentReservationReconciliationReceipt {
+    pub schema: AgentReservationReconciliationReceiptSchema,
+    pub action_id: AgentActionId,
+    pub request_sha256: Sha256,
+    pub project_id: ProjectId,
+    pub target_action_id: AgentActionId,
+    pub target_request_sha256: Sha256,
+    pub reserved_agent_name: String,
+    pub reserved_agent_cwd: String,
+    pub reconciled_at: Rfc3339,
+    pub reconciliation_event_id: String,
+    pub target_response: AgentManagementResponse,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AgentReservationReconciliationOutcome {
+    Complete {
+        receipt: AgentReservationReconciliationReceipt,
+        replayed: bool,
+    },
+    NoWrite {
+        code: String,
+        detail: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentReservationReconciliationResponse {
+    pub schema: AgentReservationReconciliationSchema,
+    pub action_id: AgentActionId,
+    pub outcome: AgentReservationReconciliationOutcome,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AgentManagementError {
     InvalidRequest(&'static str),
@@ -812,6 +997,9 @@ pub enum AgentManagementError {
     PersistenceUnavailable,
     InvalidStore,
     External(String),
+    ReconciliationPresent(String),
+    ReconciliationAmbiguous(String),
+    ReconciliationUnavailable(String),
 }
 
 impl AgentManagementError {
@@ -828,6 +1016,9 @@ impl AgentManagementError {
             Self::PersistenceUnavailable => "persistence_unavailable",
             Self::InvalidStore => "invalid_store",
             Self::External(_) => "external_failure",
+            Self::ReconciliationPresent(_) => "reservation_evidence_present",
+            Self::ReconciliationAmbiguous(_) => "reservation_evidence_ambiguous",
+            Self::ReconciliationUnavailable(_) => "reservation_evidence_unavailable",
         }
     }
 }
@@ -838,7 +1029,11 @@ impl fmt::Display for AgentManagementError {
             Self::InvalidRequest(reason) | Self::NotFound(reason) | Self::Conflict(reason) => {
                 write!(formatter, "{}: {reason}", self.code())
             }
-            Self::OwnerActionRequired(reason) | Self::External(reason) => {
+            Self::OwnerActionRequired(reason)
+            | Self::External(reason)
+            | Self::ReconciliationPresent(reason)
+            | Self::ReconciliationAmbiguous(reason)
+            | Self::ReconciliationUnavailable(reason) => {
                 write!(formatter, "{}: {reason}", self.code())
             }
             _ => formatter.write_str(self.code()),
@@ -876,6 +1071,25 @@ mod tests {
     }
 
     #[test]
+    fn operator_grant_and_revoke_requests_are_strict_typed_cas_operations() {
+        for operation in ["grant_operator", "revoke_operator"] {
+            let value = serde_json::json!({
+                "schema": "cutex/agent-management/v1",
+                "action_id": format!("{operation}-1"),
+                "project_id": "project-alpha",
+                "operation": operation,
+                "operator_cutex_session_id": "cutex.worker",
+                "expected_grant_revision": 0
+            });
+            let request: AgentManagementRequest = serde_json::from_value(value.clone()).unwrap();
+            request.validate().unwrap();
+            let mut forged = value;
+            forged["operator_name"] = serde_json::json!("worker");
+            assert!(serde_json::from_value::<AgentManagementRequest>(forged).is_err());
+        }
+    }
+
+    #[test]
     fn project_selector_is_strict_when_present() {
         assert!(ProjectId::new("project:alpha-1").is_ok());
         for invalid in ["", "project alpha", "../alpha", "/absolute"] {
@@ -885,10 +1099,44 @@ mod tests {
     }
 
     #[test]
+    fn reservation_reconciliation_request_is_closed_and_uses_only_cas_selectors() {
+        let value = serde_json::json!({
+            "schema": "cutex/agent-management/reservation-reconciliation/v1",
+            "action_id": "root-reconcile-1",
+            "project_id": "example-project",
+            "target_action_id": "legacy-rotation-1",
+            "expected_target_request_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "expected_phase": "owner_action_required",
+            "expected_reserved_agent_name": "example-director-v2",
+            "expected_reserved_agent_cwd": "/tmp/example-director-v2",
+            "expected_authorized_director_session": "cutex.director-r4",
+            "expected_authority_epoch": 1
+        });
+        assert!(
+            serde_json::from_value::<AgentReservationReconciliationRequest>(value.clone()).is_ok()
+        );
+        for forbidden in [
+            "successor_absent",
+            "native_session_absent",
+            "agent_bus_endpoint_absent",
+            "force",
+            "caller_cutex_session",
+        ] {
+            let mut changed = value.clone();
+            changed[forbidden] = serde_json::json!(true);
+            assert!(
+                serde_json::from_value::<AgentReservationReconciliationRequest>(changed).is_err(),
+                "{forbidden} must not become caller-supplied absence evidence"
+            );
+        }
+    }
+
+    #[test]
     fn custom_message_metadata_preserves_typed_director_provenance() {
         let metadata = AgentManagementMessageMetadata {
             schema: AgentManagementSchema::V1,
             requested_by_director: CutexSessionId::new("cutex.director-r11").unwrap(),
+            requested_by_operator: None,
         };
         let encoded = serde_json::to_value(&metadata).unwrap();
         assert_eq!(encoded["schema"], "cutex/agent-management/v1");

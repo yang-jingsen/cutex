@@ -42,7 +42,7 @@ pub const NATIVE_REQUEST_ALLOW_RULES_SHA256: &str =
 pub const CUTEX_METHOD_REGISTRY_INDEX_SHA256: &str =
     "5c97fce39614e2ecc0c751ea0a7b289e5086bb0c6d4043ad1b5ea71347be6896";
 pub const CUTEX_METHOD_REGISTRY_SCHEMA_SHA256: &str =
-    "6efab871e39598c776a5439d938f76d08fa3c1078c98e834a6ae434978c04780";
+    "306ae387f5e84656e67e06add996a367b3c3330781dc2d412fa8907a656f8826";
 
 pub const CUTEX_METHOD_REGISTRY_INDEX: &str = include_str!("schema/cutex-method-registry-v3.json");
 

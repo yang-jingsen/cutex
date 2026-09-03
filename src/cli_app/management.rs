@@ -61,7 +61,39 @@ pub(crate) fn run_command(command: ManagementCommand) -> anyhow::Result<()> {
             port,
             token,
         } => cmd_management_agent_ownership_import(&request_file, port, token.as_deref()),
+        ManagementCommand::AgentReservationReconcile {
+            request_file,
+            port,
+            token,
+        } => cmd_management_agent_reservation_reconcile(&request_file, port, token.as_deref()),
     }
+}
+
+fn cmd_management_agent_reservation_reconcile(
+    request_file: &str,
+    port: Option<u16>,
+    explicit_root_token: Option<&str>,
+) -> anyhow::Result<()> {
+    let bytes = fs::read(request_file).with_context(|| {
+        format!("Failed to read Agent reservation reconciliation request: {request_file}")
+    })?;
+    let request: cutex::agent_management::AgentReservationReconciliationRequest =
+        serde_json::from_slice(&bytes)
+            .context("Failed to parse strict Agent reservation reconciliation request")?;
+    let body = serde_json::to_vec(&request)?;
+    let config = load_codez_config();
+    let port = port.unwrap_or(DEFAULT_MANAGEMENT_PORT);
+    validate_management_port(port)?;
+    let token = management_root_credential(&config, explicit_root_token)?;
+    let response = management_http_json(
+        &management_base_url(port),
+        "POST",
+        "/v2/agent-management/reservation-reconciliation",
+        Some(token),
+        Some(&body),
+    )?;
+    println!("{}", serde_json::to_string(&response)?);
+    Ok(())
 }
 
 fn cmd_management_agent_ownership_import(

@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-#[cfg(unix)]
 use std::fs::File;
 use std::fs::{self, OpenOptions};
 use std::io;
@@ -15,18 +14,31 @@ use crate::role_revision::{Rfc3339, Sha256};
 
 use super::{
     AgentActionId, AgentActionRecord, AgentManagementError, AgentManagementFailureEvent,
-    AgentManagementPhaseEvent, AgentManagementStoreSchema, LegacyDirectorOwnershipImportReceipt,
-    ManagedAgentRecord, ProjectAuthority, ProjectAuthorityReceipt, ProjectId,
+    AgentManagementPhaseEvent, AgentManagementStoreSchema, AgentOperatorAuditEvent,
+    AgentOperatorGrant, AgentReservationReconciliationEvent, AgentReservationReconciliationReceipt,
+    LegacyDirectorOwnershipImportReceipt, ManagedAgentRecord, ProjectAuthority,
+    ProjectAuthorityReceipt, ProjectId,
 };
 
 const STORE_FILE: &str = "agent-management-v1.json";
 const LOCK_FILE: &str = "agent-management-v1.lock";
+const MUTATION_LOCK_FILE: &str = "agent-management-mutation-v1.lock";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentManagementSnapshot {
     pub schema: AgentManagementStoreSchema,
     pub store_revision: u64,
     pub projects: BTreeMap<ProjectId, ProjectAuthority>,
+    /// Exact project/session keyed Agent Operator grants. Missing on legacy v1
+    /// stores and therefore migrated as an empty grant set.
+    #[serde(default)]
+    pub operator_grants:
+        BTreeMap<ProjectId, BTreeMap<crate::role_revision::CutexSessionId, AgentOperatorGrant>>,
+    /// Per-project CAS revision for the complete Operator grant set.
+    #[serde(default)]
+    pub operator_grant_revisions: BTreeMap<ProjectId, u64>,
+    #[serde(default)]
+    pub operator_audit_events: BTreeMap<String, AgentOperatorAuditEvent>,
     /// Non-authoritative UI metadata. Its map key is always the canonical
     /// provider-owned project identity; none of these values participate in
     /// authorization.
@@ -40,6 +52,11 @@ pub struct AgentManagementSnapshot {
     #[serde(default)]
     pub legacy_director_ownership_import_receipts:
         BTreeMap<AgentActionId, LegacyDirectorOwnershipImportReceipt>,
+    #[serde(default)]
+    pub reservation_reconciliation_receipts:
+        BTreeMap<AgentActionId, AgentReservationReconciliationReceipt>,
+    #[serde(default)]
+    pub reservation_reconciliation_events: BTreeMap<String, AgentReservationReconciliationEvent>,
     pub failure_events: BTreeMap<String, AgentManagementFailureEvent>,
     /// Preserve additive provider fields across presentation-only writes so a
     /// newer store is not silently downgraded by this reader.
@@ -53,12 +70,17 @@ impl AgentManagementSnapshot {
             schema: AgentManagementStoreSchema::V1,
             store_revision: 0,
             projects: BTreeMap::new(),
+            operator_grants: BTreeMap::new(),
+            operator_grant_revisions: BTreeMap::new(),
+            operator_audit_events: BTreeMap::new(),
             project_presentations: BTreeMap::new(),
             agents: BTreeMap::new(),
             actions: BTreeMap::new(),
             phase_events: BTreeMap::new(),
             authority_receipts: BTreeMap::new(),
             legacy_director_ownership_import_receipts: BTreeMap::new(),
+            reservation_reconciliation_receipts: BTreeMap::new(),
+            reservation_reconciliation_events: BTreeMap::new(),
             failure_events: BTreeMap::new(),
             extra: BTreeMap::new(),
         }
@@ -92,6 +114,21 @@ impl AgentManagementStore {
 
     pub fn snapshot(&self) -> Result<AgentManagementSnapshot, AgentManagementError> {
         self.with_state(false, |state| Ok((state.clone(), state, false)))
+    }
+
+    /// Holds the provider-wide mutation fence across authorization checks and
+    /// external lifecycle effects. The process mutex in the provider covers
+    /// threads; this OS lock extends the same ordering across processes.
+    pub(crate) fn lock_mutations(&self) -> Result<File, AgentManagementError> {
+        let path = self.root.join(MUTATION_LOCK_FILE);
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        set_private_open_options(&mut options);
+        let lock = options
+            .open(path)
+            .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
+        FileExt::lock_exclusive(&lock).map_err(|_| AgentManagementError::PersistenceUnavailable)?;
+        Ok(lock)
     }
 
     pub(crate) fn with_state<T>(
@@ -257,17 +294,30 @@ mod tests {
     }
 
     #[test]
-    fn accepted_v1_snapshot_without_import_receipts_remains_readable() {
+    fn accepted_single_director_v1_snapshot_migrates_to_empty_operator_grants() {
         let mut value = serde_json::to_value(AgentManagementSnapshot::empty()).unwrap();
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("legacy_director_ownership_import_receipts");
+        let object = value.as_object_mut().unwrap();
+        object.remove("legacy_director_ownership_import_receipts");
+        object.remove("reservation_reconciliation_receipts");
+        object.remove("reservation_reconciliation_events");
+        object.remove("operator_grants");
+        object.remove("operator_grant_revisions");
+        object.remove("operator_audit_events");
+        object.insert(
+            "future_additive_field".to_string(),
+            serde_json::json!({"kept": true}),
+        );
 
         let snapshot: AgentManagementSnapshot =
             serde_json::from_value(value).expect("accepted snapshot remains compatible");
         assert!(snapshot
             .legacy_director_ownership_import_receipts
             .is_empty());
+        assert!(snapshot.reservation_reconciliation_receipts.is_empty());
+        assert!(snapshot.reservation_reconciliation_events.is_empty());
+        assert!(snapshot.operator_grants.is_empty());
+        assert!(snapshot.operator_grant_revisions.is_empty());
+        assert!(snapshot.operator_audit_events.is_empty());
+        assert_eq!(snapshot.extra["future_additive_field"]["kept"], true);
     }
 }

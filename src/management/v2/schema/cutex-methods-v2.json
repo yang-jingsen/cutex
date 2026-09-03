@@ -613,7 +613,7 @@
         "action_id": { "$ref": "#/$defs/requestId" },
         "request_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
         "operation": {
-          "enum": ["create", "query_managed", "online", "offline", "restart", "close", "replace", "director_rotate"]
+          "enum": ["create", "query_managed", "online", "offline", "restart", "close", "replace", "grant_operator", "revoke_operator", "director_rotate"]
         },
         "project_id": { "$ref": "#/$defs/nonEmptyString" },
         "completed_at": { "$ref": "#/$defs/timestamp" },
@@ -640,7 +640,7 @@
         "action_id": { "$ref": "#/$defs/requestId" },
         "project_id": { "$ref": "#/$defs/nonEmptyString" },
         "operation": {
-          "enum": ["create", "query_managed", "online", "offline", "restart", "close", "replace", "director_rotate"]
+          "enum": ["create", "query_managed", "online", "offline", "restart", "close", "replace", "grant_operator", "revoke_operator", "director_rotate"]
         },
         "code": { "$ref": "#/$defs/nonEmptyString" },
         "detail": { "type": "string" },
@@ -679,7 +679,7 @@
         "action_id": { "$ref": "#/$defs/requestId" },
         "project_id": { "$ref": "#/$defs/nonEmptyString" },
         "operation": {
-          "enum": ["create", "query_managed", "online", "offline", "restart", "close", "replace", "director_rotate"]
+          "enum": ["create", "query_managed", "online", "offline", "restart", "close", "replace", "grant_operator", "revoke_operator", "director_rotate"]
         },
         "phase": {
           "enum": [

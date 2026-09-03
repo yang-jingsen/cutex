@@ -307,11 +307,13 @@ control-plane integrations should prefer the Management host connection.
 
 Agent Management is a project-scoped, authenticated lifecycle service for
 durable Cutex agents. It supports create, query, online, offline, restart,
-close, replace, and Director rotation operations:
+close, replace, explicit Agent Operator grant/revoke, and Primary Director
+rotation operations:
 
 ```sh
 cutex agent manage query-managed --request-file <private-json-file>
 cutex agent manage create --request-file <private-json-file>
+cutex agent manage grant-operator --request-file <private-json-file>
 ```
 
 The caller's current durable session and authenticated live runtime determine
@@ -323,6 +325,12 @@ Requests use the strict `cutex/agent-management/v1` document contract and a
 stable `action_id`. Exact replay is idempotent; changed-payload reuse conflicts.
 Administrative project-authority repair and legacy ownership import are
 separate root-only Management commands, not general Agent operations.
+
+Every project retains one Primary Director. Exact, durable Agent Operator
+grants can delegate ordinary same-project lifecycle work without conferring
+Director rotation, grant/revoke, presentation, ownership-import, reservation,
+or Task Service decision authority. The Task Service Director seat remains
+separate, and no Observer grant is inferred.
 
 See [docs/agent-management-provider.md](docs/agent-management-provider.md) for
 the provider boundary, authority rules, and recovery behavior.

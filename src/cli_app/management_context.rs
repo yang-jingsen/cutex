@@ -28,6 +28,7 @@ pub(crate) fn management_request_context() -> ManagementRequestContext {
         request_release_rotation: super::rotation::execute_release_rotation,
         bind_project_authority: super::agent_management::bind_project_authority,
         import_legacy_director_ownership: super::agent_management::import_legacy_director_ownership,
+        reconcile_agent_reservation: super::agent_management::reconcile_agent_reservation,
     }
 }
 

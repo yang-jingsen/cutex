@@ -14,7 +14,8 @@ cutex agent manage <operation> --request-file <private-json-path>
 ```
 
 `<operation>` is one of `create`, `query-managed`, `online`, `offline`,
-`restart`, `close`, `replace`, or `director-rotate`. The request file must be a
+`restart`, `close`, `replace`, `grant-operator`, `revoke-operator`, or
+`director-rotate`. The request file must be a
 private regular file. The caller process supplies its ambient `CUTEX_AGENT_ID`;
 normal Cutex Agent Bus URL and token configuration authenticate that live
 runtime. The consumer must not read or interpret `CUTEX_AGENT_GROUPS`.
@@ -52,7 +53,42 @@ the sender. It then reads the Agent Management provider store:
 - a selector must name a project currently authorized to that caller;
 - no authorized projects denies ordinary Workers and retired Directors;
 - an exact existing action replay retains its originally resolved project while
-  still requiring the caller to hold current authority for that project.
+  still requiring the caller to hold current authority for unfinished effects.
+
+## Project roles and seats
+
+Each project has exactly one **Primary Director**, stored in
+`authorized_director_session`. The Primary Director retains rotation,
+grant/revoke, Project presentation, failure-routing, ownership-import,
+reservation-reconciliation, and Task Service decision authority.
+
+An **Agent Operator** is an additive durable grant keyed only by the exact
+`ProjectId` and exact Cutex session ID. The grantee must be an active,
+unretired explicit managed Agent in that project. Operators may query the
+project and managed roster and may create, online, offline, restart, close, or
+replace ordinary same-project Agents. They cannot rotate the Director,
+grant/revoke Operators, change presentation, import ownership, reconcile
+reservations, act on the Primary Director, or disable another privileged
+Operator. Names, cwd, groups, model, profile, runtime IDs, and prose never
+confer this role.
+
+An **Observer** is a read-oriented product role, not a persisted Agent
+Management grant in v1. This change does not infer Observer access from an
+Operator grant.
+
+The **Task Service Director seat** is a separate logical seat. Operator grants
+do not occupy or authorize it. Only its authenticated occupant can make Task
+Service Director decisions, and Director rotation keeps that seat coupled to
+the Primary Director.
+
+Grant and revoke are strict typed Agent Management operations with stable
+action IDs and an `expected_grant_revision` compare-and-swap. Successful
+changes increment the per-project grant-set revision and append an immutable
+audit event. Authorization is rechecked while holding the provider-wide
+cross-process mutation lock. Therefore revoke and lifecycle operations have a
+single linear order: once revoke wins, no new or unfinished external effect can
+start. An already-terminal complete/no-write response remains exactly
+replayable by its original authenticated caller without a new effect.
 
 Selection failures do not reserve an action or mutate provider state. Stable
 typed codes include `stale_runtime_identity`, `not_authorized_director`,
@@ -99,6 +135,13 @@ the project-authority CAS and releases that fence. Close-predecessor and both
 retained-predecessor modes preserve their existing lifecycle and message
 behavior around these authority steps.
 
+After a retained-predecessor rotation commits the successor as Primary
+Director, the predecessor is retained exactly once as an Agent Operator in the
+same durable project-authority transaction. Close-predecessor rotation never
+creates or retains that grant. Crash recovery verifies the Project Primary,
+Task Service seat, and intended Operator grant before returning a completed
+replay.
+
 If the process stops after the seat CAS but before project authority commits,
 the original action remains at `authority_transfer_pending` with its exact
 successor identity, while the seat store retains the transfer receipt and active
@@ -116,7 +159,7 @@ The cute-codex 0.150 handler should remove ambient-project discovery and all
 `CUTEX_AGENT_GROUPS` parsing. Keep `CUTEX_AGENT_ID`, the existing argv operation
 mapping, private request file, timeout, and typed response handling. Add an
 optional `project_id` selector to the native tool/provider request; omit it for
-the common one-project Director. Continue to reject model-supplied caller,
+the common one-project Primary Director or Operator. Continue to reject model-supplied caller,
 runtime, seat, Director, or authority claims.
 
 The handler can still compute `request_sha256` from its stable serialized
@@ -234,14 +277,29 @@ authorizes another bootstrap. Concurrent replay and service restart converge
 on the captured SID, original request digest/reservation/spec/groups, and
 original message ID. The historical failure event remains immutable.
 
+## Root reservation reconciliation
+
+`POST /v2/agent-management/reservation-reconciliation` and
+`cutex management agent-reservation-reconcile --request-file ...` are dedicated
+root-administration surfaces. They are not Agent operations and are never
+accepted through the ambient Agent Bus lifecycle tool. The strict request
+contains only CAS selectors for the project authority and one legacy reserved
+action. The provider clears no reservation unless the immutable failure is the
+allowlisted pre-effect predecessor-ownership failure and every authoritative
+Agent, durable-session, Agent Bus, cute-alden, native-index, and rollout source
+proves the reserved successor absent. Success appends audit and `no_write`
+phase evidence, preserves the original failure journal, and caches an
+idempotent reconciliation receipt.
+
 ## Cutex Projects read and presentation projection
 
 `AgentManagementProvider::list_cutex_projects` and `read_cutex_project` expose
 the bounded workspace projection for an authenticated Agent Management
 principal. The provider store's exact `ProjectId` key is the sole ownership
-identity. Reads require the caller's durable Cutex session to occupy the
-current Director seat and return only that exact project's authority epoch,
-Director, active durable Agents, retired durable Agents, and runtime
+identity. Reads require the caller's durable Cutex session to be the current
+Primary Director or an exact active Agent Operator and return only that exact
+project's authority epoch, Primary Director, Agent Operators, ordinary active
+durable Agents, retired durable Agents, and runtime
 observations where available. Groups, cwd, names, runtime IDs, and native Codex
 workspace records never select a project or grant access.
 
@@ -249,7 +307,7 @@ Project presentation is a separate non-authoritative record keyed by canonical
 `ProjectId`. It contains only a display name, a one- or two-cell badge, a color
 from the finite high-contrast palette, update provenance, and an independent
 revision. Missing presentation records produce deterministic defaults without
-writing. Only the authenticated current Director can update presentation, and
+writing. Only the authenticated current Primary Director can update presentation, and
 the canonical ID and authority fields are absent from the editable payload.
 Optimistic presentation revisions prevent lost updates. Additive store and
 presentation fields survive presentation-only writes.

@@ -11,7 +11,9 @@ use cutex::agent_management::{
     AgentActionPhase, AgentLifecycle, AgentManagementInvocation, AgentManagementMessageMetadata,
     AgentManagementOutcome, AgentManagementPhaseEvent, AgentManagementPhaseObserver,
     AgentManagementProvider, AgentManagementRequest, AgentManagementResponse,
-    AgentManagementSchema, AgentOperationKind, AgentRuntimeObservation,
+    AgentManagementSchema, AgentOperationKind, AgentReservationReconciliationEvidence,
+    AgentReservationReconciliationOutcome, AgentReservationReconciliationRequest,
+    AgentReservationReconciliationResponse, AgentRuntimeObservation,
     HistoricalRuntimeOccurrenceReconciliation, LegacyDirectorOwnershipEvidence,
     LegacyDirectorOwnershipImportOutcome, LegacyDirectorOwnershipImportRequest,
     LegacyDirectorOwnershipImportResponse, LifecycleFailure, ManagedAgentSpec,
@@ -183,6 +185,206 @@ pub(crate) fn import_legacy_director_ownership(
         outcome,
     })
     .expect("legacy Director ownership import response is serializable")
+}
+
+pub(crate) fn reconcile_agent_reservation(
+    request: AgentReservationReconciliationRequest,
+) -> serde_json::Value {
+    let action_id = request.action_id.clone();
+    let outcome = match AgentManagementProvider::open_default() {
+        Ok(provider) => match provider.reconcile_agent_reservation(
+            &request,
+            |reserved_name, reserved_cwd, started_at, failed_at| {
+                load_agent_reservation_absence_evidence(
+                    reserved_name,
+                    reserved_cwd,
+                    started_at,
+                    failed_at,
+                )
+            },
+        ) {
+            Ok((receipt, replayed)) => {
+                AgentReservationReconciliationOutcome::Complete { receipt, replayed }
+            }
+            Err(error) => AgentReservationReconciliationOutcome::NoWrite {
+                code: error.code().to_string(),
+                detail: error.to_string(),
+            },
+        },
+        Err(error) => AgentReservationReconciliationOutcome::NoWrite {
+            code: "persistence_unavailable".to_string(),
+            detail: format!("Agent Management provider is unavailable: {error:#}"),
+        },
+    };
+    serde_json::to_value(AgentReservationReconciliationResponse {
+        schema: request.schema,
+        action_id,
+        outcome,
+    })
+    .expect("Agent reservation reconciliation response is serializable")
+}
+
+fn load_agent_reservation_absence_evidence(
+    reserved_name: &str,
+    reserved_cwd: &str,
+    started_at: &Rfc3339,
+    failed_at: &Rfc3339,
+) -> AgentReservationReconciliationEvidence {
+    match try_load_agent_reservation_absence_evidence(
+        reserved_name,
+        reserved_cwd,
+        started_at,
+        failed_at,
+    ) {
+        Ok(evidence) => evidence,
+        Err(error) => AgentReservationReconciliationEvidence::Unavailable {
+            reason: format!("authoritative reservation evidence is unavailable: {error:#}"),
+        },
+    }
+}
+
+fn try_load_agent_reservation_absence_evidence(
+    reserved_name: &str,
+    reserved_cwd: &str,
+    started_at: &Rfc3339,
+    failed_at: &Rfc3339,
+) -> anyhow::Result<AgentReservationReconciliationEvidence> {
+    let bus = cutex::agent_bus::store::load_agent_bus_state_from_registry()
+        .context("failed to load current and stale Agent Bus endpoints")?;
+    if bus.agents.values().any(|agent| {
+        agent.cwd == reserved_cwd
+            || agent.name == reserved_name
+            || agent.base_name.as_deref() == Some(reserved_name)
+            || agent.thread_name.as_deref() == Some(reserved_name)
+    }) {
+        return Ok(AgentReservationReconciliationEvidence::Present {
+            reason: "a current or stale Agent Bus endpoint matches the reserved name or cwd"
+                .to_string(),
+        });
+    }
+
+    let durable = load_cutex_session_store().context("failed to load durable session store")?;
+    if durable.sessions.values().any(|record| {
+        record.cwd == reserved_cwd
+            || record.managed_cwd.as_deref() == Some(reserved_cwd)
+            || record.thread_name.as_deref() == Some(reserved_name)
+            || record.display_name_hint.as_deref() == Some(reserved_name)
+    }) {
+        return Ok(AgentReservationReconciliationEvidence::Present {
+            reason: "a durable native/managed session matches the reserved name or cwd".to_string(),
+        });
+    }
+
+    let accounts = super::account_store::load_store_read_only()
+        .context("failed to load the complete launch profile catalog")?;
+    let alden_sessions = cute_alden_sessions().context("failed to query cute-alden directly")?;
+    let expected_alden_names = accounts
+        .accounts
+        .iter()
+        .map(|account| {
+            cutex::runtime::managed_launch::default_managed_session_name_for_cwd(
+                account,
+                Path::new(reserved_cwd),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    for session in &alden_sessions {
+        if expected_alden_names.contains(session.name.as_deref().unwrap_or_default()) {
+            return Ok(
+                if cutex::platform::process::process_is_running(session.pid) {
+                    AgentReservationReconciliationEvidence::Present {
+                        reason:
+                            "a live cute-alden occurrence has a deterministic reserved-cwd name"
+                                .to_string(),
+                    }
+                } else {
+                    AgentReservationReconciliationEvidence::Ambiguous {
+                        reason:
+                            "a stale cute-alden occurrence has a deterministic reserved-cwd name"
+                                .to_string(),
+                    }
+                },
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let process_cwd = std::fs::read_link(format!("/proc/{}/cwd", session.pid));
+            match process_cwd {
+                Ok(process_cwd) if process_cwd == Path::new(reserved_cwd) => {
+                    return Ok(AgentReservationReconciliationEvidence::Present {
+                        reason: "a direct cute-alden process occurrence uses the reserved cwd"
+                            .to_string(),
+                    });
+                }
+                Ok(_) => {}
+                Err(error) if cutex::platform::process::process_is_running(session.pid) => {
+                    return Ok(AgentReservationReconciliationEvidence::Unavailable {
+                        reason: format!(
+                            "cannot inspect live cute-alden process {} cwd: {error}",
+                            session.pid
+                        ),
+                    });
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    let mut codex_homes = BTreeSet::new();
+    codex_homes.insert(
+        cutex::config::paths::host_codex_home_dir()
+            .context("failed to resolve host native index")?,
+    );
+    codex_homes.insert(
+        cutex::config::paths::legacy_host_codex_home_dir()
+            .context("failed to resolve legacy host native index")?,
+    );
+    codex_homes.insert(
+        cutex::config::paths::docker_runtime_home_dir()
+            .context("failed to resolve Docker native index")?
+            .join(".codex"),
+    );
+    codex_homes.insert(
+        cutex::config::paths::legacy_docker_runtime_home_dir()
+            .context("failed to resolve legacy Docker native index")?
+            .join(".codex"),
+    );
+    for account in &accounts.accounts {
+        if !matches!(account.cli_kind, cutex::profiles::model::CliKind::Codex) {
+            continue;
+        }
+        if let cutex::profiles::model::RuntimeConfig::Docker { user_name, .. } = &account.runtime {
+            let user_name = cutex::launch::docker::docker_user_name(user_name.as_deref())?;
+            codex_homes.insert(
+                cutex::launch::docker::DockerLaunchPaths::new(&user_name, &account.id)?
+                    .host_user_home
+                    .join(".codex"),
+            );
+        }
+    }
+    for codex_home in codex_homes {
+        match cutex::runtime::codex_home::correlate_codex_session_between_in_home(
+            &codex_home,
+            started_at,
+            failed_at,
+            Path::new(reserved_cwd),
+        )? {
+            cutex::runtime::codex_home::NativeSessionCorrelation::ProvenAbsent => {}
+            cutex::runtime::codex_home::NativeSessionCorrelation::Present { session_id } => {
+                return Ok(AgentReservationReconciliationEvidence::Present {
+                    reason: format!(
+                        "native index/rollout evidence matches the reserved cwd ({session_id})"
+                    ),
+                });
+            }
+            cutex::runtime::codex_home::NativeSessionCorrelation::Ambiguous { reason } => {
+                return Ok(AgentReservationReconciliationEvidence::Ambiguous { reason });
+            }
+        }
+    }
+    Ok(AgentReservationReconciliationEvidence::ProvenAbsent {
+        reason: "Agent Management ownership, durable sessions, current/stale Agent Bus endpoints, direct cute-alden occurrences, and every configured native index/rollout source prove the reserved successor absent".to_string(),
+    })
 }
 
 fn load_legacy_director_ownership_evidence(

@@ -15,9 +15,9 @@ use crossterm::terminal::{
 };
 use cutex::agent_management::{
     AgentManagementError, AgentManagementInvocation, AgentManagementProvider,
-    AgentRuntimeObservation, CutexProjectSummary, CutexProjectWorkspace, ProjectMemberLifecycle,
-    ProjectPaletteColor, ProjectPresentationInput, ProjectPresentationUpdateRequest,
-    ProjectRuntimeObserver,
+    AgentRuntimeObservation, CutexProjectSummary, CutexProjectWorkspace, ProjectAccessRole,
+    ProjectMemberLifecycle, ProjectPaletteColor, ProjectPresentationInput,
+    ProjectPresentationUpdateRequest, ProjectRuntimeObserver,
 };
 use cutex::role_revision::CutexSessionId;
 use cutex::session::service::cutex_session_launch_cwd;
@@ -81,6 +81,12 @@ impl CutexProjectsModel {
         let Some(details) = self.details.as_ref() else {
             return;
         };
+        if details.access_role != ProjectAccessRole::PrimaryDirector {
+            self.failure = Some(
+                "Only the Primary Director may edit Project presentation settings.".to_string(),
+            );
+            return;
+        }
         self.editor = Some(PresentationEditor {
             display_name: details.presentation.display_name.clone(),
             badge_label: details.presentation.badge_label.clone(),
@@ -138,7 +144,7 @@ fn reload(model: &mut CutexProjectsModel, open_details: bool) -> anyhow::Result<
     let invocation = model
         .invocation
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("authenticated Director context is unavailable"))?;
+        .ok_or_else(|| anyhow::anyhow!("authenticated Agent Manager context is unavailable"))?;
     let selected_id = model
         .selected_project()
         .map(|project| project.project_id.clone());
@@ -169,7 +175,7 @@ fn load_details(model: &mut CutexProjectsModel) -> anyhow::Result<()> {
     let invocation = model
         .invocation
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("authenticated Director context is unavailable"))?;
+        .ok_or_else(|| anyhow::anyhow!("authenticated Agent Manager context is unavailable"))?;
     let provider = AgentManagementProvider::open_default()?;
     let observer = CliProjectRuntimeObserver::load()?;
     model.details = Some(
@@ -203,7 +209,7 @@ fn save_editor(model: &mut CutexProjectsModel) -> anyhow::Result<()> {
     let invocation = model
         .invocation
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("authenticated Director context is unavailable"))?;
+        .ok_or_else(|| anyhow::anyhow!("authenticated Agent Manager context is unavailable"))?;
     AgentManagementProvider::open_default()?
         .update_project_presentation(invocation, &request)
         .map_err(|error| anyhow::anyhow!(error))?;
@@ -376,7 +382,12 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel) {
                 .style(Style::new().fg(palette_color(project.presentation.color))),
             Cell::from(project.presentation.display_name.clone()),
             Cell::from(project.project_id.to_string()),
+            Cell::from(match project.access_role {
+                ProjectAccessRole::PrimaryDirector => "primary",
+                ProjectAccessRole::AgentOperator => "operator",
+            }),
             Cell::from(project.director_cutex_session_id.as_str().to_string()),
+            Cell::from(project.operator_count.to_string()),
             Cell::from(project.active_member_count.to_string()),
             Cell::from(project.retired_member_count.to_string()),
         ])
@@ -387,7 +398,9 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel) {
             Constraint::Length(4),
             Constraint::Length(22),
             Constraint::Min(16),
+            Constraint::Length(9),
             Constraint::Length(24),
+            Constraint::Length(4),
             Constraint::Length(7),
             Constraint::Length(7),
         ],
@@ -397,7 +410,9 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel) {
             "BADGE",
             "NAME",
             "PROJECT ID",
-            "DIRECTOR",
+            "YOUR ROLE",
+            "PRIMARY DIRECTOR",
+            "OPS",
             "ACTIVE",
             "RETIRED",
         ])
@@ -415,7 +430,7 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel) {
     frame.render_stateful_widget(table, area, &mut state);
     if model.projects.is_empty() {
         frame.render_widget(
-            Paragraph::new("No authorized Cutex Projects are visible for this Director.")
+            Paragraph::new("No authorized Cutex Projects are visible for this Agent Manager.")
                 .alignment(Alignment::Center)
                 .style(Style::new().fg(Color::DarkGray)),
             Rect {
@@ -452,7 +467,7 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, details: Option<&CutexProje
         Line::from(format!("Canonical project_id: {}", project.project_id)),
         Line::from(format!("Authority epoch: {}", project.authority_epoch)),
         Line::from(format!(
-            "Director: {}{}",
+            "Primary Director: {}{}",
             project.director.cutex_session_id.as_str(),
             project
                 .director
@@ -461,12 +476,40 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, details: Option<&CutexProje
                 .map(|member| format!("  [{}]", lifecycle_label(member.lifecycle)))
                 .unwrap_or_else(|| "  [provider seat only]".to_string())
         )),
+        Line::from(format!(
+            "Your role: {}",
+            match project.access_role {
+                ProjectAccessRole::PrimaryDirector => "Primary Director",
+                ProjectAccessRole::AgentOperator => "Agent Operator",
+            }
+        )),
+        Line::from(format!(
+            "Operator grant revision: {}",
+            project.operator_grant_revision
+        )),
         Line::from(""),
         Line::from(Span::styled(
-            "Active/offline members",
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            "Agent Operators",
+            Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
         )),
     ];
+    if project.agent_operators.is_empty() {
+        lines.push(Line::from("  None"));
+    } else {
+        lines.extend(project.agent_operators.iter().map(|operator| {
+            Line::from(format!(
+                "  {}  [{}]  {}",
+                operator.member.agent.spec.name,
+                lifecycle_label(operator.member.lifecycle),
+                operator.grant.operator_cutex_session_id.as_str()
+            ))
+        }));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Ordinary active/offline Agents",
+        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
     if project.active_agents.is_empty() {
         lines.push(Line::from("  None"));
     } else {

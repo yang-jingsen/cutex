@@ -320,6 +320,19 @@ pub fn agent_bus_submit_task_service_query(
         .context("Failed to parse typed Cutex Task Service query response")
 }
 
+/// Submit a semantic Task Service Director action through the authenticated
+/// local Agent Bus route. Caller identity is deliberately derived by the
+/// bridge from the registered runtime; the document carries no identity or
+/// mechanical authority fields.
+pub fn agent_bus_submit_task_service_director_action(
+    config: &CodezConfig,
+    request: &crate::task_service::DirectorActionRequest,
+) -> anyhow::Result<crate::task_service::DirectorActionReceipt> {
+    let response = submit_task_worker_control(config, "/api/task/v2/director-action", request)?;
+    serde_json::from_slice(&response)
+        .context("Failed to parse typed Cutex Task Service Director action response")
+}
+
 pub fn agent_bus_submit_task_worker_reconciliation(
     config: &CodezConfig,
     request: &TaskWorkerReconciliationRequest,

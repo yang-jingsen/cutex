@@ -170,7 +170,9 @@ fn v2_required_token<'a>(
 fn agent_management_admin_path(path: &str) -> bool {
     matches!(
         path,
-        "/v2/agent-management/authority" | "/v2/agent-management/legacy-director-ownership-import"
+        "/v2/agent-management/authority"
+            | "/v2/agent-management/legacy-director-ownership-import"
+            | "/v2/agent-management/reservation-reconciliation"
     )
 }
 
@@ -238,6 +240,9 @@ fn handle_v2_request_with_repository(
         }
         ("POST", "/v2/agent-management/legacy-director-ownership-import") => {
             handle_legacy_director_ownership_import(stream, request, context)
+        }
+        ("POST", "/v2/agent-management/reservation-reconciliation") => {
+            handle_agent_reservation_reconciliation(stream, request, context)
         }
         ("GET", "/v2/sessions") => {
             super::archive::handle_session_collection_get(stream, request, context, repository)
@@ -442,6 +447,32 @@ fn handle_legacy_director_ownership_import(
             }
         };
     let response = (context.import_legacy_director_ownership)(payload);
+    write_json_response(stream, 200, "OK", &response)
+}
+
+fn handle_agent_reservation_reconciliation(
+    stream: &mut TcpStream,
+    request: &SimpleHttpRequest,
+    context: ManagementRequestContext,
+) -> anyhow::Result<()> {
+    let payload: crate::agent_management::AgentReservationReconciliationRequest =
+        match serde_json::from_slice(&request.body) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return write_v2_error(
+                    stream,
+                    400,
+                    "Bad Request",
+                    "invalid_request",
+                    &format!(
+                        "strict Agent reservation reconciliation request parsing failed: {error}"
+                    ),
+                    false,
+                    json!({}),
+                )
+            }
+        };
+    let response = (context.reconcile_agent_reservation)(payload);
     write_json_response(stream, 200, "OK", &response)
 }
 
@@ -3763,11 +3794,50 @@ mod tests {
             Some(raw_agent_bus_bearer),
             "ordinary Agent Bus authentication must not authorize ownership import"
         );
+        assert_eq!(
+            v2_required_token(
+                "/v2/agent-management/reservation-reconciliation",
+                Some(raw_agent_bus_bearer),
+                Some(&scoped),
+                Some("agent-management-root"),
+            ),
+            Some("agent-management-root")
+        );
+        assert_ne!(
+            v2_required_token(
+                "/v2/agent-management/reservation-reconciliation",
+                Some(raw_agent_bus_bearer),
+                Some(&scoped),
+                Some("agent-management-root"),
+            ),
+            Some(raw_agent_bus_bearer),
+            "ordinary Agent Bus authentication must not authorize reservation reconciliation"
+        );
     }
 
     #[test]
     fn legacy_director_import_is_root_scoped_and_not_an_ambient_agent_route() {
         let path = "/v2/agent-management/legacy-director-ownership-import";
+        assert!(agent_management_admin_path(path));
+        assert!(!agent_management_admin_path("/v2/agent-management/actions"));
+        assert_eq!(
+            v2_required_token(
+                path,
+                Some("ordinary-management"),
+                Some("seat-admin"),
+                Some("agent-management-root"),
+            ),
+            Some("agent-management-root")
+        );
+        assert_eq!(
+            v2_required_token(path, Some("ordinary-management"), Some("seat-admin"), None,),
+            None
+        );
+    }
+
+    #[test]
+    fn reservation_reconciliation_is_root_scoped_and_not_an_ambient_agent_route() {
+        let path = "/v2/agent-management/reservation-reconciliation";
         assert!(agent_management_admin_path(path));
         assert!(!agent_management_admin_path("/v2/agent-management/actions"));
         assert_eq!(

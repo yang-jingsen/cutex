@@ -235,7 +235,10 @@ where
             serde_json::from_value(event.cutex.as_ref().expect("checked").params.clone())?;
         if matches!(
             receipt.operation,
-            AgentOperationKind::QueryManaged | AgentOperationKind::DirectorRotate
+            AgentOperationKind::QueryManaged
+                | AgentOperationKind::GrantOperator
+                | AgentOperationKind::RevokeOperator
+                | AgentOperationKind::DirectorRotate
         ) {
             // A Director rotation publishes exact, audience-switched phase
             // facts through AGENT_MANAGEMENT_PHASE_TRANSITION_METHOD. Projecting
@@ -259,7 +262,9 @@ where
                 observation,
                 ..
             } => (successor, observation),
-            AgentManagementResult::QueryManaged { .. } => {
+            AgentManagementResult::QueryManaged { .. }
+            | AgentManagementResult::OperatorGranted { .. }
+            | AgentManagementResult::OperatorRevoked { .. } => {
                 return Ok(MappingDisposition::Skip);
             }
         };
@@ -730,7 +735,9 @@ fn managed_operation(operation: AgentOperationKind) -> Option<ManagedAgentOperat
         AgentOperationKind::Replace => Some(ManagedAgentOperation::Replace),
         AgentOperationKind::Close => Some(ManagedAgentOperation::Close),
         AgentOperationKind::DirectorRotate => Some(ManagedAgentOperation::DirectorRotate),
-        AgentOperationKind::QueryManaged => None,
+        AgentOperationKind::QueryManaged
+        | AgentOperationKind::GrantOperator
+        | AgentOperationKind::RevokeOperator => None,
     }
 }
 

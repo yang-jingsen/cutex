@@ -262,4 +262,22 @@ mod tests {
         }))
         .is_err());
     }
+
+    #[test]
+    fn v2_director_query_is_typed_and_keeps_worker_authority_out_of_the_document() {
+        let request: DirectorActionRequest = serde_json::from_value(json!({
+            "schema": "cutex/task-service-director-action/v2",
+            "action_id": "project-query-1",
+            "operation": "query",
+            "selector": { "kind": "all" }
+        }))
+        .expect("v2 Director query");
+        assert_eq!(request.schema, DirectorActionSchema::V2);
+        let mut forged = serde_json::to_value(request).unwrap();
+        forged
+            .as_object_mut()
+            .unwrap()
+            .insert("attempt_token".to_string(), json!("forged"));
+        assert!(serde_json::from_value::<DirectorActionRequest>(forged).is_err());
+    }
 }

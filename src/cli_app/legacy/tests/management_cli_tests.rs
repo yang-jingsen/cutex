@@ -67,6 +67,8 @@ fn every_agent_management_operation_has_a_structured_cli_surface() {
         ("restart", AgentOperationKind::Restart),
         ("close", AgentOperationKind::Close),
         ("replace", AgentOperationKind::Replace),
+        ("grant-operator", AgentOperationKind::GrantOperator),
+        ("revoke-operator", AgentOperationKind::RevokeOperator),
         ("director-rotate", AgentOperationKind::DirectorRotate),
     ];
     for (name, expected) in cases {
@@ -90,6 +92,12 @@ fn every_agent_management_operation_has_a_structured_cli_surface() {
                 AgentManagementCliCommand::Restart { .. } => AgentOperationKind::Restart,
                 AgentManagementCliCommand::Close { .. } => AgentOperationKind::Close,
                 AgentManagementCliCommand::Replace { .. } => AgentOperationKind::Replace,
+                AgentManagementCliCommand::GrantOperator { .. } => {
+                    AgentOperationKind::GrantOperator
+                }
+                AgentManagementCliCommand::RevokeOperator { .. } => {
+                    AgentOperationKind::RevokeOperator
+                }
                 AgentManagementCliCommand::DirectorRotate { .. } => {
                     AgentOperationKind::DirectorRotate
                 }
@@ -145,5 +153,29 @@ fn legacy_director_ownership_import_is_a_separate_root_management_surface() {
                 token: None,
             }
         }) if request_file == "/tmp/legacy-director-import.json"
+    ));
+}
+
+#[test]
+fn reservation_reconciliation_is_a_separate_root_management_surface() {
+    let cli = Cli::try_parse_from([
+        "cutex",
+        "management",
+        "agent-reservation-reconcile",
+        "--request-file",
+        "/tmp/reconcile.json",
+        "--port",
+        "24270",
+    ])
+    .expect("reservation reconciliation command should parse");
+    assert!(matches!(
+        cli.command,
+        Some(CommandKind::Management {
+            command: ManagementCommand::AgentReservationReconcile {
+                request_file,
+                port: Some(24270),
+                token: None,
+            }
+        }) if request_file == "/tmp/reconcile.json"
     ));
 }

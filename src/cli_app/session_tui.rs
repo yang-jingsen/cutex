@@ -102,6 +102,7 @@ enum SelectorTarget {
     RetiredSessions,
     CutexProjects,
     Projects,
+    Tasks,
     Profiles,
     GlobalSettings,
 }
@@ -114,6 +115,7 @@ impl SelectorTarget {
             Self::RetiredAgent(_) | Self::RetiredSessions => SessionTuiWorkspace::RetiredSessions,
             Self::CutexProjects => SessionTuiWorkspace::CutexProjects,
             Self::Projects => SessionTuiWorkspace::Projects,
+            Self::Tasks => SessionTuiWorkspace::Tasks,
             Self::Profiles => SessionTuiWorkspace::Profiles,
             Self::GlobalSettings => SessionTuiWorkspace::GlobalSettings,
         }
@@ -126,6 +128,7 @@ impl SelectorTarget {
             | Self::RetiredSessions
             | Self::CutexProjects
             | Self::Projects
+            | Self::Tasks
             | Self::Profiles
             | Self::GlobalSettings => None,
         }
@@ -143,6 +146,10 @@ impl SelectorTarget {
         matches!(self, Self::CutexProjects)
     }
 
+    fn is_tasks(&self) -> bool {
+        matches!(self, Self::Tasks)
+    }
+
     fn is_retired_sessions(&self) -> bool {
         matches!(self, Self::RetiredSessions)
     }
@@ -158,6 +165,7 @@ impl SelectorTarget {
                 | Self::RetiredSessions
                 | Self::CutexProjects
                 | Self::Projects
+                | Self::Tasks
                 | Self::Profiles
                 | Self::GlobalSettings
         )
@@ -357,6 +365,7 @@ enum SelectorControl {
     OpenProfileManager,
     OpenCutexProjects,
     OpenProjects,
+    OpenTasks,
     ApplySettings(SessionSettingsApplyRequest),
     ApplyGlobalSettings(GlobalSettingsApplyRequest),
     ApplyProfileSettings(ProfileSettingsApplyRequest),
@@ -454,6 +463,7 @@ enum SessionTuiCycleOutcome {
     LoginProfile,
     CutexProjects,
     Projects,
+    Tasks,
 }
 
 #[derive(Debug)]
@@ -1176,6 +1186,11 @@ impl SelectorModel {
                     .is_selected(&SelectorTarget::Projects) =>
             {
                 return SelectorControl::OpenProjects;
+            }
+            SelectorEvent::OpenActions | SelectorEvent::OpenSettings | SelectorEvent::Activate
+                if self.workspace_selection.is_selected(&SelectorTarget::Tasks) =>
+            {
+                return SelectorControl::OpenTasks;
             }
             SelectorEvent::OpenActions => self.open_action_menu(),
             SelectorEvent::OpenSettings
@@ -3025,6 +3040,9 @@ impl SelectorModel {
         if row.target.is_projects() {
             return SelectorControl::OpenProjects;
         }
+        if row.target.is_tasks() {
+            return SelectorControl::OpenTasks;
+        }
         let Some(action) = row
             .actions
             .iter()
@@ -3833,6 +3851,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
             }
             SessionTuiCycleOutcome::CutexProjects => super::session_tui_cutex_projects::run()?,
             SessionTuiCycleOutcome::Projects => super::session_tui_projects::run()?,
+            SessionTuiCycleOutcome::Tasks => super::session_tui_tasks::run()?,
         }
     }
 }
@@ -4177,6 +4196,7 @@ fn selector_rows_from_store(
     rows.push(recent_sessions_row());
     rows.push(cutex_projects_row());
     rows.push(projects_row());
+    rows.push(tasks_row());
     rows.push(profiles_row(config, profile_names));
     rows.push(global_settings_row_with_profiles(config, profile_names));
     rows
@@ -4346,6 +4366,30 @@ fn cutex_projects_row() -> SelectorRow {
     }
 }
 
+fn tasks_row() -> SelectorRow {
+    SelectorRow {
+        target: SelectorTarget::Tasks,
+        agent: "Tasks".to_string(),
+        project: None,
+        configured_profile: None,
+        lifecycle: None,
+        host: "-".to_string(),
+        backend: "Task Service".to_string(),
+        managed_path: "Director-scoped read-only".to_string(),
+        retired_at: None,
+        revision: 0,
+        activity_session_id: None,
+        activity: None,
+        actions: Vec::new(),
+        settings: Vec::new(),
+        settings_snapshot: None,
+        global_settings_snapshot: None,
+        attachable: false,
+        pinned: false,
+        managed: false,
+    }
+}
+
 fn recent_sessions_row() -> SelectorRow {
     SelectorRow {
         target: SelectorTarget::RecentSessions,
@@ -4484,8 +4528,9 @@ fn system_row_rank(target: &SelectorTarget) -> Option<u8> {
         SelectorTarget::RetiredSessions => Some(1),
         SelectorTarget::CutexProjects => Some(2),
         SelectorTarget::Projects => Some(3),
-        SelectorTarget::Profiles => Some(4),
-        SelectorTarget::GlobalSettings => Some(5),
+        SelectorTarget::Tasks => Some(4),
+        SelectorTarget::Profiles => Some(5),
+        SelectorTarget::GlobalSettings => Some(6),
     }
 }
 
@@ -4657,6 +4702,7 @@ fn run_event_loop(
                         SelectorControl::OpenCutexProjects => {
                             return Ok(SessionTuiCycleOutcome::CutexProjects);
                         }
+                        SelectorControl::OpenTasks => return Ok(SessionTuiCycleOutcome::Tasks),
                         SelectorControl::ApplySettings(request) => {
                             match apply_session_settings(&request) {
                                 Ok(result) => model.settings_apply_succeeded(
@@ -5282,6 +5328,7 @@ fn render_item_context(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel)
         SelectorTarget::RetiredSessions => " Retired sessions ",
         SelectorTarget::CutexProjects => " Cutex Projects ",
         SelectorTarget::Projects => " Codex Workspaces ",
+        SelectorTarget::Tasks => " Tasks ",
         SelectorTarget::Profiles => " Profiles ",
         SelectorTarget::GlobalSettings => " Global settings ",
         SelectorTarget::Agent(_) | SelectorTarget::RetiredAgent(_) => " Agent ",
@@ -6813,6 +6860,8 @@ fn selector_table_row<'a>(
         Cell::from("permissions").style(Style::new().fg(Color::Cyan))
     } else if row.target.is_projects() {
         Cell::from("workspace").style(Style::new().fg(Color::Cyan))
+    } else if row.target.is_tasks() {
+        Cell::from("tasks").style(Style::new().fg(Color::Cyan))
     } else {
         Cell::from("global").style(Style::new().fg(Color::Cyan))
     };
@@ -6821,6 +6870,8 @@ fn selector_table_row<'a>(
     } else if row.target.is_profiles() {
         "manage"
     } else if row.target.is_cutex_projects() || row.target.is_projects() {
+        "open"
+    } else if row.target.is_tasks() {
         "open"
     } else if row.target.is_global_settings() {
         "settings"
@@ -6927,6 +6978,7 @@ fn selector_state_label(row: &SelectorRow) -> &'static str {
         None if row.target.is_retired_sessions() => "archive",
         None if row.target.is_cutex_projects() => "permissions",
         None if row.target.is_projects() => "workspace",
+        None if row.target.is_tasks() => "tasks",
         None => "global",
     }
 }
@@ -7560,6 +7612,7 @@ mod tests {
         let agent = ManagedAgentRecord {
             project_id: project_id.clone(),
             created_by_director_session: CutexSessionId::new("cutex.director").unwrap(),
+            created_by_operator_session: None,
             cutex_session_id: cutex_session_id.clone(),
             native_session_id: "native-worker".to_string(),
             spec: ManagedAgentSpec {
@@ -7583,6 +7636,9 @@ mod tests {
             schema: AgentManagementStoreSchema::V1,
             store_revision: 1,
             projects: BTreeMap::new(),
+            operator_grants: BTreeMap::new(),
+            operator_grant_revisions: BTreeMap::new(),
+            operator_audit_events: BTreeMap::new(),
             project_presentations: presentation
                 .map(|presentation| BTreeMap::from([(project_id, presentation)]))
                 .unwrap_or_default(),
@@ -7591,6 +7647,8 @@ mod tests {
             phase_events: BTreeMap::new(),
             authority_receipts: BTreeMap::new(),
             legacy_director_ownership_import_receipts: BTreeMap::new(),
+            reservation_reconciliation_receipts: BTreeMap::new(),
+            reservation_reconciliation_events: BTreeMap::new(),
             failure_events: BTreeMap::new(),
             extra: BTreeMap::new(),
         }
@@ -8195,6 +8253,7 @@ mod tests {
                 SelectorTarget::RetiredSessions => "retired",
                 SelectorTarget::CutexProjects => "cutex-projects",
                 SelectorTarget::Projects => "workspaces",
+                SelectorTarget::Tasks => "tasks",
                 SelectorTarget::Profiles => "profiles",
                 SelectorTarget::GlobalSettings => "global",
             })
@@ -8214,6 +8273,7 @@ mod tests {
                 SelectorTarget::RetiredSessions => "retired",
                 SelectorTarget::CutexProjects => "cutex-projects",
                 SelectorTarget::Projects => "workspaces",
+                SelectorTarget::Tasks => "tasks",
                 SelectorTarget::Profiles => "profiles",
                 SelectorTarget::GlobalSettings => "global",
             })
@@ -8233,6 +8293,7 @@ mod tests {
                     SelectorTarget::RetiredSessions => "retired",
                     SelectorTarget::CutexProjects => "cutex-projects",
                     SelectorTarget::Projects => "workspaces",
+                    SelectorTarget::Tasks => "tasks",
                     SelectorTarget::Profiles => "profiles",
                     SelectorTarget::GlobalSettings => "global",
                 })
@@ -11880,6 +11941,7 @@ mod tests {
                 SelectorTarget::RecentSessions,
                 SelectorTarget::CutexProjects,
                 SelectorTarget::Projects,
+                SelectorTarget::Tasks,
                 SelectorTarget::Profiles,
                 SelectorTarget::GlobalSettings,
             ]
