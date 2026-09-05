@@ -12,6 +12,9 @@ use anyhow::Context;
 use serde::Serialize;
 use uuid::Uuid;
 
+#[cfg(windows)]
+static WINDOWS_ATOMIC_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn write_pretty_json_atomic<T: Serialize + ?Sized>(
     path: &Path,
     value: &T,
@@ -55,6 +58,15 @@ fn write_bytes_atomic_with_privacy(
         .ok_or_else(|| anyhow!("path has no parent directory: {}", path.display()))?;
     fs::create_dir_all(parent)
         .with_context(|| format!("Failed to create parent dir: {}", parent.display()))?;
+
+    // Windows can reject simultaneous replacements of the same destination
+    // with ERROR_ACCESS_DENIED even though every writer uses a distinct temp
+    // file. Keep in-process state writers ordered; the bounded retry in
+    // `replace_file_atomic` also covers a short-lived cross-process share lock.
+    #[cfg(windows)]
+    let _windows_atomic_write_guard = WINDOWS_ATOMIC_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let tmp_path = atomic_write_temp_path(path);
     let result = (|| -> anyhow::Result<()> {
@@ -113,9 +125,14 @@ fn replace_file_atomic(from: &Path, to: &Path) -> io::Result<()> {
 #[cfg(windows)]
 fn replace_file_atomic(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
+    use std::time::Duration;
 
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
     const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+    const MAX_ATTEMPTS: u32 = 8;
 
     #[link(name = "kernel32")]
     extern "system" {
@@ -135,17 +152,30 @@ fn replace_file_atomic(from: &Path, to: &Path) -> io::Result<()> {
 
     let from = wide_null(from);
     let to = wide_null(to);
-    let ok = unsafe {
-        MoveFileExW(
-            from.as_ptr(),
-            to.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
+    let mut delay_ms = 1;
+    for attempt in 0..MAX_ATTEMPTS {
+        let ok = unsafe {
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok != 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        let retryable = matches!(
+            error.raw_os_error(),
+            Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+        );
+        if !retryable || attempt + 1 == MAX_ATTEMPTS {
+            return Err(error);
+        }
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        delay_ms = (delay_ms * 2).min(32);
     }
-    Ok(())
+    unreachable!("Windows atomic replace loop returns on success or final failure")
 }
 
 #[cfg(not(any(unix, windows)))]

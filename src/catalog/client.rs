@@ -13,7 +13,7 @@ use crate::app_server::protocol::RpcError;
 use crate::config::paths::host_codex_home_dir;
 use crate::launch::program::codex_program;
 
-const EXPECTED_PROVIDER_VERSION_PREFIX: &str = "0.150.";
+const EXPECTED_PROVIDER_VERSION_PREFIX: &str = "0.153.";
 const MAX_ERROR_TEXT_CHARS: usize = 2_048;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -505,7 +505,7 @@ mod tests {
         let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut initial = vec![
             Ok(json!({
-                "userAgent": "cutex_catalog/0.150.0 (test)",
+                "userAgent": "cutex_catalog/0.153.2 (test)",
                 "codexHome": "/cutex/codex-home",
                 "platformFamily": "unix",
                 "platformOs": "linux",
@@ -540,7 +540,7 @@ mod tests {
         let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let error = CatalogClient::from_endpoint(FakeEndpoint {
             responses: vec![Ok(json!({
-                "userAgent": "cutex_catalog/0.149.0 (test)",
+                "userAgent": "cutex_catalog/0.150.1 (test)",
                 "codexHome": "/tmp",
             }))]
             .into(),
@@ -553,7 +553,7 @@ mod tests {
         let error = CatalogClient::from_endpoint(FakeEndpoint {
             responses: vec![
                 Ok(json!({
-                    "userAgent": "cutex_catalog/0.150.1 (test)",
+                    "userAgent": "cutex_catalog/0.153.2 (test)",
                     "codexHome": "/tmp",
                 })),
                 Err(CatalogError::Rpc {

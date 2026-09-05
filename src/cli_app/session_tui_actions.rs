@@ -43,7 +43,11 @@ impl SessionTuiAction {
     pub(super) fn requires_confirmation(self) -> bool {
         matches!(
             self,
-            Self::CloseAndRestart | Self::CloseRuntime | Self::RetireSession | Self::RestoreSession
+            Self::Online
+                | Self::CloseAndRestart
+                | Self::CloseRuntime
+                | Self::RetireSession
+                | Self::RestoreSession
         )
     }
 

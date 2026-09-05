@@ -9,6 +9,8 @@ use cutex::cli::args::{
     ManagementCommand, ManagementReleaseRotationBoundaryArg, ManagementReleaseRotationCommand,
     ManagementReleaseRotationExternalStepArg, ManagementSeatCommand,
 };
+#[cfg(windows)]
+use cutex::config::env::{env_bool_override, CUTEX_WINDOWS_DESKTOP_LAUNCHER_ENV_VAR};
 use cutex::config::store::load_codez_config;
 use cutex::management::remote::{
     ensure_management_remote_tunnel, management_http_json, raw_management_ssh_tunnel_command,
@@ -33,7 +35,10 @@ const DIM: &str = "\x1b[2m";
 
 pub(crate) fn run_command(command: ManagementCommand) -> anyhow::Result<()> {
     match command {
-        ManagementCommand::Serve { port, bind, token } => cmd_management_serve(port, &bind, token),
+        ManagementCommand::Serve { port, bind, token } => {
+            arm_windows_hosted_launcher_guard()?;
+            cmd_management_serve(port, &bind, token)
+        }
         ManagementCommand::RemoteUp {
             host,
             service_id,
@@ -67,6 +72,14 @@ pub(crate) fn run_command(command: ManagementCommand) -> anyhow::Result<()> {
             token,
         } => cmd_management_agent_reservation_reconcile(&request_file, port, token.as_deref()),
     }
+}
+
+fn arm_windows_hosted_launcher_guard() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    if env_bool_override(CUTEX_WINDOWS_DESKTOP_LAUNCHER_ENV_VAR) == Some(true) {
+        cutex::platform::windows_parent_guard::arm_launcher_exit_guard()?;
+    }
+    Ok(())
 }
 
 fn cmd_management_agent_reservation_reconcile(

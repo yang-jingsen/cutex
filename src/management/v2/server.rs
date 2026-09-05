@@ -173,7 +173,11 @@ fn agent_management_admin_path(path: &str) -> bool {
         "/v2/agent-management/authority"
             | "/v2/agent-management/legacy-director-ownership-import"
             | "/v2/agent-management/reservation-reconciliation"
-    )
+            | "/v2/agent-management/projects"
+            | "/v2/agent-management/project-presentation"
+            | "/v2/agent-management/operator-actions"
+            | "/v2/task-service/management-query"
+    ) || management_project_id_from_path(path).is_some()
 }
 
 fn materialize_active_stream_reset(
@@ -243,6 +247,23 @@ fn handle_v2_request_with_repository(
         }
         ("POST", "/v2/agent-management/reservation-reconciliation") => {
             handle_agent_reservation_reconciliation(stream, request, context)
+        }
+        ("GET", "/v2/agent-management/projects") => {
+            handle_management_project_collection(stream, context)
+        }
+        ("GET", path) if management_project_id_from_path(path).is_some() => {
+            let project_id = management_project_id_from_path(path)
+                .expect("matched strict Management Project path");
+            handle_management_project_read(stream, context, &project_id)
+        }
+        ("POST", "/v2/agent-management/project-presentation") => {
+            handle_management_project_presentation(stream, request, context)
+        }
+        ("POST", "/v2/agent-management/operator-actions") => {
+            handle_management_operator_action(stream, request, context)
+        }
+        ("POST", "/v2/task-service/management-query") => {
+            handle_management_task_query(stream, request, context)
         }
         ("GET", "/v2/sessions") => {
             super::archive::handle_session_collection_get(stream, request, context, repository)
@@ -474,6 +495,160 @@ fn handle_agent_reservation_reconciliation(
         };
     let response = (context.reconcile_agent_reservation)(payload);
     write_json_response(stream, 200, "OK", &response)
+}
+
+fn management_project_id_from_path(path: &str) -> Option<crate::agent_management::ProjectId> {
+    let value = path.strip_prefix("/v2/agent-management/projects/")?;
+    if value.is_empty() || value.contains('/') || value.contains('%') {
+        return None;
+    }
+    crate::agent_management::ProjectId::new(value.to_string()).ok()
+}
+
+fn handle_management_project_collection(
+    stream: &mut TcpStream,
+    context: ManagementRequestContext,
+) -> anyhow::Result<()> {
+    let principal = crate::management::control_plane::HumanManagementPrincipal::authenticated();
+    match (context.list_management_projects)(&principal) {
+        Ok(response) => write_json_response(stream, 200, "OK", &serde_json::to_value(response)?),
+        Err(error) => write_agent_management_control_error(stream, error),
+    }
+}
+
+fn handle_management_project_read(
+    stream: &mut TcpStream,
+    context: ManagementRequestContext,
+    project_id: &crate::agent_management::ProjectId,
+) -> anyhow::Result<()> {
+    let principal = crate::management::control_plane::HumanManagementPrincipal::authenticated();
+    match (context.read_management_project)(&principal, project_id) {
+        Ok(response) => write_json_response(stream, 200, "OK", &serde_json::to_value(response)?),
+        Err(error) => write_agent_management_control_error(stream, error),
+    }
+}
+
+fn handle_management_project_presentation(
+    stream: &mut TcpStream,
+    request: &SimpleHttpRequest,
+    context: ManagementRequestContext,
+) -> anyhow::Result<()> {
+    let payload: crate::management::control_plane::HumanManagementPresentationUpdateRequest =
+        match serde_json::from_slice(&request.body) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return write_v2_error(
+                    stream,
+                    400,
+                    "Bad Request",
+                    "invalid_request",
+                    &format!("strict Management presentation request parsing failed: {error}"),
+                    false,
+                    json!({}),
+                )
+            }
+        };
+    let principal = crate::management::control_plane::HumanManagementPrincipal::authenticated();
+    match (context.update_management_project_presentation)(&principal, &payload) {
+        Ok(response) => write_json_response(stream, 200, "OK", &serde_json::to_value(response)?),
+        Err(error) => write_agent_management_control_error(stream, error),
+    }
+}
+
+fn handle_management_operator_action(
+    stream: &mut TcpStream,
+    request: &SimpleHttpRequest,
+    context: ManagementRequestContext,
+) -> anyhow::Result<()> {
+    let payload: crate::management::control_plane::HumanManagementOperatorActionRequest =
+        match serde_json::from_slice(&request.body) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return write_v2_error(
+                    stream,
+                    400,
+                    "Bad Request",
+                    "invalid_request",
+                    &format!("strict Management Operator request parsing failed: {error}"),
+                    false,
+                    json!({}),
+                )
+            }
+        };
+    let principal = crate::management::control_plane::HumanManagementPrincipal::authenticated();
+    match (context.execute_management_operator_action)(&principal, &payload) {
+        Ok(response) => write_json_response(stream, 200, "OK", &serde_json::to_value(response)?),
+        Err(error) => write_agent_management_control_error(stream, error),
+    }
+}
+
+fn handle_management_task_query(
+    stream: &mut TcpStream,
+    request: &SimpleHttpRequest,
+    context: ManagementRequestContext,
+) -> anyhow::Result<()> {
+    let payload: crate::management::control_plane::HumanManagementTaskQueryRequest =
+        match serde_json::from_slice(&request.body) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return write_v2_error(
+                    stream,
+                    400,
+                    "Bad Request",
+                    "invalid_request",
+                    &format!("strict Management Task query parsing failed: {error}"),
+                    false,
+                    json!({}),
+                )
+            }
+        };
+    let principal = crate::management::control_plane::HumanManagementPrincipal::authenticated();
+    match (context.query_management_tasks)(&principal, &payload) {
+        Ok(response) => write_json_response(stream, 200, "OK", &serde_json::to_value(response)?),
+        Err(error) => write_v2_error(
+            stream,
+            503,
+            "Service Unavailable",
+            "management_task_query_unavailable",
+            &format!("{error:#}"),
+            true,
+            json!({}),
+        ),
+    }
+}
+
+fn write_agent_management_control_error(
+    stream: &mut TcpStream,
+    error: crate::agent_management::AgentManagementError,
+) -> anyhow::Result<()> {
+    use crate::agent_management::AgentManagementError;
+    let (status, reason, retryable) = match &error {
+        AgentManagementError::InvalidRequest(_) => (400, "Bad Request", false),
+        AgentManagementError::Unauthorized
+        | AgentManagementError::NotAuthorizedDirector
+        | AgentManagementError::ProjectSelectionRequired
+        | AgentManagementError::ProjectNotAuthorized => (403, "Forbidden", false),
+        AgentManagementError::NotFound(_) => (404, "Not Found", false),
+        AgentManagementError::Conflict(_) => (409, "Conflict", false),
+        AgentManagementError::PersistenceUnavailable => (503, "Service Unavailable", true),
+        AgentManagementError::OwnerActionRequired(_)
+        | AgentManagementError::InvalidStore
+        | AgentManagementError::External(_)
+        | AgentManagementError::ReconciliationPresent(_)
+        | AgentManagementError::ReconciliationAmbiguous(_)
+        | AgentManagementError::ReconciliationUnavailable(_) => {
+            (500, "Internal Server Error", false)
+        }
+    };
+    write_v2_error(
+        stream,
+        status,
+        reason,
+        error.code(),
+        &error.to_string(),
+        retryable,
+        json!({}),
+    )
 }
 
 fn owner_task_project_from_path(path: &str) -> Option<crate::agent_management::ProjectId> {
@@ -3853,6 +4028,34 @@ mod tests {
             v2_required_token(path, Some("ordinary-management"), Some("seat-admin"), None,),
             None
         );
+    }
+
+    #[test]
+    fn human_management_projects_tasks_and_writes_require_the_dedicated_root_credential() {
+        for path in [
+            "/v2/agent-management/projects",
+            "/v2/agent-management/projects/cutex-stack-main",
+            "/v2/agent-management/project-presentation",
+            "/v2/agent-management/operator-actions",
+            "/v2/task-service/management-query",
+        ] {
+            assert!(agent_management_admin_path(path), "root scope: {path}");
+            assert_eq!(
+                v2_required_token(
+                    path,
+                    Some("ordinary-management"),
+                    Some("seat-admin"),
+                    Some("agent-management-root"),
+                ),
+                Some("agent-management-root"),
+                "dedicated credential: {path}"
+            );
+            assert_eq!(
+                v2_required_token(path, Some("ordinary-management"), Some("seat-admin"), None,),
+                None,
+                "ordinary and seat credentials must not authorize: {path}"
+            );
+        }
     }
 
     #[test]

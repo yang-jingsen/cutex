@@ -24,6 +24,7 @@ mod legacy;
 mod management;
 mod management_archive;
 mod management_context;
+mod management_control_plane;
 mod management_focus;
 mod management_lifecycle;
 mod notify;

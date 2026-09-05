@@ -94,6 +94,36 @@ Selection failures do not reserve an action or mutate provider state. Stable
 typed codes include `stale_runtime_identity`, `not_authorized_director`,
 `project_selection_required`, and `project_not_authorized`.
 
+## Managed Agent process boundary
+
+On Linux with a running systemd user manager, every manager-owned app-server
+core starts in a stable per-`cutex_session` transient scope named
+`cutex-agent-<readable-id>-<identity>.scope` beneath `cutex-agents.slice`.
+`systemd-run --scope` executes the app-server in place, so the PID persisted in
+the runtime binding and Agent Bus registration remains exact. Commands, tests,
+builds, and their crash/resource accounting inherit the Agent scope instead of
+the Cutex service cgroup. The optional native TUI remains a detachable peer and
+is not the tool-execution owner.
+
+`offline`, `close`, failed-start cleanup, stale-runtime recovery, and therefore
+`restart` signal the entire Agent scope before applying the existing exact-PID
+and durable CAS cleanup. Graceful lifecycle sends `SIGTERM` and preserves the
+existing bounded failure result; force lifecycle may then send `SIGKILL`.
+Transient units use `--collect`, allowing the same durable Agent name to be
+reused by its next runtime generation. An occurrence already running before
+this code is installed remains in its original cgroup until its next explicitly
+authorized launch or restart; installation does not migrate or restart it.
+
+Windows, non-Linux platforms, Linux not booted with systemd/cgroup v2, and
+Linux without a reachable user manager or the required
+`systemd-run`/`systemctl` capabilities retain direct process launch. That
+supported fallback is explicit in
+`CUTEX_MANAGED_AGENT_ISOLATION=direct:<reason>` and the Cutex service log.
+Detected systemd scope startup failures do not silently retry outside the
+scope; normal launch readiness fails with the wrapper error in the runtime log.
+No lifecycle path starts an alternate service, scheduled task, or visible
+terminal fallback.
+
 ## Crash-safe predecessor closure
 
 Replace with `close_before_create` or `close_after_ready`, and Director Rotate
@@ -313,5 +343,25 @@ Optimistic presentation revisions prevent lost updates. Additive store and
 presentation fields survive presentation-only writes.
 
 The terminal UI presents this projection as **Cutex Projects**. The unrelated
-native Codex catalog remains available as **Workspaces / Codex Workspaces** and
-retains its existing create and import operations.
+native Codex catalog remains available as the secondary **Workspaces** entry
+and retains its existing create and import operations.
+
+R36 adds a second, explicit read/write adapter for the normal Human TUI. It is
+reachable only through dedicated Management-root HTTP routes. The server mints
+a private, non-serializable Human principal after authenticating that bearer;
+the client request never supplies or fabricates `CUTEX_AGENT_ID`, a Director,
+or an Operator identity. Collection and detail reads preserve the same
+canonical provider authority projection.
+
+Human presentation changes compare both the current project authority epoch
+and presentation revision and record Human/Management provenance without
+mislabeling the Primary Director as the actor. Human Operator grant/revoke
+requests compare both authority epoch and grant-set revision, use a separate
+idempotency domain, and append the same durable Operator audit facts with an
+explicit Human/Management actor marker.
+
+Completed legacy retained-predecessor rotations can be shown as review-only
+Operator repair candidates when their exact successor and authority epoch are
+still current. Projection is read-only: the only repair path is an explicit
+confirmed Human grant through the normal CAS and audit boundary. See
+[r36-management-ui.md](r36-management-ui.md).

@@ -777,7 +777,7 @@ mod tests {
         assert_eq!(record.display_name_hint.as_deref(), Some("test-agent"));
         assert_eq!(
             record.runtime_backend,
-            CutexSessionRuntimeBackend::CuteAlden
+            default_managed_session_runtime_backend()
         );
         assert_eq!(
             record.registration_class,
@@ -4245,11 +4245,13 @@ requires_openai_auth = false
             std::env::set_var("HOME", &temp_home);
         }
 
-        let entry = sample_im_registration("019e-alpha");
+        let mut entry = sample_im_registration("019e-alpha");
+        let local_host = current_host_name();
+        entry.host_id = local_host.clone();
         let mut record = CutexSessionRecord::new_at(
             "cutex.019e-alpha".to_string(),
             Some("019e-alpha".to_string()),
-            "tethys".to_string(),
+            local_host,
             "/home/example/Projects/scgpt".to_string(),
             Some("aemeath".to_string()),
             "2026-06-25T00:00:00Z".to_string(),

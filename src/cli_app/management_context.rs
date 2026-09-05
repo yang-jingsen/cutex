@@ -29,6 +29,133 @@ pub(crate) fn management_request_context() -> ManagementRequestContext {
         bind_project_authority: super::agent_management::bind_project_authority,
         import_legacy_director_ownership: super::agent_management::import_legacy_director_ownership,
         reconcile_agent_reservation: super::agent_management::reconcile_agent_reservation,
+        list_management_projects,
+        read_management_project,
+        update_management_project_presentation,
+        execute_management_operator_action,
+        query_management_tasks,
+    }
+}
+
+fn management_agent_provider() -> Result<
+    cutex::agent_management::AgentManagementProvider,
+    cutex::agent_management::AgentManagementError,
+> {
+    cutex::agent_management::AgentManagementProvider::open_default()
+        .map_err(|_| cutex::agent_management::AgentManagementError::PersistenceUnavailable)
+}
+
+fn list_management_projects(
+    principal: &cutex::management::control_plane::HumanManagementPrincipal,
+) -> Result<
+    cutex::management::control_plane::HumanManagementProjectCollection,
+    cutex::agent_management::AgentManagementError,
+> {
+    management_agent_provider()?.list_cutex_projects_for_management(principal)
+}
+
+fn read_management_project(
+    principal: &cutex::management::control_plane::HumanManagementPrincipal,
+    project_id: &cutex::agent_management::ProjectId,
+) -> Result<
+    cutex::management::control_plane::HumanManagementProjectWorkspace,
+    cutex::agent_management::AgentManagementError,
+> {
+    let observer = ManagementProjectRuntimeObserver::load()?;
+    management_agent_provider()?.read_cutex_project_for_management(principal, project_id, &observer)
+}
+
+fn update_management_project_presentation(
+    principal: &cutex::management::control_plane::HumanManagementPrincipal,
+    request: &cutex::management::control_plane::HumanManagementPresentationUpdateRequest,
+) -> Result<
+    cutex::agent_management::ProjectPresentationSettings,
+    cutex::agent_management::AgentManagementError,
+> {
+    management_agent_provider()?.update_project_presentation_for_management(principal, request)
+}
+
+fn execute_management_operator_action(
+    principal: &cutex::management::control_plane::HumanManagementPrincipal,
+    request: &cutex::management::control_plane::HumanManagementOperatorActionRequest,
+) -> Result<
+    cutex::management::control_plane::HumanManagementOperatorReceipt,
+    cutex::agent_management::AgentManagementError,
+> {
+    management_agent_provider()?.execute_operator_action_for_management(principal, request)
+}
+
+fn query_management_tasks(
+    principal: &cutex::management::control_plane::HumanManagementPrincipal,
+    request: &cutex::management::control_plane::HumanManagementTaskQueryRequest,
+) -> anyhow::Result<cutex::management::control_plane::HumanManagementTaskQueryResponse> {
+    cutex::agent_bus::server::human_management_task_query(principal, request)
+}
+
+struct ManagementProjectRuntimeObserver {
+    sessions: cutex::session::model::CutexSessionStore,
+    live_agents: Vec<cutex::agent_bus::model::AgentBusAgent>,
+}
+
+impl ManagementProjectRuntimeObserver {
+    fn load() -> Result<Self, cutex::agent_management::AgentManagementError> {
+        Ok(Self {
+            sessions: load_cutex_session_store().map_err(|_| {
+                cutex::agent_management::AgentManagementError::PersistenceUnavailable
+            })?,
+            live_agents: cutex::agent_bus::client::agent_bus_fetch_agents_if_healthy(
+                &cutex::config::store::load_codez_config(),
+            ),
+        })
+    }
+}
+
+impl cutex::agent_management::ProjectRuntimeObserver for ManagementProjectRuntimeObserver {
+    fn observe(
+        &self,
+        cutex_session_id: &cutex::role_revision::CutexSessionId,
+    ) -> Result<
+        cutex::agent_management::AgentRuntimeObservation,
+        cutex::agent_management::AgentManagementError,
+    > {
+        use cutex::agent_management::{AgentManagementError, AgentRuntimeObservation};
+        let record = self
+            .sessions
+            .sessions
+            .get(cutex_session_id.as_str())
+            .ok_or(AgentManagementError::NotFound("durable_session_not_found"))?;
+        let native_session_id = record
+            .codex_session_id
+            .clone()
+            .ok_or(AgentManagementError::NotFound("native_session_not_found"))?;
+        let mut runtime_agent_ids = self
+            .live_agents
+            .iter()
+            .filter(|agent| agent.cutex_session_id.as_deref() == Some(cutex_session_id.as_str()))
+            .map(|agent| agent.id.clone())
+            .collect::<Vec<_>>();
+        runtime_agent_ids.sort();
+        Ok(AgentRuntimeObservation {
+            cutex_session_id: cutex_session_id.clone(),
+            native_session_id,
+            active: record.is_active(),
+            cwd: cutex::session::service::cutex_session_launch_cwd(record).to_string(),
+            profile: record.profile.clone().unwrap_or_default(),
+            runtime_backend: serde_json::to_value(record.runtime_backend)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_default(),
+            model: record.model_defaults.clone().unwrap_or_default(),
+            reasoning: record.reasoning_defaults.clone().unwrap_or_default(),
+            permissions: record.permission_defaults.clone().unwrap_or_default(),
+            approval_policy: record.approval_policy.clone().unwrap_or_default(),
+            sandbox_mode: record.sandbox_mode.clone().unwrap_or_default(),
+            groups: record.agent_groups.clone(),
+            runtime_generation: record.runtime_generation,
+            runtime_agent_ids,
+            app_server_runtime: record.app_server_runtime.is_some(),
+            agent_bus_endpoint_ids: Vec::new(),
+        })
     }
 }
 

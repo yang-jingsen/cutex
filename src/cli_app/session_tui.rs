@@ -81,7 +81,10 @@ use super::session_tui_settings::{
     SessionSettingsField, SessionSettingsSnapshot, SessionTuiSettingCategory,
     SessionTuiSettingOption,
 };
-use super::session_tui_workspace::{SessionTuiWorkspace, WorkspaceSelection};
+use super::session_tui_workspace::{
+    primary_panel_shortcut, primary_panel_tabs, PrimaryPanel, PrimaryPanelOutcome,
+    SessionTuiWorkspace, WorkspaceSelection,
+};
 use super::session_tui_workspace_events::{workspace_event_from_key, WorkspaceEvent};
 use super::session_tui_workspace_loading::{WorkspaceLoad, WorkspaceLoadPoll};
 use super::session_tui_workspace_render::{render_workspace, WorkspaceRenderer};
@@ -89,6 +92,7 @@ use super::session_tui_workspace_render::{render_workspace, WorkspaceRenderer};
 const WIDE_LAYOUT_MIN_WIDTH: u16 = 96;
 const EXTRA_WIDE_LAYOUT_MIN_WIDTH: u16 = 136;
 const SETTINGS_TWO_PANE_MIN_WIDTH: u16 = 64;
+const INSPECTOR_SPLIT_MIN_WIDTH: u16 = 112;
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -180,6 +184,9 @@ impl SelectorTarget {
 struct SelectorRow {
     target: SelectorTarget,
     agent: String,
+    /// Mutable native conversation title. It is presentation-only and never
+    /// participates in the managed Agent's primary identity.
+    thread_title: Option<String>,
     project: Option<SelectorProjectContext>,
     configured_profile: Option<String>,
     lifecycle: Option<CutexSessionLifecycleState>,
@@ -201,6 +208,7 @@ struct SelectorRow {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SelectorProjectContext {
+    agent_name: String,
     project_id: String,
     display_name: String,
     badge_label: String,
@@ -464,6 +472,7 @@ enum SessionTuiCycleOutcome {
     CutexProjects,
     Projects,
     Tasks,
+    Switch(PrimaryPanel),
 }
 
 #[derive(Debug)]
@@ -491,7 +500,7 @@ struct ProfileManagementResult {
 struct PendingSettingsRefreshOverride {
     target: SelectorTarget,
     snapshot: SessionSettingsSnapshot,
-    agent: String,
+    agent: Option<String>,
     configured_profile: Option<String>,
     backend: String,
     pinned: bool,
@@ -553,6 +562,25 @@ enum SettingsFocus {
     Categories,
     Options,
     Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InspectorSection {
+    Overview,
+    Actions,
+    Settings,
+}
+
+impl InspectorSection {
+    const ALL: [Self; 3] = [Self::Overview, Self::Actions, Self::Settings];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::Actions => "Actions",
+            Self::Settings => "Settings",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -704,6 +732,10 @@ struct SelectorModel {
     query: Input,
     workspace_selection: WorkspaceSelection<SelectorTarget>,
     mode: SelectorMode,
+    suspended_managed_mode: Option<SelectorMode>,
+    inspector_overview_focused: bool,
+    confirmation_returns_to_list: bool,
+    show_thread_titles: bool,
     enhanced_keyboard: bool,
     refreshing: bool,
     warning: Option<String>,
@@ -733,6 +765,10 @@ impl SelectorModel {
             query: Input::default(),
             workspace_selection: WorkspaceSelection::default(),
             mode: SelectorMode::Agents,
+            suspended_managed_mode: None,
+            inspector_overview_focused: false,
+            confirmation_returns_to_list: false,
+            show_thread_titles: false,
             enhanced_keyboard,
             refreshing,
             warning: None,
@@ -750,6 +786,152 @@ impl SelectorModel {
         };
         model.ensure_selection();
         model
+    }
+
+    fn activate_primary_panel(&mut self, panel: PrimaryPanel) {
+        match panel {
+            PrimaryPanel::Recent if !matches!(self.mode, SelectorMode::RecentSessions) => {
+                self.suspended_managed_mode = Some(self.mode.clone());
+                self.mode = SelectorMode::RecentSessions;
+            }
+            PrimaryPanel::Agents if matches!(self.mode, SelectorMode::RecentSessions) => {
+                self.mode = self
+                    .suspended_managed_mode
+                    .take()
+                    .unwrap_or(SelectorMode::Agents);
+                self.normalize_mode_after_snapshot();
+            }
+            PrimaryPanel::Agents
+            | PrimaryPanel::Projects
+            | PrimaryPanel::Tasks
+            | PrimaryPanel::Recent => {}
+        }
+    }
+
+    fn handle_focus_traversal(&mut self, forward: bool) -> SelectorControl {
+        if self.action_overlay.is_some()
+            || self.settings_overlay.is_some()
+            || self.profile_overlay.is_some()
+        {
+            return self.handle(if forward {
+                SelectorEvent::Down
+            } else {
+                SelectorEvent::Up
+            });
+        }
+        match self.mode.clone() {
+            SelectorMode::Agents if self.inspector_overview_focused => {
+                if !forward {
+                    self.inspector_overview_focused = false;
+                }
+                SelectorControl::Continue
+            }
+            SelectorMode::Agents if forward && self.selected_managed_agent().is_some() => {
+                self.inspector_overview_focused = true;
+                SelectorControl::Continue
+            }
+            SelectorMode::Agents if forward => self.handle(SelectorEvent::OpenActions),
+            SelectorMode::Agents => SelectorControl::Continue,
+            SelectorMode::Actions { .. } => {
+                if !forward {
+                    self.handle(SelectorEvent::Back)
+                } else {
+                    SelectorControl::Continue
+                }
+            }
+            SelectorMode::Settings { target, .. } if target.agent_key().is_some() => {
+                if !forward {
+                    self.handle(SelectorEvent::OpenSettings)
+                } else {
+                    SelectorControl::Continue
+                }
+            }
+            SelectorMode::Settings { .. } | SelectorMode::ProfileManager { .. } => {
+                self.handle(SelectorEvent::OpenSettings)
+            }
+            SelectorMode::RecentSessions if self.recent.review().is_some() => {
+                self.handle(if forward {
+                    SelectorEvent::Down
+                } else {
+                    SelectorEvent::Up
+                })
+            }
+            SelectorMode::RecentSessions if forward => self.handle(SelectorEvent::Activate),
+            SelectorMode::RecentSessions => SelectorControl::Continue,
+            SelectorMode::RetiredSessions { .. } if forward => {
+                self.handle(SelectorEvent::OpenActions)
+            }
+            SelectorMode::RetiredSessions { .. } => self.handle(SelectorEvent::Back),
+            SelectorMode::ConfirmRuntimeAction { .. } => self.handle(if forward {
+                SelectorEvent::Down
+            } else {
+                SelectorEvent::Up
+            }),
+            SelectorMode::ClosingRuntime { .. } => SelectorControl::Continue,
+        }
+    }
+
+    fn handle_horizontal_navigation(&mut self, expand: bool) -> SelectorControl {
+        // Text editors own Left/Right as cursor movement. Other overlays keep
+        // the keys local and inert; none may leak into top-level navigation or
+        // commit the selected operation.
+        if matches!(
+            self.settings_overlay.as_ref(),
+            Some(SettingsOverlay::Groups { .. } | SettingsOverlay::Text { .. })
+        ) || matches!(
+            self.profile_overlay.as_ref(),
+            Some(ProfileOverlay::RenameInput { .. })
+        ) {
+            return self.handle(if expand {
+                SelectorEvent::OpenActions
+            } else {
+                SelectorEvent::Back
+            });
+        }
+        if self.action_overlay.is_some()
+            || self.settings_overlay.is_some()
+            || self.profile_overlay.is_some()
+        {
+            return SelectorControl::Continue;
+        }
+        match self.mode.clone() {
+            SelectorMode::Agents if self.inspector_overview_focused && !expand => {
+                self.inspector_overview_focused = false;
+                SelectorControl::Continue
+            }
+            SelectorMode::Agents => SelectorControl::Continue,
+            SelectorMode::Actions { .. } if !expand => self.handle(SelectorEvent::Back),
+            SelectorMode::Actions { .. } => SelectorControl::Continue,
+            SelectorMode::Settings { .. } => self.handle(if expand {
+                SelectorEvent::OpenActions
+            } else {
+                SelectorEvent::Back
+            }),
+            SelectorMode::ProfileManager { focus, .. } => match (expand, focus) {
+                (true, ProfileWorkspaceFocus::Items) => self.handle(SelectorEvent::OpenActions),
+                (false, ProfileWorkspaceFocus::Editor) => self.handle(SelectorEvent::Back),
+                _ => SelectorControl::Continue,
+            },
+            SelectorMode::RecentSessions if self.recent.review().is_some() => {
+                self.handle(if expand {
+                    SelectorEvent::Down
+                } else {
+                    SelectorEvent::Escape
+                })
+            }
+            SelectorMode::RecentSessions if expand => self.handle(SelectorEvent::Activate),
+            SelectorMode::RecentSessions => SelectorControl::Continue,
+            SelectorMode::RetiredSessions { .. } if expand => {
+                self.handle(SelectorEvent::OpenActions)
+            }
+            SelectorMode::RetiredSessions { .. } => self.handle(SelectorEvent::Back),
+            SelectorMode::ConfirmRuntimeAction { .. } => self.handle(if expand {
+                SelectorEvent::OpenActions
+            } else {
+                SelectorEvent::Back
+            }),
+            SelectorMode::ClosingRuntime { .. } => SelectorControl::Continue,
+        }
     }
 
     fn visible_indices(&self) -> Vec<usize> {
@@ -814,6 +996,43 @@ impl SelectorModel {
     fn selected_row(&self) -> Option<&SelectorRow> {
         let selected_target = self.workspace_selection.selected()?;
         self.rows.iter().find(|row| row.target == *selected_target)
+    }
+
+    fn selected_managed_agent(&self) -> Option<&SelectorRow> {
+        self.selected_row()
+            .filter(|row| row.managed && matches!(&row.target, SelectorTarget::Agent(_)))
+    }
+
+    fn shows_managed_inspector(&self) -> bool {
+        match &self.mode {
+            SelectorMode::Agents => self.selected_managed_agent().is_some(),
+            SelectorMode::Actions { .. }
+            | SelectorMode::Settings { .. }
+            | SelectorMode::ConfirmRuntimeAction { .. }
+            | SelectorMode::ClosingRuntime { .. } => self
+                .active_row()
+                .is_some_and(|row| row.managed && matches!(&row.target, SelectorTarget::Agent(_))),
+            SelectorMode::RecentSessions
+            | SelectorMode::RetiredSessions { .. }
+            | SelectorMode::ProfileManager { .. } => false,
+        }
+    }
+
+    fn inspector_section(&self) -> InspectorSection {
+        match &self.mode {
+            SelectorMode::Actions { .. }
+            | SelectorMode::ConfirmRuntimeAction { .. }
+            | SelectorMode::ClosingRuntime { .. } => InspectorSection::Actions,
+            SelectorMode::Settings { .. } => InspectorSection::Settings,
+            SelectorMode::Agents
+            | SelectorMode::RecentSessions
+            | SelectorMode::RetiredSessions { .. }
+            | SelectorMode::ProfileManager { .. } => InspectorSection::Overview,
+        }
+    }
+
+    fn inspector_is_focused(&self) -> bool {
+        !matches!(&self.mode, SelectorMode::Agents) || self.inspector_overview_focused
     }
 
     #[cfg(test)]
@@ -1099,6 +1318,32 @@ impl SelectorModel {
     }
 
     fn handle_agent_event(&mut self, event: SelectorEvent) -> SelectorControl {
+        if self.inspector_overview_focused {
+            match event {
+                SelectorEvent::OpenActions => {
+                    self.inspector_overview_focused = false;
+                    self.open_action_menu();
+                }
+                SelectorEvent::OpenSettings => {
+                    self.inspector_overview_focused = false;
+                    self.open_settings();
+                }
+                SelectorEvent::Back | SelectorEvent::Escape => {
+                    self.inspector_overview_focused = false;
+                }
+                SelectorEvent::Exit => return SelectorControl::Exit,
+                SelectorEvent::Up
+                | SelectorEvent::Down
+                | SelectorEvent::First
+                | SelectorEvent::Last
+                | SelectorEvent::Insert(_)
+                | SelectorEvent::Backspace
+                | SelectorEvent::Delete
+                | SelectorEvent::ClearInput
+                | SelectorEvent::Activate => {}
+            }
+            return SelectorControl::Continue;
+        }
         match event {
             SelectorEvent::Up => self.move_selection(-1),
             SelectorEvent::Down => self.move_selection(1),
@@ -1247,20 +1492,16 @@ impl SelectorModel {
                 }
                 self.recent.begin_review();
             }
-            SelectorEvent::OpenActions
+            SelectorEvent::Insert('n' | 'N')
                 if self.recent.next_cursor().is_some() && !self.recent.loading() =>
             {
                 return SelectorControl::Recent(RecentCommand::LoadMore);
             }
-            SelectorEvent::OpenActions
-                if matches!(self.recent.load_state(), RecentLoadState::Failed(_))
-                    && !self.recent.loading() =>
-            {
-                return SelectorControl::Recent(RecentCommand::Retry);
+            SelectorEvent::OpenActions => {
+                self.recent.begin_review();
             }
-            SelectorEvent::OpenActions => {}
             SelectorEvent::Back | SelectorEvent::Escape | SelectorEvent::OpenSettings => {
-                self.mode = SelectorMode::Agents;
+                self.activate_primary_panel(PrimaryPanel::Agents);
                 self.ensure_selection();
             }
             SelectorEvent::Exit => return SelectorControl::Exit,
@@ -1274,7 +1515,11 @@ impl SelectorModel {
 
     fn recent_catalog_reply(&mut self, reply: super::session_tui_recent::CatalogReply) {
         match load_cutex_session_store() {
-            Ok(store) => self.recent.receive(reply, &store),
+            Ok(store) => {
+                let managed_names = managed_names_by_native_session_id();
+                self.recent
+                    .receive_with_managed_names(reply, &store, &managed_names);
+            }
             Err(error) => {
                 self.recent.reconciliation_failed(
                     reply,
@@ -1509,7 +1754,7 @@ impl SelectorModel {
             return self.handle_settings_overlay_event(event, &target);
         }
 
-        if matches!(event, SelectorEvent::Insert('a' | 'A')) {
+        if matches!(event, SelectorEvent::Insert('a' | 'A' | 's' | 'S')) {
             if let Some(key) = target.agent_key() {
                 let changed_count = self.settings_draft.dirty_count();
                 if changed_count == 0 {
@@ -1705,7 +1950,7 @@ impl SelectorModel {
         focus: ProfileWorkspaceFocus,
         editor_selected: usize,
     ) -> SelectorControl {
-        if matches!(event, SelectorEvent::Insert('a' | 'A')) {
+        if matches!(event, SelectorEvent::Insert('a' | 'A' | 's' | 'S')) {
             if selected == 0 {
                 let changed_count = self.global_settings_draft.dirty_count();
                 if changed_count == 0 {
@@ -2944,6 +3189,12 @@ impl SelectorModel {
                 });
             }
             SelectorEvent::Activate | SelectorEvent::Escape => {
+                if self.confirmation_returns_to_list {
+                    self.confirmation_returns_to_list = false;
+                    self.inspector_overview_focused = false;
+                    self.mode = SelectorMode::Agents;
+                    return SelectorControl::Continue;
+                }
                 if action == SessionTuiAction::RestoreSession {
                     let selected = self
                         .retired_rows
@@ -3049,16 +3300,32 @@ impl SelectorModel {
             .find(|item| item.primary)
             .map(|item| item.action)
         else {
+            if row.managed && matches!(&row.target, SelectorTarget::Agent(_)) {
+                self.warning = Some(format!(
+                    "No attach or start route is currently available for {}",
+                    row.agent
+                ));
+            }
             return SelectorControl::Continue;
         };
-        if action.requires_confirmation() {
-            return SelectorControl::Continue;
-        }
         let Some(agent_key) = row.target.agent_key() else {
             return SelectorControl::Continue;
         };
+        let agent_key = agent_key.to_string();
+        if (row.managed && row.lifecycle == Some(CutexSessionLifecycleState::Offline))
+            || action.requires_confirmation()
+        {
+            self.confirmation_returns_to_list = true;
+            self.mode = SelectorMode::ConfirmRuntimeAction {
+                agent_key,
+                action,
+                launch_profile: None,
+                confirmed: false,
+            };
+            return SelectorControl::Continue;
+        }
         SelectorControl::Selected(SessionTuiIntent {
-            key: agent_key.to_string(),
+            key: agent_key,
             action,
             launch_profile: None,
         })
@@ -3083,7 +3350,18 @@ impl SelectorModel {
             ));
             return SelectorControl::Continue;
         }
-        if action.requires_confirmation() {
+        let starts_offline_agent = self.row_for_action_key(&agent_key).is_some_and(|row| {
+            row.lifecycle == Some(CutexSessionLifecycleState::Offline)
+                && matches!(
+                    action,
+                    SessionTuiAction::ResumeAttach
+                        | SessionTuiAction::OpenTui
+                        | SessionTuiAction::ResumeHere
+                        | SessionTuiAction::ResumeManaged
+                )
+        });
+        if action.requires_confirmation() || starts_offline_agent {
+            self.confirmation_returns_to_list = false;
             self.mode = SelectorMode::ConfirmRuntimeAction {
                 agent_key,
                 action,
@@ -3129,11 +3407,14 @@ impl SelectorModel {
             ));
             return SelectorControl::Continue;
         }
-        SelectorControl::Selected(SessionTuiIntent {
-            key: agent_key.to_string(),
+        self.mode = SelectorMode::ConfirmRuntimeAction {
+            agent_key: agent_key.to_string(),
             action: SessionTuiAction::CloseRuntime,
             launch_profile: None,
-        })
+            confirmed: false,
+        };
+        self.confirmation_returns_to_list = true;
+        SelectorControl::Continue
     }
 
     fn runtime_close_started(&mut self, intent: &SessionTuiIntent) {
@@ -3149,6 +3430,7 @@ impl SelectorModel {
             agent_name,
             action: intent.action,
         };
+        self.confirmation_returns_to_list = false;
         self.notice = None;
         self.warning = None;
     }
@@ -3222,6 +3504,18 @@ impl SelectorModel {
         ));
     }
 
+    fn dispatch_failed(&mut self, agent_key: &str, message: String) {
+        self.workspace_selection
+            .select(Some(SelectorTarget::Agent(agent_key.to_string())));
+        self.mode = SelectorMode::Agents;
+        self.inspector_overview_focused = true;
+        self.confirmation_returns_to_list = false;
+        self.notice = None;
+        self.warning = Some(format!(
+            "Unable to enter the selected Agent; no fallback terminal was launched: {message}"
+        ));
+    }
+
     fn runtime_close_identity(&self) -> Option<(String, String, SessionTuiAction)> {
         match &self.mode {
             SelectorMode::ClosingRuntime {
@@ -3261,7 +3555,9 @@ impl SelectorModel {
                     .snapshot
                     .categories(&SessionSettingsDraft::default());
                 row.settings_snapshot = Some(settings_override.snapshot);
-                row.agent = settings_override.agent;
+                if let Some(agent) = settings_override.agent {
+                    row.agent = agent;
+                }
                 row.configured_profile = settings_override.configured_profile;
                 row.backend = settings_override.backend;
                 row.pinned = settings_override.pinned;
@@ -3332,7 +3628,8 @@ impl SelectorModel {
             self.pending_settings_refresh_override = Some(PendingSettingsRefreshOverride {
                 target: target.clone(),
                 snapshot: snapshot.clone(),
-                agent: cutex_session_display_name(record),
+                agent: (!cutex_session_is_managed(record))
+                    .then(|| cutex_session_display_name(record)),
                 configured_profile: record.profile.clone(),
                 backend: runtime_backend_short_label(record.runtime_backend).to_string(),
                 pinned: record.quick_action == CutexSessionQuickActionMode::Pinned,
@@ -3344,7 +3641,12 @@ impl SelectorModel {
         if let Some(row) = self.rows.iter_mut().find(|row| row.target == target) {
             row.settings = snapshot.categories(&SessionSettingsDraft::default());
             row.settings_snapshot = Some(snapshot);
-            row.agent = cutex_session_display_name(record);
+            if !cutex_session_is_managed(record) {
+                row.agent = cutex_session_display_name(record);
+            }
+            row.thread_title = cutex_session_is_managed(record)
+                .then(|| record.thread_name.clone())
+                .flatten();
             row.configured_profile = record.profile.clone();
             row.backend = runtime_backend_short_label(record.runtime_backend).to_string();
             row.pinned = record.quick_action == CutexSessionQuickActionMode::Pinned;
@@ -3431,7 +3733,7 @@ impl SelectorModel {
             self.pending_settings_refresh_override = Some(PendingSettingsRefreshOverride {
                 target: target.clone(),
                 snapshot: snapshot.clone(),
-                agent: cutex_session_display_name(record),
+                agent: (!managed).then(|| cutex_session_display_name(record)),
                 configured_profile: record.profile.clone(),
                 backend: runtime_backend_short_label(record.runtime_backend).to_string(),
                 pinned: record.quick_action == CutexSessionQuickActionMode::Pinned,
@@ -3443,7 +3745,10 @@ impl SelectorModel {
         if let Some(row) = self.rows.iter_mut().find(|row| row.target == target) {
             row.settings = snapshot.categories(&SessionSettingsDraft::default());
             row.settings_snapshot = Some(snapshot);
-            row.agent = cutex_session_display_name(record);
+            if !managed {
+                row.agent = cutex_session_display_name(record);
+            }
+            row.thread_title = managed.then(|| record.thread_name.clone()).flatten();
             row.configured_profile = record.profile.clone();
             row.backend = runtime_backend_short_label(record.runtime_backend).to_string();
             row.pinned = record.quick_action == CutexSessionQuickActionMode::Pinned;
@@ -3608,7 +3913,11 @@ impl SelectorModel {
 
     fn normalize_mode_after_snapshot(&mut self) {
         match self.mode.clone() {
-            SelectorMode::Agents => {}
+            SelectorMode::Agents => {
+                if self.selected_managed_agent().is_none() {
+                    self.inspector_overview_focused = false;
+                }
+            }
             SelectorMode::RecentSessions => {}
             SelectorMode::RetiredSessions { selected } => {
                 self.mode = SelectorMode::RetiredSessions {
@@ -3840,48 +4149,115 @@ pub(crate) fn run() -> anyhow::Result<()> {
     require_interactive_terminal(io::stdin().is_terminal(), io::stdout().is_terminal())?;
 
     let mut startup = None;
+    let mut panel = PrimaryPanel::Agents;
+    let mut selector_model = None;
+    let mut projects_model = None;
+    let mut tasks_model = None;
     loop {
-        match run_terminal_cycle(startup.take())? {
+        let outcome = match panel {
+            PrimaryPanel::Agents | PrimaryPanel::Recent => {
+                let (outcome, model) =
+                    run_terminal_cycle(startup.take(), panel, selector_model.take())?;
+                selector_model = Some(model);
+                outcome
+            }
+            PrimaryPanel::Projects => {
+                let (outcome, model) =
+                    super::session_tui_cutex_projects::run(projects_model.take())?;
+                projects_model = Some(model);
+                match outcome {
+                    PrimaryPanelOutcome::Exit => return Ok(()),
+                    PrimaryPanelOutcome::Switch(next) => {
+                        panel = next;
+                        continue;
+                    }
+                }
+            }
+            PrimaryPanel::Tasks => {
+                let (outcome, model) = super::session_tui_tasks::run(tasks_model.take())?;
+                tasks_model = Some(model);
+                match outcome {
+                    PrimaryPanelOutcome::Exit => return Ok(()),
+                    PrimaryPanelOutcome::Switch(next) => {
+                        panel = next;
+                        continue;
+                    }
+                }
+            }
+        };
+        match outcome {
             SessionTuiCycleOutcome::Exit => return Ok(()),
             SessionTuiCycleOutcome::Selected(intent) => {
-                return super::session_tui_dispatch::dispatch_session_tui_intent(intent);
+                let key = intent.key.clone();
+                match super::session_tui_dispatch::dispatch_session_tui_intent(intent) {
+                    Ok(()) => return Ok(()),
+                    Err(error) => {
+                        if let Some(model) = selector_model.as_mut() {
+                            model.dispatch_failed(&key, format!("{error:#}"));
+                        }
+                        panel = PrimaryPanel::Agents;
+                    }
+                }
             }
             SessionTuiCycleOutcome::LoginProfile => {
                 startup = Some(profile_login_startup(super::auth::login_interactive()));
+                panel = PrimaryPanel::Agents;
             }
-            SessionTuiCycleOutcome::CutexProjects => super::session_tui_cutex_projects::run()?,
+            SessionTuiCycleOutcome::CutexProjects => {
+                panel = PrimaryPanel::Projects;
+            }
             SessionTuiCycleOutcome::Projects => super::session_tui_projects::run()?,
-            SessionTuiCycleOutcome::Tasks => super::session_tui_tasks::run()?,
+            SessionTuiCycleOutcome::Tasks => {
+                panel = PrimaryPanel::Tasks;
+            }
+            SessionTuiCycleOutcome::Switch(next) => {
+                panel = next;
+            }
         }
     }
 }
 
 fn run_terminal_cycle(
     startup: Option<ProfileManagerStartup>,
-) -> anyhow::Result<SessionTuiCycleOutcome> {
-    let store = load_reconciled_session_store()?;
-    let config = load_codez_config();
-    let (profile_names, profile_warning) = profile_names_with_warning();
-    let (activity_states, activity_warning) = activity_states_with_warning();
-    let (project_contexts, project_warning) = project_contexts_with_warning();
-    let initial_rows = selector_rows_from_store(
-        &store,
-        &[],
-        &[],
-        &config,
-        &profile_names,
-        &activity_states,
-        &project_contexts,
-    );
+    initial_panel: PrimaryPanel,
+    previous_model: Option<SelectorModel>,
+) -> anyhow::Result<(SessionTuiCycleOutcome, SelectorModel)> {
+    let mut initial_warning = None;
+    let initial_rows = if previous_model.is_none() {
+        let store = load_reconciled_session_store()?;
+        let config = load_codez_config();
+        let (profile_names, profile_warning) = profile_names_with_warning();
+        let (activity_states, activity_warning) = activity_states_with_warning();
+        let (project_contexts, project_warning) = project_contexts_with_warning();
+        initial_warning = combine_warnings(
+            combine_warnings(profile_warning, activity_warning),
+            project_warning,
+        );
+        selector_rows_from_store(
+            &store,
+            &[],
+            &[],
+            &config,
+            &profile_names,
+            &activity_states,
+            &project_contexts,
+        )
+    } else {
+        Vec::new()
+    };
     let mut refresh = spawn_snapshot_refresh()?;
     let recent_catalog = RecentCatalog::spawn()?;
     let startup_profiles = startup.as_ref().map(|_| load_profile_catalog_read_only());
     let (mut terminal, restore, enhanced_keyboard) = open_terminal()?;
-    let mut model = SelectorModel::new(initial_rows, refresh.is_loading(), enhanced_keyboard);
-    model.warning = combine_warnings(
-        combine_warnings(profile_warning, activity_warning),
-        project_warning,
-    );
+    let mut model = previous_model.unwrap_or_else(|| {
+        SelectorModel::new(initial_rows, refresh.is_loading(), enhanced_keyboard)
+    });
+    model.enhanced_keyboard = enhanced_keyboard;
+    model.refreshing = refresh.is_loading();
+    model.activate_primary_panel(initial_panel);
+    if model.warning.is_none() {
+        model.warning = initial_warning;
+    }
     if let Some(startup) = startup {
         match startup_profiles.expect("profile startup catalog should exist") {
             Ok(profiles) => model.open_profile_manager(profiles),
@@ -3892,10 +4268,10 @@ fn run_terminal_cycle(
         model.warning = combine_warnings(model.warning.take(), startup.warning);
     }
 
-    let result = run_event_loop(&mut terminal, &mut model, &mut refresh, &recent_catalog);
+    let outcome = run_event_loop(&mut terminal, &mut model, &mut refresh, &recent_catalog);
     drop(terminal);
     drop(restore);
-    result
+    Ok((outcome?, model))
 }
 
 fn profile_login_startup(result: anyhow::Result<()>) -> ProfileManagerStartup {
@@ -4014,7 +4390,11 @@ fn load_reconciled_session_store_with(
 
 fn load_retired_selector_rows() -> anyhow::Result<Vec<SelectorRow>> {
     let store = load_cutex_session_store()?;
-    Ok(retired_selector_rows_from_store(&store))
+    let contexts = AgentManagementStore::open_default()
+        .and_then(|store| store.snapshot().map_err(anyhow::Error::new))
+        .map(|snapshot| selector_project_contexts(&snapshot))
+        .unwrap_or_default();
+    Ok(retired_selector_rows_from_store(&store, &contexts))
 }
 
 fn profile_names_with_warning() -> (Vec<String>, Option<String>) {
@@ -4063,6 +4443,7 @@ fn selector_project_contexts(
             (
                 cutex_session_id.as_str().to_string(),
                 SelectorProjectContext {
+                    agent_name: agent.spec.name.clone(),
                     project_id: agent.project_id.as_str().to_string(),
                     display_name: presentation.display_name,
                     badge_label: presentation.badge_label,
@@ -4071,6 +4452,19 @@ fn selector_project_contexts(
             )
         })
         .collect()
+}
+
+fn managed_names_by_native_session_id() -> HashMap<String, String> {
+    AgentManagementStore::open_default()
+        .and_then(|store| store.snapshot().map_err(anyhow::Error::new))
+        .map(|snapshot| {
+            snapshot
+                .agents
+                .values()
+                .map(|agent| (agent.native_session_id.clone(), agent.spec.name.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn combine_warnings(left: Option<String>, right: Option<String>) -> Option<String> {
@@ -4181,7 +4575,18 @@ fn selector_rows_from_store(
                 .get(&record.cutex_session_id)
                 .and_then(selector_activity_from_state);
             if row.managed {
-                row.project = project_contexts.get(&record.cutex_session_id).cloned();
+                if let Some(context) = project_contexts.get(&record.cutex_session_id) {
+                    // Managed identity is owned by Agent Management. Native
+                    // thread titles remain optional secondary presentation.
+                    row.agent = context.agent_name.clone();
+                    row.project = Some(context.clone());
+                } else {
+                    // Agent Management persists the formal name in the durable
+                    // display-name hint. Keep using it while a remote project's
+                    // local projection is unavailable, but never substitute a
+                    // mutable native thread title for managed identity.
+                    row.agent = managed_session_fallback_name(record);
+                }
             }
             row
         })
@@ -4193,31 +4598,40 @@ fn selector_rows_from_store(
             .filter(|record| record.is_retired() && cutex_session_is_managed(record))
             .count(),
     ));
-    rows.push(recent_sessions_row());
-    rows.push(cutex_projects_row());
     rows.push(projects_row());
-    rows.push(tasks_row());
     rows.push(profiles_row(config, profile_names));
     rows.push(global_settings_row_with_profiles(config, profile_names));
     rows
 }
 
-fn retired_selector_rows_from_store(store: &CutexSessionStore) -> Vec<SelectorRow> {
+fn retired_selector_rows_from_store(
+    store: &CutexSessionStore,
+    project_contexts: &HashMap<String, SelectorProjectContext>,
+) -> Vec<SelectorRow> {
     let mut rows = store
         .sessions
         .iter()
         .filter(|(_, record)| record.is_retired() && cutex_session_is_managed(record))
-        .map(|(key, record)| retired_selector_row(key, record))
+        .map(|(key, record)| {
+            retired_selector_row(key, record, project_contexts.get(&record.cutex_session_id))
+        })
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| left.agent.cmp(&right.agent));
     rows
 }
 
-fn retired_selector_row(key: &str, record: &CutexSessionRecord) -> SelectorRow {
+fn retired_selector_row(
+    key: &str,
+    record: &CutexSessionRecord,
+    context: Option<&SelectorProjectContext>,
+) -> SelectorRow {
     SelectorRow {
         target: SelectorTarget::RetiredAgent(key.to_string()),
-        agent: cutex_session_display_name(record),
-        project: None,
+        agent: context
+            .map(|context| context.agent_name.clone())
+            .unwrap_or_else(|| managed_session_fallback_name(record)),
+        thread_title: record.thread_name.clone(),
+        project: context.cloned(),
         configured_profile: record.profile.clone(),
         lifecycle: Some(CutexSessionLifecycleState::Offline),
         host: nonempty_or_dash(&record.host_id),
@@ -4245,6 +4659,16 @@ fn retired_selector_row(key: &str, record: &CutexSessionRecord) -> SelectorRow {
     }
 }
 
+fn managed_session_fallback_name(record: &CutexSessionRecord) -> String {
+    record
+        .display_name_hint
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| record.cutex_session_id.clone())
+}
+
 fn selector_row(
     key: &str,
     record: &CutexSessionRecord,
@@ -4266,6 +4690,9 @@ fn selector_row(
     SelectorRow {
         target: SelectorTarget::Agent(key.to_string()),
         agent: cutex_session_display_name(record),
+        thread_title: cutex_session_is_managed(record)
+            .then(|| record.thread_name.clone())
+            .flatten(),
         project: None,
         configured_profile: record.profile.clone(),
         lifecycle: Some(cutex_session_lifecycle_state_with_agents(
@@ -4298,6 +4725,7 @@ fn retired_sessions_row(retired_count: usize) -> SelectorRow {
     SelectorRow {
         target: SelectorTarget::RetiredSessions,
         agent: format!("Retired sessions ({retired_count})"),
+        thread_title: None,
         project: None,
         configured_profile: None,
         lifecycle: None,
@@ -4322,6 +4750,7 @@ fn projects_row() -> SelectorRow {
     SelectorRow {
         target: SelectorTarget::Projects,
         agent: "Workspaces".to_string(),
+        thread_title: None,
         project: None,
         configured_profile: None,
         lifecycle: None,
@@ -4342,10 +4771,12 @@ fn projects_row() -> SelectorRow {
     }
 }
 
+#[cfg(test)]
 fn cutex_projects_row() -> SelectorRow {
     SelectorRow {
         target: SelectorTarget::CutexProjects,
         agent: "Cutex Projects".to_string(),
+        thread_title: None,
         project: None,
         configured_profile: None,
         lifecycle: None,
@@ -4366,34 +4797,12 @@ fn cutex_projects_row() -> SelectorRow {
     }
 }
 
-fn tasks_row() -> SelectorRow {
-    SelectorRow {
-        target: SelectorTarget::Tasks,
-        agent: "Tasks".to_string(),
-        project: None,
-        configured_profile: None,
-        lifecycle: None,
-        host: "-".to_string(),
-        backend: "Task Service".to_string(),
-        managed_path: "Director-scoped read-only".to_string(),
-        retired_at: None,
-        revision: 0,
-        activity_session_id: None,
-        activity: None,
-        actions: Vec::new(),
-        settings: Vec::new(),
-        settings_snapshot: None,
-        global_settings_snapshot: None,
-        attachable: false,
-        pinned: false,
-        managed: false,
-    }
-}
-
+#[cfg(test)]
 fn recent_sessions_row() -> SelectorRow {
     SelectorRow {
         target: SelectorTarget::RecentSessions,
         agent: "Recent sessions".to_string(),
+        thread_title: None,
         project: None,
         configured_profile: None,
         lifecycle: None,
@@ -4448,6 +4857,7 @@ fn global_settings_row_with_profiles(
     SelectorRow {
         target: SelectorTarget::GlobalSettings,
         agent: "Global settings".to_string(),
+        thread_title: None,
         project: None,
         configured_profile: None,
         lifecycle: None,
@@ -4474,6 +4884,7 @@ fn profiles_row(config: &CodezConfig, profile_names: &[String]) -> SelectorRow {
     SelectorRow {
         target: SelectorTarget::Profiles,
         agent: "Profiles".to_string(),
+        thread_title: None,
         project: None,
         configured_profile: None,
         lifecycle: None,
@@ -4640,12 +5051,70 @@ fn run_event_loop(
         }
         match event::read()? {
             Event::Key(key) => {
-                let control = if close_runtime_shortcut_from_key(key) {
-                    Some(model.activate_close_shortcut())
-                } else {
-                    selector_event_from_key(key, model.enhanced_keyboard)
-                        .map(|selector_event| model.handle(selector_event))
-                };
+                if let Some(panel) = primary_panel_shortcut(key) {
+                    if matches!(model.mode, SelectorMode::ClosingRuntime { .. }) {
+                        continue;
+                    }
+                    let active = if matches!(model.mode, SelectorMode::RecentSessions) {
+                        PrimaryPanel::Recent
+                    } else {
+                        PrimaryPanel::Agents
+                    };
+                    if panel != active {
+                        return Ok(SessionTuiCycleOutcome::Switch(panel));
+                    }
+                    continue;
+                }
+                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                    && key.modifiers == KeyModifiers::NONE
+                    && key.code == KeyCode::F(5)
+                {
+                    if matches!(model.mode, SelectorMode::ClosingRuntime { .. }) {
+                        continue;
+                    }
+                    if matches!(model.mode, SelectorMode::RecentSessions) {
+                        if recent_catalog.request(RecentCommand::Retry, None) {
+                            model.recent_loading_started();
+                        } else {
+                            model.warning = Some(
+                                "recent catalog worker stopped; retry by reopening the TUI"
+                                    .to_string(),
+                            );
+                        }
+                    } else if !model.refreshing {
+                        match spawn_snapshot_refresh() {
+                            Ok(next) => {
+                                *refresh = next;
+                                model.refreshing = true;
+                            }
+                            Err(error) => model.mark_refresh_failed(format!("{error:#}")),
+                        }
+                    }
+                    continue;
+                }
+                if let Some(next_panel) = selector_list_panel_from_horizontal_key(model, key) {
+                    if let Some(next_panel) = next_panel {
+                        return Ok(SessionTuiCycleOutcome::Switch(next_panel));
+                    }
+                    continue;
+                }
+                if handle_managed_inspector_shortcut(model, key) {
+                    continue;
+                }
+                if handle_recent_actions_shortcut(model, key) {
+                    continue;
+                }
+                let control =
+                    if let Some(control) = selector_navigation_control_from_key(model, key) {
+                        Some(control)
+                    } else if toggle_managed_thread_titles_from_key(model, key) {
+                        None
+                    } else if close_runtime_shortcut_from_key(key) {
+                        Some(model.activate_close_shortcut())
+                    } else {
+                        selector_event_from_key(key, model.enhanced_keyboard)
+                            .map(|selector_event| model.handle(selector_event))
+                    };
                 if let Some(control) = control {
                     match control {
                         SelectorControl::Continue => {}
@@ -5129,6 +5598,118 @@ fn close_runtime_shortcut_from_key(key: KeyEvent) -> bool {
         && matches!(key.code, KeyCode::Char('x' | 'X'))
 }
 
+fn selector_navigation_control_from_key(
+    model: &mut SelectorModel,
+    key: KeyEvent,
+) -> Option<SelectorControl> {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        || key
+            .modifiers
+            .contains(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
+    }
+    match key.code {
+        KeyCode::Tab => Some(model.handle_focus_traversal(true)),
+        KeyCode::BackTab => Some(model.handle_focus_traversal(false)),
+        KeyCode::Right => Some(model.handle_horizontal_navigation(true)),
+        KeyCode::Left => Some(model.handle_horizontal_navigation(false)),
+        _ => None,
+    }
+}
+
+fn selector_list_panel_from_horizontal_key(
+    model: &SelectorModel,
+    key: KeyEvent,
+) -> Option<Option<PrimaryPanel>> {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        || key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        || model.action_overlay.is_some()
+        || model.settings_overlay.is_some()
+        || model.profile_overlay.is_some()
+    {
+        return None;
+    }
+    let active = match &model.mode {
+        SelectorMode::Agents if !model.inspector_overview_focused => PrimaryPanel::Agents,
+        SelectorMode::RecentSessions if model.recent.review().is_none() => PrimaryPanel::Recent,
+        _ => return None,
+    };
+    match key.code {
+        KeyCode::Right => Some(active.adjacent(true)),
+        KeyCode::Left => Some(active.adjacent(false)),
+        _ => None,
+    }
+}
+
+fn handle_managed_inspector_shortcut(model: &mut SelectorModel, key: KeyEvent) -> bool {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        || key.modifiers != KeyModifiers::ALT
+        || model.action_overlay.is_some()
+        || model.settings_overlay.is_some()
+        || model.profile_overlay.is_some()
+        || !model.shows_managed_inspector()
+        || !matches!(
+            &model.mode,
+            SelectorMode::Agents | SelectorMode::Actions { .. } | SelectorMode::Settings { .. }
+        )
+    {
+        return false;
+    }
+    match key.code {
+        KeyCode::Char('a' | 'A') => {
+            if matches!(&model.mode, SelectorMode::Settings { .. })
+                && (model.settings_draft.is_dirty() || model.global_settings_draft.is_dirty())
+            {
+                model.warning =
+                    Some("Save or discard staged settings before opening Actions".into());
+            } else if !matches!(&model.mode, SelectorMode::Actions { .. }) {
+                model.inspector_overview_focused = false;
+                model.open_action_menu();
+            }
+            true
+        }
+        KeyCode::Char('e' | 'E') => {
+            if !matches!(&model.mode, SelectorMode::Settings { .. }) {
+                model.inspector_overview_focused = false;
+                model.open_settings();
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn toggle_managed_thread_titles_from_key(model: &mut SelectorModel, key: KeyEvent) -> bool {
+    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        && key.modifiers == KeyModifiers::ALT
+        && matches!(key.code, KeyCode::Char('v' | 'V'))
+        && matches!(model.mode, SelectorMode::Agents)
+        && model.selected_managed_agent().is_some()
+    {
+        model.show_thread_titles = !model.show_thread_titles;
+        true
+    } else {
+        false
+    }
+}
+
+fn handle_recent_actions_shortcut(model: &mut SelectorModel, key: KeyEvent) -> bool {
+    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        && key.modifiers == KeyModifiers::ALT
+        && matches!(key.code, KeyCode::Char('a' | 'A'))
+        && matches!(model.mode, SelectorMode::RecentSessions)
+        && model.recent.review().is_none()
+    {
+        let _ = model.handle(SelectorEvent::OpenActions);
+        true
+    } else {
+        false
+    }
+}
+
 fn selector_event_from_key(key: KeyEvent, enhanced_keyboard: bool) -> Option<SelectorEvent> {
     workspace_event_from_key(key, enhanced_keyboard)
 }
@@ -5149,56 +5730,72 @@ fn render_selector_contents(frame: &mut Frame<'_>, model: &SelectorModel) {
     let area = frame.area();
     let chunks = Layout::vertical([
         Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Length(3),
         Constraint::Min(1),
         Constraint::Length(1),
     ])
     .split(area);
-    render_header(frame, chunks[0], model);
-    match &model.mode {
-        SelectorMode::Agents => {
-            render_filter(frame, chunks[1], model);
-            render_table(frame, chunks[2], model);
-        }
-        SelectorMode::RecentSessions => {
-            render_recent_context(frame, chunks[1], model);
-            render_recent_workspace(frame, chunks[2], model);
-        }
-        SelectorMode::RetiredSessions { .. } => {
-            render_retired_context(frame, chunks[1], model);
-            render_retired_table(frame, chunks[2], model);
-        }
-        SelectorMode::Actions { .. } => {
-            render_item_context(frame, chunks[1], model);
-            render_action_table(frame, chunks[2], model);
-            render_action_overlay(frame, chunks[2], model);
-        }
-        SelectorMode::Settings { .. } => {
-            render_item_context(frame, chunks[1], model);
-            render_settings_browser(frame, chunks[2], model);
-            render_settings_overlay(frame, chunks[2], model);
-        }
-        SelectorMode::ProfileManager { .. } => {
-            render_profile_context(frame, chunks[1], model);
-            render_profile_manager(frame, chunks[2], model);
-            render_settings_overlay(frame, chunks[2], model);
-            render_profile_overlay(frame, chunks[2], model);
-        }
-        SelectorMode::ConfirmRuntimeAction { .. } => {
-            render_item_context(frame, chunks[1], model);
-            render_runtime_action_confirmation(frame, chunks[2], model);
-        }
-        SelectorMode::ClosingRuntime { .. } => {
-            render_item_context(frame, chunks[1], model);
-            render_runtime_close_progress(frame, chunks[2], model);
+    let active_panel = if matches!(&model.mode, SelectorMode::RecentSessions) {
+        PrimaryPanel::Recent
+    } else {
+        PrimaryPanel::Agents
+    };
+    frame.render_widget(Paragraph::new(primary_panel_tabs(active_panel)), chunks[0]);
+    render_header(frame, chunks[1], model);
+    let main_area = Rect {
+        y: chunks[2].y,
+        height: chunks[2].height.saturating_add(chunks[3].height),
+        ..chunks[2]
+    };
+    if model.shows_managed_inspector() {
+        render_managed_workspace_with_inspector(frame, main_area, model);
+    } else {
+        match &model.mode {
+            SelectorMode::Agents => {
+                render_filter(frame, chunks[2], model, true);
+                render_table(frame, chunks[3], model);
+            }
+            SelectorMode::RecentSessions => {
+                render_recent_context(frame, chunks[2], model);
+                render_recent_workspace(frame, chunks[3], model);
+            }
+            SelectorMode::RetiredSessions { .. } => {
+                render_retired_context(frame, chunks[2], model);
+                render_retired_table(frame, chunks[3], model);
+            }
+            SelectorMode::Actions { .. } => {
+                render_item_context(frame, chunks[2], model);
+                render_action_table(frame, chunks[3], model);
+                render_action_overlay(frame, chunks[3], model);
+            }
+            SelectorMode::Settings { .. } => {
+                render_item_context(frame, chunks[2], model);
+                render_settings_browser(frame, chunks[3], model);
+                render_settings_overlay(frame, chunks[3], model);
+            }
+            SelectorMode::ProfileManager { .. } => {
+                render_profile_context(frame, chunks[2], model);
+                render_profile_manager(frame, chunks[3], model);
+                render_settings_overlay(frame, chunks[3], model);
+                render_profile_overlay(frame, chunks[3], model);
+            }
+            SelectorMode::ConfirmRuntimeAction { .. } => {
+                render_item_context(frame, chunks[2], model);
+                render_runtime_action_confirmation(frame, chunks[3], model);
+            }
+            SelectorMode::ClosingRuntime { .. } => {
+                render_item_context(frame, chunks[2], model);
+                render_runtime_close_progress(frame, chunks[3], model);
+            }
         }
     }
-    render_footer(frame, chunks[3], model);
+    render_footer(frame, chunks[4], model);
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
     let (view, count) = match &model.mode {
-        SelectorMode::Agents => ("agents", model.visible_indices().len()),
+        SelectorMode::Agents => ("managed", model.visible_indices().len()),
         SelectorMode::RecentSessions => ("recent sessions", model.recent.rows().len()),
         SelectorMode::RetiredSessions { .. } => ("retired sessions", model.retired_rows.len()),
         SelectorMode::Actions { .. } => (
@@ -5246,6 +5843,12 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
         if hidden > 0 {
             spans.push(Span::styled(
                 format!("  {hidden} offline searchable"),
+                Style::new().fg(Color::DarkGray),
+            ));
+        }
+        if model.show_thread_titles {
+            spans.push(Span::styled(
+                "  thread titles expanded",
                 Style::new().fg(Color::DarkGray),
             ));
         }
@@ -5327,7 +5930,7 @@ fn render_item_context(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel)
         SelectorTarget::RecentSessions => " Recent sessions ",
         SelectorTarget::RetiredSessions => " Retired sessions ",
         SelectorTarget::CutexProjects => " Cutex Projects ",
-        SelectorTarget::Projects => " Codex Workspaces ",
+        SelectorTarget::Projects => " Workspaces ",
         SelectorTarget::Tasks => " Tasks ",
         SelectorTarget::Profiles => " Profiles ",
         SelectorTarget::GlobalSettings => " Global settings ",
@@ -5483,7 +6086,7 @@ fn render_recent_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorMo
         _ => {
             let rows = model.recent.rows().iter().map(|row| {
                 Row::new([
-                    Cell::from(row.title.clone()),
+                    Cell::from(row.primary_label().to_string()),
                     Cell::from(
                         row.cwd
                             .as_deref()
@@ -6073,7 +6676,231 @@ fn render_profile_overlay(frame: &mut Frame<'_>, area: Rect, model: &SelectorMod
     }
 }
 
-fn render_filter(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
+fn render_managed_workspace_with_inspector(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    model: &SelectorModel,
+) {
+    let list_focused =
+        matches!(&model.mode, SelectorMode::Agents) && !model.inspector_overview_focused;
+    if area.width >= INSPECTOR_SPLIT_MIN_WIDTH {
+        let panes = Layout::horizontal([Constraint::Percentage(46), Constraint::Percentage(54)])
+            .split(area);
+        render_managed_list_pane(frame, panes[0], model, list_focused);
+        render_agent_inspector(frame, panes[1], model);
+    } else if list_focused {
+        render_managed_list_pane(frame, area, model, true);
+    } else {
+        render_agent_inspector(frame, area, model);
+    }
+}
+
+fn render_managed_list_pane(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    model: &SelectorModel,
+    focused: bool,
+) {
+    let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(area);
+    render_filter(frame, chunks[0], model, focused);
+    render_table(frame, chunks[1], model);
+}
+
+fn render_agent_inspector(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
+    let active = model.inspector_is_focused();
+    let block = Block::bordered()
+        .title(" Inspector ")
+        .border_style(Style::new().fg(if active { Color::Cyan } else { Color::DarkGray }));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Min(1),
+    ])
+    .split(inner);
+    let section = model.inspector_section();
+    let mut tabs = Vec::new();
+    for (index, candidate) in InspectorSection::ALL.into_iter().enumerate() {
+        if index > 0 {
+            tabs.push(Span::styled(" | ", Style::new().fg(Color::DarkGray)));
+        }
+        let label = if candidate == InspectorSection::Actions {
+            format!("{} [Alt+A]", candidate.label())
+        } else if candidate == InspectorSection::Settings {
+            format!("{} [Alt+E]", candidate.label())
+        } else {
+            candidate.label().to_string()
+        };
+        tabs.push(Span::styled(
+            label,
+            if candidate == section {
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(Color::Gray)
+            },
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(tabs)), chunks[0]);
+
+    let Some(row) = model.active_row() else {
+        frame.render_widget(
+            Paragraph::new("Selected Agent is no longer available")
+                .style(Style::new().fg(Color::Yellow)),
+            chunks[2],
+        );
+        return;
+    };
+    let lifecycle = row
+        .lifecycle
+        .map(CutexSessionLifecycleState::label)
+        .unwrap_or("-");
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                row.agent.as_str(),
+                Style::new().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(vec![
+                Span::styled(
+                    lifecycle,
+                    row.lifecycle.map(lifecycle_style).unwrap_or_default(),
+                ),
+                Span::styled(
+                    format!("  {}  {}", row.host, row.backend),
+                    Style::new().fg(Color::DarkGray),
+                ),
+            ]),
+        ]),
+        chunks[1],
+    );
+
+    match &model.mode {
+        SelectorMode::Agents => render_inspector_overview(frame, chunks[2], model, row),
+        SelectorMode::Actions { .. } => {
+            render_action_table(frame, chunks[2], model);
+            render_action_overlay(frame, chunks[2], model);
+        }
+        SelectorMode::Settings { .. } => {
+            render_inspector_settings(frame, chunks[2], model, row);
+            render_settings_overlay(frame, chunks[2], model);
+        }
+        SelectorMode::ConfirmRuntimeAction { .. } => {
+            render_runtime_action_confirmation(frame, chunks[2], model)
+        }
+        SelectorMode::ClosingRuntime { .. } => {
+            render_runtime_close_progress(frame, chunks[2], model)
+        }
+        SelectorMode::RecentSessions
+        | SelectorMode::RetiredSessions { .. }
+        | SelectorMode::ProfileManager { .. } => {}
+    }
+}
+
+fn render_inspector_overview(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    model: &SelectorModel,
+    row: &SelectorRow,
+) {
+    let profile = row
+        .configured_profile
+        .as_deref()
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "~{}",
+                selector_default_profile_name(model).unwrap_or("unset")
+            )
+        });
+    let configured_model = row
+        .settings
+        .iter()
+        .flat_map(|category| category.options.iter())
+        .find(|option| option.label == "Model")
+        .map(|option| option.value.as_str())
+        .unwrap_or("default");
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Cutex Project: ", Style::new().fg(Color::DarkGray)),
+            Span::raw(
+                row.project
+                    .as_ref()
+                    .map(|project| {
+                        format!(
+                            "[{}] {} ({})",
+                            project.badge_label, project.display_name, project.project_id
+                        )
+                    })
+                    .unwrap_or_else(|| "unassigned".to_string()),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Profile / model: ", Style::new().fg(Color::DarkGray)),
+            Span::raw(format!("{profile} / {configured_model}")),
+        ]),
+        Line::from(vec![
+            Span::styled("Managed path: ", Style::new().fg(Color::DarkGray)),
+            Span::raw(row.managed_path.as_str()),
+        ]),
+        Line::from(vec![
+            Span::styled("Activity: ", Style::new().fg(Color::DarkGray)),
+            Span::raw(format_selector_activity(row.activity.as_ref(), Utc::now())),
+        ]),
+    ];
+    if model.show_thread_titles {
+        if let Some(title) = row
+            .thread_title
+            .as_deref()
+            .filter(|title| !title.trim().is_empty() && *title != row.agent)
+        {
+            lines.push(Line::from(vec![
+                Span::styled("Thread title: ", Style::new().fg(Color::DarkGray)),
+                Span::styled(title, Style::new().fg(Color::Gray)),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Read-only overview  ·  Alt+A Actions  ·  Alt+E Settings",
+        Style::new().fg(Color::DarkGray),
+    )));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn render_inspector_settings(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    model: &SelectorModel,
+    row: &SelectorRow,
+) {
+    if let Some(project) = row.project.as_ref() {
+        let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(area);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!(" {} ", project.badge_label),
+                    Style::new()
+                        .fg(Color::White)
+                        .bg(project_palette_color(project.color))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(" {}  ", project.display_name)),
+                Span::styled("Alt+P edit", Style::new().fg(Color::Cyan)),
+            ]))
+            .block(Block::bordered().title(" Project badge settings ")),
+            chunks[0],
+        );
+        render_settings_browser(frame, chunks[1], model);
+    } else {
+        render_settings_browser(frame, area, model);
+    }
+}
+
+fn render_filter(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel, focused: bool) {
     let input_width = area.width.saturating_sub(2) as usize;
     let cursor_width = input_width.saturating_sub(1).max(1);
     let scroll = model.query.visual_scroll(cursor_width);
@@ -6086,7 +6913,7 @@ fn render_filter(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
         );
     frame.render_widget(input, area);
 
-    if area.height >= 3 && input_width > 0 {
+    if focused && area.height >= 3 && input_width > 0 {
         let cursor = model
             .query
             .visual_cursor()
@@ -6098,12 +6925,20 @@ fn render_filter(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
 
 fn render_table(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
     let visible = model.visible_rows();
-    let wide = frame.area().width >= WIDE_LAYOUT_MIN_WIDTH;
-    let extra_wide = frame.area().width >= EXTRA_WIDE_LAYOUT_MIN_WIDTH;
+    let wide = area.width >= WIDE_LAYOUT_MIN_WIDTH;
+    let extra_wide = area.width >= EXTRA_WIDE_LAYOUT_MIN_WIDTH;
     let default_profile = selector_default_profile_name(model);
     let rows = visible
         .iter()
-        .map(|row| selector_table_row(row, wide, extra_wide, default_profile))
+        .map(|row| {
+            selector_table_row(
+                row,
+                wide,
+                extra_wide,
+                default_profile,
+                model.show_thread_titles,
+            )
+        })
         .collect::<Vec<_>>();
     let header_style = Style::new().fg(Color::Gray).add_modifier(Modifier::BOLD);
     let header = if wide {
@@ -6729,6 +7564,29 @@ fn render_runtime_action_confirmation(frame: &mut Frame<'_>, area: Rect, model: 
         Style::new().fg(Color::Yellow)
     };
     let (title, prompt, action_label, detail) = match action {
+        SessionTuiAction::Online
+        | SessionTuiAction::ResumeAttach
+        | SessionTuiAction::OpenTui
+        | SessionTuiAction::ResumeHere
+        | SessionTuiAction::ResumeManaged
+            if row.lifecycle == Some(CutexSessionLifecycleState::Offline) =>
+        {
+            (
+                " Start & attach ",
+                "Start & attach?".to_string(),
+                "  Start & attach  ",
+                format!(
+                    "Start {} using the selected managed route, then enter its exact TUI.",
+                    row.agent
+                ),
+            )
+        }
+        SessionTuiAction::Online => (
+            " Confirm start ",
+            format!("Start managed runtime for {}?", row.agent),
+            "  Start runtime  ",
+            "The selected managed launch route will be used.".to_string(),
+        ),
         SessionTuiAction::CloseAndRestart => (
             " Confirm restart ",
             format!("Close and restart runtime for {}?", row.agent),
@@ -6843,6 +7701,7 @@ fn selector_table_row<'a>(
     wide: bool,
     extra_wide: bool,
     default_profile: Option<&str>,
+    show_thread_titles: bool,
 ) -> Row<'a> {
     let state = if let Some(lifecycle) = row.lifecycle {
         let label = selector_state_label(row);
@@ -6869,9 +7728,7 @@ fn selector_table_row<'a>(
         "browse"
     } else if row.target.is_profiles() {
         "manage"
-    } else if row.target.is_cutex_projects() || row.target.is_projects() {
-        "open"
-    } else if row.target.is_tasks() {
+    } else if row.target.is_cutex_projects() || row.target.is_projects() || row.target.is_tasks() {
         "open"
     } else if row.target.is_global_settings() {
         "settings"
@@ -6883,8 +7740,8 @@ fn selector_table_row<'a>(
             .unwrap_or("-")
     };
     let primary = Cell::from(primary_label).style(Style::new().fg(Color::Cyan));
-    let agent = if let Some(project) = row.project.as_ref() {
-        Cell::from(Line::from(vec![
+    let primary_agent_line = if let Some(project) = row.project.as_ref() {
+        Line::from(vec![
             Span::styled(
                 project.badge_label.as_str(),
                 Style::new()
@@ -6894,11 +7751,29 @@ fn selector_table_row<'a>(
             ),
             Span::raw(" "),
             Span::raw(row.agent.as_str()),
-        ]))
+        ])
     } else if row.target.is_system() {
-        Cell::from(row.agent.as_str()).style(Style::new().fg(Color::Cyan))
+        Line::from(Span::styled(
+            row.agent.as_str(),
+            Style::new().fg(Color::Cyan),
+        ))
     } else {
-        Cell::from(row.agent.as_str())
+        Line::from(row.agent.as_str())
+    };
+    let thread_title = show_thread_titles
+        .then_some(row.thread_title.as_deref())
+        .flatten()
+        .filter(|title| !title.trim().is_empty() && *title != row.agent);
+    let agent = if let Some(thread_title) = thread_title {
+        Cell::from(vec![
+            primary_agent_line,
+            Line::from(vec![
+                Span::styled("  thread: ", Style::new().fg(Color::DarkGray)),
+                Span::styled(thread_title, Style::new().fg(Color::Gray)),
+            ]),
+        ])
+    } else {
+        Cell::from(primary_agent_line)
     };
     let profile = if row.target.is_system() {
         Cell::from("-").style(Style::new().fg(Color::DarkGray))
@@ -6910,16 +7785,7 @@ fn selector_table_row<'a>(
     };
     let activity = Cell::from(format_selector_activity(row.activity.as_ref(), Utc::now()))
         .style(Style::new().fg(Color::Gray));
-    if extra_wide {
-        Row::new([
-            agent,
-            profile,
-            state,
-            activity,
-            Cell::from(row.managed_path.as_str()),
-            primary,
-        ])
-    } else if wide {
+    let rendered = if extra_wide || wide {
         Row::new([
             agent,
             profile,
@@ -6930,6 +7796,11 @@ fn selector_table_row<'a>(
         ])
     } else {
         Row::new([agent, profile, state, primary])
+    };
+    if thread_title.is_some() {
+        rendered.height(2)
+    } else {
+        rendered
     }
 }
 
@@ -7143,34 +8014,55 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
         }
     } else {
         match &model.mode {
+            SelectorMode::Agents if model.inspector_overview_focused && very_narrow => {
+                footer_hints(&[("Alt+A", ""), ("Alt+E", ""), ("Shift+Tab/Esc", "")])
+            }
+            SelectorMode::Agents if model.inspector_overview_focused => footer_hints(&[
+                ("Alt+A", "Actions"),
+                ("Alt+E", "Settings"),
+                ("Shift+Tab/Esc", "Agent list"),
+                ("F5", "refresh"),
+            ]),
             SelectorMode::Agents if very_narrow => footer_hints(&[
                 ("Up/Down", ""),
                 ("Enter", ""),
-                ("Right", ""),
+                ("L/R", ""),
+                ("Alt+A", ""),
+                ("Alt+E", ""),
+                ("Alt+V", ""),
                 ("Tab", ""),
                 ("Esc", ""),
             ]),
             SelectorMode::Agents if narrow => footer_hints(&[
                 ("Up/Down", ""),
                 ("Enter", ""),
-                ("Right", ""),
-                ("Tab", "settings"),
-                ("Ctrl+X", "close"),
+                ("L/R", ""),
+                ("Alt+A", ""),
+                ("Alt+E", ""),
+                ("Alt+V", ""),
+                ("Tab", ""),
+                ("Ctrl+X", ""),
                 ("Esc", ""),
             ]),
             SelectorMode::Agents => {
                 let mut spans = footer_hints(&[
                     ("Up/Down", "move"),
-                    ("Enter", "primary"),
-                    ("Right", "actions"),
-                    ("Tab", "settings"),
-                    ("Ctrl+X", "close"),
+                    ("Enter", "attach/enter"),
+                    ("L/R", "tabs"),
+                    ("Alt+A", "actions"),
+                    ("Alt+E", "settings"),
+                    ("Alt+V", "titles"),
+                    ("Tab", "Inspector"),
+                    ("F5", "refresh"),
                 ]);
-                if model.enhanced_keyboard && area.width >= 120 {
-                    spans.extend(footer_hints(&[("Shift+Enter", "actions")]));
-                }
                 if area.width >= 120 {
                     spans.extend(footer_hints(&[("~", "global profile")]));
+                }
+                if model.enhanced_keyboard && area.width >= 180 {
+                    spans.extend(footer_hints(&[("Shift+Enter", "actions")]));
+                }
+                if area.width >= 180 {
+                    spans.extend(footer_hints(&[("Ctrl+X", "review close")]));
                 }
                 spans.extend(footer_hints(&[("Esc", "clear/exit")]));
                 spans
@@ -7183,13 +8075,17 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
             SelectorMode::RecentSessions
                 if matches!(model.recent.load_state(), RecentLoadState::Failed(_)) =>
             {
-                footer_hints(&[("Enter", "retry"), ("Left/Esc", "back")])
+                footer_hints(&[("Enter/F5", "retry"), ("Tab", "focus"), ("Esc", "back")])
             }
             SelectorMode::RecentSessions => footer_hints(&[
                 ("Up/Down", "move"),
                 ("Enter", "review adoption"),
-                ("Right", "load more"),
-                ("Left/Esc", "back"),
+                ("Alt+A", "actions"),
+                ("n", "load more"),
+                ("Tab", "review"),
+                ("Left/Right", "tabs"),
+                ("F5", "refresh"),
+                ("Esc", "back"),
             ]),
             SelectorMode::RetiredSessions { .. } if very_narrow => {
                 footer_hints(&[("Up/Down", ""), ("Enter", ""), ("Left/Esc", "")])
@@ -7202,18 +8098,48 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
             SelectorMode::Actions { .. } if very_narrow => {
                 footer_hints(&[("Up/Down", ""), ("Enter", ""), ("Left/Esc", "")])
             }
+            SelectorMode::Actions { .. } if model.shows_managed_inspector() => footer_hints(&[
+                ("Up/Down", "move"),
+                ("Enter", "selected action"),
+                ("Alt+E", "Settings"),
+                ("Shift+Tab/Esc", "Agent list"),
+            ]),
             SelectorMode::Actions { .. } => footer_hints(&[
                 ("Up/Down", "move"),
                 ("Enter", "select"),
-                ("Left/Esc", "back"),
+                ("Left/Tab/Esc", "back"),
             ]),
+            SelectorMode::Settings { target, .. }
+                if target.agent_key().is_some() && very_narrow =>
+            {
+                footer_hints(&[
+                    ("Up/Down", ""),
+                    ("Enter", ""),
+                    ("Alt+A", ""),
+                    ("V", ""),
+                    ("S", ""),
+                    ("D", ""),
+                    ("Shift+Tab/Esc", ""),
+                ])
+            }
+            SelectorMode::Settings { target, .. } if target.agent_key().is_some() => {
+                footer_hints(&[
+                    ("Up/Down", "move"),
+                    ("Enter", "edit"),
+                    ("V", "view"),
+                    ("Alt+A", "Actions"),
+                    ("S", "save"),
+                    ("D", "discard"),
+                    ("Shift+Tab/Esc", "Agent list"),
+                ])
+            }
             SelectorMode::Settings {
                 view: SettingsView::Expanded,
                 ..
             } if model.settings_are_editable() && very_narrow => footer_hints(&[
                 ("Up/Down", ""),
                 ("Enter", ""),
-                ("A", ""),
+                ("S", ""),
                 ("D", ""),
                 ("Tab/Esc", ""),
             ]),
@@ -7224,7 +8150,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
                 ("Up/Down", ""),
                 ("Enter", "edit"),
                 ("V", "view"),
-                ("A", "apply"),
+                ("S", "save"),
                 ("D", "discard"),
                 ("Tab/Esc", ""),
             ]),
@@ -7235,7 +8161,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
                 ("Up/Down", "move"),
                 ("Enter", "edit"),
                 ("V", "view"),
-                ("A", "apply"),
+                ("S", "save"),
                 ("D", "discard"),
                 ("Left/Tab/Esc", "list"),
             ]),
@@ -7262,7 +8188,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
                     ("Up/Down", ""),
                     ("Enter", ""),
                     ("Left", ""),
-                    ("A", ""),
+                    ("S", ""),
                     ("D", ""),
                     ("Tab/Esc", ""),
                 ])
@@ -7273,7 +8199,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
                     ("Right/Enter", ""),
                     ("Left", ""),
                     ("V", ""),
-                    ("A", ""),
+                    ("S", ""),
                     ("D", ""),
                     ("Tab/Esc", ""),
                 ])
@@ -7283,7 +8209,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
                 ("Right/Enter", "open"),
                 ("Left", "back"),
                 ("V", "view"),
-                ("A", "apply"),
+                ("S", "save"),
                 ("D", "discard"),
                 ("Tab/Esc", "list"),
             ]),
@@ -7331,7 +8257,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
                 ("Up/Down", ""),
                 ("Enter", ""),
                 ("Left", ""),
-                ("A", ""),
+                ("S", ""),
                 ("D", ""),
                 ("Tab/Esc", ""),
             ]),
@@ -7342,7 +8268,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
             } if narrow => footer_hints(&[
                 ("Up/Down", ""),
                 ("Enter", ""),
-                ("A", ""),
+                ("S", ""),
                 ("D", ""),
                 ("Left/Tab", ""),
             ]),
@@ -7354,7 +8280,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
                 ("Up/Down", "move"),
                 ("Enter", "edit"),
                 ("Left", "profiles"),
-                ("A", "apply"),
+                ("S", "save"),
                 ("D", "discard"),
                 ("Tab/Esc", "agents"),
             ]),
@@ -7364,8 +8290,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
             } if very_narrow => footer_hints(&[
                 ("Up/Down", ""),
                 ("Enter", ""),
-                ("Right", ""),
-                ("A", ""),
+                ("a", ""),
+                ("S", ""),
                 ("D", ""),
                 ("Left/Tab", ""),
             ]),
@@ -7375,8 +8301,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
             } if narrow => footer_hints(&[
                 ("Up/Down", ""),
                 ("Enter", ""),
-                ("Right", ""),
-                ("A", ""),
+                ("a", ""),
+                ("S", ""),
                 ("D", ""),
                 ("Left/Tab", ""),
             ]),
@@ -7386,8 +8312,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
             } => footer_hints(&[
                 ("Up/Down", "move"),
                 ("Enter", "edit"),
-                ("Right", "actions"),
-                ("A", "apply"),
+                ("a", "actions"),
+                ("S", "save"),
                 ("D", "discard"),
                 ("Left", "profiles"),
                 ("Tab/Esc", "agents"),
@@ -7545,6 +8471,7 @@ mod tests {
         SelectorRow {
             target: SelectorTarget::Agent(key.to_string()),
             agent: agent.to_string(),
+            thread_title: None,
             project: None,
             configured_profile: Some("aemeath".to_string()),
             lifecycle: Some(lifecycle),
@@ -7601,6 +8528,15 @@ mod tests {
         }
     }
 
+    fn confirmed_close_intent(model: &mut SelectorModel) -> SessionTuiIntent {
+        assert_eq!(model.activate_close_shortcut(), SelectorControl::Continue);
+        model.handle(SelectorEvent::OpenActions);
+        match model.handle(SelectorEvent::Activate) {
+            SelectorControl::Selected(intent) => intent,
+            control => panic!("expected confirmed close intent, got {control:?}"),
+        }
+    }
+
     fn project_snapshot(
         cutex_session_id: &str,
         project_id: &str,
@@ -7639,6 +8575,7 @@ mod tests {
             operator_grants: BTreeMap::new(),
             operator_grant_revisions: BTreeMap::new(),
             operator_audit_events: BTreeMap::new(),
+            human_management_operator_actions: BTreeMap::new(),
             project_presentations: presentation
                 .map(|presentation| BTreeMap::from([(project_id, presentation)]))
                 .unwrap_or_default(),
@@ -7661,7 +8598,8 @@ mod tests {
             color: ProjectPaletteColor::Green,
             revision: 4,
             updated_at: Rfc3339::new("2026-09-03T00:00:00Z").unwrap(),
-            updated_by_director_session: CutexSessionId::new("cutex.director").unwrap(),
+            updated_by_director_session: Some(CutexSessionId::new("cutex.director").unwrap()),
+            updated_by_human_management: false,
             extra: BTreeMap::new(),
         }
     }
@@ -7836,6 +8774,7 @@ mod tests {
             model.rows.push(SelectorRow {
                 target: SelectorTarget::Profiles,
                 agent: "Profiles".to_string(),
+                thread_title: None,
                 project: None,
                 configured_profile: None,
                 lifecycle: None,
@@ -7915,6 +8854,7 @@ mod tests {
         assert_eq!(
             first.get("cutex.worker-zeta"),
             Some(&SelectorProjectContext {
+                agent_name: "worker-zeta".to_string(),
                 project_id: "project-alpha".to_string(),
                 display_name: "project-alpha".to_string(),
                 badge_label: "PA".to_string(),
@@ -7935,6 +8875,7 @@ mod tests {
         let mut exact = editable_record();
         exact.cutex_session_id = "cutex.exact-worker".to_string();
         exact.display_name_hint = Some("exact-worker".to_string());
+        exact.thread_name = Some("Generated conversation title".to_string());
         exact.registration_class = AgentRegistrationClass::Persistent;
         exact.agent_groups = vec!["unrelated".to_string()];
         exact.cwd = "/tmp/unrelated".to_string();
@@ -7942,6 +8883,7 @@ mod tests {
         let mut decoy = editable_record();
         decoy.cutex_session_id = "cutex.decoy-worker".to_string();
         decoy.display_name_hint = Some("decoy-worker".to_string());
+        decoy.thread_name = Some("Decoy conversation title".to_string());
         decoy.registration_class = AgentRegistrationClass::Persistent;
         decoy.agent_groups = vec!["project-alpha".to_string(), "NX".to_string()];
         decoy.cwd = "/tmp/Nova Operations/project-alpha".to_string();
@@ -7979,6 +8921,13 @@ mod tests {
                 .map(|project| project.project_id.as_str()),
             Some("project-alpha")
         );
+        assert_eq!(exact.agent, "worker-zeta");
+        assert_eq!(
+            exact.thread_title.as_deref(),
+            Some("Generated conversation title")
+        );
+        assert_eq!(decoy.agent, "decoy-worker");
+        assert_ne!(decoy.agent, "Decoy conversation title");
         assert!(decoy.project.is_none());
         assert!(rows
             .iter()
@@ -7996,6 +8945,7 @@ mod tests {
             true,
         );
         associated.project = Some(SelectorProjectContext {
+            agent_name: "worker-zeta".to_string(),
             project_id: "project-8f31".to_string(),
             display_name: "Nova Operations".to_string(),
             badge_label: "NX".to_string(),
@@ -8035,6 +8985,7 @@ mod tests {
             true,
         );
         project_row.project = Some(SelectorProjectContext {
+            agent_name: "worker-zeta".to_string(),
             project_id: "project-8f31".to_string(),
             display_name: "Nova Operations".to_string(),
             badge_label: "NX".to_string(),
@@ -8069,6 +9020,231 @@ mod tests {
             assert!(text.contains("NX worker-zeta"), "width {width}");
             assert!(text.contains("Filter agents / Projects"), "width {width}");
         }
+    }
+
+    #[test]
+    fn inspector_settings_links_the_selected_agents_project_badge_editor() {
+        let mut project_row = row(
+            "associated",
+            "worker-zeta",
+            CutexSessionLifecycleState::Online,
+            false,
+            true,
+        );
+        project_row.project = Some(SelectorProjectContext {
+            agent_name: "worker-zeta".to_string(),
+            project_id: "project-8f31".to_string(),
+            display_name: "Nova Operations".to_string(),
+            badge_label: "NX".to_string(),
+            color: ProjectPaletteColor::Green,
+        });
+        let mut model = SelectorModel::new(vec![project_row], false, false);
+
+        assert!(handle_managed_inspector_shortcut(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT),
+        ));
+        let rendered = rendered_text_at(180, 24, &model);
+        assert!(rendered.contains("Project badge settings"));
+        assert!(rendered.contains("NX  Nova Operations"));
+        assert!(rendered.contains("Alt+P edit"));
+    }
+
+    #[test]
+    fn v_toggles_secondary_thread_title_without_replacing_managed_name() {
+        let mut managed = row(
+            "cutex.stable-worker",
+            "Stable Managed Name",
+            CutexSessionLifecycleState::Online,
+            false,
+            true,
+        );
+        managed.thread_title = Some("Generated conversation title".to_string());
+        let mut model = SelectorModel::new(vec![managed], false, false);
+
+        let collapsed = rendered_text_at(100, 18, &model);
+        assert!(collapsed.contains("Stable Managed Name"));
+        assert!(!collapsed.contains("Generated conversation title"));
+
+        assert!(!toggle_managed_thread_titles_from_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        ));
+        assert!(!model.show_thread_titles);
+
+        assert!(toggle_managed_thread_titles_from_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT),
+        ));
+        let expanded = rendered_text_at(100, 18, &model);
+        assert!(expanded.contains("Stable Managed Name"));
+        assert!(expanded.contains("thread: Generated"));
+        assert_eq!(
+            model.selected_row().map(|row| row.agent.as_str()),
+            Some("Stable Managed Name")
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(72, 12)).expect("test terminal");
+        terminal
+            .draw(|frame| render_selector(frame, &model))
+            .expect("render narrow expanded selector");
+        terminal.backend_mut().resize(140, 24);
+        terminal
+            .draw(|frame| render_selector(frame, &model))
+            .expect("render resized expanded selector");
+        let resized = rendered_text_at(140, 24, &model);
+        assert!(resized.contains("Stable Managed Name"));
+        assert!(resized.contains("Thread title: Generated conversation title"));
+
+        assert!(toggle_managed_thread_titles_from_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('V'), KeyModifiers::ALT),
+        ));
+        assert!(!model.show_thread_titles);
+
+        let mut system_row_model = SelectorModel::new(vec![projects_row()], false, false);
+        assert!(!toggle_managed_thread_titles_from_key(
+            &mut system_row_model,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT),
+        ));
+        assert!(!system_row_model.show_thread_titles);
+    }
+
+    #[test]
+    fn tab_and_horizontal_keys_stay_within_the_managed_workspace() {
+        let mut model = SelectorModel::new(
+            vec![row(
+                "cutex.worker",
+                "Worker",
+                CutexSessionLifecycleState::Online,
+                false,
+                true,
+            )],
+            false,
+            false,
+        );
+
+        assert_eq!(
+            selector_navigation_control_from_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            ),
+            Some(SelectorControl::Continue)
+        );
+        assert_eq!(model.mode, SelectorMode::Agents);
+        assert!(model.inspector_overview_focused);
+        assert_eq!(model.inspector_section(), InspectorSection::Overview);
+        assert!(rendered_text_at(120, 18, &model).contains("Inspector"));
+        assert_eq!(
+            selector_navigation_control_from_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            ),
+            Some(SelectorControl::Continue)
+        );
+        assert!(model.inspector_overview_focused);
+        assert_eq!(
+            selector_navigation_control_from_key(
+                &mut model,
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            ),
+            Some(SelectorControl::Continue)
+        );
+        assert_eq!(model.mode, SelectorMode::Agents);
+        assert!(!model.inspector_overview_focused);
+        assert_eq!(
+            selector_list_panel_from_horizontal_key(
+                &model,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            ),
+            Some(Some(PrimaryPanel::Recent))
+        );
+        assert_eq!(
+            selector_list_panel_from_horizontal_key(
+                &model,
+                KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            ),
+            Some(None)
+        );
+
+        assert!(!handle_managed_inspector_shortcut(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        ));
+        for character in ['a', 'e', 'v'] {
+            let event = selector_event_from_key(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                false,
+            )
+            .expect("printable filter character");
+            model.handle(event);
+        }
+        assert_eq!(model.query.value(), "aev");
+        model.query.reset();
+        model.ensure_selection();
+        model.inspector_overview_focused = true;
+        assert!(handle_managed_inspector_shortcut(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT),
+        ));
+        assert_eq!(model.inspector_section(), InspectorSection::Actions);
+        assert_eq!(
+            selector_navigation_control_from_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            ),
+            Some(SelectorControl::Continue)
+        );
+        assert_eq!(model.inspector_section(), InspectorSection::Actions);
+        assert!(handle_managed_inspector_shortcut(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT),
+        ));
+        assert_eq!(model.inspector_section(), InspectorSection::Settings);
+        assert_eq!(
+            model.handle_focus_traversal(false),
+            SelectorControl::Continue
+        );
+        assert_eq!(model.mode, SelectorMode::Agents);
+        assert!(!model.inspector_overview_focused);
+    }
+
+    #[test]
+    fn recent_switch_restores_managed_editor_and_view_state() {
+        let mut model = SelectorModel::new(
+            vec![row(
+                "cutex.worker",
+                "Worker",
+                CutexSessionLifecycleState::Offline,
+                false,
+                true,
+            )],
+            false,
+            false,
+        );
+        model.open_settings();
+        let original_mode = model.mode.clone();
+        model.settings_overlay = Some(SettingsOverlay::Text {
+            field: SettingsEditField::Session(SessionSettingsField::AgentName),
+            input: Input::new("Uncommitted editor text".to_string()),
+            tags: false,
+            masked: false,
+        });
+        model.query = Input::new("worker".to_string());
+        model.show_thread_titles = true;
+
+        model.activate_primary_panel(PrimaryPanel::Recent);
+        assert_eq!(model.mode, SelectorMode::RecentSessions);
+        model.activate_primary_panel(PrimaryPanel::Agents);
+
+        assert_eq!(model.mode, original_mode);
+        assert_eq!(model.query.value(), "worker");
+        assert!(model.show_thread_titles);
+        assert!(matches!(
+            &model.settings_overlay,
+            Some(SettingsOverlay::Text { input, .. })
+                if input.value() == "Uncommitted editor text"
+        ));
     }
 
     #[test]
@@ -9422,7 +10598,7 @@ mod tests {
         assert!(categorized.contains("1 pending"));
         assert!(categorized.contains("Permission preset *"));
         assert!(categorized.contains("full-access"));
-        assert!(categorized.contains("A apply"));
+        assert!(categorized.contains("S save"));
 
         model.handle(SelectorEvent::Escape);
         assert!(matches!(
@@ -9873,7 +11049,7 @@ mod tests {
 
         let medium = rendered_text_at(80, 24, &model);
         assert!(medium.contains("home+default"));
-        assert!(medium.contains("Right"));
+        assert!(medium.contains("S"));
         assert!(medium.contains("Left/Tab"));
 
         let narrow = rendered_text_at(50, 18, &model);
@@ -10990,7 +12166,7 @@ mod tests {
     }
 
     #[test]
-    fn view_key_remains_a_filter_character_on_the_agent_list() {
+    fn view_key_remains_editor_text_outside_the_managed_list() {
         let mut model = SelectorModel::new(
             vec![row(
                 "agent",
@@ -11002,11 +12178,23 @@ mod tests {
             false,
             false,
         );
+        model.open_settings();
+        model.settings_overlay = Some(SettingsOverlay::Text {
+            field: SettingsEditField::Session(SessionSettingsField::AgentName),
+            input: Input::default(),
+            tags: false,
+            masked: false,
+        });
 
-        model.handle(SelectorEvent::Insert('v'));
+        let key = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE);
+        assert!(!toggle_managed_thread_titles_from_key(&mut model, key));
+        model.handle(selector_event_from_key(key, false).expect("text event"));
 
-        assert_eq!(model.query.value(), "v");
-        assert_eq!(model.mode, SelectorMode::Agents);
+        assert!(matches!(
+            &model.settings_overlay,
+            Some(SettingsOverlay::Text { input, .. }) if input.value() == "v"
+        ));
+        assert!(!model.show_thread_titles);
     }
 
     #[test]
@@ -11094,7 +12282,174 @@ mod tests {
     }
 
     #[test]
-    fn direct_close_shortcut_returns_a_close_intent_without_confirmation() {
+    fn offline_primary_enter_reviews_start_and_attach_before_dispatch() {
+        let mut model = SelectorModel::new(
+            vec![row(
+                "agent",
+                "Stable Agent Name",
+                CutexSessionLifecycleState::Offline,
+                true,
+                true,
+            )],
+            false,
+            false,
+        );
+
+        assert_eq!(
+            model.handle(SelectorEvent::Activate),
+            SelectorControl::Continue
+        );
+        assert!(matches!(
+            model.mode,
+            SelectorMode::ConfirmRuntimeAction {
+                action: SessionTuiAction::ResumeAttach,
+                confirmed: false,
+                ..
+            }
+        ));
+        let review = rendered_text_at(80, 18, &model);
+        assert!(review.contains("Start & attach?"));
+        assert!(review.contains("Stable Agent Name"));
+
+        assert_eq!(
+            selector_navigation_control_from_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            ),
+            Some(SelectorControl::Continue)
+        );
+        assert!(matches!(
+            model.mode,
+            SelectorMode::ConfirmRuntimeAction {
+                confirmed: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            selector_navigation_control_from_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            ),
+            Some(SelectorControl::Continue)
+        );
+        assert!(matches!(
+            model.mode,
+            SelectorMode::ConfirmRuntimeAction {
+                confirmed: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            model.handle(SelectorEvent::Activate),
+            SelectorControl::Continue
+        );
+        assert_eq!(model.mode, SelectorMode::Agents);
+
+        model.handle(SelectorEvent::Activate);
+        model.handle(SelectorEvent::Down);
+        assert_eq!(
+            model.handle(SelectorEvent::Activate),
+            SelectorControl::Selected(SessionTuiIntent {
+                key: "agent".to_string(),
+                action: SessionTuiAction::ResumeAttach,
+                launch_profile: None,
+            })
+        );
+    }
+
+    #[test]
+    fn stale_primary_start_opens_review_instead_of_becoming_a_noop() {
+        let mut stale = row(
+            "agent",
+            "Stable Agent Name",
+            CutexSessionLifecycleState::Stale,
+            true,
+            true,
+        );
+        stale.actions[0].primary = false;
+        stale.actions[1].primary = true;
+        let mut model = SelectorModel::new(vec![stale], false, false);
+
+        assert_eq!(
+            model.handle(SelectorEvent::Activate),
+            SelectorControl::Continue
+        );
+        assert!(matches!(
+            model.mode,
+            SelectorMode::ConfirmRuntimeAction {
+                action: SessionTuiAction::Online,
+                confirmed: false,
+                ..
+            }
+        ));
+        assert!(rendered_text_at(80, 18, &model)
+            .contains("Start managed runtime for Stable Agent Name?"));
+    }
+
+    #[test]
+    fn dispatch_failure_stays_in_the_tui_without_a_fallback_terminal() {
+        let mut model = SelectorModel::new(
+            vec![row(
+                "agent",
+                "Stable Agent Name",
+                CutexSessionLifecycleState::Online,
+                false,
+                true,
+            )],
+            false,
+            false,
+        );
+
+        model.dispatch_failed("agent", "exact route unavailable".to_string());
+
+        assert_eq!(model.mode, SelectorMode::Agents);
+        assert!(model.inspector_overview_focused);
+        assert_eq!(
+            model.selected_target(),
+            Some(SelectorTarget::Agent("agent".to_string()))
+        );
+        let rendered = rendered_text_at(120, 18, &model);
+        assert!(rendered.contains("Stable Agent Name"));
+        assert!(rendered.contains("no fallback terminal was launched"));
+        assert!(rendered.contains("exact route unavailable"));
+    }
+
+    #[test]
+    fn horizontal_keys_move_text_cursor_without_leaving_the_editor() {
+        let record = editable_record();
+        let mut model = editable_model(&record);
+        model.handle(SelectorEvent::OpenSettings);
+        model.settings_overlay = Some(SettingsOverlay::Text {
+            field: SettingsEditField::Session(SessionSettingsField::AgentName),
+            input: Input::new("ab".to_string()),
+            tags: false,
+            masked: false,
+        });
+
+        assert_eq!(
+            selector_list_panel_from_horizontal_key(
+                &model,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            ),
+            None
+        );
+        assert_eq!(
+            selector_navigation_control_from_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            ),
+            Some(SelectorControl::Continue)
+        );
+        model.handle(SelectorEvent::Insert('X'));
+        assert!(matches!(
+            &model.settings_overlay,
+            Some(SettingsOverlay::Text { input, .. }) if input.value() == "aXb"
+        ));
+        assert!(matches!(model.mode, SelectorMode::Settings { .. }));
+    }
+
+    #[test]
+    fn direct_close_shortcut_opens_review_and_defaults_to_cancel() {
         let mut model = SelectorModel::new(
             vec![row(
                 "agent",
@@ -11107,15 +12462,16 @@ mod tests {
             false,
         );
 
+        assert_eq!(model.activate_close_shortcut(), SelectorControl::Continue);
         assert_eq!(
-            model.activate_close_shortcut(),
-            SelectorControl::Selected(SessionTuiIntent {
-                key: "agent".to_string(),
+            model.mode,
+            SelectorMode::ConfirmRuntimeAction {
+                agent_key: "agent".to_string(),
                 action: SessionTuiAction::CloseRuntime,
                 launch_profile: None,
-            })
+                confirmed: false,
+            }
         );
-        assert_eq!(model.mode, SelectorMode::Agents);
     }
 
     #[test]
@@ -11131,7 +12487,9 @@ mod tests {
             false,
             false,
         );
-        let intent = match model.activate_close_shortcut() {
+        assert_eq!(model.activate_close_shortcut(), SelectorControl::Continue);
+        model.handle(SelectorEvent::OpenActions);
+        let intent = match model.handle(SelectorEvent::Activate) {
             SelectorControl::Selected(intent) => intent,
             control => panic!("expected close intent, got {control:?}"),
         };
@@ -11192,7 +12550,7 @@ mod tests {
         let mut store = CutexSessionStore::default();
         store.sessions.insert("archive-key".to_string(), record);
         let mut model = SelectorModel::new(vec![retired_sessions_row(1)], false, false);
-        model.open_retired_sessions(retired_selector_rows_from_store(&store));
+        model.open_retired_sessions(retired_selector_rows_from_store(&store, &HashMap::new()));
 
         let rendered = rendered_text_at(100, 20, &model);
         for column in ["AGENT", "PROFILE", "MANAGED PATH", "RETIRED AT", "REVISION"] {
@@ -11227,10 +12585,7 @@ mod tests {
             false,
         );
         model.handle(SelectorEvent::Insert('a'));
-        let intent = match model.activate_close_shortcut() {
-            SelectorControl::Selected(intent) => intent,
-            control => panic!("expected close intent, got {control:?}"),
-        };
+        let intent = confirmed_close_intent(&mut model);
         model.runtime_close_started(&intent);
         let (sender, receiver) = mpsc::channel();
         sender
@@ -11300,10 +12655,7 @@ mod tests {
             false,
             false,
         );
-        let intent = match model.activate_close_shortcut() {
-            SelectorControl::Selected(intent) => intent,
-            control => panic!("expected close intent, got {control:?}"),
-        };
+        let intent = confirmed_close_intent(&mut model);
         model.runtime_close_started(&intent);
         let (sender, receiver) = mpsc::channel();
         sender
@@ -11339,10 +12691,7 @@ mod tests {
             false,
             false,
         );
-        let intent = match model.activate_close_shortcut() {
-            SelectorControl::Selected(intent) => intent,
-            control => panic!("expected close intent, got {control:?}"),
-        };
+        let intent = confirmed_close_intent(&mut model);
         model.runtime_close_started(&intent);
         let (sender, receiver) = mpsc::channel();
         sender
@@ -11586,6 +12935,21 @@ mod tests {
         model.handle(SelectorEvent::Down);
         assert_eq!(
             model.handle(SelectorEvent::Activate),
+            SelectorControl::Continue
+        );
+        assert!(matches!(
+            model.mode,
+            SelectorMode::ConfirmRuntimeAction {
+                action: SessionTuiAction::Online,
+                launch_profile: Some(ref profile),
+                confirmed: false,
+                ..
+            } if profile == "beta"
+        ));
+        assert!(rendered_text_at(80, 24, &model).contains("Start & attach?"));
+        model.handle(SelectorEvent::Down);
+        assert_eq!(
+            model.handle(SelectorEvent::Activate),
             SelectorControl::Selected(SessionTuiIntent {
                 key: EDITABLE_AGENT_KEY.to_string(),
                 action: SessionTuiAction::Online,
@@ -11600,6 +12964,18 @@ mod tests {
         offline.profile = Some("alpha".to_string());
         offline.registration_class = AgentRegistrationClass::Persistent;
         let mut model = editable_model_with_profiles(&offline, &["beta".to_string()]);
+        assert_eq!(
+            model.handle(SelectorEvent::Activate),
+            SelectorControl::Continue
+        );
+        assert!(matches!(
+            model.mode,
+            SelectorMode::ConfirmRuntimeAction {
+                confirmed: false,
+                ..
+            }
+        ));
+        model.handle(SelectorEvent::Down);
         assert!(matches!(
             model.handle(SelectorEvent::Activate),
             SelectorControl::Selected(SessionTuiIntent {
@@ -11696,6 +13072,32 @@ mod tests {
     }
 
     #[test]
+    fn refresh_clears_inspector_focus_when_the_selected_agent_disappears() {
+        let mut model = SelectorModel::new(
+            vec![row(
+                "agent",
+                "Agent",
+                CutexSessionLifecycleState::Online,
+                false,
+                true,
+            )],
+            false,
+            false,
+        );
+        model.handle_focus_traversal(true);
+        assert!(model.inspector_overview_focused);
+
+        model.replace_snapshot(SelectorSnapshot {
+            rows: vec![projects_row()],
+            warning: None,
+        });
+
+        assert_eq!(model.mode, SelectorMode::Agents);
+        assert!(!model.inspector_overview_focused);
+        assert_eq!(model.selected_target(), Some(SelectorTarget::Projects));
+    }
+
+    #[test]
     fn responsive_layouts_keep_agent_first_and_show_managed_path() {
         let mut activity_row = row(
             "agent",
@@ -11711,65 +13113,36 @@ mod tests {
         });
         let model = SelectorModel::new(vec![activity_row], false, false);
 
-        let wide_boundary = rendered_text_at(WIDE_LAYOUT_MIN_WIDTH, 8, &model);
+        let wide_boundary = rendered_text_at(WIDE_LAYOUT_MIN_WIDTH, 9, &model);
         assert_eq!(
-            wide_boundary.lines().nth(4),
+            wide_boundary.lines().nth(5),
             Some("  AGENT                 PROFILE             ST     ACTIVITY     MANAGED PATH          ACTION    ")
         );
         assert_eq!(
-            wide_boundary.lines().nth(6),
+            wide_boundary.lines().nth(7),
             Some("> cutex-dev-v5          aemeath             ON     OUT 10m      ~/Projects/cutex      takeover  ")
         );
-        let extra_wide_boundary = rendered_text_at(EXTRA_WIDE_LAYOUT_MIN_WIDTH, 8, &model);
-        assert_eq!(
-            extra_wide_boundary.lines().nth(4),
-            Some("  AGENT                                    PROFILE               ST     ACTIVITY     MANAGED PATH                             ACTION    ")
-        );
-        assert_eq!(
-            extra_wide_boundary.lines().nth(6),
-            Some("> cutex-dev-v5                             aemeath               ON     OUT 10m      ~/Projects/cutex                         takeover  ")
-        );
+        let last_unsplit = rendered_text_at(INSPECTOR_SPLIT_MIN_WIDTH - 1, 12, &model);
+        assert!(last_unsplit.contains("ACTIVITY"));
+        assert!(last_unsplit.contains("MANAGED PATH"));
+        assert!(!last_unsplit.contains("Overview | Actions [Alt+A]"));
 
-        let extra_wide = rendered_text(150, &model);
-        let agent = extra_wide.find("AGENT").expect("agent heading");
-        let profile = extra_wide.find("PROFILE").expect("profile heading");
-        let state = extra_wide.find("ST").expect("state heading");
-        let activity = extra_wide.find("ACTIVITY").expect("activity heading");
-        let managed_path = extra_wide
-            .find("MANAGED PATH")
-            .expect("managed path heading");
-        let primary = extra_wide.find("ACTION").expect("action heading");
-        assert!(
-            agent < profile
-                && profile < state
-                && state < activity
-                && activity < managed_path
-                && managed_path < primary
-        );
-        assert!(extra_wide.contains("cutex-dev-v5"));
-        assert!(extra_wide.contains("~/Projects/cutex"));
-        assert!(extra_wide.contains("aemeath"));
-        assert!(extra_wide.contains("OUT 10m"));
-        assert!(extra_wide.contains("takeover"));
-        assert!(extra_wide.contains("~ global profile"));
+        let split = rendered_text_at(150, 18, &model);
+        assert!(split.contains("Inspector"));
+        assert!(split.contains("Overview"));
+        assert!(split.contains("Actions [Alt+A]"));
+        assert!(split.contains("Settings [Alt+E]"));
+        assert!(split.contains("cutex-dev-v5"));
+        assert!(split.contains("Managed path: ~/Projects/cutex"));
+        assert!(split.contains("Profile / model: aemeath / default"));
+        assert!(split.contains("Activity: OUT 10m"));
+        assert!(split.contains("takeover"));
+        assert!(!split.contains("HOST"));
+        assert!(!split.contains("BACKEND"));
 
-        let wide = rendered_text(120, &model);
-        let agent = wide.find("AGENT").expect("agent heading");
-        let profile = wide.find("PROFILE").expect("profile heading");
-        let state = wide.find("ST").expect("state heading");
-        let activity = wide.find("ACTIVITY").expect("activity heading");
-        let managed_path = wide.find("MANAGED PATH").expect("managed path heading");
-        let primary = wide.find("ACTION").expect("action heading");
-        assert!(
-            agent < profile
-                && profile < state
-                && state < activity
-                && activity < managed_path
-                && managed_path < primary
-        );
-        assert!(!extra_wide.contains("HOST"));
-        assert!(!extra_wide.contains("BACKEND"));
-        assert!(wide.contains("~/Projects/cutex"));
+        let split_boundary = rendered_text_at(INSPECTOR_SPLIT_MIN_WIDTH, 18, &model);
+        assert!(split_boundary.contains("Inspector"));
+        assert!(split_boundary.contains("Managed path:"));
 
         let minimum_wide = rendered_text(WIDE_LAYOUT_MIN_WIDTH, &model);
         assert!(minimum_wide.contains("ACTIVITY"));
@@ -11789,7 +13162,7 @@ mod tests {
         assert!(!narrow.contains("MANAGED PATH"));
         assert!(!narrow.contains("~ global profile"));
         assert!(narrow.contains("aemeath"));
-        assert!(narrow.contains("Ctrl+X close"));
+        assert!(narrow.contains("Ctrl+X"));
         assert!(narrow.contains("Ctrl+C exit"));
     }
 
@@ -11938,10 +13311,7 @@ mod tests {
             vec![
                 SelectorTarget::Agent("store-key".to_string()),
                 SelectorTarget::RetiredSessions,
-                SelectorTarget::RecentSessions,
-                SelectorTarget::CutexProjects,
                 SelectorTarget::Projects,
-                SelectorTarget::Tasks,
                 SelectorTarget::Profiles,
                 SelectorTarget::GlobalSettings,
             ]
@@ -12164,7 +13534,9 @@ mod tests {
             false,
         );
         agent_model.handle(SelectorEvent::OpenSettings);
-        let wide = rendered_text_at(120, 24, &agent_model);
+        let wide = rendered_text_at(220, 24, &agent_model);
+        assert!(wide.contains("Inspector"));
+        assert!(wide.contains("Settings [Alt+E]"));
         assert!(wide.contains("view [Expanded] Categories"));
         let setting = wide.find("SETTING").expect("setting heading");
         let value = wide.find("VALUE").expect("value heading");
@@ -12174,12 +13546,14 @@ mod tests {
         assert!(wide.contains("cutex-dev-v5"));
         assert!(wide.contains("Launch"));
         assert!(wide.contains("  Runtime backend"));
-        assert!(wide.contains("V switch view"));
+        assert!(wide.contains("V view"));
+        assert!(wide.contains("Alt+A Actions"));
+        assert!(wide.contains("D discard"));
         assert!(!wide.contains("Identity options"));
 
         agent_model.handle(SelectorEvent::Down);
         agent_model.handle(SelectorEvent::Insert('v'));
-        let categorized = rendered_text(120, &agent_model);
+        let categorized = rendered_text_at(220, 24, &agent_model);
         assert!(categorized.contains("view Expanded [Categories]"));
         let categories = categorized.find("Categories").expect("category pane");
         let options = categorized.find("Identity options").expect("option pane");
@@ -12201,7 +13575,7 @@ mod tests {
         assert!(medium.contains("Ctrl+C exit"));
 
         let wide_boundary = rendered_text(96, &global_model);
-        assert!(wide_boundary.contains("A apply"));
+        assert!(wide_boundary.contains("S save"));
         assert!(wide_boundary.contains("D discard"));
         assert!(wide_boundary.contains("Ctrl+C exit"));
 
@@ -12260,7 +13634,7 @@ mod tests {
         let record = editable_record();
         let mut model = editable_model(&record);
         model.handle(SelectorEvent::OpenSettings);
-        let width = 120;
+        let width = 220;
         let height = 16;
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -12274,7 +13648,7 @@ mod tests {
             .collect::<String>();
 
         for (phrase, key, description) in [
-            ("A apply", "A", "apply"),
+            ("S save", "S", "save"),
             ("D discard", "D", "discard"),
             ("Ctrl+C exit", "Ctrl+C", "exit"),
         ] {
@@ -12342,11 +13716,15 @@ mod tests {
         );
         assert_eq!(
             selector_event_from_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), false),
-            Some(SelectorEvent::OpenActions)
+            None
+        );
+        assert_eq!(
+            selector_event_from_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), false),
+            Some(SelectorEvent::Insert('a'))
         );
         assert_eq!(
             selector_event_from_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), false),
-            Some(SelectorEvent::OpenSettings)
+            None
         );
     }
 

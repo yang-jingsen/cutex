@@ -1,9 +1,10 @@
-//! Read-only, Director-authorized Task Service workspace.
+//! Read-only, Human-authenticated Task Service workspace.
 //!
 //! This module intentionally owns its own small model and refresh worker.  It
 //! never reads cwd, collaboration groups, native workspaces, or names to
 //! determine task ownership: the Task Service Director query is the source of
-//! task state, and its authenticated route enforces the Director authority.
+//! task state, and the Management route preserves the exact current Director
+//! seat plus Primary Director project-authority scope.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, IsTerminal, Stdout};
@@ -18,15 +19,17 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use cutex::agent_bus::client::{
-    agent_bus_fetch_agents_if_healthy, agent_bus_submit_task_service_director_action,
-};
+use cutex::agent_bus::client::agent_bus_fetch_agents_if_healthy;
 use cutex::agent_bus::model::AgentBusAgent;
-use cutex::agent_management::{effective_presentation, AgentManagementProvider, ProjectId};
+use cutex::agent_management::ProjectId;
 use cutex::config::store::load_codez_config;
+use cutex::management::control_plane::{
+    HumanManagementTaskQueryRequest, HumanManagementTaskQueryResponse,
+    HumanManagementTaskQuerySchema,
+};
 use cutex::task_service::{
-    ActionId, DirectorActionRequest, DirectorActionSchema, DirectorActionStatus,
-    DirectorAssignmentView, DirectorAttemptView, DirectorQuerySelector, DirectorSemanticOperation,
+    ActionId, DirectorActionStatus, DirectorAssignmentView, DirectorAttemptView,
+    DirectorQuerySelector,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -36,6 +39,11 @@ use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wr
 use ratatui::{Frame, Terminal};
 use tui_input::{Input, InputRequest};
 use uuid::Uuid;
+
+use super::management_control_plane::ManagementControlClient;
+use super::session_tui_workspace::{
+    primary_panel_shortcut, primary_panel_tabs, PrimaryPanel, PrimaryPanelOutcome,
+};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -263,48 +271,37 @@ fn task_rows(
 /// records. Each lookup is an exact canonical `ProjectId` map lookup; names,
 /// badges, cwd, groups, and native workspaces are never used as keys.
 fn exact_project_presentations(
-    receipt: &cutex::task_service::DirectorActionReceipt,
+    response: &HumanManagementTaskQueryResponse,
 ) -> BTreeMap<ProjectId, TaskProjectPresentation> {
-    let project_ids = receipt
+    let receipt_project_ids = response
+        .receipt
         .assignments
         .iter()
         .filter_map(|assignment| assignment.project_id.as_ref().cloned())
         .collect::<BTreeSet<_>>();
-    let Ok(provider) = AgentManagementProvider::open_default() else {
-        return BTreeMap::new();
-    };
-    let Ok(snapshot) = provider.store().snapshot() else {
-        return BTreeMap::new();
-    };
-    let authoritative_project_ids = snapshot.projects.keys().cloned().collect::<BTreeSet<_>>();
-    project_ids
+    let authoritative_project_ids = response
+        .project_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    receipt_project_ids
         .into_iter()
         .filter_map(|project_id| {
-            exact_project_presentation(
-                &project_id,
-                &authoritative_project_ids,
-                &snapshot.project_presentations,
-            )
-            .map(|presentation| (project_id, presentation))
+            authoritative_project_ids
+                .contains(&project_id)
+                .then(|| response.project_presentations.get(&project_id))
+                .flatten()
+                .map(|presentation| {
+                    (
+                        project_id,
+                        TaskProjectPresentation {
+                            display_name: presentation.display_name.clone(),
+                            badge_label: presentation.badge_label.clone(),
+                        },
+                    )
+                })
         })
         .collect()
-}
-
-fn exact_project_presentation(
-    project_id: &ProjectId,
-    authoritative_project_ids: &BTreeSet<ProjectId>,
-    stored_presentations: &BTreeMap<
-        ProjectId,
-        cutex::agent_management::ProjectPresentationSettings,
-    >,
-) -> Option<TaskProjectPresentation> {
-    authoritative_project_ids.contains(project_id).then(|| {
-        let presentation = effective_presentation(project_id, stored_presentations.get(project_id));
-        TaskProjectPresentation {
-            display_name: presentation.display_name,
-            badge_label: presentation.badge_label,
-        }
-    })
 }
 
 fn merged_activity(attempt: Option<&DirectorAttemptView>) -> String {
@@ -344,10 +341,11 @@ fn bounded_single_line(value: &str, max: usize) -> String {
 }
 
 #[derive(Debug, Clone)]
-struct TaskModel {
+pub(super) struct TaskModel {
     rows: Vec<TaskRow>,
     selected_assignment_id: Option<String>,
     query: Input,
+    filter_focused: bool,
     show_closed: bool,
     detail: bool,
     loading: bool,
@@ -361,6 +359,7 @@ impl Default for TaskModel {
             rows: Vec::new(),
             selected_assignment_id: None,
             query: Input::default(),
+            filter_focused: false,
             show_closed: false,
             detail: false,
             loading: true,
@@ -477,12 +476,10 @@ fn spawn_refresh(sender: mpsc::Sender<RefreshResult>) {
     thread::spawn(move || {
         let config = load_codez_config();
         let request = match ActionId::new(format!("tasks-query-{}", Uuid::new_v4())) {
-            Ok(action_id) => DirectorActionRequest {
-                schema: DirectorActionSchema::V2,
+            Ok(action_id) => HumanManagementTaskQueryRequest {
+                schema: HumanManagementTaskQuerySchema::V1,
                 action_id,
-                action: DirectorSemanticOperation::Query {
-                    selector: DirectorQuerySelector::All {},
-                },
+                selector: DirectorQuerySelector::All {},
             },
             Err(error) => {
                 let _ = sender.send(RefreshResult::Error(format!(
@@ -491,20 +488,22 @@ fn spawn_refresh(sender: mpsc::Sender<RefreshResult>) {
                 return;
             }
         };
-        let result = agent_bus_submit_task_service_director_action(&config, &request)
-            .map_err(|error| format!("Task Service Director query unavailable: {error:#}"))
-            .and_then(|receipt| match receipt.status {
+        let result = ManagementControlClient::connect()
+            .and_then(|client| client.tasks(&request))
+            .map_err(|error| format!("Management Task query unavailable: {error:#}"))
+            .and_then(|response| match response.receipt.status {
                 DirectorActionStatus::CurrentState | DirectorActionStatus::Committed => {
                     Ok(task_rows(
-                        &receipt,
+                        &response.receipt,
                         &agent_bus_fetch_agents_if_healthy(&config),
-                        &exact_project_presentations(&receipt),
+                        &exact_project_presentations(&response),
                     ))
                 }
                 _ => Err(format!(
                     "Task Service Director query returned {}{}",
-                    director_status_label(receipt.status),
-                    receipt
+                    director_status_label(response.receipt.status),
+                    response
+                        .receipt
                         .code
                         .as_deref()
                         .map(|code| format!(" ({code})"))
@@ -528,7 +527,9 @@ fn director_status_label(status: DirectorActionStatus) -> &'static str {
     }
 }
 
-pub(super) fn run() -> anyhow::Result<()> {
+pub(super) fn run(
+    previous_model: Option<TaskModel>,
+) -> anyhow::Result<(PrimaryPanelOutcome, TaskModel)> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         anyhow::bail!("Tasks workspace requires an interactive terminal");
     }
@@ -537,16 +538,19 @@ pub(super) fn run() -> anyhow::Result<()> {
     execute!(stdout, EnterAlternateScreen).context("Failed to enter alternate screen")?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("Failed to create Tasks terminal")?;
-    let result = run_loop(&mut terminal);
+    let mut model = previous_model.unwrap_or_default();
+    let result = run_loop(&mut terminal, &mut model);
     disable_raw_mode().ok();
     execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
     terminal.show_cursor().ok();
-    result
+    Ok((result?, model))
 }
 
-fn run_loop(terminal: &mut TaskTerminal) -> anyhow::Result<()> {
+fn run_loop(
+    terminal: &mut TaskTerminal,
+    model: &mut TaskModel,
+) -> anyhow::Result<PrimaryPanelOutcome> {
     let (sender, receiver) = mpsc::channel();
-    let mut model = TaskModel::default();
     let mut cadence = RefreshCadence::new(Instant::now());
     let mut request_in_flight = false;
     loop {
@@ -571,7 +575,7 @@ fn run_loop(terminal: &mut TaskTerminal) -> anyhow::Result<()> {
             }
             Err(TryRecvError::Empty) => {}
         }
-        terminal.draw(|frame| render(frame, &model))?;
+        terminal.draw(|frame| render(frame, model))?;
         if !event::poll(EVENT_POLL_INTERVAL)? {
             continue;
         }
@@ -581,66 +585,103 @@ fn run_loop(terminal: &mut TaskTerminal) -> anyhow::Result<()> {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             continue;
         }
-        if handle_key(&mut model, &mut cadence, key) {
-            return Ok(());
+        if let Some(outcome) = handle_key(model, &mut cadence, key) {
+            return Ok(outcome);
         }
     }
 }
 
-/// Returns true when the caller should leave the workspace.
-fn handle_key(model: &mut TaskModel, cadence: &mut RefreshCadence, key: KeyEvent) -> bool {
+fn handle_key(
+    model: &mut TaskModel,
+    cadence: &mut RefreshCadence,
+    key: KeyEvent,
+) -> Option<PrimaryPanelOutcome> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
     {
-        return true;
+        return Some(PrimaryPanelOutcome::Exit);
+    }
+    if let Some(panel) = primary_panel_shortcut(key) {
+        return (panel != PrimaryPanel::Tasks).then_some(PrimaryPanelOutcome::Switch(panel));
+    }
+    if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::F(5) {
+        cadence.request_now(Instant::now());
+        return None;
     }
     if key.modifiers == KeyModifiers::CONTROL && matches!(key.code, KeyCode::Char('r' | 'R')) {
         cadence.request_now(Instant::now());
-        return false;
+        return None;
     }
     if key.modifiers == KeyModifiers::CONTROL && matches!(key.code, KeyCode::Char('a' | 'A')) {
         model.show_closed = !model.show_closed;
         model.retain_selection();
-        return false;
+        return None;
+    }
+    if model.filter_focused {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab => {
+                model.filter_focused = false
+            }
+            KeyCode::Backspace => {
+                model.query.handle(InputRequest::DeletePrevChar);
+                model.retain_selection();
+            }
+            KeyCode::Delete => {
+                model.query.handle(InputRequest::DeleteNextChar);
+                model.retain_selection();
+            }
+            KeyCode::Left => {
+                model.query.handle(InputRequest::GoToPrevChar);
+            }
+            KeyCode::Right => {
+                model.query.handle(InputRequest::GoToNextChar);
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                model.query.handle(InputRequest::InsertChar(character));
+                model.retain_selection();
+            }
+            _ => {}
+        }
+        return None;
     }
     match key.code {
-        KeyCode::Esc | KeyCode::Left => {
+        KeyCode::Esc => {
             if model.detail {
                 model.detail = false;
             } else if !model.query.value().is_empty() {
                 model.query.reset();
                 model.retain_selection();
             } else {
-                return true;
+                return Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Agents));
             }
         }
+        KeyCode::Left if model.detail => model.detail = false,
+        KeyCode::Right if model.detail => {}
+        KeyCode::Left => {
+            return PrimaryPanel::Tasks
+                .adjacent(false)
+                .map(PrimaryPanelOutcome::Switch)
+        }
+        KeyCode::Right => return None,
+        KeyCode::Tab if model.detail => model.detail = false,
+        KeyCode::Tab => model.detail = model.selected_row().is_some(),
+        KeyCode::BackTab => model.detail = false,
         KeyCode::Up => model.move_selection(-1),
         KeyCode::Down => model.move_selection(1),
-        KeyCode::Enter | KeyCode::Right => model.detail = model.selected_row().is_some(),
-        KeyCode::Backspace => {
-            model.query.handle(InputRequest::DeletePrevChar);
-            model.retain_selection();
-        }
-        KeyCode::Delete => {
-            model.query.handle(InputRequest::DeleteNextChar);
-            model.retain_selection();
-        }
-        KeyCode::F(5) => cadence.request_now(Instant::now()),
-        KeyCode::Char(character)
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-        {
-            model.query.handle(InputRequest::InsertChar(character));
-            model.retain_selection();
-        }
+        KeyCode::Enter | KeyCode::Char('a') => model.detail = model.selected_row().is_some(),
+        KeyCode::Char('/') => model.filter_focused = true,
         _ => {}
     }
-    false
+    None
 }
 
 fn render(frame: &mut Frame<'_>, model: &TaskModel) {
     let area = frame.area();
     let chunks = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(3),
         Constraint::Min(4),
@@ -654,6 +695,10 @@ fn render(frame: &mut Frame<'_>, model: &TaskModel) {
         "active"
     };
     frame.render_widget(
+        Paragraph::new(primary_panel_tabs(PrimaryPanel::Tasks)),
+        chunks[0],
+    );
+    frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
                 "Cutex Tasks",
@@ -666,14 +711,18 @@ fn render(frame: &mut Frame<'_>, model: &TaskModel) {
                 Style::new().fg(Color::Yellow),
             ),
         ])),
-        chunks[0],
+        chunks[1],
     );
-    render_filter(frame, chunks[1], model);
-    render_table(frame, chunks[2], model);
+    render_filter(frame, chunks[2], model);
+    render_table(frame, chunks[3], model);
+    let footer = if model.detail {
+        "←/BackTab/Tab/Esc close inspector  ↑/↓ select  F5 refresh"
+    } else {
+        "↑/↓ select  Enter/a/Tab inspect  ←/→ tabs  / filter  F5 refresh  Esc back"
+    };
     frame.render_widget(
-        Paragraph::new("↑↓ select  Enter inspect  Ctrl-A all/active  F5/Ctrl-R refresh  Esc back")
-            .style(Style::new().fg(Color::DarkGray)),
-        chunks[3],
+        Paragraph::new(footer).style(Style::new().fg(Color::DarkGray)),
+        chunks[4],
     );
     if model.detail {
         render_detail(frame, centered_rect(area, 86, 72), model);
@@ -715,13 +764,9 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, model: &TaskModel) {
         .iter()
         .map(|index| task_table_row(&model.rows[*index], wide))
         .collect::<Vec<_>>();
-    let header = if wide {
-        Row::new(["TASK", "ST", "AGENT", "TRY", "UPDATED", "ACTIVITY"])
-    } else {
-        Row::new(["TASK", "ST", "AGENT", "TRY", "UPDATED", "ACTIVITY"])
-    }
-    .style(Style::new().fg(Color::Gray).add_modifier(Modifier::BOLD))
-    .bottom_margin(1);
+    let header = Row::new(["TASK", "ST", "AGENT", "TRY", "UPDATED", "ACTIVITY"])
+        .style(Style::new().fg(Color::Gray).add_modifier(Modifier::BOLD))
+        .bottom_margin(1);
     let widths = if wide {
         vec![
             Constraint::Length(20),
@@ -1006,25 +1051,32 @@ mod tests {
     fn project_presentation_uses_only_exact_authoritative_project_ids() {
         let alpha = ProjectId::new("project-alpha").unwrap();
         let beta = ProjectId::new("project-beta").unwrap();
-        let authoritative_ids = BTreeSet::from([alpha.clone()]);
-        let stored = BTreeMap::from([(
-            alpha.clone(),
-            serde_json::from_value(serde_json::json!({
-                "display_name": "Core Platform",
-                "badge_label": "CP",
-                "color": "magenta",
-                "revision": 7,
-                "updated_at": "2026-01-01T00:00:00Z",
-                "updated_by_director_session": "cutex.director"
-            }))
-            .unwrap(),
-        )]);
-
-        let alpha_presentation =
-            exact_project_presentation(&alpha, &authoritative_ids, &stored).unwrap();
+        let response: HumanManagementTaskQueryResponse = serde_json::from_value(serde_json::json!({
+            "schema": "cutex/human-management-task-query/v1",
+            "director_seat_occupant": "cutex.director",
+            "director_seat_epoch": 2,
+            "project_ids": ["project-alpha"],
+            "project_presentations": {
+                "project-alpha": {
+                    "display_name": "Core Platform", "badge_label": "CP", "color": "magenta",
+                    "revision": 7, "stored": true
+                }
+            },
+            "receipt": {
+                "schema": "cutex/task-service-director-receipt/v1",
+                "action_id": "management-query-1", "operation": "query",
+                "status": "current_state",
+                "assignments": [
+                    {"project_id":"project-alpha","assignment_id":"a-1","task_id":"t-1","task_revision":1,"assignee_cutex_session_id":"cutex.worker","state":"active","created_at":"2026-01-01T00:00:00Z","attempts":[]},
+                    {"project_id":"project-beta","assignment_id":"a-2","task_id":"t-2","task_revision":1,"assignee_cutex_session_id":"cutex.worker","state":"active","created_at":"2026-01-01T00:00:00Z","attempts":[]}
+                ]
+            }
+        })).unwrap();
+        let presentations = exact_project_presentations(&response);
+        let alpha_presentation = presentations.get(&alpha).cloned().unwrap();
         assert_eq!(alpha_presentation.display_name, "Core Platform");
         assert_eq!(alpha_presentation.badge_label, "CP");
-        assert!(exact_project_presentation(&beta, &authoritative_ids, &stored).is_none());
+        assert!(!presentations.contains_key(&beta));
 
         let mut alpha_row = row("alpha", TaskState::Running, "2026-01-01T00:00:00Z");
         alpha_row.project_presentation = Some(alpha_presentation);
@@ -1043,6 +1095,100 @@ mod tests {
         assert!(cadence.due(start));
         assert!(!cadence.due(start + Duration::from_millis(999)));
         assert!(cadence.due(start + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn task_list_arrows_switch_tabs_and_detail_arrows_stay_local() {
+        let now = Instant::now();
+        let mut cadence = RefreshCadence::new(now);
+        let mut model = TaskModel {
+            rows: vec![
+                row("one", TaskState::Running, "2026-01-01T00:00:00Z"),
+                row("two", TaskState::Blocked, "2026-01-02T00:00:00Z"),
+            ],
+            selected_assignment_id: Some("one".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            handle_key(
+                &mut model,
+                &mut cadence,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            ),
+            None
+        );
+        assert!(!model.detail);
+        assert_eq!(model.selected_assignment_id.as_deref(), Some("one"));
+        assert_eq!(
+            handle_key(
+                &mut model,
+                &mut cadence,
+                KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            ),
+            Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Projects))
+        );
+        assert!(!model.detail);
+        handle_key(
+            &mut model,
+            &mut cadence,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        );
+        assert_eq!(model.selected_assignment_id.as_deref(), Some("two"));
+        handle_key(
+            &mut model,
+            &mut cadence,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        );
+        assert!(model.detail);
+        let selected = model.selected_assignment_id.clone();
+        assert_eq!(
+            handle_key(
+                &mut model,
+                &mut cadence,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            ),
+            None
+        );
+        assert!(model.detail);
+        assert_eq!(model.selected_assignment_id, selected);
+        handle_key(
+            &mut model,
+            &mut cadence,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(!model.detail);
+        handle_key(
+            &mut model,
+            &mut cadence,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(model.detail);
+    }
+
+    #[test]
+    fn alt_shortcuts_preserve_task_selection_filter_and_detail_view() {
+        let now = Instant::now();
+        let mut cadence = RefreshCadence::new(now);
+        let mut model = TaskModel {
+            rows: vec![row("one", TaskState::Running, "2026-01-01T00:00:00Z")],
+            selected_assignment_id: Some("one".to_string()),
+            query: Input::new("running".to_string()),
+            detail: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            handle_key(
+                &mut model,
+                &mut cadence,
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT),
+            ),
+            Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Projects))
+        );
+        assert_eq!(model.selected_assignment_id.as_deref(), Some("one"));
+        assert_eq!(model.query.value(), "running");
+        assert!(model.detail);
     }
 
     #[test]
@@ -1074,6 +1220,17 @@ mod tests {
             })
             .unwrap();
         assert!(format!("{:?}", terminal.backend().buffer()).contains("unavailable"));
+
+        let mut terminal = Terminal::new(TestBackend::new(38, 9)).unwrap();
+        let model = TaskModel {
+            rows: vec![row("resize", TaskState::Running, "2020-01-01T00:00:00Z")],
+            selected_assignment_id: Some("resize".to_string()),
+            ..Default::default()
+        };
+        terminal.draw(|frame| render(frame, &model)).unwrap();
+        terminal.backend_mut().resize(120, 24);
+        terminal.draw(|frame| render(frame, &model)).unwrap();
+        assert!(format!("{:?}", terminal.backend().buffer()).contains("resize"));
     }
 
     #[test]

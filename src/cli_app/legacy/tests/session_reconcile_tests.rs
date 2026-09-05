@@ -343,7 +343,7 @@ fn cutex_session_reconcile_marks_im_registration_exposure() {
     );
     assert_eq!(
         record.runtime_backend,
-        CutexSessionRuntimeBackend::CuteAlden
+        default_managed_session_runtime_backend()
     );
     assert!(record.agent_enabled);
 }

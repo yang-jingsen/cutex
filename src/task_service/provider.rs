@@ -37,6 +37,7 @@ const LOCK_FILE: &str = "task-service-provider-v2.lock";
 const ZERO_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const MAX_CONTRACT_BYTES: usize = 1024 * 1024;
 const MAX_EVIDENCE_BYTES: usize = 512 * 1024;
+const MAX_BLOCKER_SUMMARY_BYTES: usize = 2048;
 const MAX_DECISION_REFERENCE_BYTES: usize = 4096;
 const MAX_WATCH_LIMIT: usize = 1000;
 const MAX_PREPARED_WORKER_ACTIONS: usize = 4096;
@@ -664,6 +665,15 @@ pub struct StatusActionRequest {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct BlockActionRequest {
+    pub schema: ProviderActionSchema,
+    pub action_id: ActionId,
+    pub assignment_id: AssignmentId,
+    pub summary: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubmitActionRequest {
     pub schema: ProviderActionSchema,
     pub action_id: ActionId,
@@ -677,7 +687,7 @@ pub struct SubmitActionRequest {
 pub enum WorkerActionRequest {
     Start(AssignmentActionRequest),
     ReportStatus(StatusActionRequest),
-    Block(AssignmentActionRequest),
+    Block(BlockActionRequest),
     Resume(AssignmentActionRequest),
     Submit(SubmitActionRequest),
     Decline(AssignmentActionRequest),
@@ -688,10 +698,10 @@ impl WorkerActionRequest {
     pub fn action_id(&self) -> &ActionId {
         match self {
             Self::Start(value)
-            | Self::Block(value)
             | Self::Resume(value)
             | Self::Decline(value)
             | Self::AbortAttempt(value) => &value.action_id,
+            Self::Block(value) => &value.action_id,
             Self::ReportStatus(value) => &value.action_id,
             Self::Submit(value) => &value.action_id,
         }
@@ -712,10 +722,10 @@ impl WorkerActionRequest {
     fn assignment_id(&self) -> &AssignmentId {
         match self {
             Self::Start(value)
-            | Self::Block(value)
             | Self::Resume(value)
             | Self::Decline(value)
             | Self::AbortAttempt(value) => &value.assignment_id,
+            Self::Block(value) => &value.assignment_id,
             Self::ReportStatus(value) => &value.assignment_id,
             Self::Submit(value) => &value.assignment_id,
         }
@@ -2182,17 +2192,22 @@ impl TaskServiceProvider {
                         Ok(ProviderResult::Attempt(attempt.clone()))
                     }
                     WorkerActionRequest::Block(value) => {
+                        validate_text(
+                            &value.summary,
+                            MAX_BLOCKER_SUMMARY_BYTES,
+                            "blocker_summary",
+                        )?;
                         require_worker_attempt_context(state, assignment_id, &request.context)?;
                         require_assignment_revision(state, assignment_id, &request.context)?;
                         let result = transition_bound_attempt(
                             state,
-                            value,
+                            &value.assignment_id,
                             request.context.attempt.as_ref().expect("validated context"),
                             AttemptPhase::Running,
                             AttemptPhase::Blocked,
                             now,
                         )?;
-                        schedule_completion_notification(
+                        schedule_blocked_notification(
                             state,
                             assignment_id,
                             request
@@ -2201,9 +2216,7 @@ impl TaskServiceProvider {
                                 .as_ref()
                                 .map(|value| value.attempt_number),
                             &value.action_id,
-                            CompletionNotificationKind::Blocked,
-                            NotificationTarget::Coordinator,
-                            CompletionNotificationDeliveryMode::Soon,
+                            &value.summary,
                             now,
                         )?;
                         Ok(result)
@@ -2213,7 +2226,7 @@ impl TaskServiceProvider {
                         require_assignment_revision(state, assignment_id, &request.context)?;
                         transition_bound_attempt(
                             state,
-                            value,
+                            &value.assignment_id,
                             request.context.attempt.as_ref().expect("validated context"),
                             AttemptPhase::Blocked,
                             AttemptPhase::Running,
@@ -2857,6 +2870,9 @@ fn validate_worker_action_semantics(action: &WorkerActionRequest) -> Result<(), 
         WorkerActionRequest::ReportStatus(value) => {
             validate_text(&value.summary, MAX_EVIDENCE_BYTES, "status_summary")
         }
+        WorkerActionRequest::Block(value) => {
+            validate_text(&value.summary, MAX_BLOCKER_SUMMARY_BYTES, "blocker_summary")
+        }
         WorkerActionRequest::Submit(value) => validate_text(
             &value.result_reference,
             MAX_EVIDENCE_BYTES,
@@ -3171,13 +3187,13 @@ fn bound_attempt_mut<'a>(
 
 fn transition_bound_attempt(
     state: &mut TaskServiceSnapshot,
-    request: &AssignmentActionRequest,
+    assignment_id: &AssignmentId,
     binding: &AttemptMechanicalContext,
     expected: AttemptPhase,
     resulting: AttemptPhase,
     now: &Rfc3339,
 ) -> Result<ProviderResult, ProviderError> {
-    let attempt = bound_attempt_mut(state, &request.assignment_id, binding)?;
+    let attempt = bound_attempt_mut(state, assignment_id, binding)?;
     if attempt.phase != expected {
         return Err(ProviderError::IllegalState("attempt_phase_conflict"));
     }
@@ -3193,6 +3209,32 @@ enum NotificationTarget {
     Coordinator,
 }
 
+fn schedule_blocked_notification(
+    state: &mut TaskServiceSnapshot,
+    assignment_id: &AssignmentId,
+    attempt_number: Option<AttemptNumber>,
+    transition_action_id: &ActionId,
+    blocker_summary: &str,
+    now: &Rfc3339,
+) -> Result<NotificationId, ProviderError> {
+    validate_text(
+        blocker_summary,
+        MAX_BLOCKER_SUMMARY_BYTES,
+        "blocker_summary",
+    )?;
+    schedule_completion_notification_with_detail(
+        state,
+        assignment_id,
+        attempt_number,
+        transition_action_id,
+        CompletionNotificationKind::Blocked,
+        NotificationTarget::Coordinator,
+        CompletionNotificationDeliveryMode::Soon,
+        Some(blocker_summary.trim()),
+        now,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn schedule_completion_notification(
     state: &mut TaskServiceSnapshot,
@@ -3202,6 +3244,31 @@ fn schedule_completion_notification(
     kind: CompletionNotificationKind,
     target: NotificationTarget,
     delivery_mode: CompletionNotificationDeliveryMode,
+    now: &Rfc3339,
+) -> Result<NotificationId, ProviderError> {
+    schedule_completion_notification_with_detail(
+        state,
+        assignment_id,
+        attempt_number,
+        transition_action_id,
+        kind,
+        target,
+        delivery_mode,
+        None,
+        now,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn schedule_completion_notification_with_detail(
+    state: &mut TaskServiceSnapshot,
+    assignment_id: &AssignmentId,
+    attempt_number: Option<AttemptNumber>,
+    transition_action_id: &ActionId,
+    kind: CompletionNotificationKind,
+    target: NotificationTarget,
+    delivery_mode: CompletionNotificationDeliveryMode,
+    blocker_summary: Option<&str>,
     now: &Rfc3339,
 ) -> Result<NotificationId, ProviderError> {
     let assignment = assignment(state, assignment_id)?.clone();
@@ -3226,15 +3293,31 @@ fn schedule_completion_notification(
     let digest = format!("{:x}", Sha256Hasher::digest(correlation.as_bytes()));
     let notification_id = NotificationId::new(format!("tsn-{digest}"))?;
     let external_message_id = notification_id.as_str().to_string();
-    let human_readable_content = format!(
-        "Task Service transition {kind:?} for assignment {} (task {} revision {}, attempt {}).",
-        assignment.assignment_id.as_str(),
-        assignment.task_id.as_str(),
-        assignment.task_revision.get(),
-        attempt_number
-            .map(|number| number.get().to_string())
-            .unwrap_or_else(|| "none".to_string()),
-    );
+    let attempt_label = attempt_number
+        .map(|number| number.get().to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let human_readable_content = match (kind, blocker_summary) {
+        (CompletionNotificationKind::Blocked, Some(summary)) => format!(
+            "Task Service reports assignment {} is blocked (task {} revision {}, attempt {}).\nBlocker summary: {}\nTransition action identity: {}.\nDirector action required: reply with guidance or resolve the blocker, then resume the assignment.",
+            assignment.assignment_id.as_str(),
+            assignment.task_id.as_str(),
+            assignment.task_revision.get(),
+            attempt_label,
+            summary,
+            transition_action_id.as_str(),
+        ),
+        (CompletionNotificationKind::Blocked, None) => {
+            return Err(ProviderError::InvalidRequest("blocker_summary"));
+        }
+        (_, Some(_)) => return Err(ProviderError::InvalidRequest("notification_detail")),
+        (_, None) => format!(
+            "Task Service transition {kind:?} for assignment {} (task {} revision {}, attempt {}).",
+            assignment.assignment_id.as_str(),
+            assignment.task_id.as_str(),
+            assignment.task_revision.get(),
+            attempt_label,
+        ),
+    };
     let notification = CompletionNotification {
         project_id: assignment.project_id,
         notification_id: notification_id.clone(),
@@ -5390,10 +5473,11 @@ mod tests {
             .unwrap()
             .completion_notifications
             .is_empty());
-        fixture.worker_action(WorkerActionRequest::Block(AssignmentActionRequest {
+        fixture.worker_action(WorkerActionRequest::Block(BlockActionRequest {
             schema: ProviderActionSchema::V2,
             action_id: action("block"),
             assignment_id: assignment_id(),
+            summary: "normal Windows service lifecycle cannot stop the managed runtime".into(),
         }));
         fixture.worker_action(WorkerActionRequest::AbortAttempt(AssignmentActionRequest {
             schema: ProviderActionSchema::V2,
@@ -5409,6 +5493,22 @@ mod tests {
             );
             assert_eq!(notification.target_seat_id.as_str(), "director");
         }
+        let blocked = state
+            .completion_notifications
+            .values()
+            .find(|notification| notification.kind == CompletionNotificationKind::Blocked)
+            .expect("blocked notification");
+        assert_eq!(blocked.transition_action_id.as_str(), "block");
+        assert!(blocked.human_readable_content.contains(
+            "Blocker summary: normal Windows service lifecycle cannot stop the managed runtime"
+        ));
+        assert!(blocked
+            .human_readable_content
+            .contains("Transition action identity: block."));
+        assert!(blocked
+            .human_readable_content
+            .contains("Director action required:"));
+        assert!(blocked.human_readable_content.len() <= 4096);
     }
 
     #[test]
@@ -6410,6 +6510,45 @@ mod tests {
     }
 
     #[test]
+    fn block_requires_a_bounded_summary_before_durable_preparation() {
+        let missing = serde_json::json!({
+            "operation": "block",
+            "body": {
+                "schema": "cutex/task-service-action/v2",
+                "action_id": "missing-blocker-summary",
+                "assignment_id": "assignment-1"
+            }
+        });
+        assert!(serde_json::from_value::<WorkerActionRequest>(missing).is_err());
+
+        let fixture = Fixture::new("blocker-summary-bound");
+        fixture.provision();
+        fixture.start("start");
+        for (label, summary) in [
+            ("empty", "   ".to_string()),
+            ("oversized", "x".repeat(MAX_BLOCKER_SUMMARY_BYTES + 1)),
+        ] {
+            let request = WorkerPrepareRequest {
+                schema: WorkerPrepareRequestSchema::V2,
+                action: WorkerActionRequest::Block(BlockActionRequest {
+                    schema: ProviderActionSchema::V2,
+                    action_id: action(&format!("block-{label}")),
+                    assignment_id: assignment_id(),
+                    summary,
+                }),
+            };
+            let before = fixture.provider.query().unwrap();
+            assert_eq!(
+                fixture
+                    .provider
+                    .prepare_worker_action(&fixture.worker, &request),
+                Err(ProviderError::InvalidRequest("blocker_summary"))
+            );
+            assert_eq!(fixture.provider.query().unwrap(), before);
+        }
+    }
+
+    #[test]
     fn strict_worker_schema_rejects_mechanical_fields() {
         for forbidden in [
             "runtime_agent_id",
@@ -6504,10 +6643,11 @@ mod tests {
                 fixture.provision();
                 fixture.start("start");
                 if operation == "resume" {
-                    fixture.worker_action(WorkerActionRequest::Block(AssignmentActionRequest {
+                    fixture.worker_action(WorkerActionRequest::Block(BlockActionRequest {
                         schema: ProviderActionSchema::V2,
                         action_id: action("prepare-blocked"),
                         assignment_id: assignment_id(),
+                        summary: "prepare the blocked-state fixture".into(),
                     }));
                 }
                 let action = match operation {
@@ -6518,10 +6658,11 @@ mod tests {
                         summary: "still working".into(),
                         evidence_sha256: None,
                     }),
-                    "block" => WorkerActionRequest::Block(AssignmentActionRequest {
+                    "block" => WorkerActionRequest::Block(BlockActionRequest {
                         schema: ProviderActionSchema::V2,
                         action_id: action("probe-block"),
                         assignment_id: assignment_id(),
+                        summary: "mechanical binding probe is blocked".into(),
                     }),
                     "resume" => WorkerActionRequest::Resume(AssignmentActionRequest {
                         schema: ProviderActionSchema::V2,

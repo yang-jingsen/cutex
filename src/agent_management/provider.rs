@@ -224,7 +224,7 @@ pub struct AgentManagementProvider {
     fail_after_director_seat_transfer_once: Arc<AtomicBool>,
 }
 
-fn provider_execution_lock() -> &'static Mutex<()> {
+pub(super) fn provider_execution_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
@@ -351,6 +351,9 @@ impl AgentManagementProvider {
         self.store.with_state(true, |mut state| {
             if state.actions.contains_key(&request.action_id)
                 || state
+                    .human_management_operator_actions
+                    .contains_key(&request.action_id)
+                || state
                     .legacy_director_ownership_import_receipts
                     .contains_key(&request.action_id)
                 || state
@@ -448,6 +451,9 @@ impl AgentManagementProvider {
         let digest = request_sha256(request)?;
         self.store.with_state(true, |mut state| {
             if state.actions.contains_key(&request.action_id)
+                || state
+                    .human_management_operator_actions
+                    .contains_key(&request.action_id)
                 || state.authority_receipts.contains_key(&request.action_id)
                 || state
                     .reservation_reconciliation_receipts
@@ -581,6 +587,9 @@ impl AgentManagementProvider {
         let (receipt, replayed, phase_event) =
             self.store.with_state(true, |mut state| {
                 if state.actions.contains_key(&request.action_id)
+                    || state
+                        .human_management_operator_actions
+                        .contains_key(&request.action_id)
                     || state.authority_receipts.contains_key(&request.action_id)
                     || state
                         .legacy_director_ownership_import_receipts
@@ -1039,6 +1048,9 @@ impl AgentManagementProvider {
         self.store
             .with_state(true, |mut state| {
                 if state.authority_receipts.contains_key(&request.action_id)
+                    || state
+                        .human_management_operator_actions
+                        .contains_key(&request.action_id)
                     || state
                         .legacy_director_ownership_import_receipts
                         .contains_key(&request.action_id)
@@ -2509,6 +2521,7 @@ impl AgentManagementProvider {
                 grant_revision: revision,
                 granted_at: committed_at.clone(),
                 granted_by_primary_director_session: invocation.caller_cutex_session.clone(),
+                performed_by_human_management: false,
             };
             state
                 .operator_grants
@@ -2693,6 +2706,7 @@ impl AgentManagementProvider {
                                 .agent
                                 .cutex_session_id
                                 .clone(),
+                            performed_by_human_management: false,
                         };
                         state
                             .operator_grants
@@ -3536,6 +3550,7 @@ fn insert_operator_audit_event(
         previous_grant_revision: previous_revision,
         grant_revision: revision,
         primary_director_cutex_session_id: primary_director.clone(),
+        performed_by_human_management: false,
         committed_at,
     };
     if state

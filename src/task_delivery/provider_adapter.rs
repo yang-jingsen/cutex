@@ -1875,6 +1875,144 @@ mod tests {
     }
 
     #[test]
+    fn blocked_completion_wakes_the_director_with_actionable_bounded_context() {
+        let root = std::env::temp_dir().join(format!(
+            "cutex-blocked-completion-dispatch-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let provider = TaskServiceProvider::open(root.join("provider")).unwrap();
+        let seats = crate::seat::SeatOccupancyStore::open(root.join("seats")).unwrap();
+        let director_session =
+            crate::role_revision::CutexSessionId::new("director-session").unwrap();
+        let worker_session = crate::role_revision::CutexSessionId::new("worker-session").unwrap();
+        let director_seat = SeatId::new("cutex-director").unwrap();
+        let coordinator = AuthenticatedPrincipal::seated_session(
+            director_session.clone(),
+            director_seat.clone(),
+            1,
+        )
+        .unwrap();
+        let task_id = TaskId::new("CUTEX-blocked-completion").unwrap();
+        provider
+            .create_revision(
+                &coordinator,
+                &CreateRevisionRequest {
+                    schema: ProviderActionSchema::V2,
+                    action_id: ActionId::new("create-blocked").unwrap(),
+                    workflow_id: WorkflowId::new("blocked-workflow").unwrap(),
+                    task_id: task_id.clone(),
+                    task_revision: TaskRevision::new(1).unwrap(),
+                    contract_sha256: sha("blocked contract"),
+                    opaque_contract: "blocked contract".to_string(),
+                    completion_policy: CompletionPolicy {
+                        kind: CompletionPolicyKind::DirectorAcceptance,
+                        authority_seat_id: director_seat.clone(),
+                    },
+                },
+                None,
+            )
+            .unwrap();
+        let assignment_id = crate::task_service::AssignmentId::new("assignment-blocked").unwrap();
+        provider
+            .assign_and_dispatch(
+                &coordinator,
+                &AssignAndDispatchRequest {
+                    schema: ProviderActionSchema::V2,
+                    action_id: ActionId::new("assign-blocked").unwrap(),
+                    assignment_id: assignment_id.clone(),
+                    task_id,
+                    task_revision: TaskRevision::new(1).unwrap(),
+                    assignee_cutex_session: worker_session.clone(),
+                    send_attempt_id: SendAttemptId::new("send-blocked").unwrap(),
+                    external_message_id: "assignment-blocked-message".to_string(),
+                },
+                1,
+                "assignment",
+            )
+            .unwrap();
+        let worker = AuthenticatedPrincipal::session(worker_session);
+        for action in [
+            crate::task_service::WorkerActionRequest::Start(
+                crate::task_service::AssignmentActionRequest {
+                    schema: ProviderActionSchema::V2,
+                    action_id: ActionId::new("start-blocked").unwrap(),
+                    assignment_id: assignment_id.clone(),
+                },
+            ),
+            crate::task_service::WorkerActionRequest::Block(
+                crate::task_service::BlockActionRequest {
+                    schema: ProviderActionSchema::V2,
+                    action_id: ActionId::new("block-windows-lifecycle").unwrap(),
+                    assignment_id: assignment_id.clone(),
+                    summary: "typed Windows service stop is unavailable".to_string(),
+                },
+            ),
+        ] {
+            let crate::task_service::WorkerPrepareOutcome::Prepared(envelope) = provider
+                .prepare_worker_action(
+                    &worker,
+                    &crate::task_service::WorkerPrepareRequest {
+                        schema: crate::task_service::WorkerPrepareRequestSchema::V2,
+                        action,
+                    },
+                )
+                .unwrap()
+            else {
+                panic!("new Worker action must prepare")
+            };
+            provider.execute_worker_action(&worker, &envelope).unwrap();
+        }
+        seats
+            .bind(&crate::seat::SeatOccupancyBindRequest {
+                schema: crate::seat::SeatOccupancyCommandSchema::V1,
+                action_id: ActionId::new("bind-director").unwrap(),
+                seat_id: director_seat,
+                occupant_cutex_session: director_session.clone(),
+            })
+            .unwrap();
+        let state = Arc::new(Mutex::new(AgentBusState::default()));
+        state.lock().unwrap().agents.insert(
+            "director-runtime".to_string(),
+            roster("director-runtime", director_session.as_str()),
+        );
+
+        let dispatched = TaskServiceAgentBusDispatcher::dispatch_pending_completion_notifications(
+            &provider, &seats, &state, 1,
+        )
+        .unwrap();
+        assert_eq!(dispatched.queued, 1);
+        let message = state.lock().unwrap().messages["director-runtime"][0].clone();
+        assert_eq!(
+            message.delivery_mode,
+            crate::agent_bus::delivery::AgentDeliveryMode::Soon
+        );
+        assert!(message.trigger_turn);
+        assert_eq!(
+            message.external_action_id.as_deref(),
+            Some("block-windows-lifecycle")
+        );
+        assert!(message
+            .content
+            .contains("Blocker summary: typed Windows service stop is unavailable"));
+        assert!(message
+            .content
+            .contains("Transition action identity: block-windows-lifecycle."));
+        assert!(message.content.contains("Director action required:"));
+        let metadata: TaskServiceCompletionMetadata =
+            serde_json::from_value(message.control_payload.unwrap()).unwrap();
+        assert_eq!(
+            metadata.kind,
+            crate::task_service::CompletionNotificationKind::Blocked
+        );
+        assert_eq!(
+            metadata.transition_action_id.as_str(),
+            "block-windows-lifecycle"
+        );
+        assert_eq!(metadata.target_seat_id.as_str(), "cutex-director");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn worker_followup_retries_exact_assignee_and_context_insert_is_exactly_once() {
         let root = std::env::temp_dir().join(format!(
             "cutex-worker-followup-dispatch-{}",

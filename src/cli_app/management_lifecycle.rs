@@ -54,6 +54,7 @@ use cutex::runtime::lifecycle::{
     cutex_session_host_is_local, live_remote_tui_attach_plan, session_new_thread_base_codex_args,
     session_online_agent_groups, session_online_log_path, session_online_log_tail,
     session_online_resume_plan, session_runtime_stop_target, spawn_detached_session_launch,
+    spawn_managed_agent_runtime_launch,
 };
 use cutex::runtime::lifecycle::{
     default_cutex_alden_session_name, session_online_agent_id,
@@ -62,6 +63,7 @@ use cutex::runtime::lifecycle::{
 };
 #[cfg(test)]
 use cutex::runtime::lifecycle::{finalize_session_online_launch, SessionOnlineLaunch};
+use cutex::runtime::process_scope::terminate_managed_agent_scope;
 use cutex::session::model::{CutexSessionRecord, CutexSessionRuntimeBackend, LaunchProfileSource};
 use cutex::session::service::{
     apply_session_online_runtime_observation, clear_cutex_session_runtime_record,
@@ -400,23 +402,26 @@ fn start_cutex_session_online_with_profile_inner(
         }
     }
 
-    let mut app_server_child =
-        match spawn_detached_session_launch(&app_server_launch, &resume_plan.launch_cwd, &log_path)
-        {
-            Ok(child) => child,
-            Err(error) => {
-                let cleanup = layout.cleanup_files();
-                let rollback = rollback_after_cleanup(&cleanup, || {
-                    restore_app_server_launch_claim(&key, &record, &app_server_launch_claim_id)
-                });
-                return Err(error_with_cleanup_and_rollback(
-                    error,
-                    cleanup,
-                    rollback,
-                    "child spawn",
-                ));
-            }
-        };
+    let mut app_server_child = match spawn_managed_agent_runtime_launch(
+        &record.cutex_session_id,
+        &app_server_launch,
+        &resume_plan.launch_cwd,
+        &log_path,
+    ) {
+        Ok(child) => child,
+        Err(error) => {
+            let cleanup = layout.cleanup_files();
+            let rollback = rollback_after_cleanup(&cleanup, || {
+                restore_app_server_launch_claim(&key, &record, &app_server_launch_claim_id)
+            });
+            return Err(error_with_cleanup_and_rollback(
+                error,
+                cleanup,
+                rollback,
+                "child spawn",
+            ));
+        }
+    };
     let mut binding = layout.binding(app_server_child.id(), Utc::now().to_rfc3339());
     binding.launched_profile = Some(account.name.clone());
     binding.launch_profile_source = Some(launch_profile_source);
@@ -706,8 +711,12 @@ pub(crate) fn start_cutex_session_new_thread(
     }
 
     let launch_cwd = cutex_session_launch_cwd(&record).to_string();
-    let mut child = match spawn_detached_session_launch(&app_server_launch, &launch_cwd, &log_path)
-    {
+    let mut child = match spawn_managed_agent_runtime_launch(
+        &record.cutex_session_id,
+        &app_server_launch,
+        &launch_cwd,
+        &log_path,
+    ) {
         Ok(child) => child,
         Err(error) => {
             let cleanup = layout.cleanup_files();
@@ -1295,6 +1304,16 @@ fn cleanup_failed_app_server_start(
     alden_session_name: Option<&str>,
 ) -> anyhow::Result<()> {
     let mut errors = Vec::new();
+    match terminate_managed_agent_scope(cutex_session_id, true) {
+        Ok(outcome) if outcome.stopped => {}
+        Ok(outcome) => errors.push(format!(
+            "managed Agent process scope did not stop: {}",
+            outcome.detail
+        )),
+        Err(error) => errors.push(format!(
+            "failed to stop managed Agent process scope: {error:#}"
+        )),
+    }
     if let Some(session) = alden_session_name.and_then(find_cute_alden_session_by_name) {
         match terminate_process_and_wait(session.pid, true) {
             Ok(outcome) if outcome.stopped => {}
@@ -1508,8 +1527,9 @@ pub(crate) fn stop_cutex_session_runtime_for_entry(
     let disconnect_error = app_server_runtime::disconnect_runtime(&record.cutex_session_id)
         .err()
         .map(|error| format!("manager_disconnect_failed:{error:#}"));
+    let scope_stop = terminate_managed_agent_scope(&record.cutex_session_id, force)?;
 
-    if !target.had_runtime {
+    if !target.had_runtime && !scope_stop.found {
         persist_runtime_stop_with_reconciliation(store, &key, &record)?;
         return Ok(SessionRuntimeStopResult {
             had_runtime: false,
@@ -1528,28 +1548,36 @@ pub(crate) fn stop_cutex_session_runtime_for_entry(
         && app_server_binding.is_none()
         && alden_session.is_none()
         && live_agents.is_empty()
+        && scope_stop.stopped
     {
         clear_stale_failed_start_claim(&mut store, &key)?;
         persist_cutex_session_store_and_im_record(&store, &key)?;
         return Ok(SessionRuntimeStopResult {
             had_runtime: true,
             stopped: true,
-            forced: false,
+            forced: scope_stop.forced,
             pid: None,
             pids: Vec::new(),
             alden_session_name: target.alden_session_name,
             runtime_agent_id: target.runtime_agent_id,
-            detail: "stale_runtime_claim_cleared".to_string(),
+            detail: if scope_stop.found {
+                format!("stale_runtime_claim_cleared,{}", scope_stop.detail)
+            } else {
+                "stale_runtime_claim_cleared".to_string()
+            },
         });
     }
 
-    if target.pids.is_empty() {
+    if target.pids.is_empty() && !scope_stop.found {
         anyhow::bail!("runtime_stop_unsupported: no local cute-alden/runtime pid recorded");
     }
 
-    let mut stopped = true;
-    let mut forced = false;
+    let mut stopped = scope_stop.stopped;
+    let mut forced = scope_stop.forced;
     let mut details = Vec::new();
+    if scope_stop.found {
+        details.push(scope_stop.detail);
+    }
     if let Some(error) = disconnect_error {
         details.push(error);
     }

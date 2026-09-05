@@ -20,6 +20,7 @@ pub use crate::runtime::args::{
     effective_runtime_permission_defaults,
 };
 pub use crate::runtime::codex_home::codex_session_exists_in_home;
+use crate::runtime::process_scope::{managed_agent_launch_plan, ManagedAgentProcessIsolation};
 pub use crate::runtime::session_online::{
     default_cutex_alden_session_name, session_online_agent_id, session_online_agent_identity_env,
     session_online_agent_identity_env_with_id, session_online_log_path, session_online_log_tail,
@@ -279,6 +280,21 @@ pub fn spawn_detached_session_launch(
     command
         .spawn()
         .with_context(|| format!("Failed to start session runtime: {}", launch.program))
+}
+
+pub fn spawn_managed_agent_runtime_launch(
+    cutex_session_id: &str,
+    launch: &LaunchCommand,
+    cwd: &str,
+    log_path: &Path,
+) -> anyhow::Result<Child> {
+    let plan = managed_agent_launch_plan(cutex_session_id, launch.clone());
+    if let ManagedAgentProcessIsolation::Direct { reason } = plan.isolation {
+        eprintln!(
+            "managed Agent process isolation fallback: cutex_session_id={cutex_session_id} mode=direct reason={reason}"
+        );
+    }
+    spawn_detached_session_launch(&plan.launch, cwd, log_path)
 }
 
 #[cfg(test)]

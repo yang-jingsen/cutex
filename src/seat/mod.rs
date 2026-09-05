@@ -974,7 +974,7 @@ fn next_revision(current: u64) -> Result<u64, SeatAuthorityError> {
 }
 
 fn now() -> Rfc3339 {
-    Rfc3339::new(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    Rfc3339::new(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
         .expect("UTC timestamp is RFC3339")
 }
 

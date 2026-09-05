@@ -8,6 +8,8 @@ pub mod host;
 #[cfg(windows)]
 pub mod private_fs;
 pub mod process;
+#[cfg(windows)]
+pub mod windows_parent_guard;
 
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;

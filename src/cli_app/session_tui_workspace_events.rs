@@ -13,6 +13,7 @@ pub(super) enum WorkspaceEvent {
     OpenActions,
     OpenSettings,
     Activate,
+    #[allow(dead_code)]
     Back,
     Escape,
     Exit,
@@ -47,9 +48,10 @@ pub(super) fn workspace_event_from_key(
         KeyCode::Down => Some(WorkspaceEvent::Down),
         KeyCode::Home => Some(WorkspaceEvent::First),
         KeyCode::End => Some(WorkspaceEvent::Last),
-        KeyCode::Right => Some(WorkspaceEvent::OpenActions),
-        KeyCode::Left => Some(WorkspaceEvent::Back),
-        KeyCode::Tab => Some(WorkspaceEvent::OpenSettings),
+        // Focus traversal and view expansion are workspace-specific. Keeping
+        // them out of this shared action map prevents Left/Right from ever
+        // becoming an implicit lifecycle action.
+        KeyCode::Right | KeyCode::Left | KeyCode::Tab | KeyCode::BackTab => None,
         KeyCode::Enter => Some(WorkspaceEvent::Activate),
         KeyCode::Char(character) => Some(WorkspaceEvent::Insert(character)),
         KeyCode::Backspace => Some(WorkspaceEvent::Backspace),
@@ -67,7 +69,11 @@ mod tests {
     fn maps_shared_workspace_keys_without_exposing_view_specific_behavior() {
         assert_eq!(
             workspace_event_from_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), false),
-            Some(WorkspaceEvent::OpenSettings)
+            None
+        );
+        assert_eq!(
+            workspace_event_from_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), false),
+            None
         );
         assert_eq!(
             workspace_event_from_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT), false),
@@ -76,6 +82,30 @@ mod tests {
         assert_eq!(
             workspace_event_from_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT), true),
             Some(WorkspaceEvent::OpenActions)
+        );
+        assert_eq!(
+            workspace_event_from_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), false),
+            None
+        );
+        assert_eq!(
+            workspace_event_from_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), false),
+            None
+        );
+        assert_eq!(
+            workspace_event_from_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), false),
+            Some(WorkspaceEvent::Insert('a'))
+        );
+        assert_eq!(
+            workspace_event_from_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE), false),
+            Some(WorkspaceEvent::Insert('e'))
+        );
+        assert_eq!(
+            workspace_event_from_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE), false),
+            Some(WorkspaceEvent::Insert('v'))
+        );
+        assert_eq!(
+            workspace_event_from_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT), false),
+            None
         );
     }
 }

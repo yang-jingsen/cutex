@@ -37,6 +37,8 @@ use cutex::agent_management::{
 };
 use cutex::cli::args::{AgentCommand, AgentGroupsCommand, AgentManagementCliCommand};
 use cutex::config::env::CUTEX_AGENT_ID_ENV_VAR;
+#[cfg(windows)]
+use cutex::config::env::{env_bool_override, CUTEX_WINDOWS_DESKTOP_LAUNCHER_ENV_VAR};
 use cutex::config::store::load_codez_config;
 use cutex::platform::command::command_exists_in_path;
 use cutex::platform::now_epoch_secs;
@@ -99,9 +101,18 @@ pub(crate) fn run_command(command: AgentCommand) -> anyhow::Result<()> {
             no_config,
         ),
         AgentCommand::Serve { port, token } => {
+            arm_windows_hosted_launcher_guard()?;
             agent_bus_server::cmd_agent_serve(port, token, agent_bus_server::request_handlers())
         }
     }
+}
+
+fn arm_windows_hosted_launcher_guard() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    if env_bool_override(CUTEX_WINDOWS_DESKTOP_LAUNCHER_ENV_VAR) == Some(true) {
+        cutex::platform::windows_parent_guard::arm_launcher_exit_guard()?;
+    }
+    Ok(())
 }
 
 fn cmd_agent_management(command: AgentManagementCliCommand) -> anyhow::Result<()> {

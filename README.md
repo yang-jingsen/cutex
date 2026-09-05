@@ -149,16 +149,29 @@ attachments, Agent Bus presence, and locally projected activity. It continues
 refreshing while open and uses responsive columns for narrow and wide
 terminals.
 
-The main list also contains entry rows for Profiles, Global settings, and the
-retired-session archive. From an agent row you can:
+The direct top-level workspaces are `Alt+M` **Managed**, `Alt+R` **Recent**,
+`Alt+P` **Cutex Projects**, and `Alt+T` **Tasks**. `Tab`/`BackTab` traverse focus
+inside the current workspace. On an ordinary top-level list, `Left`/`Right`
+move to the adjacent main tab without wrapping; inside an Inspector, editor,
+or modal they only collapse, expand, or move local focus. The Managed list also
+contains secondary entry rows for Profiles, Global settings, the
+retired-session archive, and the generic native **Workspaces** catalog. From an
+Agent row you can:
 
-- run the primary lifecycle action with `Enter`;
-- open the complete action list with `Right` (or `Shift+Enter` where enhanced
-  keyboard reporting is available);
-- open session settings with `Tab`;
+- attach to or enter the selected Agent with `Enter`; an offline Agent first
+  presents a cancel-by-default `Start & attach?` review, and a route failure
+  remains in the TUI without opening a fallback terminal;
+- focus the unified Agent Inspector with `Tab`, return with `BackTab`/`Esc`,
+  and open its complete Actions or Settings sections with `a` or `e`;
+- toggle the secondary native thread-title line with `v`; the stable managed
+  label always comes from `ManagedAgentRecord.spec.name` and there is no
+  title-only mode;
+- refresh the current workspace with `F5`;
 - close a known runtime with `Ctrl+X`, after confirmation;
 - search by typing, clear the search with `Ctrl+U`, and exit with `Ctrl+C`.
 
+The Inspector has read-only Overview, explicit Actions, and Settings sections;
+Settings links to the selected Agent's editable Cutex Project badge settings.
 Available actions depend on the selected record and current lifecycle state.
 They include attaching or taking over an existing terminal, opening a TUI for
 an online app-server, bringing a managed runtime online, resuming in the
@@ -170,6 +183,15 @@ workbench visibility, quick-action policy, managed cwd, runtime backend,
 permissions, approval policy, sandbox, model, reasoning effort, and extra CLI
 arguments. The Profiles workspace can add, activate, rename, remove, and edit
 profiles; staged edits are applied explicitly.
+
+Projects and Tasks use the authenticated local Human/Management boundary and
+therefore do not require `CUTEX_AGENT_ID`. Projects exposes canonical Agent
+Management authority, members, Operator grants, and display settings. Tasks is
+a read-only one-second projection anchored to the exact current Task Service
+Director seat and exact Primary Director project authority. Workspace state,
+including selection, filter, scroll anchor, view, and uncommitted editor/modal
+input, survives direct workspace switches. `Esc` returns or cancels;
+`Left`/`Right` never commit an action.
 
 For scripted or filtered selection, the compatibility picker remains useful:
 

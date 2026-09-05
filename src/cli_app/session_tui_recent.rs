@@ -3,7 +3,7 @@
 //! The catalog worker owns its app-server connection for the lifetime of one
 //! TUI cycle.  It deliberately never inspects Codex provider storage.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
@@ -46,12 +46,22 @@ pub(super) struct RecentThreadRow {
     /// adoption; `session_id` is intentionally not retained as an identity.
     pub(super) thread_id: String,
     pub(super) title: String,
+    /// Stable managed identity, populated only by an exact native-session
+    /// join to Agent Management (or a durable session-id fallback). Native
+    /// title remains available separately for unmanaged adoption review.
+    pub(super) managed_name: Option<String>,
     pub(super) cwd: Option<String>,
     pub(super) provider: String,
     pub(super) source: String,
     pub(super) project_id: Option<String>,
     pub(super) recency_at: Option<i64>,
     pub(super) state: RecentThreadState,
+}
+
+impl RecentThreadRow {
+    pub(super) fn primary_label(&self) -> &str {
+        self.managed_name.as_deref().unwrap_or(&self.title)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,7 +248,17 @@ impl RecentSessionsWorkspace {
         self.review.as_ref().is_some_and(|review| review.confirmed)
     }
 
+    #[cfg(test)]
     pub(super) fn receive(&mut self, reply: CatalogReply, store: &CutexSessionStore) {
+        self.receive_with_managed_names(reply, store, &HashMap::new());
+    }
+
+    pub(super) fn receive_with_managed_names(
+        &mut self,
+        reply: CatalogReply,
+        store: &CutexSessionStore,
+        managed_names: &HashMap<String, String>,
+    ) {
         let CatalogReply::Page { cursor, result } = reply;
         self.loading = false;
         match result {
@@ -248,7 +268,7 @@ impl RecentSessionsWorkspace {
                 let mut incoming = page
                     .data
                     .into_iter()
-                    .map(|thread| recent_row(thread, store))
+                    .map(|thread| recent_row(thread, store, managed_names))
                     .collect::<Vec<_>>();
                 incoming.sort_by(|left, right| {
                     right
@@ -315,6 +335,13 @@ impl RecentSessionsWorkspace {
     pub(super) fn reproject(&mut self, store: &CutexSessionStore) {
         for row in &mut self.rows {
             row.state = thread_state(&row.thread_id, row.cwd.is_some(), store);
+            let known_managed_name = row.managed_name.clone();
+            row.managed_name = managed_primary_label(
+                &row.thread_id,
+                row.state,
+                store,
+                known_managed_name.as_deref(),
+            );
         }
     }
 
@@ -385,7 +412,11 @@ impl RecentSessionsWorkspace {
     }
 }
 
-fn recent_row(thread: CatalogThread, store: &CutexSessionStore) -> RecentThreadRow {
+fn recent_row(
+    thread: CatalogThread,
+    store: &CutexSessionStore,
+    managed_names: &HashMap<String, String>,
+) -> RecentThreadRow {
     let cwd = thread
         .cwd
         .map(|path| path.display().to_string())
@@ -405,9 +436,16 @@ fn recent_row(thread: CatalogThread, store: &CutexSessionStore) -> RecentThreadR
         .map(bound)
         .unwrap_or_else(|| "native".to_string());
     let state = thread_state(&thread.id, cwd.is_some(), store);
+    let managed_name = managed_primary_label(
+        &thread.id,
+        state,
+        store,
+        managed_names.get(&thread.id).map(String::as_str),
+    );
     RecentThreadRow {
         thread_id: thread.id,
         title: bound(&title),
+        managed_name,
         cwd,
         provider,
         source,
@@ -418,6 +456,30 @@ fn recent_row(thread: CatalogThread, store: &CutexSessionStore) -> RecentThreadR
             .or(thread.created_at),
         state,
     }
+}
+
+fn managed_primary_label(
+    thread_id: &str,
+    state: RecentThreadState,
+    store: &CutexSessionStore,
+    authoritative_name: Option<&str>,
+) -> Option<String> {
+    matches!(
+        state,
+        RecentThreadState::Managed | RecentThreadState::Retired
+    )
+    .then(|| {
+        authoritative_name
+            .filter(|name| !name.trim().is_empty())
+            .map(bound)
+            .or_else(|| {
+                store.sessions.values().find_map(|record| {
+                    (record.codex_session_id.as_deref() == Some(thread_id))
+                        .then(|| record.cutex_session_id.clone())
+                })
+            })
+            .unwrap_or_else(|| thread_id.to_string())
+    })
 }
 
 fn thread_state(thread_id: &str, has_cwd: bool, store: &CutexSessionStore) -> RecentThreadState {
@@ -592,7 +654,7 @@ mod tests {
         let long_cwd = format!("/work/{}", "segment".repeat(80));
         let mut long_thread = thread("thread-1", "tree", 1);
         long_thread.cwd = Some(long_cwd.clone().into());
-        let row = recent_row(long_thread, &CutexSessionStore::default());
+        let row = recent_row(long_thread, &CutexSessionStore::default(), &HashMap::new());
         assert_eq!(row.cwd.as_deref(), Some(long_cwd.as_str()));
 
         let mut workspace = RecentSessionsWorkspace::default();
@@ -603,9 +665,50 @@ mod tests {
 
         let mut empty_thread = thread("thread-2", "tree", 1);
         empty_thread.cwd = Some("".into());
-        let empty = recent_row(empty_thread, &CutexSessionStore::default());
+        let empty = recent_row(empty_thread, &CutexSessionStore::default(), &HashMap::new());
         assert_eq!(empty.cwd, None);
         assert_eq!(empty.state, RecentThreadState::MissingCwd);
+    }
+
+    #[test]
+    fn only_unmanaged_recent_rows_promote_the_native_thread_title() {
+        let mut managed_thread = thread("thread-1", "tree", 1);
+        managed_thread.name = Some("Generated conversation title".to_string());
+        let managed = recent_row(
+            managed_thread,
+            &store_with("thread-1", true, false),
+            &HashMap::from([("thread-1".to_string(), "Stable Managed Name".to_string())]),
+        );
+        assert_eq!(managed.primary_label(), "Stable Managed Name");
+        assert_eq!(managed.title, "Generated conversation title");
+
+        let mut unmanaged_thread = thread("thread-2", "tree", 1);
+        unmanaged_thread.name = Some("Unmanaged conversation title".to_string());
+        let unmanaged = recent_row(
+            unmanaged_thread,
+            &CutexSessionStore::default(),
+            &HashMap::new(),
+        );
+        assert_eq!(unmanaged.primary_label(), "Unmanaged conversation title");
+    }
+
+    #[test]
+    fn durable_reprojection_preserves_an_authoritative_managed_name() {
+        let mut managed_thread = thread("thread-1", "tree", 1);
+        managed_thread.name = Some("Generated conversation title".to_string());
+        let store = store_with("thread-1", true, false);
+        let managed = recent_row(
+            managed_thread,
+            &store,
+            &HashMap::from([("thread-1".to_string(), "Stable Managed Name".to_string())]),
+        );
+        let mut workspace = RecentSessionsWorkspace::default();
+        workspace.rows = vec![managed];
+
+        workspace.reproject(&store);
+
+        assert_eq!(workspace.rows[0].primary_label(), "Stable Managed Name");
+        assert_eq!(workspace.rows[0].title, "Generated conversation title");
     }
 
     #[test]

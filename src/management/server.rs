@@ -44,6 +44,38 @@ pub type ManagementLegacyDirectorOwnershipImportHandler =
     fn(crate::agent_management::LegacyDirectorOwnershipImportRequest) -> serde_json::Value;
 pub type ManagementAgentReservationReconciliationHandler =
     fn(crate::agent_management::AgentReservationReconciliationRequest) -> serde_json::Value;
+pub type HumanManagementProjectCollectionHandler = fn(
+    &crate::management::control_plane::HumanManagementPrincipal,
+) -> Result<
+    crate::management::control_plane::HumanManagementProjectCollection,
+    crate::agent_management::AgentManagementError,
+>;
+pub type HumanManagementProjectReadHandler = fn(
+    &crate::management::control_plane::HumanManagementPrincipal,
+    &crate::agent_management::ProjectId,
+) -> Result<
+    crate::management::control_plane::HumanManagementProjectWorkspace,
+    crate::agent_management::AgentManagementError,
+>;
+pub type HumanManagementPresentationUpdateHandler = fn(
+    &crate::management::control_plane::HumanManagementPrincipal,
+    &crate::management::control_plane::HumanManagementPresentationUpdateRequest,
+) -> Result<
+    crate::agent_management::ProjectPresentationSettings,
+    crate::agent_management::AgentManagementError,
+>;
+pub type HumanManagementOperatorActionHandler = fn(
+    &crate::management::control_plane::HumanManagementPrincipal,
+    &crate::management::control_plane::HumanManagementOperatorActionRequest,
+) -> Result<
+    crate::management::control_plane::HumanManagementOperatorReceipt,
+    crate::agent_management::AgentManagementError,
+>;
+pub type HumanManagementTaskQueryHandler =
+    fn(
+        &crate::management::control_plane::HumanManagementPrincipal,
+        &crate::management::control_plane::HumanManagementTaskQueryRequest,
+    ) -> anyhow::Result<crate::management::control_plane::HumanManagementTaskQueryResponse>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagementNativeForwardError {
@@ -68,6 +100,11 @@ pub struct ManagementRequestContext {
     pub bind_project_authority: ManagementProjectAuthorityHandler,
     pub import_legacy_director_ownership: ManagementLegacyDirectorOwnershipImportHandler,
     pub reconcile_agent_reservation: ManagementAgentReservationReconciliationHandler,
+    pub list_management_projects: HumanManagementProjectCollectionHandler,
+    pub read_management_project: HumanManagementProjectReadHandler,
+    pub update_management_project_presentation: HumanManagementPresentationUpdateHandler,
+    pub execute_management_operator_action: HumanManagementOperatorActionHandler,
+    pub query_management_tasks: HumanManagementTaskQueryHandler,
 }
 
 pub fn run_management_server(

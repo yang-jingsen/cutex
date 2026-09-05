@@ -162,6 +162,10 @@ pub struct AgentOperatorGrant {
     pub grant_revision: u64,
     pub granted_at: Rfc3339,
     pub granted_by_primary_director_session: CutexSessionId,
+    /// Distinguishes a dedicated Human/Management grant from an Agent action.
+    /// The Director field remains the exact project-authority anchor.
+    #[serde(default)]
+    pub performed_by_human_management: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -193,6 +197,11 @@ pub struct AgentOperatorAuditEvent {
     pub previous_grant_revision: u64,
     pub grant_revision: u64,
     pub primary_director_cutex_session_id: CutexSessionId,
+    /// True only when the dedicated authenticated Human/Management control
+    /// plane performed the write. The Director above remains the authority
+    /// anchor and is not misrepresented as the actor.
+    #[serde(default)]
+    pub performed_by_human_management: bool,
     pub committed_at: Rfc3339,
 }
 

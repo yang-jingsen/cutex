@@ -1341,7 +1341,7 @@ impl TaskWorkerActionHost {
                     } else {
                         None
                     };
-                return self.director_query(
+                return Self::director_query(
                     provider,
                     seat_snapshot,
                     seat_for_session_in_snapshot(seat_snapshot, session_id).as_ref(),
@@ -1732,7 +1732,6 @@ impl TaskWorkerActionHost {
     }
 
     fn director_query(
-        &self,
         provider: &crate::task_service::TaskServiceProvider,
         seat_snapshot: &crate::seat::SeatOccupancySnapshot,
         caller_seat: Option<&crate::task_service::SeatId>,
@@ -2295,6 +2294,100 @@ fn director_exact_project_scope(
     } else {
         Ok(projects)
     }
+}
+
+/// Execute the read-only Director projection for an authenticated local Human
+/// Management request. The Human principal is not converted into an Agent or
+/// seated principal: the exact current `cutex-director` occupancy is used only
+/// as the authority anchor, and the project set must independently name that
+/// same durable session as Primary Director.
+pub fn human_management_task_query(
+    _principal: &crate::management::control_plane::HumanManagementPrincipal,
+    request: &crate::management::control_plane::HumanManagementTaskQueryRequest,
+) -> anyhow::Result<crate::management::control_plane::HumanManagementTaskQueryResponse> {
+    let provider = crate::task_service::TaskServiceProvider::open(
+        crate::task_delivery::provider_adapter::default_task_service_provider_root()
+            .map_err(|error| anyhow!("Task Service provider root unavailable: {error}"))?,
+    )
+    .map_err(|error| anyhow!("Task Service provider unavailable: {error}"))?;
+    let seats = crate::seat::SeatOccupancyStore::open_default()
+        .context("Task Service seat authority unavailable")?;
+    let management = crate::agent_management::AgentManagementProvider::open_default()
+        .context("Agent Management project authority unavailable")?;
+    human_management_task_query_with_stores(_principal, request, &provider, &seats, &management)
+}
+
+fn human_management_task_query_with_stores(
+    _principal: &crate::management::control_plane::HumanManagementPrincipal,
+    request: &crate::management::control_plane::HumanManagementTaskQueryRequest,
+    provider: &crate::task_service::TaskServiceProvider,
+    seats: &crate::seat::SeatOccupancyStore,
+    management: &crate::agent_management::AgentManagementProvider,
+) -> anyhow::Result<crate::management::control_plane::HumanManagementTaskQueryResponse> {
+    let director_seat = crate::task_service::SeatId::new("cutex-director")
+        .map_err(|error| anyhow!("invalid Director seat identity: {error}"))?;
+    let initial = seats
+        .query()
+        .map_err(|error| anyhow!("Task Service seat authority unavailable: {error}"))?;
+    let occupant = initial
+        .occupancies
+        .get(&director_seat)
+        .map(|occupancy| occupancy.occupant_cutex_session.clone())
+        .ok_or_else(|| anyhow!("current cutex-director seat is not bound"))?;
+
+    seats
+        .with_current_principal_snapshot(&occupant, |_seated_principal, seat_snapshot| {
+            let occupancy = seat_snapshot
+                .occupancies
+                .get(&director_seat)
+                .filter(|occupancy| occupancy.occupant_cutex_session == occupant)
+                .ok_or_else(|| anyhow!("current cutex-director seat changed during query"))?;
+            let project_snapshot = management.store().snapshot().map_err(|error| {
+                anyhow!("Agent Management project authority unavailable: {error}")
+            })?;
+            let mut project_ids =
+                exact_project_scope_from_authorities(project_snapshot.projects.clone(), &occupant)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+            project_ids.sort();
+            if project_ids.is_empty() {
+                anyhow::bail!(
+                    "current cutex-director seat has no exact Primary Director project authority"
+                );
+            }
+            let exact_scope = project_ids.iter().cloned().collect::<BTreeSet<_>>();
+            let project_presentations = project_ids
+                .iter()
+                .map(|project_id| {
+                    (
+                        project_id.clone(),
+                        crate::agent_management::effective_presentation(
+                            project_id,
+                            project_snapshot.project_presentations.get(project_id),
+                        ),
+                    )
+                })
+                .collect();
+            let receipt = TaskWorkerActionHost::director_query(
+                provider,
+                seat_snapshot,
+                Some(&director_seat),
+                request.action_id.clone(),
+                &request.selector,
+                Some(&exact_scope),
+            );
+            Ok(
+                crate::management::control_plane::HumanManagementTaskQueryResponse {
+                    schema: request.schema,
+                    director_seat_occupant: occupant.clone(),
+                    director_seat_epoch: occupancy.epoch,
+                    project_ids,
+                    project_presentations,
+                    receipt,
+                },
+            )
+        })
+        .map_err(|error| anyhow!("Director seat authorization changed during query: {error}"))?
 }
 
 fn exact_project_scope_from_authorities(
@@ -4126,6 +4219,153 @@ mod tests {
         // Matching a presentation-like string is intentionally irrelevant.
         assert!(!scope
             .contains(&crate::agent_management::ProjectId::new("project-cutex.other").unwrap()));
+    }
+
+    #[test]
+    fn human_management_task_query_uses_exact_seat_and_project_authority_without_agent_identity() {
+        use crate::task_service::{
+            ActionId, AuthenticatedPrincipal, CompletionPolicy, CompletionPolicyKind,
+            CreateProjectRevisionRequest, DirectorActionStatus, DirectorQuerySelector,
+            ProviderActionSchema, SeatId, WorkflowId,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "cutex-human-management-task-query-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let provider = crate::task_service::TaskServiceProvider::open(root.join("tasks")).unwrap();
+        let seats = crate::seat::SeatOccupancyStore::open(root.join("seats")).unwrap();
+        let management =
+            crate::agent_management::AgentManagementProvider::open(root.join("management"))
+                .unwrap();
+        let director = crate::role_revision::CutexSessionId::new("cutex.director-r36").unwrap();
+        let director_seat = SeatId::new("cutex-director").unwrap();
+        seats
+            .bind(&crate::seat::SeatOccupancyBindRequest {
+                schema: crate::seat::SeatOccupancyCommandSchema::V1,
+                action_id: ActionId::new("bind-human-management-director").unwrap(),
+                seat_id: director_seat.clone(),
+                occupant_cutex_session: director.clone(),
+            })
+            .unwrap();
+        let coordinator =
+            AuthenticatedPrincipal::seated_session(director.clone(), director_seat.clone(), 1)
+                .unwrap();
+        let owned_project = crate::agent_management::ProjectId::new("cutex-stack-main").unwrap();
+        let foreign_project = crate::agent_management::ProjectId::new("foreign-project").unwrap();
+        for (suffix, project_id) in [
+            ("owned", owned_project.clone()),
+            ("foreign", foreign_project.clone()),
+        ] {
+            let contract = format!("human management {suffix} task");
+            provider
+                .create_project_revision(
+                    &coordinator,
+                    &CreateProjectRevisionRequest {
+                        schema: ProviderActionSchema::V3,
+                        action_id: ActionId::new(format!("create-management-{suffix}")).unwrap(),
+                        project_id,
+                        workflow_id: WorkflowId::new(format!("management-{suffix}")).unwrap(),
+                        task_id: crate::role_revision::TaskId::new(format!(
+                            "CUTEX-management-{suffix}"
+                        ))
+                        .unwrap(),
+                        task_revision: crate::role_revision::TaskRevision::new(1).unwrap(),
+                        contract_sha256: crate::task_service::sha256_bytes(contract.as_bytes()),
+                        opaque_contract: contract,
+                        completion_policy: CompletionPolicy {
+                            kind: CompletionPolicyKind::DirectorAcceptance,
+                            authority_seat_id: director_seat.clone(),
+                        },
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+        management
+            .store()
+            .with_state(true, |mut state| {
+                state.projects.insert(
+                    owned_project.clone(),
+                    crate::agent_management::ProjectAuthority {
+                        project_id: owned_project.clone(),
+                        authorized_director_session: director.clone(),
+                        authority_epoch: 9,
+                        updated_at: crate::role_revision::Rfc3339::new("2026-09-03T00:00:00Z")
+                            .unwrap(),
+                    },
+                );
+                state.projects.insert(
+                    foreign_project.clone(),
+                    crate::agent_management::ProjectAuthority {
+                        project_id: foreign_project.clone(),
+                        authorized_director_session: crate::role_revision::CutexSessionId::new(
+                            "cutex.other-director",
+                        )
+                        .unwrap(),
+                        authority_epoch: 4,
+                        updated_at: crate::role_revision::Rfc3339::new("2026-09-03T00:00:00Z")
+                            .unwrap(),
+                    },
+                );
+                Ok((state, (), true))
+            })
+            .unwrap();
+
+        let response = human_management_task_query_with_stores(
+            &crate::management::control_plane::HumanManagementPrincipal::authenticated(),
+            &crate::management::control_plane::HumanManagementTaskQueryRequest {
+                schema: crate::management::control_plane::HumanManagementTaskQuerySchema::V1,
+                action_id: ActionId::new("human-management-query").unwrap(),
+                selector: DirectorQuerySelector::All {},
+            },
+            &provider,
+            &seats,
+            &management,
+        )
+        .unwrap();
+        assert_eq!(response.director_seat_occupant, director);
+        assert_eq!(response.project_ids, vec![owned_project.clone()]);
+        assert_eq!(response.receipt.status, DirectorActionStatus::CurrentState);
+        assert_eq!(response.receipt.tasks.len(), 1);
+        assert_eq!(
+            response.receipt.tasks[0].project_id,
+            Some(owned_project.clone())
+        );
+        assert!(response.project_presentations.contains_key(&owned_project));
+        assert!(!response
+            .project_presentations
+            .contains_key(&foreign_project));
+
+        management
+            .store()
+            .with_state(true, |mut state| {
+                state
+                    .projects
+                    .get_mut(&owned_project)
+                    .unwrap()
+                    .authorized_director_session =
+                    crate::role_revision::CutexSessionId::new("cutex.replacement-director")
+                        .unwrap();
+                Ok((state, (), true))
+            })
+            .unwrap();
+        let denied = human_management_task_query_with_stores(
+            &crate::management::control_plane::HumanManagementPrincipal::authenticated(),
+            &crate::management::control_plane::HumanManagementTaskQueryRequest {
+                schema: crate::management::control_plane::HumanManagementTaskQuerySchema::V1,
+                action_id: ActionId::new("human-management-query-denied").unwrap(),
+                selector: DirectorQuerySelector::All {},
+            },
+            &provider,
+            &seats,
+            &management,
+        )
+        .unwrap_err();
+        assert!(denied
+            .to_string()
+            .contains("no exact Primary Director project authority"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -7215,7 +7455,7 @@ mod tests {
         );
         assert_eq!(replay.status, DirectorActionStatus::CurrentState);
 
-        let query = fixture.host.director_query(
+        let query = TaskWorkerActionHost::director_query(
             &fixture.provider,
             &seat_snapshot,
             Some(&director_seat),
@@ -7249,7 +7489,7 @@ mod tests {
         ] {
             assert!(!serialized.contains(forbidden));
         }
-        let outsider_query = fixture.host.director_query(
+        let outsider_query = TaskWorkerActionHost::director_query(
             &fixture.provider,
             &seat_snapshot,
             None,

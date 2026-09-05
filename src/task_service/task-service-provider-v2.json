@@ -112,7 +112,7 @@
             "start": { "const": "expected_assignment_revision; attempt=null" },
             "decline": { "const": "expected_assignment_revision; attempt=null" },
             "report_status": { "const": "expected_assignment_revision; attempt_number; attempt_token; expected_attempt_revision" },
-            "block": { "const": "expected_assignment_revision; attempt_number; attempt_token; expected_attempt_revision" },
+            "block": { "const": "required bounded blocker summary; expected_assignment_revision; attempt_number; attempt_token; expected_attempt_revision" },
             "resume": { "const": "expected_assignment_revision; attempt_number; attempt_token; expected_attempt_revision" },
             "submit": { "const": "expected_assignment_revision; attempt_number; attempt_token; expected_attempt_revision" },
             "abort_attempt": { "const": "expected_assignment_revision; attempt_number; attempt_token; expected_attempt_revision" }
@@ -144,7 +144,7 @@
         },
         "send_attempt_cas": { "const": "Task Service system communication events carry expected_send_attempt_revision" },
         "assignment_contract_delivery": { "const": "new protected assignment messages carry the exact committed task revision opaque_contract and contract_sha256; sender, queue and receiver verify SHA-256 over exact UTF-8 bytes; the human summary is separate and never substitutes for or duplicates the contract; legacy committed messages without opaque_contract remain readable; transport maximum is 262144 bytes with no truncation, and recovery is a new smaller task revision" },
-        "completion_notification_outbox": { "const": "semantic transitions atomically persist stable assignment+attempt+task-revision+action correlated intentions; authenticated Task Service system delivery records queued, delivered or uncertain facts without changing task completion" },
+        "completion_notification_outbox": { "const": "semantic transitions atomically persist stable assignment+attempt+task-revision+action correlated intentions; blocked notifications carry the bounded blocker summary plus transition action identity and request actionable Director guidance through Soon delivery; authenticated Task Service system delivery records queued, delivered or uncertain facts without changing task completion" },
         "worker_followup_outbox": { "const": "request_changes atomically persists one exact-assignee durable-session follow-up; authenticated Task Service Soon delivery records queued, delivered or uncertain facts and requires native context insertion before Agent Bus acknowledgement" },
         "stable_digest": { "const": "authenticated action ID + semantic request + durable original attempt binding where applicable; excludes every expected aggregate revision, journal sequence, runtime occurrence and session-store revision for Worker, coordinator, terminal and system-send actions" },
         "durable_preparation": { "const": "journaled prepared_worker_actions keyed by action ID survive provider reopen; same semantic action may refresh CAS only while assignment and attempt identity remain unchanged and legal; successful execution collapses preparation into its durable receipt" },

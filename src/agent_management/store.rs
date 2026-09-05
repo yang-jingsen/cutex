@@ -19,6 +19,7 @@ use super::{
     LegacyDirectorOwnershipImportReceipt, ManagedAgentRecord, ProjectAuthority,
     ProjectAuthorityReceipt, ProjectId,
 };
+use crate::management::control_plane::HumanManagementOperatorActionRecord;
 
 const STORE_FILE: &str = "agent-management-v1.json";
 const LOCK_FILE: &str = "agent-management-v1.lock";
@@ -39,6 +40,11 @@ pub struct AgentManagementSnapshot {
     pub operator_grant_revisions: BTreeMap<ProjectId, u64>,
     #[serde(default)]
     pub operator_audit_events: BTreeMap<String, AgentOperatorAuditEvent>,
+    /// Idempotency receipts for the separate Human/Management action domain.
+    /// These records never impersonate an Agent Management action caller.
+    #[serde(default)]
+    pub human_management_operator_actions:
+        BTreeMap<AgentActionId, HumanManagementOperatorActionRecord>,
     /// Non-authoritative UI metadata. Its map key is always the canonical
     /// provider-owned project identity; none of these values participate in
     /// authorization.
@@ -73,6 +79,7 @@ impl AgentManagementSnapshot {
             operator_grants: BTreeMap::new(),
             operator_grant_revisions: BTreeMap::new(),
             operator_audit_events: BTreeMap::new(),
+            human_management_operator_actions: BTreeMap::new(),
             project_presentations: BTreeMap::new(),
             agents: BTreeMap::new(),
             actions: BTreeMap::new(),

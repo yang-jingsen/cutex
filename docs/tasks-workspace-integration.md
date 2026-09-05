@@ -1,20 +1,23 @@
 # Tasks workspace integration
 
-This change is intentionally modular: the Task Service table, its refresh
-model, rendering tests, and Director-query client live in
-`src/cli_app/session_tui_tasks.rs` and do not depend on agent selector data.
+The Task Service table, one-second refresh model, rendering tests, and
+Human/Management query client live in `src/cli_app/session_tui_tasks.rs` and do
+not derive authority from the Agent selector.
 
-This change is rebased on `9be37fbc485f472853e24d30be52d9f494c48391`. The
-home panel retains distinct Cutex Projects, Codex Workspaces, and Tasks rows;
-the Tasks route is isolated in `session_tui_tasks::run()`. The Tasks module
-continues to issue only
-`cutex/task-service-director-action/v2` queries; do not replace this with a
-cwd, group, display-name, or native-workspace lookup.
+As of R36, the normal no-environment TUI calls the root-authenticated
+`POST /v2/task-service/management-query` route. The request is a strict query
+document and cannot claim an Agent, Director, project, or seat identity. The
+server anchors the read to the exact current `cutex-director` seat occupant and
+intersects it with exact Agent Management Primary Director authority before
+using the existing Director projection. An Operator grant never supplies Task
+Service Director authority.
 
-The v2 Director route now filters task records against the authenticated
-Director session's exact Agent Management project authority. Presentation
-metadata is display/filter-only and cannot grant or select that scope. For
-each returned task, the UI resolves Project display name and badge only by an
-exact canonical `project_id` lookup in the authoritative Project store. A
-missing exact record remains visibly unavailable; it never falls back to a
-similar name, badge, workspace, cwd, or group.
+Presentation metadata is display/filter-only. For each returned task, the UI
+resolves the Project display name and badge only by an exact canonical
+`project_id` lookup in the authenticated response. A missing exact record
+remains visibly unavailable; it never falls back to a similar name, badge,
+workspace, cwd, group, runtime ID, or Agent name. Online status is likewise an
+exact `cutex_session_id` join against the live Agent Bus roster.
+
+See [r36-management-ui.md](r36-management-ui.md) for the shared credential and
+navigation contract.

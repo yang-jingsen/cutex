@@ -35,6 +35,7 @@ use cutex::platform::process::{process_is_running, process_started_at};
 use cutex::profiles::model::CodezConfig;
 use cutex::runtime::alden::find_live_cute_alden_session_by_name;
 use cutex::runtime::lifecycle::cutex_session_host_is_local;
+use cutex::runtime::process_scope::terminate_managed_agent_scope;
 use cutex::session::model::CutexAppServerRuntimeBinding;
 use cutex::session::model::CutexAppServerTransport;
 use cutex::session::model::CutexSessionRecord;
@@ -304,6 +305,14 @@ pub(crate) fn recover_persisted_runtime_for_lifecycle(
     match classify_local_persisted_runtime_recovery(expected, process_is_running) {
         PersistedRuntimeRecoveryAction::Launch => Ok(ManagedRuntimeRecoveryOutcome::NoClaim),
         PersistedRuntimeRecoveryAction::ClearStaleAndLaunch => {
+            let scope_stop = terminate_managed_agent_scope(&expected.cutex_session_id, true)
+                .context("failed to clean a stale managed Agent process scope")?;
+            if !scope_stop.stopped {
+                anyhow::bail!(
+                    "stale managed Agent process scope remained active: {}",
+                    scope_stop.detail
+                );
+            }
             clear_stale_persisted_runtime(expected)?;
             Ok(ManagedRuntimeRecoveryOutcome::ClearedDeadClaim)
         }

@@ -1773,7 +1773,12 @@ mod tests {
     fn spec() -> ManagedAgentSpec {
         ManagedAgentSpec {
             name: "worker-r1".to_string(),
-            cwd: "/tmp/project/agent-home/worker-r1".to_string(),
+            cwd: if cfg!(windows) {
+                r"C:\tmp\project\agent-home\worker-r1"
+            } else {
+                "/tmp/project/agent-home/worker-r1"
+            }
+            .to_string(),
             profile: "aemeath".to_string(),
             runtime_backend: "cute_alden".to_string(),
             model: "gpt-5.6-sol".to_string(),
@@ -1982,8 +1987,9 @@ mod tests {
 
     #[test]
     fn bootstrap_plan_uses_normal_cutex_exec_hi_lifecycle() {
-        let plan = native_bootstrap_plan(&spec()).unwrap();
-        assert_eq!(plan.cwd, PathBuf::from("/tmp/project/agent-home/worker-r1"));
+        let spec = spec();
+        let plan = native_bootstrap_plan(&spec).unwrap();
+        assert_eq!(plan.cwd, PathBuf::from(&spec.cwd));
         assert_eq!(
             plan.args,
             [

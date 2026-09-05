@@ -661,7 +661,7 @@ fn render(frame: &mut Frame<'_>, model: &ProjectModel) {
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                "Codex Workspaces",
+                "Workspaces",
                 Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
             Span::styled(status, Style::new().fg(Color::Yellow)),
@@ -879,8 +879,7 @@ fn open_terminal() -> anyhow::Result<ProjectTerminal> {
         let _ = disable_raw_mode();
         return Err(error).context("Failed to enter alternate screen");
     }
-    Terminal::new(CrosstermBackend::new(stdout))
-        .context("Failed to initialize Codex Workspaces terminal")
+    Terminal::new(CrosstermBackend::new(stdout)).context("Failed to initialize Workspaces terminal")
 }
 
 impl Drop for ProjectTerminalRestore {
@@ -900,7 +899,12 @@ mod tests {
         assert!(valid_name(" ").is_err());
         assert!(valid_name(&"a".repeat(201)).is_err());
         assert!(valid_roots("relative").is_err());
-        assert_eq!(valid_roots("/work/a, /work/b").unwrap().len(), 2);
+        let roots = if cfg!(windows) {
+            r"C:\work\a, C:\work\b"
+        } else {
+            "/work/a, /work/b"
+        };
+        assert_eq!(valid_roots(roots).unwrap().len(), 2);
     }
     #[test]
     fn pagination_keeps_the_selected_project_id_when_present() {
@@ -1006,7 +1010,7 @@ mod tests {
         let form = Form {
             kind: FormKind::Import,
             name: "a".to_string(),
-            roots: "/a".to_string(),
+            roots: if cfg!(windows) { r"C:\a" } else { "/a" }.to_string(),
             threads: "t1".to_string(),
             field: 2,
         };
