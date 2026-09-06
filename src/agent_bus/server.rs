@@ -92,6 +92,82 @@ const RESET: &str = "\x1b[0m";
 const YELLOW: &str = "\x1b[33m";
 const MAX_POLL_WAIT: Duration = Duration::from_secs(5);
 const COMPLETION_DRAIN_RETRY_SECS: u64 = 5;
+const TASK_WATCHDOG_FAILURE_LOG_BACKOFF: Duration = Duration::from_secs(300);
+
+type TaskWatchdogPresentationKey = (String, String);
+
+// Process-local because the integration dedupe ledger is the durable commit
+// oracle. Retaining only the current (Director, fact) pairs prevents a stable
+// fact from rescanning the entire bounded Management v2 journal every poll,
+// while a Director rebind still gets its own owner-scoped presentation.
+#[derive(Default)]
+struct TaskWatchdogPresentationCommits {
+    keys: BTreeSet<TaskWatchdogPresentationKey>,
+}
+
+impl TaskWatchdogPresentationCommits {
+    fn contains(&self, key: &TaskWatchdogPresentationKey) -> bool {
+        self.keys.contains(key)
+    }
+
+    fn insert(&mut self, key: TaskWatchdogPresentationKey) {
+        self.keys.insert(key);
+    }
+
+    fn retain_active(&mut self, active: &BTreeSet<TaskWatchdogPresentationKey>) {
+        self.keys.retain(|key| active.contains(key));
+    }
+}
+
+struct TaskWatchdogFailureLogEntry {
+    fingerprint: String,
+    last_emitted_at: Instant,
+    suppressed: u64,
+}
+
+// Watchdog decisions remain fail-closed on every poll. This state changes only
+// how often an identical diagnostic is printed, not whether scans are retried.
+#[derive(Default)]
+struct TaskWatchdogFailureLog {
+    current: Option<TaskWatchdogFailureLogEntry>,
+}
+
+impl TaskWatchdogFailureLog {
+    fn record_failure(
+        &mut self,
+        fingerprint: &str,
+        now: Instant,
+        backoff: Duration,
+    ) -> Option<u64> {
+        match self.current.as_mut() {
+            Some(current)
+                if current.fingerprint == fingerprint
+                    && now.saturating_duration_since(current.last_emitted_at) < backoff =>
+            {
+                current.suppressed = current.suppressed.saturating_add(1);
+                None
+            }
+            Some(current) if current.fingerprint == fingerprint => {
+                let suppressed = current.suppressed;
+                current.last_emitted_at = now;
+                current.suppressed = 0;
+                Some(suppressed)
+            }
+            _ => {
+                self.current = Some(TaskWatchdogFailureLogEntry {
+                    fingerprint: fingerprint.to_string(),
+                    last_emitted_at: now,
+                    suppressed: 0,
+                });
+                Some(0)
+            }
+        }
+    }
+
+    fn record_success(&mut self) {
+        self.current = None;
+    }
+}
 
 #[cfg(test)]
 #[derive(Default)]
@@ -136,6 +212,7 @@ pub struct TaskWorkerActionHost {
     provider: Option<crate::task_service::TaskServiceProvider>,
     seat_authority: Option<crate::seat::SeatOccupancyStore>,
     watchdog: Option<Arc<crate::task_service::TaskStaleWatchdog>>,
+    watchdog_presentation_commits: Mutex<TaskWatchdogPresentationCommits>,
     execution: Mutex<()>,
     completion_drain_requested: AtomicBool,
     completion_unavailable_target_seats: Mutex<BTreeSet<String>>,
@@ -179,6 +256,7 @@ impl TaskWorkerActionHost {
             provider: Some(provider),
             seat_authority: Some(seat_authority),
             watchdog: Some(watchdog),
+            watchdog_presentation_commits: Mutex::new(TaskWatchdogPresentationCommits::default()),
             execution: Mutex::new(()),
             completion_drain_requested: AtomicBool::new(true),
             completion_unavailable_target_seats: Mutex::new(BTreeSet::new()),
@@ -205,6 +283,7 @@ impl TaskWorkerActionHost {
             provider: None,
             seat_authority: None,
             watchdog: None,
+            watchdog_presentation_commits: Mutex::new(TaskWatchdogPresentationCommits::default()),
             execution: Mutex::new(()),
             completion_drain_requested: AtomicBool::new(false),
             completion_unavailable_target_seats: Mutex::new(BTreeSet::new()),
@@ -231,6 +310,7 @@ impl TaskWorkerActionHost {
             provider: Some(provider),
             seat_authority: Some(seat_authority),
             watchdog: None,
+            watchdog_presentation_commits: Mutex::new(TaskWatchdogPresentationCommits::default()),
             execution: Mutex::new(()),
             completion_drain_requested: AtomicBool::new(true),
             completion_unavailable_target_seats: Mutex::new(BTreeSet::new()),
@@ -398,13 +478,27 @@ impl TaskWorkerActionHost {
         let state = Arc::clone(state);
         std::thread::Builder::new()
             .name("cutex-task-watchdog".to_string())
-            .spawn(move || loop {
-                if let Err(error) = host.run_task_watchdog_once(&state) {
-                    eprintln!(
-                        "{YELLOW}warning:{RESET} Task Service watchdog scan failed closed: {error:#}"
-                    );
+            .spawn(move || {
+                let mut failure_log = TaskWatchdogFailureLog::default();
+                loop {
+                    match host.run_task_watchdog_once(&state) {
+                        Ok(()) => failure_log.record_success(),
+                        Err(error) => {
+                            let fingerprint = format!("{error:#}");
+                            if let Some(suppressed) = failure_log.record_failure(
+                                &fingerprint,
+                                Instant::now(),
+                                TASK_WATCHDOG_FAILURE_LOG_BACKOFF,
+                            ) {
+                                eprintln!(
+                                    "{YELLOW}warning:{RESET} Task Service watchdog scan failed closed: {fingerprint} [at {}; suppressed {suppressed} identical failure(s)]",
+                                    Utc::now().to_rfc3339(),
+                                );
+                            }
+                        }
+                    }
+                    std::thread::sleep(interval);
                 }
-                std::thread::sleep(interval);
             })
             .context("failed to spawn Task Service watchdog scheduler")?;
         Ok(())
@@ -451,6 +545,7 @@ impl TaskWorkerActionHost {
             });
         }
 
+        let mut active_presentation_commits = BTreeSet::new();
         for fact in &outcome.presentations {
             let assignment_id =
                 match crate::task_service::AssignmentId::new(fact.assignment_id.clone()) {
@@ -480,11 +575,32 @@ impl TaskWorkerActionHost {
             else {
                 continue;
             };
-            crate::management::v2::integration_events::append_task_watchdog_fact(
+            let presentation_key = (
+                director.occupant_cutex_session.as_str().to_string(),
+                fact.fact_id.clone(),
+            );
+            active_presentation_commits.insert(presentation_key.clone());
+            if self
+                .watchdog_presentation_commits
+                .lock()
+                .map_err(|_| anyhow!("Task watchdog presentation commit lock poisoned"))?
+                .contains(&presentation_key)
+            {
+                continue;
+            }
+            crate::management::v2::integration_events::ensure_task_watchdog_fact_committed(
                 &director.occupant_cutex_session,
                 fact,
             )?;
+            self.watchdog_presentation_commits
+                .lock()
+                .map_err(|_| anyhow!("Task watchdog presentation commit lock poisoned"))?
+                .insert(presentation_key);
         }
+        self.watchdog_presentation_commits
+            .lock()
+            .map_err(|_| anyhow!("Task watchdog presentation commit lock poisoned"))?
+            .retain_active(&active_presentation_commits);
 
         for notification in outcome.notifications {
             let target_session = match &notification.target {
@@ -4187,6 +4303,56 @@ mod tests {
         PilotDeliveryRequest, PilotOwnerSnapshot, PilotPublishRequest, PilotTaskSpecification,
         TaskDeliveryPilot,
     };
+
+    #[test]
+    fn watchdog_failure_logging_backs_off_identical_errors_and_resets_after_success() {
+        let mut log = TaskWatchdogFailureLog::default();
+        let start = Instant::now();
+        let backoff = Duration::from_secs(60);
+
+        assert_eq!(log.record_failure("retention", start, backoff), Some(0));
+        assert_eq!(
+            log.record_failure("retention", start + Duration::from_secs(1), backoff),
+            None
+        );
+        assert_eq!(
+            log.record_failure("retention", start + Duration::from_secs(59), backoff),
+            None
+        );
+        assert_eq!(
+            log.record_failure("retention", start + Duration::from_secs(60), backoff),
+            Some(2)
+        );
+        assert_eq!(
+            log.record_failure("different", start + Duration::from_secs(61), backoff),
+            Some(0)
+        );
+
+        log.record_success();
+        assert_eq!(
+            log.record_failure("retention", start + Duration::from_secs(62), backoff),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn watchdog_presentation_commits_are_active_bounded_and_owner_scoped() {
+        let old_owner = ("cutex.director-old".to_string(), "twf_same".to_string());
+        let new_owner = ("cutex.director-new".to_string(), "twf_same".to_string());
+        let mut commits = TaskWatchdogPresentationCommits::default();
+
+        commits.insert(old_owner.clone());
+        assert!(commits.contains(&old_owner));
+        assert!(!commits.contains(&new_owner));
+
+        commits.retain_active(&BTreeSet::from([new_owner.clone()]));
+        assert!(!commits.contains(&old_owner));
+        commits.insert(new_owner.clone());
+        assert!(commits.contains(&new_owner));
+
+        commits.retain_active(&BTreeSet::new());
+        assert!(commits.keys.is_empty());
+    }
 
     #[test]
     fn v2_project_scope_uses_only_the_exact_director_session() {

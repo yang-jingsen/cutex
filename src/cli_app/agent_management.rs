@@ -671,15 +671,15 @@ impl AgentLifecycle for CutexAgentLifecycle {
     ) -> Result<NativeBootstrapReconciliation, LifecycleFailure> {
         let resolved = super::launch::resolve_launch_profile_override(&spec.profile)
             .map_err(unknown("native_bootstrap_reconciliation_unavailable"))?;
-        let effective_profile = resolved.effective_name();
         let expected_agent_name = cutex::agent_bus::identity::account_agent_name(&resolved.account);
         let expected_alden_name =
             cutex::runtime::managed_launch::default_managed_session_name_for_cwd(
                 &resolved.account,
                 Path::new(&spec.cwd),
             );
-        // The cwd is a correlation marker only. Exact identity additionally
-        // requires the launch profile/name/groups; no authority is inferred.
+        // The cwd is a correlation marker only. Exact correlation additionally
+        // requires the managed name/groups; the selected profile determines
+        // where native rollout evidence is read, but is not durable identity.
         let state = self.state.lock().map_err(|_| {
             LifecycleFailure::outcome_unknown(
                 "native_bootstrap_reconciliation_unavailable",
@@ -693,7 +693,6 @@ impl AgentLifecycle for CutexAgentLifecycle {
             .collect::<Vec<_>>();
         if !matching_agents.is_empty() {
             let exact = matching_agents.len() == 1
-                && matching_agents[0].profile == effective_profile
                 && (matching_agents[0].name == expected_agent_name
                     || matching_agents[0].base_name.as_deref()
                         == Some(expected_agent_name.as_str()))
@@ -703,8 +702,7 @@ impl AgentLifecycle for CutexAgentLifecycle {
                     .all(|group| matching_agents[0].groups.contains(group));
             return Ok(if exact {
                 NativeBootstrapReconciliation::Present {
-                    reason: "exact Agent Bus profile/name/cwd/groups identity is registered"
-                        .to_string(),
+                    reason: "exact Agent Bus name/cwd/groups correlation is registered".to_string(),
                 }
             } else {
                 NativeBootstrapReconciliation::Ambiguous {
@@ -726,7 +724,6 @@ impl AgentLifecycle for CutexAgentLifecycle {
             .collect::<Vec<_>>();
         if !matching_records.is_empty() {
             let exact = matching_records.len() == 1
-                && matching_records[0].profile.as_deref() == Some(effective_profile)
                 && (matching_records[0].thread_name.as_deref() == Some(spec.name.as_str())
                     || matching_records[0].display_name_hint.as_deref()
                         == Some(spec.name.as_str()))
@@ -736,8 +733,7 @@ impl AgentLifecycle for CutexAgentLifecycle {
                     .all(|group| matching_records[0].agent_groups.contains(group));
             return Ok(if exact {
                 NativeBootstrapReconciliation::Present {
-                    reason: "exact durable session profile/name/cwd/groups identity exists"
-                        .to_string(),
+                    reason: "exact durable session name/cwd/groups correlation exists".to_string(),
                 }
             } else {
                 NativeBootstrapReconciliation::Ambiguous {
@@ -804,7 +800,6 @@ impl AgentLifecycle for CutexAgentLifecycle {
     ) -> Result<NativeBootstrapIdentityReconciliation, LifecycleFailure> {
         let resolved = super::launch::resolve_launch_profile_override(&spec.profile)
             .map_err(unknown("native_bootstrap_reconciliation_unavailable"))?;
-        let effective_profile = resolved.effective_name();
         let expected_agent_name = cutex::agent_bus::identity::account_agent_name(&resolved.account);
         let expected_alden_name =
             cutex::runtime::managed_launch::default_managed_session_name_for_cwd(
@@ -834,7 +829,6 @@ impl AgentLifecycle for CutexAgentLifecycle {
             .collect::<Vec<_>>();
         if !matching_agents.is_empty() {
             let exact = matching_agents.len() == 1
-                && matching_agents[0].profile == effective_profile
                 && (matching_agents[0].name == expected_agent_name
                     || matching_agents[0].base_name.as_deref()
                         == Some(expected_agent_name.as_str()))
@@ -879,7 +873,6 @@ impl AgentLifecycle for CutexAgentLifecycle {
                     &matching_records[0].host_id,
                     &cutex::platform::host::current_host_name(),
                 )
-                && matching_records[0].profile.as_deref() == Some(effective_profile)
                 && (matching_records[0].thread_name.as_deref() == Some(spec.name.as_str())
                     || matching_records[0].display_name_hint.as_deref()
                         == Some(spec.name.as_str()))
@@ -959,11 +952,11 @@ impl AgentLifecycle for CutexAgentLifecycle {
         let candidates = candidates.into_iter().collect::<Vec<_>>();
         match (attempt_window_native_sid.as_deref(), candidates.as_slice()) {
             (Some(window_sid), [native_session_id]) if window_sid == native_session_id => {
+                let reason = "one native SID is shared by selected-profile rollout evidence and exact managed runtime sources"
+                    .to_string();
                 Ok(NativeBootstrapIdentityReconciliation::Exact {
-                native_session_id: native_session_id.clone(),
-                reason:
-                    "one native SID matches the selected profile/runtime and exact managed identity"
-                        .to_string(),
+                    native_session_id: native_session_id.clone(),
+                    reason,
                 })
             }
             (None, []) if identity_present_without_sid => {
@@ -1415,36 +1408,58 @@ fn validate_managed_recovery_record(
     } else {
         CutexSessionQuickActionMode::Auto
     };
-    let exact = record.is_active()
-        && record.cutex_session_id == cutex_session_id.as_str()
-        && cutex::runtime::lifecycle::cutex_session_host_is_local(
-            &record.host_id,
-            &cutex::platform::host::current_host_name(),
-        )
-        && record.codex_session_id.as_deref() == Some(native_session_id)
-        && record.managed_cwd.as_deref() == Some(spec.cwd.as_str())
-        && cutex_session_launch_cwd(record) == spec.cwd
-        && record.profile.as_deref() == Some(spec.profile.as_str())
-        && record.runtime_backend == backend
-        && record.thread_name.as_deref() == Some(spec.name.as_str())
-        && record.display_name_hint.as_deref() == Some(spec.name.as_str())
-        && record.agent_enabled
-        && groups_match
-        && record.registration_class == AgentRegistrationClass::Persistent
-        && record.exposed_to_backend == spec.expose_to_im
-        && record.quick_action == quick_action
-        && record.permission_defaults.as_deref() == Some(spec.permissions.as_str())
-        && record.approval_policy.as_deref() == Some(spec.approval_policy.as_str())
-        && record.sandbox_mode.as_deref() == Some(spec.sandbox_mode.as_str())
-        && record.model_defaults.as_deref() == Some(spec.model.as_str())
-        && record.reasoning_defaults.as_deref() == Some(spec.reasoning.as_str());
-    if exact {
-        Ok(())
+    // The durable record's profile may be inherited, cleared, or changed after
+    // creation. It is launch configuration, not recovery identity.
+    let mismatch = if !record.is_active() {
+        Some("active")
+    } else if record.cutex_session_id != cutex_session_id.as_str() {
+        Some("cutex_session_id")
+    } else if !cutex::runtime::lifecycle::cutex_session_host_is_local(
+        &record.host_id,
+        &cutex::platform::host::current_host_name(),
+    ) {
+        Some("host_id")
+    } else if record.codex_session_id.as_deref() != Some(native_session_id) {
+        Some("native_session_id")
+    } else if record.managed_cwd.as_deref() != Some(spec.cwd.as_str()) {
+        Some("managed_cwd")
+    } else if cutex_session_launch_cwd(record) != spec.cwd {
+        Some("launch_cwd")
+    } else if record.runtime_backend != backend {
+        Some("runtime_backend")
+    } else if record.thread_name.as_deref() != Some(spec.name.as_str()) {
+        Some("thread_name")
+    } else if record.display_name_hint.as_deref() != Some(spec.name.as_str()) {
+        Some("display_name_hint")
+    } else if !record.agent_enabled {
+        Some("agent_enabled")
+    } else if !groups_match {
+        Some("groups")
+    } else if record.registration_class != AgentRegistrationClass::Persistent {
+        Some("registration_class")
+    } else if record.exposed_to_backend != spec.expose_to_im {
+        Some("expose_to_im")
+    } else if record.quick_action != quick_action {
+        Some("pin")
+    } else if record.permission_defaults.as_deref() != Some(spec.permissions.as_str()) {
+        Some("permissions")
+    } else if record.approval_policy.as_deref() != Some(spec.approval_policy.as_str()) {
+        Some("approval_policy")
+    } else if record.sandbox_mode.as_deref() != Some(spec.sandbox_mode.as_str()) {
+        Some("sandbox_mode")
+    } else if record.model_defaults.as_deref() != Some(spec.model.as_str()) {
+        Some("model")
+    } else if record.reasoning_defaults.as_deref() != Some(spec.reasoning.as_str()) {
+        Some("reasoning")
     } else {
-        Err(LifecycleFailure::definite(
+        None
+    };
+    match mismatch {
+        Some(field) => Err(LifecycleFailure::definite(
             "runtime_recovery_spec_mismatch",
-            "durable session/native identity or managed runtime spec does not match",
-        ))
+            format!("durable managed runtime mismatch: {field}"),
+        )),
+        None => Ok(()),
     }
 }
 
@@ -1904,7 +1919,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_runtime_recovery_requires_exact_durable_native_and_spec_identity() {
+    fn managed_runtime_recovery_requires_exact_durable_native_and_stable_spec_identity() {
         let spec = spec();
         let cutex_session_id = CutexSessionId::new("cutex.worker-r1").unwrap();
         let native_session_id = "01a041ba-47f6-7e31-bb09-1462cd309ae4";
@@ -1942,9 +1957,6 @@ mod tests {
         reject_record_change!("managed cwd", |value: &mut CutexSessionRecord| {
             value.managed_cwd = Some("/tmp/other-managed-cwd".to_string())
         });
-        reject_record_change!("profile", |value: &mut CutexSessionRecord| {
-            value.profile = Some("other-profile".to_string())
-        });
         reject_record_change!("name", |value: &mut CutexSessionRecord| {
             value.thread_name = Some("other-worker".to_string())
         });
@@ -1966,6 +1978,30 @@ mod tests {
         reject_record_change!("reasoning", |value: &mut CutexSessionRecord| {
             value.reasoning_defaults = Some("low".to_string())
         });
+    }
+
+    #[test]
+    fn managed_runtime_recovery_accepts_null_empty_or_changed_durable_profile() {
+        let spec = spec();
+        let cutex_session_id = CutexSessionId::new("cutex.worker-r1").unwrap();
+        let native_session_id = "01a041ba-47f6-7e31-bb09-1462cd309ae4";
+
+        for profile in [None, Some(""), Some("octobre")] {
+            let mut record = managed_recovery_record(&spec);
+            record.profile = profile.map(str::to_string);
+            let result = validate_managed_recovery_record(
+                &record,
+                &cutex_session_id,
+                native_session_id,
+                &spec,
+            );
+            assert!(
+                result.is_ok(),
+                "spec profile aemeath must not reject observed profile {:?}: {:?}",
+                profile,
+                result
+            );
+        }
     }
 
     #[test]

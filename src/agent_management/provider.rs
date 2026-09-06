@@ -3647,25 +3647,13 @@ fn validate_recovery_spec(
     let spec = &agent.spec;
     let groups_match = observation.groups == spec.groups
         || observation.groups == expected_runtime_groups(&spec.cwd, &spec.groups);
-    if observation.active
-        && observation.cutex_session_id == agent.cutex_session_id
-        && observation.native_session_id == agent.native_session_id
-        && observation.cwd == spec.cwd
-        && observation.profile == spec.profile
-        && observation.runtime_backend == spec.runtime_backend
-        && observation.model == spec.model
-        && observation.reasoning == spec.reasoning
-        && observation.permissions == spec.permissions
-        && observation.approval_policy == spec.approval_policy
-        && observation.sandbox_mode == spec.sandbox_mode
-        && groups_match
-    {
-        Ok(())
-    } else {
-        Err(AgentManagementError::OwnerActionRequired(
-            "runtime recovery durable/native identity or managed spec mismatch".to_string(),
-        ))
+    if !observation.active {
+        return Err(managed_observation_mismatch("runtime recovery", "active"));
     }
+    if let Some(field) = managed_spec_mismatch(agent, observation, groups_match) {
+        return Err(managed_observation_mismatch("runtime recovery", field));
+    }
+    Ok(())
 }
 
 fn validate_managed_observation_identity(
@@ -3675,25 +3663,19 @@ fn validate_managed_observation_identity(
     let spec = &agent.spec;
     let groups_match = observation.groups == spec.groups
         || observation.groups == expected_runtime_groups(&spec.cwd, &spec.groups);
-    if observation.cutex_session_id == agent.cutex_session_id
-        && observation.native_session_id == agent.native_session_id
-        && observation.cwd == spec.cwd
-        && observation.profile == spec.profile
-        && observation.runtime_backend == spec.runtime_backend
-        && observation.model == spec.model
-        && observation.reasoning == spec.reasoning
-        && observation.permissions == spec.permissions
-        && observation.approval_policy == spec.approval_policy
-        && observation.sandbox_mode == spec.sandbox_mode
-        && groups_match
-        && observation.runtime_generation > 0
-    {
-        Ok(())
-    } else {
-        Err(AgentManagementError::OwnerActionRequired(
-            "predecessor durable/native identity or managed spec mismatch".to_string(),
-        ))
+    if let Some(field) = managed_spec_mismatch(agent, observation, groups_match) {
+        return Err(managed_observation_mismatch(
+            "managed Agent observation",
+            field,
+        ));
     }
+    if observation.runtime_generation == 0 {
+        return Err(managed_observation_mismatch(
+            "managed Agent observation",
+            "runtime_generation",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_ready(
@@ -3701,31 +3683,81 @@ fn validate_ready(
     observation: &AgentRuntimeObservation,
 ) -> Result<(), AgentManagementError> {
     let spec = &agent.spec;
-    let one_runtime = observation.runtime_agent_ids.as_slice();
-    let one_endpoint = observation.agent_bus_endpoint_ids.as_slice();
-    let exact = observation.active
-        && observation.cutex_session_id == agent.cutex_session_id
-        && observation.native_session_id == agent.native_session_id
-        && observation.cwd == spec.cwd
-        && observation.profile == spec.profile
-        && observation.runtime_backend == spec.runtime_backend
-        && observation.model == spec.model
-        && observation.reasoning == spec.reasoning
-        && observation.permissions == spec.permissions
-        && observation.approval_policy == spec.approval_policy
-        && observation.sandbox_mode == spec.sandbox_mode
-        && observation.groups == expected_runtime_groups(&spec.cwd, &spec.groups)
-        && observation.runtime_generation > 0
-        && observation.app_server_runtime
-        && matches!((one_runtime, one_endpoint), ([runtime], [endpoint]) if runtime == endpoint);
-    if exact {
-        Ok(())
-    } else {
-        Err(AgentManagementError::OwnerActionRequired(
-            "Agent readiness does not match the exact durable specification and sole endpoint"
-                .to_string(),
-        ))
+    if !observation.active {
+        return Err(managed_observation_mismatch("Agent readiness", "active"));
     }
+    let groups_match = observation.groups == expected_runtime_groups(&spec.cwd, &spec.groups);
+    if let Some(field) = managed_spec_mismatch(agent, observation, groups_match) {
+        return Err(managed_observation_mismatch("Agent readiness", field));
+    }
+    if observation.runtime_generation == 0 {
+        return Err(managed_observation_mismatch(
+            "Agent readiness",
+            "runtime_generation",
+        ));
+    }
+    if !observation.app_server_runtime {
+        return Err(managed_observation_mismatch(
+            "Agent readiness",
+            "app_server_runtime",
+        ));
+    }
+    let [runtime] = observation.runtime_agent_ids.as_slice() else {
+        return Err(managed_observation_mismatch(
+            "Agent readiness",
+            "runtime_agent_ids",
+        ));
+    };
+    let [endpoint] = observation.agent_bus_endpoint_ids.as_slice() else {
+        return Err(managed_observation_mismatch(
+            "Agent readiness",
+            "agent_bus_endpoint_ids",
+        ));
+    };
+    if runtime != endpoint {
+        return Err(managed_observation_mismatch(
+            "Agent readiness",
+            "sole_endpoint_identity",
+        ));
+    }
+    Ok(())
+}
+
+fn managed_spec_mismatch(
+    agent: &ManagedAgentRecord,
+    observation: &AgentRuntimeObservation,
+    groups_match: bool,
+) -> Option<&'static str> {
+    let spec = &agent.spec;
+    // `profile` is mutable launch configuration/provenance. It is deliberately
+    // excluded from the durable/native identity and stable-spec comparison.
+    if observation.cutex_session_id != agent.cutex_session_id {
+        Some("cutex_session_id")
+    } else if observation.native_session_id != agent.native_session_id {
+        Some("native_session_id")
+    } else if observation.cwd != spec.cwd {
+        Some("cwd")
+    } else if observation.runtime_backend != spec.runtime_backend {
+        Some("runtime_backend")
+    } else if observation.model != spec.model {
+        Some("model")
+    } else if observation.reasoning != spec.reasoning {
+        Some("reasoning")
+    } else if observation.permissions != spec.permissions {
+        Some("permissions")
+    } else if observation.approval_policy != spec.approval_policy {
+        Some("approval_policy")
+    } else if observation.sandbox_mode != spec.sandbox_mode {
+        Some("sandbox_mode")
+    } else if !groups_match {
+        Some("groups")
+    } else {
+        None
+    }
+}
+
+fn managed_observation_mismatch(context: &str, field: &str) -> AgentManagementError {
+    AgentManagementError::OwnerActionRequired(format!("{context} mismatch: {field}"))
 }
 
 fn expected_runtime_groups(cwd: &str, groups: &[String]) -> Vec<String> {
@@ -3987,6 +4019,16 @@ mod tests {
             state.agents.get_mut(cutex_session_id).unwrap().groups = groups;
         }
 
+        fn set_profile(&self, cutex_session_id: &CutexSessionId, profile: &str) {
+            self.state
+                .lock()
+                .unwrap()
+                .agents
+                .get_mut(cutex_session_id)
+                .unwrap()
+                .profile = profile.to_string();
+        }
+
         fn disconnect_with_claim(&self, cutex_session_id: &CutexSessionId, recovery: FakeRecovery) {
             let mut state = self.state.lock().unwrap();
             state.recovery = recovery;
@@ -4198,7 +4240,6 @@ mod tests {
             let agent = state.agents.get_mut(cutex_session_id).unwrap();
             if agent.native_session_id != native_session_id
                 || agent.cwd != spec.cwd
-                || agent.profile != spec.profile
                 || agent.runtime_backend != spec.runtime_backend
                 || agent.model != spec.model
                 || agent.reasoning != spec.reasoning
@@ -5294,16 +5335,14 @@ mod tests {
             ($field:ident, $value:expr) => {{
                 let mut changed = ready.clone();
                 changed.$field = $value.to_string();
-                assert!(
-                    validate_ready(&agent, &changed).is_err(),
-                    stringify!($field)
-                );
+                let error = validate_ready(&agent, &changed)
+                    .expect_err(concat!("must reject ", stringify!($field)));
+                assert!(error.to_string().contains(stringify!($field)));
             }};
         }
 
         reject_string_change!(native_session_id, "other-native");
         reject_string_change!(cwd, test_agent_cwd("other-cwd"));
-        reject_string_change!(profile, "other-profile");
         reject_string_change!(runtime_backend, "host_foreground");
         reject_string_change!(model, "other-model");
         reject_string_change!(reasoning, "other-reasoning");
@@ -5320,6 +5359,35 @@ mod tests {
             .agent_bus_endpoint_ids
             .push("runtime:unexpected:2".to_string());
         assert!(validate_ready(&agent, &extra_endpoint).is_err());
+    }
+
+    #[test]
+    fn profile_is_not_identity_for_recovery_managed_observation_or_readiness() {
+        let agent = ManagedAgentRecord {
+            project_id: project(),
+            created_by_director_session: session("cutex.director"),
+            created_by_operator_session: None,
+            cutex_session_id: session("cutex.worker"),
+            native_session_id: "native-worker".to_string(),
+            spec: spec("worker"),
+            created_at: now(),
+            retired_at: None,
+        };
+        assert_eq!(agent.spec.profile, "aemeath");
+
+        for observed_profile in ["", "octobre"] {
+            let mut observed = ready_observation(&agent);
+            observed.profile = observed_profile.to_string();
+            validate_recovery_spec(&agent, &observed).unwrap_or_else(|error| {
+                panic!("recovery rejected observed profile {observed_profile:?}: {error}")
+            });
+            validate_managed_observation_identity(&agent, &observed).unwrap_or_else(|error| {
+                panic!("managed identity rejected observed profile {observed_profile:?}: {error}")
+            });
+            validate_ready(&agent, &observed).unwrap_or_else(|error| {
+                panic!("readiness rejected observed profile {observed_profile:?}: {error}")
+            });
+        }
     }
 
     #[test]
@@ -6137,6 +6205,49 @@ mod tests {
         assert_eq!(lifecycle.message_count(), 0);
         assert_eq!(provider.store().snapshot().unwrap().projects, authority);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn online_recovery_accepts_empty_or_changed_observed_profile() {
+        for (label, observed_profile) in [("empty", ""), ("changed", "octobre")] {
+            let root = root(&format!("online-recover-profile-{label}"));
+            let provider = AgentManagementProvider::open(&root).unwrap();
+            bind(&provider, "bind", "cutex.director", None);
+            let lifecycle = FakeLifecycle::default();
+            let created = created_agent(&completed(provider.execute(
+                &invocation("cutex.director"),
+                &create_request("create", "worker", AgentStartMode::BootstrapOnly),
+                &lifecycle,
+            )));
+            assert_eq!(created.spec.profile, "aemeath");
+            let generation = lifecycle
+                .observe(&created.cutex_session_id)
+                .unwrap()
+                .runtime_generation;
+            let launches = lifecycle.launch_count();
+            let recoveries = lifecycle.recovery_count();
+            lifecycle.set_profile(&created.cutex_session_id, observed_profile);
+            lifecycle.disconnect_with_claim(&created.cutex_session_id, FakeRecovery::ExactLive);
+            let request = AgentManagementRequest {
+                schema: AgentManagementSchema::V1,
+                action_id: action(&format!("online-recover-profile-{label}")),
+                project_id: Some(project()),
+                operation: AgentOperation::Online {
+                    cutex_session_id: created.cutex_session_id.clone(),
+                },
+            };
+
+            let receipt =
+                completed(provider.execute(&invocation("cutex.director"), &request, &lifecycle));
+            let AgentManagementResult::Lifecycle { observation, .. } = receipt.result else {
+                panic!("expected lifecycle result")
+            };
+            assert_eq!(observation.profile, observed_profile);
+            assert_eq!(observation.runtime_generation, generation);
+            assert_eq!(lifecycle.launch_count(), launches);
+            assert_eq!(lifecycle.recovery_count(), recoveries + 1);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

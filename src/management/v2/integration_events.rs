@@ -282,17 +282,7 @@ pub fn append_task_watchdog_fact(
     director: &CutexSessionId,
     fact: &crate::task_service::TaskWatchdogFact,
 ) -> anyhow::Result<EventEnvelope> {
-    if fact.schema != crate::task_service::TASK_WATCHDOG_FACT_SCHEMA
-        || fact.event_key != fact.stage.event_key()
-    {
-        anyhow::bail!("invalid Task watchdog presentation fact");
-    }
-    let method = match fact.stage {
-        crate::task_service::TaskWatchdogStage::FirstStale => TASK_WATCHDOG_FIRST_STALE_METHOD,
-        crate::task_service::TaskWatchdogStage::DirectorEscalated => {
-            TASK_WATCHDOG_DIRECTOR_ESCALATED_METHOD
-        }
-    };
+    let method = task_watchdog_fact_method(fact)?;
     append_owner_event_once(
         director.as_str(),
         method,
@@ -302,6 +292,51 @@ pub fn append_task_watchdog_fact(
             ..Default::default()
         },
     )
+}
+
+/// Ensures the presentation fact reached the durable Management v2 stream.
+///
+/// Unlike callers that need the original envelope for immediate projection,
+/// the watchdog only needs durable commit evidence. Its private dedupe ledger
+/// remains authoritative after the bounded event journal expires that exact
+/// envelope, so expiry is an acknowledged prior commit rather than a request
+/// to manufacture a duplicate event.
+pub(crate) fn ensure_task_watchdog_fact_committed(
+    director: &CutexSessionId,
+    fact: &crate::task_service::TaskWatchdogFact,
+) -> anyhow::Result<()> {
+    let method = task_watchdog_fact_method(fact)?;
+    let action_id = fact.fact_id.clone();
+    let repository = management_v2_repository()?;
+    let _ = append_owner_event_once_with_repository_policy(
+        repository,
+        director.as_str(),
+        method,
+        &action_id,
+        serde_json::to_value(fact)?,
+        EventCorrelation {
+            management_request_id: Some(action_id.clone()),
+            ..Default::default()
+        },
+        MissingCommittedEventPolicy::AcceptCommittedOutsideRetention,
+    )?;
+    Ok(())
+}
+
+fn task_watchdog_fact_method(
+    fact: &crate::task_service::TaskWatchdogFact,
+) -> anyhow::Result<&'static str> {
+    if fact.schema != crate::task_service::TASK_WATCHDOG_FACT_SCHEMA
+        || fact.event_key != fact.stage.event_key()
+    {
+        anyhow::bail!("invalid Task watchdog presentation fact");
+    }
+    Ok(match fact.stage {
+        crate::task_service::TaskWatchdogStage::FirstStale => TASK_WATCHDOG_FIRST_STALE_METHOD,
+        crate::task_service::TaskWatchdogStage::DirectorEscalated => {
+            TASK_WATCHDOG_DIRECTOR_ESCALATED_METHOD
+        }
+    })
 }
 
 fn receipt_assignment_id(receipt: &ProviderReceipt) -> anyhow::Result<&AssignmentId> {
@@ -400,6 +435,33 @@ fn append_owner_event_once_with_repository(
     params: Value,
     correlation: EventCorrelation,
 ) -> anyhow::Result<EventEnvelope> {
+    append_owner_event_once_with_repository_policy(
+        repository,
+        owner_cutex_session_id,
+        method,
+        action_id,
+        params,
+        correlation,
+        MissingCommittedEventPolicy::RequireRetainedEvent,
+    )?
+    .context("committed integration event is no longer retained")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MissingCommittedEventPolicy {
+    RequireRetainedEvent,
+    AcceptCommittedOutsideRetention,
+}
+
+fn append_owner_event_once_with_repository_policy(
+    repository: &EventRepository,
+    owner_cutex_session_id: &str,
+    method: &str,
+    action_id: &str,
+    params: Value,
+    correlation: EventCorrelation,
+    missing_committed_event: MissingCommittedEventPolicy,
+) -> anyhow::Result<Option<EventEnvelope>> {
     let key = format!("{owner_cutex_session_id}\u{0}{method}\u{0}{action_id}");
     let lock_path = repository.root().join(INTEGRATION_DEDUPE_LOCK);
     fs::create_dir_all(repository.root())?;
@@ -410,7 +472,7 @@ fn append_owner_event_once_with_repository(
         .write(true)
         .open(&lock_path)?;
     lock.lock_exclusive()?;
-    let result = (|| -> anyhow::Result<EventEnvelope> {
+    let result = (|| -> anyhow::Result<Option<EventEnvelope>> {
         let state_path = repository.root().join(INTEGRATION_DEDUPE_STATE);
         let mut state = match fs::read(&state_path) {
             Ok(bytes) => serde_json::from_slice::<IntegrationEventDedupeState>(&bytes)
@@ -421,8 +483,25 @@ fn append_owner_event_once_with_repository(
             Err(error) => return Err(error.into()),
         };
         if state.committed.contains(&key) {
-            return find_integration_event(repository, owner_cutex_session_id, method, action_id)?
-                .context("committed integration event is no longer retained");
+            return match find_integration_event(
+                repository,
+                owner_cutex_session_id,
+                method,
+                action_id,
+            )? {
+                Some(event) => Ok(Some(event)),
+                None if missing_committed_event
+                    == MissingCommittedEventPolicy::AcceptCommittedOutsideRetention =>
+                {
+                    // `committed` is written only after EventRepository::append has
+                    // durably committed the envelope. Management v2 intentionally
+                    // expires exact cursors, so a presentation-only watchdog replay
+                    // may acknowledge that durable commit without inventing a new
+                    // envelope or extending the bounded event retention window.
+                    Ok(None)
+                }
+                None => anyhow::bail!("committed integration event is no longer retained"),
+            };
         }
         if let Some(existing) =
             find_integration_event(repository, owner_cutex_session_id, method, action_id)?
@@ -434,7 +513,7 @@ fn append_owner_event_once_with_repository(
                 &state,
                 "integration event dedupe state",
             )?;
-            return Ok(existing);
+            return Ok(Some(existing));
         }
         state.pending.insert(key.clone());
         crate::config::atomic::write_private_pretty_json_atomic(
@@ -461,7 +540,7 @@ fn append_owner_event_once_with_repository(
             &state,
             "integration event dedupe state",
         )?;
-        Ok(event)
+        Ok(Some(event))
     })();
     let _ = FileExt::unlock(&lock);
     result
@@ -648,6 +727,122 @@ mod tests {
                 .unwrap();
         assert!(state.pending.is_empty());
         assert_eq!(state.committed.len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn watchdog_commit_outlives_bounded_event_retention_without_rematerializing() {
+        use crate::management::v2::repository::RepositoryOptions;
+
+        let root = std::env::temp_dir().join(format!(
+            "cutex-watchdog-retention-dedupe-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let repository = EventRepository::open_with_options(
+            &root,
+            current_host_name(),
+            RepositoryOptions {
+                rotate_bytes: 900,
+                retained_files: 1,
+            },
+        )
+        .unwrap();
+        let owner = "cutex.director";
+        let method = TASK_WATCHDOG_FIRST_STALE_METHOD;
+        let action = "twf_retention_regression";
+        let params = serde_json::json!({
+            "schema": crate::task_service::TASK_WATCHDOG_FACT_SCHEMA,
+            "event_key": "task_watchdog.first_stale",
+            "fact_id": action,
+            "episode_id": "twe_retention_regression",
+            "task_id": "task-retention-regression",
+            "task_revision": 1,
+            "assignment_id": "assignment-retention-regression",
+            "attempt_number": 1,
+            "assignee_cutex_session_id": "cutex.worker",
+            "activity_watermark": "2026-09-06T00:00:00Z",
+            "activity_kind": "phase_transition",
+            "idle_duration_secs": 600,
+            "stage": "first_stale",
+            "source_sequence": 7,
+            "occurred_at": "2026-09-06T00:10:00Z",
+        });
+        let correlation = EventCorrelation {
+            management_request_id: Some(action.to_string()),
+            ..Default::default()
+        };
+        let committed = append_owner_event_once_with_repository(
+            &repository,
+            owner,
+            method,
+            action,
+            params.clone(),
+            correlation.clone(),
+        )
+        .unwrap();
+
+        let mut expired = false;
+        for value in 0..64 {
+            repository
+                .append(PendingEvent {
+                    cutex_session_id: "cutex.noisy-owner".to_string(),
+                    host_id: current_host_name(),
+                    source: EventSource::Cutex,
+                    schema: None,
+                    correlation: EventCorrelation::default(),
+                    native: None,
+                    cutex: Some(CutexMessage {
+                        method: "cutex/test/retentionPressure".to_string(),
+                        params: serde_json::json!({
+                            "value": value,
+                            "padding": "x".repeat(700),
+                        }),
+                    }),
+                })
+                .unwrap();
+            if find_integration_event(&repository, owner, method, action)
+                .unwrap()
+                .is_none()
+            {
+                expired = true;
+                break;
+            }
+        }
+        assert!(
+            expired,
+            "fixture must move the committed event past retention"
+        );
+        let before = repository.checkpoint().unwrap();
+
+        let strict = append_owner_event_once_with_repository(
+            &repository,
+            owner,
+            method,
+            action,
+            params.clone(),
+            correlation.clone(),
+        )
+        .unwrap_err();
+        assert!(strict
+            .to_string()
+            .contains("committed integration event is no longer retained"));
+
+        let recovered = append_owner_event_once_with_repository_policy(
+            &repository,
+            owner,
+            method,
+            action,
+            params,
+            correlation,
+            MissingCommittedEventPolicy::AcceptCommittedOutsideRetention,
+        )
+        .unwrap();
+        assert!(recovered.is_none());
+        assert_eq!(repository.checkpoint().unwrap(), before);
+        assert!(find_integration_event(&repository, owner, method, action)
+            .unwrap()
+            .is_none());
+        assert!(committed.sequence < before.sequence);
         fs::remove_dir_all(root).unwrap();
     }
 }
