@@ -1524,6 +1524,18 @@ pub(crate) fn stop_cutex_session_runtime_for_entry(
     let target =
         session_runtime_stop_target(&record, live_agents, alden_session.as_ref(), &local_host);
     let app_server_binding = record.app_server_runtime.clone();
+    let turn_stop_detail = match app_server_runtime::runtime_manager()
+        .interrupt_active_turn(&record.cutex_session_id)
+    {
+        Ok(Some(turn_id)) => Some(format!("turn_interrupted:{turn_id}")),
+        Ok(None) => None,
+        Err(error) if force => Some(format!("turn_interrupt_failed_forced:{error:#}")),
+        Err(error) => {
+            return Err(error).context(
+                "runtime stop refused because the active turn could not be interrupted safely",
+            );
+        }
+    };
     let disconnect_error = app_server_runtime::disconnect_runtime(&record.cutex_session_id)
         .err()
         .map(|error| format!("manager_disconnect_failed:{error:#}"));
@@ -1575,6 +1587,9 @@ pub(crate) fn stop_cutex_session_runtime_for_entry(
     let mut stopped = scope_stop.stopped;
     let mut forced = scope_stop.forced;
     let mut details = Vec::new();
+    if let Some(detail) = turn_stop_detail {
+        details.push(detail);
+    }
     if scope_stop.found {
         details.push(scope_stop.detail);
     }

@@ -3465,13 +3465,18 @@ impl SelectorModel {
         self.workspace_selection.mark_transiently_visible(
             matches!(
                 action,
-                SessionTuiAction::CloseRuntime | SessionTuiAction::RestoreSession
+                SessionTuiAction::CloseRuntime
+                    | SessionTuiAction::RepairInterruptedHistory
+                    | SessionTuiAction::RestoreSession
             )
             .then_some(target),
         );
         self.replace_snapshot(snapshot);
         self.notice = Some(match action {
             SessionTuiAction::CloseRuntime => format!("Runtime closed: {agent_name}"),
+            SessionTuiAction::RepairInterruptedHistory => {
+                format!("Interrupted history checked and repaired if needed: {agent_name}")
+            }
             SessionTuiAction::RetireSession => format!("Retired session: {agent_name}"),
             SessionTuiAction::RestoreSession => format!("Restored offline: {agent_name}"),
             _ => unreachable!("only selector actions enter the operation worker"),
@@ -3486,7 +3491,7 @@ impl SelectorModel {
             self.mode = SelectorMode::Agents;
             self.notice = None;
             self.warning = Some(format!(
-                "{} completed, but refresh failed: {message}; reopen Retired sessions to resync",
+                "{} completed, but refresh failed: {message}; refresh the session list to resync",
                 action.label()
             ));
             return;
@@ -3509,15 +3514,17 @@ impl SelectorModel {
     }
 
     fn runtime_close_failed(&mut self, message: String) {
-        let agent_name = self
-            .runtime_close_identity()
-            .map(|(_, agent_name, _)| agent_name)
+        let identity = self.runtime_close_identity();
+        let agent_name = identity
+            .as_ref()
+            .map(|(_, agent_name, _)| agent_name.clone())
             .unwrap_or_else(|| "selected agent".to_string());
+        let action = identity
+            .map(|(_, _, action)| action.label())
+            .unwrap_or("complete the operation");
         self.mode = SelectorMode::Agents;
         self.notice = None;
-        self.warning = Some(format!(
-            "Failed to close runtime for {agent_name}: {message}"
-        ));
+        self.warning = Some(format!("Failed to {action} for {agent_name}: {message}"));
     }
 
     fn dispatch_failed(&mut self, agent_key: &str, message: String) {
@@ -4330,7 +4337,7 @@ fn spawn_snapshot_refresh() -> anyhow::Result<WorkspaceLoad<SelectorSnapshot>> {
 fn spawn_runtime_close(
     intent: SessionTuiIntent,
 ) -> anyhow::Result<Receiver<RuntimeCloseWorkerResult>> {
-    debug_assert_eq!(intent.action, SessionTuiAction::CloseRuntime);
+    debug_assert!(intent_runs_in_selector(&intent));
     let (sender, receiver) = mpsc::channel();
     thread::Builder::new()
         .name("cutex-tui-close".to_string())
@@ -5603,6 +5610,7 @@ fn intent_runs_in_selector(intent: &SessionTuiIntent) -> bool {
     matches!(
         intent.action,
         SessionTuiAction::CloseRuntime
+            | SessionTuiAction::RepairInterruptedHistory
             | SessionTuiAction::RetireSession
             | SessionTuiAction::RestoreSession
     )
@@ -7642,6 +7650,12 @@ fn render_runtime_action_confirmation(frame: &mut Frame<'_>, area: Rect, model: 
             "  Close runtime  ",
             "The durable Cutex session and cute-codex history are kept.".to_string(),
         ),
+        SessionTuiAction::RepairInterruptedHistory => (
+            " Confirm history repair ",
+            format!("Repair interrupted history for {}?", row.agent),
+            "  Repair history  ",
+            "The Agent must be offline. Cutex backs up the rollout, then closes only orphaned turns left without a terminal event.".to_string(),
+        ),
         SessionTuiAction::RetireSession => (
             " Confirm retire ",
             format!("Retire managed session {}?", row.agent),
@@ -7699,6 +7713,11 @@ fn render_runtime_close_progress(frame: &mut Frame<'_>, area: Rect, model: &Sele
             "Closing runtime",
             "Waiting for closed or offline status.",
             " Closing runtime ",
+        ),
+        SessionTuiAction::RepairInterruptedHistory => (
+            "Repairing history",
+            "Backing up the rollout and closing orphaned turns.",
+            " Repairing history ",
         ),
         SessionTuiAction::RetireSession => (
             "Retiring session",
@@ -7850,6 +7869,7 @@ fn homepage_action_label(action: SessionTuiAction) -> &'static str {
         SessionTuiAction::ResumeHere | SessionTuiAction::ResumeManaged => "resume",
         SessionTuiAction::CloseAndRestart
         | SessionTuiAction::CloseRuntime
+        | SessionTuiAction::RepairInterruptedHistory
         | SessionTuiAction::RetireSession
         | SessionTuiAction::RestoreSession => "manage",
     }

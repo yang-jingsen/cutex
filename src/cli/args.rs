@@ -540,6 +540,15 @@ pub enum SessionCommand {
         json: bool,
     },
 
+    /// Back up and close orphaned turns in an offline native rollout
+    RepairHistory {
+        /// cutex_session_id or Codex session id
+        id: String,
+        /// Print machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Adopt a recent/local Codex session into durable cutex management
     Adopt {
         /// cutex_session_id, Codex session id, or unique thread/display name

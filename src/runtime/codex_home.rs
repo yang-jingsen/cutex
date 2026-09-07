@@ -2,13 +2,14 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, BufRead, BufReader};
+use std::fs::OpenOptions;
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use chrono::{DateTime, Duration, NaiveDateTime, TimeZone, Utc};
 
-use crate::config::paths::host_codex_home_dir;
+use crate::config::paths::{config_dir, host_codex_home_dir};
 use crate::role_revision::Rfc3339;
 
 pub fn codex_session_exists_in_home(session_id: &str) -> anyhow::Result<bool> {
@@ -20,6 +21,288 @@ pub fn codex_session_exists_in_home(session_id: &str) -> anyhow::Result<bool> {
         &codex_home.join("sessions"),
         session_id,
     )?)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterruptedHistoryRepair {
+    pub rollout_path: PathBuf,
+    pub backup_path: Option<PathBuf>,
+    pub repaired_turn_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct UnterminatedTurn {
+    started_at: Option<i64>,
+}
+
+/// Repair terminal events omitted by a previously hard-stopped managed runtime.
+///
+/// This is deliberately an explicit, offline recovery operation rather than a
+/// permanent reinterpretation of native Codex history. The original rollout is
+/// backed up before one `turn_aborted` event is appended for each unterminated
+/// turn. Re-running the repair is a no-op.
+pub fn repair_interrupted_rollout_history(
+    session_id: &str,
+) -> anyhow::Result<InterruptedHistoryRepair> {
+    let codex_home = host_codex_home_dir()?;
+    let backup_root = config_dir()?.join("history-repair-backups");
+    repair_interrupted_rollout_history_in_home(&codex_home, &backup_root, session_id)
+}
+
+fn repair_interrupted_rollout_history_in_home(
+    codex_home: &Path,
+    backup_root: &Path,
+    session_id: &str,
+) -> anyhow::Result<InterruptedHistoryRepair> {
+    let rollout_path =
+        unique_rollout_file_for_session(&codex_home.join("sessions"), session_id)?
+            .with_context(|| format!("native rollout not found for session {session_id}"))?;
+    let file = fs::File::open(&rollout_path)
+        .with_context(|| format!("Failed to open native rollout: {}", rollout_path.display()))?;
+    let mut unterminated = BTreeMap::<String, UnterminatedTurn>::new();
+    let mut max_ordinal = None::<u64>;
+    let mut observed_session_id = None::<String>;
+    for (line_index, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.with_context(|| {
+            format!(
+                "Failed to read native rollout line {}: {}",
+                line_index + 1,
+                rollout_path.display()
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(&line).with_context(|| {
+            format!(
+                "Failed to parse native rollout line {}: {}",
+                line_index + 1,
+                rollout_path.display()
+            )
+        })?;
+        if let Some(ordinal) = value.get("ordinal").and_then(serde_json::Value::as_u64) {
+            max_ordinal = Some(max_ordinal.map_or(ordinal, |current| current.max(ordinal)));
+        }
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("session_meta") {
+            let metadata_session_id = value
+                .pointer("/payload/id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .with_context(|| {
+                    format!(
+                        "native rollout session_meta omitted its id at line {}: {}",
+                        line_index + 1,
+                        rollout_path.display()
+                    )
+                })?;
+            if observed_session_id
+                .as_deref()
+                .is_some_and(|observed| observed != metadata_session_id)
+            {
+                anyhow::bail!(
+                    "native rollout contains conflicting session ids: {}",
+                    rollout_path.display()
+                );
+            }
+            observed_session_id = Some(metadata_session_id.to_string());
+        }
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("event_msg") {
+            continue;
+        }
+        let Some(payload) = value.get("payload") else {
+            anyhow::bail!(
+                "native rollout event omitted payload at line {}: {}",
+                line_index + 1,
+                rollout_path.display()
+            );
+        };
+        let event_type = payload.get("type").and_then(serde_json::Value::as_str);
+        let turn_id = payload
+            .get("turn_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|turn_id| !turn_id.trim().is_empty());
+        match (event_type, turn_id) {
+            (Some("task_started" | "turn_started"), Some(turn_id)) => {
+                unterminated.insert(
+                    turn_id.to_string(),
+                    UnterminatedTurn {
+                        started_at: payload
+                            .get("started_at")
+                            .and_then(serde_json::Value::as_i64),
+                    },
+                );
+            }
+            (Some("task_complete" | "turn_complete" | "turn_aborted"), Some(turn_id)) => {
+                unterminated.remove(turn_id);
+            }
+            _ => {}
+        }
+    }
+    let observed_session_id = observed_session_id.with_context(|| {
+        format!(
+            "native rollout omitted session_meta: {}",
+            rollout_path.display()
+        )
+    })?;
+    if observed_session_id != session_id {
+        anyhow::bail!(
+            "native rollout identity mismatch: expected {session_id}, found {observed_session_id}"
+        );
+    }
+
+    let repaired_turn_ids = unterminated.keys().cloned().collect::<Vec<_>>();
+    if repaired_turn_ids.is_empty() {
+        return Ok(InterruptedHistoryRepair {
+            rollout_path,
+            backup_path: None,
+            repaired_turn_ids,
+        });
+    }
+
+    let backup_dir = backup_root.join(session_id);
+    fs::create_dir_all(&backup_dir).with_context(|| {
+        format!(
+            "Failed to create history repair backup directory: {}",
+            backup_dir.display()
+        )
+    })?;
+    let backup_path = backup_dir.join(format!(
+        "{}-{}",
+        Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
+        rollout_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("rollout.jsonl")
+    ));
+    fs::copy(&rollout_path, &backup_path).with_context(|| {
+        format!(
+            "Failed to back up native rollout {} to {}",
+            rollout_path.display(),
+            backup_path.display()
+        )
+    })?;
+
+    let timestamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let mut next_ordinal = max_ordinal
+        .unwrap_or(0)
+        .checked_add(1)
+        .context("native rollout ordinal overflow")?;
+    let mut output = OpenOptions::new()
+        .append(true)
+        .open(&rollout_path)
+        .with_context(|| {
+            format!(
+                "Failed to open native rollout for repair: {}",
+                rollout_path.display()
+            )
+        })?;
+    if !file_ends_with_newline(&rollout_path)? {
+        output.write_all(b"\n")?;
+    }
+    for (turn_id, turn) in unterminated {
+        let mut payload = serde_json::json!({
+            "type": "turn_aborted",
+            "turn_id": turn_id,
+            "reason": "interrupted",
+        });
+        if let Some(started_at) = turn.started_at {
+            payload["started_at"] = serde_json::Value::from(started_at);
+        }
+        serde_json::to_writer(
+            &mut output,
+            &serde_json::json!({
+                "timestamp": timestamp,
+                "ordinal": next_ordinal,
+                "type": "event_msg",
+                "payload": payload,
+            }),
+        )?;
+        output.write_all(b"\n")?;
+        next_ordinal = next_ordinal
+            .checked_add(1)
+            .context("native rollout ordinal overflow")?;
+    }
+    output.sync_all().with_context(|| {
+        format!(
+            "Failed to sync repaired rollout: {}",
+            rollout_path.display()
+        )
+    })?;
+
+    Ok(InterruptedHistoryRepair {
+        rollout_path,
+        backup_path: Some(backup_path),
+        repaired_turn_ids,
+    })
+}
+
+fn file_ends_with_newline(path: &Path) -> anyhow::Result<bool> {
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("Failed to inspect native rollout: {}", path.display()))?;
+    let length = file.metadata()?.len();
+    if length == 0 {
+        return Ok(true);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] == b'\n')
+}
+
+fn unique_rollout_file_for_session(
+    root: &Path,
+    session_id: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to read Codex sessions dir: {}", root.display()));
+        }
+    };
+    let expected_suffix = format!("-{session_id}.jsonl");
+    let mut found = None::<PathBuf>;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            anyhow::bail!(
+                "native session source contains a symlink: {}",
+                path.display()
+            );
+        }
+        if file_type.is_dir() {
+            if let Some(candidate) = unique_rollout_file_for_session(&path, session_id)? {
+                if let Some(previous) = found {
+                    anyhow::bail!(
+                        "multiple native rollouts match session {session_id}: {}, {}",
+                        previous.display(),
+                        candidate.display()
+                    );
+                }
+                found = Some(candidate);
+            }
+            continue;
+        }
+        if file_type.is_file()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(&expected_suffix))
+        {
+            if let Some(previous) = found {
+                anyhow::bail!(
+                    "multiple native rollouts match session {session_id}: {}, {}",
+                    previous.display(),
+                    path.display()
+                );
+            }
+            found = Some(path);
+        }
+    }
+    Ok(found)
 }
 
 /// Conservatively checks the complete native Codex session sources for a
@@ -719,5 +1002,60 @@ mod tests {
             .is_err());
             fs::remove_dir_all(codex_home).unwrap();
         }
+    }
+
+    #[test]
+    fn interrupted_history_repair_backs_up_and_appends_missing_terminal_once() {
+        let codex_home = root("interrupted-history-repair");
+        let backup_root = codex_home.join("repair-backups");
+        let rollout_day = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("08");
+        fs::create_dir_all(&rollout_day).unwrap();
+        let session_id = "01a05ddf-2353-7221-adc7-4776ff4bcb52";
+        let rollout_path =
+            rollout_day.join(format!("rollout-2026-09-08T09-00-00-{session_id}.jsonl"));
+        fs::write(
+            &rollout_path,
+            concat!(
+                "{\"timestamp\":\"2026-09-08T09:00:00Z\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{\"id\":\"01a05ddf-2353-7221-adc7-4776ff4bcb52\",\"timestamp\":\"2026-09-08T09:00:00Z\",\"cwd\":\"/managed\"}}\n",
+                "{\"timestamp\":\"2026-09-08T09:00:01Z\",\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"orphaned\",\"started_at\":1788858001}}\n",
+                "{\"timestamp\":\"2026-09-08T09:00:02Z\",\"ordinal\":2,\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"completed\",\"started_at\":1788858002}}\n",
+                "{\"timestamp\":\"2026-09-08T09:00:03Z\",\"ordinal\":3,\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"completed\"}}\n",
+                "{\"timestamp\":\"2026-09-08T09:00:04Z\",\"ordinal\":4,\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_started\",\"turn_id\":\"v2-completed\",\"started_at\":1788858004}}\n",
+                "{\"timestamp\":\"2026-09-08T09:00:05Z\",\"ordinal\":5,\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_complete\",\"turn_id\":\"v2-completed\"}}"
+            ),
+        )
+        .unwrap();
+
+        let repaired =
+            repair_interrupted_rollout_history_in_home(&codex_home, &backup_root, session_id)
+                .unwrap();
+        assert_eq!(repaired.rollout_path, rollout_path);
+        assert_eq!(repaired.repaired_turn_ids, vec!["orphaned"]);
+        assert!(repaired.backup_path.as_ref().unwrap().is_file());
+        let lines = BufReader::new(fs::File::open(&rollout_path).unwrap())
+            .lines()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let appended: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(appended["ordinal"], 6);
+        assert_eq!(appended["payload"]["type"], "turn_aborted");
+        assert_eq!(appended["payload"]["turn_id"], "orphaned");
+
+        let second =
+            repair_interrupted_rollout_history_in_home(&codex_home, &backup_root, session_id)
+                .unwrap();
+        assert!(second.repaired_turn_ids.is_empty());
+        assert!(second.backup_path.is_none());
+        assert_eq!(
+            BufReader::new(fs::File::open(&rollout_path).unwrap())
+                .lines()
+                .count(),
+            lines.len()
+        );
+        fs::remove_dir_all(codex_home).unwrap();
     }
 }

@@ -69,6 +69,24 @@ fn session_archive_commands_parse_with_json_and_reason() {
 }
 
 #[test]
+fn session_repair_history_command_parses_with_json() {
+    let repair = Cli::try_parse_from([
+        "cutex",
+        "session",
+        "repair-history",
+        "cutex.repair",
+        "--json",
+    ])
+    .expect("repair-history command should parse");
+    assert!(matches!(
+        repair.command,
+        Some(CommandKind::Session {
+            command: SessionCommand::RepairHistory { id, json: true }
+        }) if id == "cutex.repair"
+    ));
+}
+
+#[test]
 fn session_expose_command_parses_groups() {
     let cli = Cli::try_parse_from([
         "cutex",
