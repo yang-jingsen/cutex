@@ -71,6 +71,13 @@ pub type HumanManagementOperatorActionHandler = fn(
     crate::management::control_plane::HumanManagementOperatorReceipt,
     crate::agent_management::AgentManagementError,
 >;
+pub type HumanManagementProjectMutationHandler = fn(
+    &crate::management::control_plane::HumanManagementPrincipal,
+    &crate::management::control_plane::HumanManagementProjectMutationRequest,
+) -> Result<
+    crate::management::control_plane::HumanManagementProjectMutationReceipt,
+    crate::agent_management::AgentManagementError,
+>;
 pub type HumanManagementTaskQueryHandler =
     fn(
         &crate::management::control_plane::HumanManagementPrincipal,
@@ -104,6 +111,7 @@ pub struct ManagementRequestContext {
     pub read_management_project: HumanManagementProjectReadHandler,
     pub update_management_project_presentation: HumanManagementPresentationUpdateHandler,
     pub execute_management_operator_action: HumanManagementOperatorActionHandler,
+    pub execute_management_project_mutation: HumanManagementProjectMutationHandler,
     pub query_management_tasks: HumanManagementTaskQueryHandler,
 }
 

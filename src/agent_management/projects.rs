@@ -9,15 +9,18 @@ use std::fmt;
 use std::str::FromStr;
 
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest as _, Sha256 as Sha256Digest};
 use unicode_width::UnicodeWidthStr;
 
 use crate::management::control_plane::{
     HumanManagementOperatorActionRecord, HumanManagementOperatorActionRequest,
     HumanManagementOperatorKind, HumanManagementOperatorReceipt,
     HumanManagementPresentationUpdateRequest, HumanManagementPrincipal,
-    HumanManagementProjectCollection, HumanManagementProjectSchema,
+    HumanManagementProjectCollection, HumanManagementProjectMutationKind,
+    HumanManagementProjectMutationReceipt, HumanManagementProjectMutationRequest,
+    HumanManagementProjectMutationSchema, HumanManagementProjectSchema,
 };
-use crate::role_revision::{CutexSessionId, Rfc3339};
+use crate::role_revision::{CutexSessionId, Rfc3339, MAX_JSON_SAFE_INTEGER};
 
 use super::{
     now, AgentManagementError, AgentManagementInvocation, AgentManagementProvider,
@@ -196,6 +199,83 @@ pub enum ProjectMemberLifecycle {
     Unavailable,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectLifecycle {
+    #[default]
+    Active,
+    Archived,
+    Removed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectStateRecord {
+    pub project_id: ProjectId,
+    pub lifecycle: ProjectLifecycle,
+    pub revision: u64,
+    pub created_at: Rfc3339,
+    pub updated_at: Rfc3339,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<Rfc3339>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentProjectMembership {
+    pub cutex_session_id: CutexSessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<ProjectId>,
+    pub revision: u64,
+    pub updated_at: Rfc3339,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectTombstone {
+    pub project_id: ProjectId,
+    pub final_revision: u64,
+    pub final_authority_epoch: u64,
+    pub removed_at: Rfc3339,
+    pub removed_by_human_management: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectAuditKind {
+    Created,
+    DirectorSeatRepaired,
+    MemberAdded,
+    MemberDetached,
+    Archived,
+    Restored,
+    Removed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectAuditEvent {
+    pub event_id: String,
+    pub action_id: super::AgentActionId,
+    pub project_id: ProjectId,
+    pub kind: ProjectAuditKind,
+    pub previous_project_revision: u64,
+    pub project_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_cutex_session_id: Option<CutexSessionId>,
+    pub performed_by_human_management: bool,
+    pub committed_at: Rfc3339,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectAgentChoice {
+    pub cutex_session_id: CutexSessionId,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_project_id: Option<ProjectId>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectMemberProjection {
@@ -246,11 +326,17 @@ pub struct CutexProjectSummary {
     pub project_id: ProjectId,
     pub authority_epoch: u64,
     pub director_cutex_session_id: CutexSessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub director_name: Option<String>,
     pub access_role: ProjectAccessRole,
     pub operator_count: usize,
     pub presentation: EffectiveProjectPresentation,
     pub active_member_count: usize,
     pub retired_member_count: usize,
+    #[serde(default)]
+    pub lifecycle: ProjectLifecycle,
+    #[serde(default)]
+    pub project_revision: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -258,6 +344,10 @@ pub struct CutexProjectSummary {
 pub struct CutexProjectWorkspace {
     pub project_id: ProjectId,
     pub authority_epoch: u64,
+    #[serde(default)]
+    pub lifecycle: ProjectLifecycle,
+    #[serde(default)]
+    pub project_revision: u64,
     pub director: ProjectDirectorProjection,
     pub access_role: ProjectAccessRole,
     pub operator_grant_revision: u64,
@@ -269,6 +359,27 @@ pub struct CutexProjectWorkspace {
     /// Operator grants existed. Nothing in this projection performs a repair.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub legacy_operator_repair_candidates: Vec<LegacyOperatorRepairCandidate>,
+}
+
+pub trait ProjectTaskInspector {
+    fn has_active_tasks(
+        &self,
+        project_id: &ProjectId,
+        member: Option<&CutexSessionId>,
+    ) -> Result<bool, AgentManagementError>;
+}
+
+impl<F> ProjectTaskInspector for F
+where
+    F: Fn(&ProjectId, Option<&CutexSessionId>) -> Result<bool, AgentManagementError>,
+{
+    fn has_active_tasks(
+        &self,
+        project_id: &ProjectId,
+        member: Option<&CutexSessionId>,
+    ) -> Result<bool, AgentManagementError> {
+        self(project_id, member)
+    }
 }
 
 pub trait ProjectRuntimeObserver {
@@ -299,9 +410,16 @@ impl AgentManagementProvider {
         invocation: &AgentManagementInvocation,
     ) -> Result<Vec<CutexProjectSummary>, AgentManagementError> {
         let snapshot = self.store().snapshot()?;
+        let seats = self
+            .director_seats
+            .query()
+            .map_err(super::provider::seat_authority_error)?;
         let mut projects = snapshot
             .projects
             .values()
+            .filter(|authority| {
+                project_seat_matches_authority(&seats, authority, ProjectLifecycle::Active)
+            })
             .filter_map(|authority| {
                 project_access_role(&snapshot, invocation, &authority.project_id)
                     .ok()
@@ -323,6 +441,13 @@ impl AgentManagementProvider {
     ) -> Result<CutexProjectWorkspace, AgentManagementError> {
         let snapshot = self.store().snapshot()?;
         let (authority, access_role) = authorized_project(&snapshot, invocation, project_id)?;
+        let seats = self
+            .director_seats
+            .query()
+            .map_err(super::provider::seat_authority_error)?;
+        if !project_seat_matches_authority(&seats, authority, ProjectLifecycle::Active) {
+            return Err(AgentManagementError::ProjectNotAuthorized);
+        }
         project_workspace(&snapshot, authority, access_role, observer)
     }
 
@@ -333,6 +458,7 @@ impl AgentManagementProvider {
     ) -> Result<ProjectPresentationSettings, AgentManagementError> {
         request.presentation.validate()?;
         self.store().with_state(true, |mut state| {
+            require_active_project(&state, &request.project_id)?;
             authorized_primary_authority(&state, invocation, &request.project_id)?;
             let current_revision = state
                 .project_presentations
@@ -389,15 +515,59 @@ impl AgentManagementProvider {
         _principal: &HumanManagementPrincipal,
     ) -> Result<HumanManagementProjectCollection, AgentManagementError> {
         let snapshot = self.store().snapshot()?;
-        let mut projects = snapshot
-            .projects
-            .values()
-            .map(|authority| summary(&snapshot, authority, ProjectAccessRole::HumanManagement))
-            .collect::<Vec<_>>();
+        let seats = self
+            .director_seats
+            .query()
+            .map_err(super::provider::seat_authority_error)?;
+        let mut projects = Vec::new();
+        let mut archived_projects = Vec::new();
+        for authority in snapshot.projects.values() {
+            let project = summary(&snapshot, authority, ProjectAccessRole::HumanManagement);
+            match project.lifecycle {
+                ProjectLifecycle::Active
+                    if project_seat_matches_authority(
+                        &seats,
+                        authority,
+                        ProjectLifecycle::Active,
+                    ) =>
+                {
+                    projects.push(project)
+                }
+                ProjectLifecycle::Archived
+                    if project_seat_matches_authority(
+                        &seats,
+                        authority,
+                        ProjectLifecycle::Archived,
+                    ) =>
+                {
+                    archived_projects.push(project)
+                }
+                ProjectLifecycle::Active | ProjectLifecycle::Archived => {}
+                ProjectLifecycle::Removed => {}
+            }
+        }
         projects.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+        archived_projects.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+        let mut available_agents = snapshot
+            .agents
+            .values()
+            .filter(|agent| agent.retired_at.is_none())
+            .map(|agent| ProjectAgentChoice {
+                cutex_session_id: agent.cutex_session_id.clone(),
+                name: agent.spec.name.clone(),
+                current_project_id: current_project_id(&snapshot, agent),
+            })
+            .collect::<Vec<_>>();
+        available_agents.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.cutex_session_id.cmp(&right.cutex_session_id))
+        });
         Ok(HumanManagementProjectCollection {
             schema: HumanManagementProjectSchema::V1,
             projects,
+            archived_projects,
+            available_agents,
         })
     }
 
@@ -412,6 +582,14 @@ impl AgentManagementProvider {
             .projects
             .get(project_id)
             .ok_or(AgentManagementError::ProjectNotAuthorized)?;
+        let seats = self
+            .director_seats
+            .query()
+            .map_err(super::provider::seat_authority_error)?;
+        let lifecycle = effective_project_state(&snapshot, authority).lifecycle;
+        if !project_seat_matches_authority(&seats, authority, lifecycle) {
+            return Err(AgentManagementError::ProjectNotAuthorized);
+        }
         project_workspace(
             &snapshot,
             authority,
@@ -431,6 +609,7 @@ impl AgentManagementProvider {
             .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
         let _mutation = self.store().lock_mutations()?;
         self.store().with_state(true, |mut state| {
+            require_active_project(&state, &request.project_id)?;
             let authority = state
                 .projects
                 .get(&request.project_id)
@@ -512,6 +691,9 @@ impl AgentManagementProvider {
             if state.actions.contains_key(&request.action_id)
                 || state.authority_receipts.contains_key(&request.action_id)
                 || state
+                    .human_management_project_mutations
+                    .contains_key(&request.action_id)
+                || state
                     .legacy_director_ownership_import_receipts
                     .contains_key(&request.action_id)
                 || state
@@ -525,6 +707,7 @@ impl AgentManagementProvider {
                 .get(&request.project_id)
                 .cloned()
                 .ok_or(AgentManagementError::ProjectNotAuthorized)?;
+            require_active_project(&state, &request.project_id)?;
             if authority.authority_epoch != request.expected_authority_epoch {
                 return Err(AgentManagementError::Conflict("stale_project_authority"));
             }
@@ -547,7 +730,8 @@ impl AgentManagementProvider {
                         .agents
                         .get(&request.operator_cutex_session_id)
                         .filter(|agent| {
-                            agent.project_id == request.project_id && agent.retired_at.is_none()
+                            current_project_id(&state, agent).as_ref() == Some(&request.project_id)
+                                && agent.retired_at.is_none()
                         })
                         .ok_or(AgentManagementError::Conflict(
                             "operator_must_be_active_managed_agent",
@@ -651,6 +835,533 @@ impl AgentManagementProvider {
             Ok((state, receipt, true))
         })
     }
+
+    /// Mutates only Project structure. Runtime lifecycle and historical Agent
+    /// ownership records are deliberately outside this boundary.
+    pub fn execute_project_mutation_for_management(
+        &self,
+        _principal: &HumanManagementPrincipal,
+        request: &HumanManagementProjectMutationRequest,
+        tasks: &dyn ProjectTaskInspector,
+    ) -> Result<HumanManagementProjectMutationReceipt, AgentManagementError> {
+        if let HumanManagementProjectMutationKind::Create {
+            director_cutex_session_id,
+            presentation,
+        } = &request.operation
+        {
+            return self.create_project_for_management(
+                request,
+                director_cutex_session_id,
+                presentation,
+            );
+        }
+        if request.expected_authority_epoch == 0
+            || request.expected_authority_epoch > MAX_JSON_SAFE_INTEGER
+            || request.expected_project_revision > MAX_JSON_SAFE_INTEGER
+        {
+            return Err(AgentManagementError::InvalidRequest(
+                "invalid_project_mutation_cas",
+            ));
+        }
+        let _execution = super::provider::provider_execution_lock()
+            .lock()
+            .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
+        let _mutation = self.store().lock_mutations()?;
+        let digest = super::store::request_sha256(request)?;
+        let before = self.store().snapshot()?;
+        if !before
+            .human_management_project_mutations
+            .contains_key(&request.action_id)
+        {
+            reject_project_action_id_domain_collision(&before, &request.action_id)?;
+            let authority = before
+                .projects
+                .get(&request.project_id)
+                .ok_or(AgentManagementError::ProjectNotAuthorized)?;
+            if authority.authority_epoch != request.expected_authority_epoch {
+                return Err(AgentManagementError::Conflict("stale_project_authority"));
+            }
+            let project_state = effective_project_state(&before, authority);
+            if project_state.revision != request.expected_project_revision {
+                return Err(AgentManagementError::Conflict("project_revision_conflict"));
+            }
+            match &request.operation {
+                HumanManagementProjectMutationKind::Archive
+                | HumanManagementProjectMutationKind::RepairDirectorSeat { .. } => {
+                    require_state_lifecycle(&project_state, ProjectLifecycle::Active)?
+                }
+                HumanManagementProjectMutationKind::Restore
+                | HumanManagementProjectMutationKind::Remove => {
+                    require_state_lifecycle(&project_state, ProjectLifecycle::Archived)?
+                }
+                HumanManagementProjectMutationKind::AddMember { .. }
+                | HumanManagementProjectMutationKind::DetachMember { .. }
+                | HumanManagementProjectMutationKind::Create { .. } => {}
+            }
+            if matches!(
+                &request.operation,
+                HumanManagementProjectMutationKind::Remove
+            ) && tasks.has_active_tasks(&request.project_id, None)?
+            {
+                return Err(AgentManagementError::Conflict("project_has_active_tasks"));
+            }
+            if let HumanManagementProjectMutationKind::RepairDirectorSeat {
+                expected_legacy_occupant,
+                expected_legacy_epoch,
+            } = &request.operation
+            {
+                if expected_legacy_occupant != &authority.authorized_director_session
+                    || *expected_legacy_epoch == 0
+                    || *expected_legacy_epoch > MAX_JSON_SAFE_INTEGER
+                {
+                    return Err(AgentManagementError::InvalidRequest(
+                        "invalid_legacy_director_repair_evidence",
+                    ));
+                }
+                self.director_seats
+                    .repair_project_director_from_legacy(
+                        &request.project_id,
+                        expected_legacy_occupant,
+                        *expected_legacy_epoch,
+                    )
+                    .map_err(super::provider::seat_authority_error)?;
+            }
+            let transition = match &request.operation {
+                HumanManagementProjectMutationKind::Archive => Some((
+                    crate::seat::ProjectDirectorSeatState::Active,
+                    crate::seat::ProjectDirectorSeatState::Archived,
+                )),
+                HumanManagementProjectMutationKind::Restore => Some((
+                    crate::seat::ProjectDirectorSeatState::Archived,
+                    crate::seat::ProjectDirectorSeatState::Active,
+                )),
+                HumanManagementProjectMutationKind::Remove => Some((
+                    crate::seat::ProjectDirectorSeatState::Archived,
+                    crate::seat::ProjectDirectorSeatState::Removed,
+                )),
+                _ => None,
+            };
+            if let Some((from, to)) = transition {
+                self.director_seats
+                    .transition_project_director(
+                        &request.project_id,
+                        &authority.authorized_director_session,
+                        from,
+                        to,
+                    )
+                    .map_err(super::provider::seat_authority_error)?;
+            }
+        }
+        self.store().with_state(true, |mut state| {
+            if let Some(record) = state
+                .human_management_project_mutations
+                .get(&request.action_id)
+                .cloned()
+            {
+                return if record.request_sha256 == digest {
+                    Ok((state, record.receipt, false))
+                } else {
+                    Err(AgentManagementError::Conflict("action_id_payload_conflict"))
+                };
+            }
+            reject_project_action_id_domain_collision(&state, &request.action_id)?;
+            let authority = state
+                .projects
+                .get(&request.project_id)
+                .cloned()
+                .ok_or(AgentManagementError::ProjectNotAuthorized)?;
+            if authority.authority_epoch != request.expected_authority_epoch {
+                return Err(AgentManagementError::Conflict("stale_project_authority"));
+            }
+            let mut project_state = effective_project_state(&state, &authority);
+            if project_state.revision != request.expected_project_revision {
+                return Err(AgentManagementError::Conflict("project_revision_conflict"));
+            }
+            let previous_revision = project_state.revision;
+            let revision = next_project_revision(previous_revision)?;
+            let committed_at = now();
+            let mut membership = None;
+            let mut tombstone = None;
+            let (kind, member_cutex_session_id) = match &request.operation {
+                HumanManagementProjectMutationKind::Create { .. } => {
+                    return Err(AgentManagementError::InvalidStore)
+                }
+                HumanManagementProjectMutationKind::RepairDirectorSeat { .. } => {
+                    require_state_lifecycle(&project_state, ProjectLifecycle::Active)?;
+                    (ProjectAuditKind::DirectorSeatRepaired, None)
+                }
+                HumanManagementProjectMutationKind::AddMember { cutex_session_id } => {
+                    require_state_lifecycle(&project_state, ProjectLifecycle::Active)?;
+                    let agent = state
+                        .agents
+                        .get(cutex_session_id)
+                        .cloned()
+                        .filter(|agent| agent.retired_at.is_none())
+                        .ok_or(AgentManagementError::NotFound("active_managed_agent"))?;
+                    match current_project_id(&state, &agent) {
+                        Some(current) if current == request.project_id => {
+                            return Err(AgentManagementError::Conflict(
+                                "agent_already_project_member",
+                            ))
+                        }
+                        Some(_) => {
+                            return Err(AgentManagementError::Conflict(
+                                "agent_already_has_active_project",
+                            ))
+                        }
+                        None => {}
+                    }
+                    let record = next_membership(
+                        &state,
+                        cutex_session_id,
+                        Some(request.project_id.clone()),
+                        committed_at.clone(),
+                    )?;
+                    state
+                        .current_project_memberships
+                        .insert(cutex_session_id.clone(), record.clone());
+                    membership = Some(record);
+                    (
+                        ProjectAuditKind::MemberAdded,
+                        Some(cutex_session_id.clone()),
+                    )
+                }
+                HumanManagementProjectMutationKind::DetachMember { cutex_session_id } => {
+                    require_state_lifecycle(&project_state, ProjectLifecycle::Active)?;
+                    if cutex_session_id == &authority.authorized_director_session {
+                        return Err(AgentManagementError::Conflict(
+                            "primary_director_requires_rotation",
+                        ));
+                    }
+                    let agent = state
+                        .agents
+                        .get(cutex_session_id)
+                        .cloned()
+                        .filter(|agent| agent.retired_at.is_none())
+                        .ok_or(AgentManagementError::NotFound("active_managed_agent"))?;
+                    if current_project_id(&state, &agent).as_ref() != Some(&request.project_id) {
+                        return Err(AgentManagementError::Conflict(
+                            "agent_not_current_project_member",
+                        ));
+                    }
+                    if tasks.has_active_tasks(&request.project_id, Some(cutex_session_id))? {
+                        return Err(AgentManagementError::Conflict(
+                            "member_has_active_project_task",
+                        ));
+                    }
+                    revoke_operator_for_detach(
+                        &mut state,
+                        request,
+                        &authority,
+                        cutex_session_id,
+                        &committed_at,
+                    )?;
+                    let record =
+                        next_membership(&state, cutex_session_id, None, committed_at.clone())?;
+                    state
+                        .current_project_memberships
+                        .insert(cutex_session_id.clone(), record.clone());
+                    membership = Some(record);
+                    (
+                        ProjectAuditKind::MemberDetached,
+                        Some(cutex_session_id.clone()),
+                    )
+                }
+                HumanManagementProjectMutationKind::Archive => {
+                    require_state_lifecycle(&project_state, ProjectLifecycle::Active)?;
+                    project_state.lifecycle = ProjectLifecycle::Archived;
+                    project_state.archived_at = Some(committed_at.clone());
+                    (ProjectAuditKind::Archived, None)
+                }
+                HumanManagementProjectMutationKind::Restore => {
+                    require_state_lifecycle(&project_state, ProjectLifecycle::Archived)?;
+                    project_state.lifecycle = ProjectLifecycle::Active;
+                    project_state.archived_at = None;
+                    (ProjectAuditKind::Restored, None)
+                }
+                HumanManagementProjectMutationKind::Remove => {
+                    require_state_lifecycle(&project_state, ProjectLifecycle::Archived)?;
+                    if tasks.has_active_tasks(&request.project_id, None)? {
+                        return Err(AgentManagementError::Conflict("project_has_active_tasks"));
+                    }
+                    let members = state
+                        .agents
+                        .values()
+                        .filter(|agent| {
+                            current_project_id(&state, agent).as_ref() == Some(&request.project_id)
+                        })
+                        .map(|agent| agent.cutex_session_id.clone())
+                        .collect::<Vec<_>>();
+                    for member_id in members {
+                        let record =
+                            next_membership(&state, &member_id, None, committed_at.clone())?;
+                        state.current_project_memberships.insert(member_id, record);
+                    }
+                    if state.operator_grants.remove(&request.project_id).is_some() {
+                        let next_grant_revision = state
+                            .operator_grant_revisions
+                            .get(&request.project_id)
+                            .copied()
+                            .unwrap_or(0)
+                            .checked_add(1)
+                            .filter(|value| *value <= MAX_JSON_SAFE_INTEGER)
+                            .ok_or(AgentManagementError::Conflict(
+                                "operator_grant_revision_overflow",
+                            ))?;
+                        state
+                            .operator_grant_revisions
+                            .insert(request.project_id.clone(), next_grant_revision);
+                    }
+                    state.project_presentations.remove(&request.project_id);
+                    state.projects.remove(&request.project_id);
+                    project_state.lifecycle = ProjectLifecycle::Removed;
+                    let removed = ProjectTombstone {
+                        project_id: request.project_id.clone(),
+                        final_revision: revision,
+                        final_authority_epoch: authority.authority_epoch,
+                        removed_at: committed_at.clone(),
+                        removed_by_human_management: true,
+                    };
+                    state
+                        .project_tombstones
+                        .insert(request.project_id.clone(), removed.clone());
+                    tombstone = Some(removed);
+                    (ProjectAuditKind::Removed, None)
+                }
+            };
+            project_state.revision = revision;
+            project_state.updated_at = committed_at.clone();
+            state
+                .project_states
+                .insert(request.project_id.clone(), project_state.clone());
+            let event_id = format!(
+                "human-management:{}:project:{}",
+                request.action_id, revision
+            );
+            let audit_event = ProjectAuditEvent {
+                event_id: event_id.clone(),
+                action_id: request.action_id.clone(),
+                project_id: request.project_id.clone(),
+                kind,
+                previous_project_revision: previous_revision,
+                project_revision: revision,
+                member_cutex_session_id,
+                performed_by_human_management: true,
+                committed_at: committed_at.clone(),
+            };
+            if state
+                .project_audit_events
+                .insert(event_id, audit_event.clone())
+                .is_some()
+            {
+                return Err(AgentManagementError::InvalidStore);
+            }
+            let receipt = HumanManagementProjectMutationReceipt {
+                schema: HumanManagementProjectMutationSchema::V1,
+                action_id: request.action_id.clone(),
+                request_sha256: digest.clone(),
+                project_id: request.project_id.clone(),
+                operation: request.operation.clone(),
+                previous_project_revision: previous_revision,
+                project_revision: revision,
+                project_state: Some(project_state),
+                membership,
+                tombstone,
+                audit_event,
+                committed_at,
+            };
+            state.human_management_project_mutations.insert(
+                request.action_id.clone(),
+                crate::management::control_plane::HumanManagementProjectMutationActionRecord {
+                    request_sha256: digest.clone(),
+                    receipt: receipt.clone(),
+                },
+            );
+            Ok((state, receipt, true))
+        })
+    }
+}
+
+impl AgentManagementProvider {
+    fn create_project_for_management(
+        &self,
+        request: &HumanManagementProjectMutationRequest,
+        director_cutex_session_id: &CutexSessionId,
+        presentation: &ProjectPresentationInput,
+    ) -> Result<HumanManagementProjectMutationReceipt, AgentManagementError> {
+        if request.expected_authority_epoch != 0 || request.expected_project_revision != 0 {
+            return Err(AgentManagementError::InvalidRequest(
+                "project_create_requires_zero_cas",
+            ));
+        }
+        presentation.validate()?;
+        let _execution = super::provider::provider_execution_lock()
+            .lock()
+            .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
+        let _mutation = self.store().lock_mutations()?;
+        let digest = super::store::request_sha256(request)?;
+        let seat_action_id = project_seat_action_id(&request.action_id, &digest)?;
+        let before = self.store().snapshot()?;
+        if let Some(record) = before
+            .human_management_project_mutations
+            .get(&request.action_id)
+        {
+            if record.request_sha256 != digest {
+                return Err(AgentManagementError::Conflict("action_id_payload_conflict"));
+            }
+            self.director_seats
+                .prepare_project_director(
+                    &seat_action_id,
+                    &request.project_id,
+                    director_cutex_session_id,
+                )
+                .and_then(|_| {
+                    self.director_seats.activate_project_director(
+                        &seat_action_id,
+                        &request.project_id,
+                        director_cutex_session_id,
+                    )
+                })
+                .map_err(super::provider::seat_authority_error)?;
+            return Ok(record.receipt.clone());
+        }
+        reject_project_action_id_domain_collision(&before, &request.action_id)?;
+        if before.projects.contains_key(&request.project_id)
+            || before.project_tombstones.contains_key(&request.project_id)
+        {
+            return Err(AgentManagementError::Conflict("project_id_already_used"));
+        }
+        let director = before
+            .agents
+            .get(director_cutex_session_id)
+            .filter(|agent| agent.retired_at.is_none())
+            .ok_or(AgentManagementError::NotFound("active_managed_director"))?;
+        if current_project_id(&before, director).is_some() {
+            return Err(AgentManagementError::Conflict(
+                "director_already_has_active_project",
+            ));
+        }
+        self.director_seats
+            .prepare_project_director(
+                &seat_action_id,
+                &request.project_id,
+                director_cutex_session_id,
+            )
+            .map_err(super::provider::seat_authority_error)?;
+        let receipt = self.store().with_state(true, |mut state| {
+            if state.projects.contains_key(&request.project_id)
+                || state.project_tombstones.contains_key(&request.project_id)
+            {
+                return Err(AgentManagementError::Conflict("project_id_already_used"));
+            }
+            let director = state
+                .agents
+                .get(director_cutex_session_id)
+                .cloned()
+                .filter(|agent| agent.retired_at.is_none())
+                .ok_or(AgentManagementError::NotFound("active_managed_director"))?;
+            if current_project_id(&state, &director).is_some() {
+                return Err(AgentManagementError::Conflict(
+                    "director_already_has_active_project",
+                ));
+            }
+            let committed_at = now();
+            let authority = ProjectAuthority {
+                project_id: request.project_id.clone(),
+                authorized_director_session: director_cutex_session_id.clone(),
+                authority_epoch: 1,
+                updated_at: committed_at.clone(),
+            };
+            let project_state = ProjectStateRecord {
+                project_id: request.project_id.clone(),
+                lifecycle: ProjectLifecycle::Active,
+                revision: 1,
+                created_at: committed_at.clone(),
+                updated_at: committed_at.clone(),
+                archived_at: None,
+            };
+            let membership = next_membership(
+                &state,
+                director_cutex_session_id,
+                Some(request.project_id.clone()),
+                committed_at.clone(),
+            )?;
+            let stored_presentation = ProjectPresentationSettings {
+                display_name: presentation.display_name.trim().to_string(),
+                badge_label: presentation.badge_label.trim().to_string(),
+                color: presentation.color,
+                revision: 1,
+                updated_at: committed_at.clone(),
+                updated_by_director_session: None,
+                updated_by_human_management: true,
+                extra: BTreeMap::new(),
+            };
+            let event_id = format!("human-management:{}:project:1", request.action_id);
+            let audit_event = ProjectAuditEvent {
+                event_id: event_id.clone(),
+                action_id: request.action_id.clone(),
+                project_id: request.project_id.clone(),
+                kind: ProjectAuditKind::Created,
+                previous_project_revision: 0,
+                project_revision: 1,
+                member_cutex_session_id: Some(director_cutex_session_id.clone()),
+                performed_by_human_management: true,
+                committed_at: committed_at.clone(),
+            };
+            let receipt = HumanManagementProjectMutationReceipt {
+                schema: HumanManagementProjectMutationSchema::V1,
+                action_id: request.action_id.clone(),
+                request_sha256: digest.clone(),
+                project_id: request.project_id.clone(),
+                operation: request.operation.clone(),
+                previous_project_revision: 0,
+                project_revision: 1,
+                project_state: Some(project_state.clone()),
+                membership: Some(membership.clone()),
+                tombstone: None,
+                audit_event: audit_event.clone(),
+                committed_at,
+            };
+            state.projects.insert(request.project_id.clone(), authority);
+            state
+                .project_states
+                .insert(request.project_id.clone(), project_state);
+            state
+                .current_project_memberships
+                .insert(director_cutex_session_id.clone(), membership);
+            state
+                .project_presentations
+                .insert(request.project_id.clone(), stored_presentation);
+            state.project_audit_events.insert(event_id, audit_event);
+            state.human_management_project_mutations.insert(
+                request.action_id.clone(),
+                crate::management::control_plane::HumanManagementProjectMutationActionRecord {
+                    request_sha256: digest.clone(),
+                    receipt: receipt.clone(),
+                },
+            );
+            Ok((state, receipt, true))
+        })?;
+        self.director_seats
+            .activate_project_director(
+                &seat_action_id,
+                &request.project_id,
+                director_cutex_session_id,
+            )
+            .map_err(super::provider::seat_authority_error)?;
+        Ok(receipt)
+    }
+}
+
+fn project_seat_action_id(
+    action_id: &super::AgentActionId,
+    request_sha256: &crate::role_revision::Sha256,
+) -> Result<crate::task_service::ActionId, AgentManagementError> {
+    let digest = Sha256Digest::digest(
+        format!("{}:{}", action_id.as_str(), request_sha256.as_str()).as_bytes(),
+    );
+    crate::task_service::ActionId::new(format!("human-project-create-{digest:x}"))
+        .map_err(|_| AgentManagementError::InvalidStore)
 }
 
 fn management_operator_grant_revision(
@@ -693,6 +1404,191 @@ fn management_operator_roster(
     }
 }
 
+fn reject_project_action_id_domain_collision(
+    state: &super::AgentManagementSnapshot,
+    action_id: &super::AgentActionId,
+) -> Result<(), AgentManagementError> {
+    if state.actions.contains_key(action_id)
+        || state.authority_receipts.contains_key(action_id)
+        || state
+            .human_management_operator_actions
+            .contains_key(action_id)
+        || state
+            .legacy_director_ownership_import_receipts
+            .contains_key(action_id)
+        || state
+            .reservation_reconciliation_receipts
+            .contains_key(action_id)
+    {
+        Err(AgentManagementError::Conflict("action_id_domain_conflict"))
+    } else {
+        Ok(())
+    }
+}
+
+fn next_project_revision(current: u64) -> Result<u64, AgentManagementError> {
+    current
+        .checked_add(1)
+        .filter(|revision| *revision <= MAX_JSON_SAFE_INTEGER)
+        .ok_or(AgentManagementError::Conflict("project_revision_overflow"))
+}
+
+fn effective_project_state(
+    snapshot: &super::AgentManagementSnapshot,
+    authority: &ProjectAuthority,
+) -> ProjectStateRecord {
+    snapshot
+        .project_states
+        .get(&authority.project_id)
+        .cloned()
+        .unwrap_or_else(|| ProjectStateRecord {
+            project_id: authority.project_id.clone(),
+            lifecycle: ProjectLifecycle::Active,
+            revision: 0,
+            created_at: authority.updated_at.clone(),
+            updated_at: authority.updated_at.clone(),
+            archived_at: None,
+        })
+}
+
+fn project_seat_matches_authority(
+    seats: &crate::seat::SeatOccupancySnapshot,
+    authority: &ProjectAuthority,
+    lifecycle: ProjectLifecycle,
+) -> bool {
+    let expected = match lifecycle {
+        ProjectLifecycle::Active => crate::seat::ProjectDirectorSeatState::Active,
+        ProjectLifecycle::Archived => crate::seat::ProjectDirectorSeatState::Archived,
+        ProjectLifecycle::Removed => return false,
+    };
+    match (
+        seats
+            .project_director_occupancies
+            .get(&authority.project_id),
+        seats.project_director_states.get(&authority.project_id),
+    ) {
+        (Some(occupancy), state) => {
+            occupancy.occupant_cutex_session == authority.authorized_director_session
+                && state
+                    .copied()
+                    .unwrap_or(crate::seat::ProjectDirectorSeatState::Active)
+                    == expected
+        }
+        (None, Some(_)) => false,
+        // A store with neither scoped occupancy nor scoped lifecycle is a
+        // deterministic legacy representation. Preserve its existing
+        // visibility until the explicit migration/repair path materializes
+        // the per-project seat.
+        (None, None) => true,
+    }
+}
+
+fn require_active_project(
+    snapshot: &super::AgentManagementSnapshot,
+    project_id: &ProjectId,
+) -> Result<(), AgentManagementError> {
+    let authority = snapshot
+        .projects
+        .get(project_id)
+        .ok_or(AgentManagementError::ProjectNotAuthorized)?;
+    require_state_lifecycle(
+        &effective_project_state(snapshot, authority),
+        ProjectLifecycle::Active,
+    )
+}
+
+fn require_state_lifecycle(
+    state: &ProjectStateRecord,
+    expected: ProjectLifecycle,
+) -> Result<(), AgentManagementError> {
+    if state.lifecycle == expected {
+        Ok(())
+    } else {
+        Err(AgentManagementError::Conflict(match state.lifecycle {
+            ProjectLifecycle::Active => "project_is_active",
+            ProjectLifecycle::Archived => "project_is_archived",
+            ProjectLifecycle::Removed => "project_is_removed",
+        }))
+    }
+}
+
+pub(crate) fn current_project_id(
+    snapshot: &super::AgentManagementSnapshot,
+    agent: &ManagedAgentRecord,
+) -> Option<ProjectId> {
+    match snapshot
+        .current_project_memberships
+        .get(&agent.cutex_session_id)
+    {
+        Some(membership) => membership.project_id.clone(),
+        None if agent.retired_at.is_none() => Some(agent.project_id.clone()),
+        None => None,
+    }
+}
+
+fn next_membership(
+    snapshot: &super::AgentManagementSnapshot,
+    cutex_session_id: &CutexSessionId,
+    project_id: Option<ProjectId>,
+    updated_at: Rfc3339,
+) -> Result<CurrentProjectMembership, AgentManagementError> {
+    let revision = snapshot
+        .current_project_memberships
+        .get(cutex_session_id)
+        .map_or(Ok(1), |current| next_project_revision(current.revision))?;
+    Ok(CurrentProjectMembership {
+        cutex_session_id: cutex_session_id.clone(),
+        project_id,
+        revision,
+        updated_at,
+    })
+}
+
+fn revoke_operator_for_detach(
+    state: &mut super::AgentManagementSnapshot,
+    request: &HumanManagementProjectMutationRequest,
+    authority: &ProjectAuthority,
+    cutex_session_id: &CutexSessionId,
+    committed_at: &Rfc3339,
+) -> Result<(), AgentManagementError> {
+    let removed = state
+        .operator_grants
+        .get_mut(&request.project_id)
+        .and_then(|grants| grants.remove(cutex_session_id));
+    if removed.is_none() {
+        return Ok(());
+    }
+    let previous = management_operator_grant_revision(state, &request.project_id);
+    let revision = management_next_operator_grant_revision(previous)?;
+    state
+        .operator_grant_revisions
+        .insert(request.project_id.clone(), revision);
+    let event_id = format!(
+        "human-management:{}:member-detach-operator:{}",
+        request.action_id, revision
+    );
+    let event = super::AgentOperatorAuditEvent {
+        event_id: event_id.clone(),
+        action_id: request.action_id.clone(),
+        project_id: request.project_id.clone(),
+        operator_cutex_session_id: cutex_session_id.clone(),
+        kind: super::AgentOperatorAuditKind::Revoked,
+        previous_grant_revision: previous,
+        grant_revision: revision,
+        primary_director_cutex_session_id: authority.authorized_director_session.clone(),
+        performed_by_human_management: true,
+        committed_at: committed_at.clone(),
+    };
+    if state
+        .operator_audit_events
+        .insert(event_id, event)
+        .is_some()
+    {
+        return Err(AgentManagementError::InvalidStore);
+    }
+    Ok(())
+}
+
 fn project_workspace(
     snapshot: &super::AgentManagementSnapshot,
     authority: &ProjectAuthority,
@@ -704,11 +1600,10 @@ fn project_workspace(
     let mut retired_agents = Vec::new();
     let mut agent_operators = Vec::new();
     let mut director_member = None;
-    for agent in snapshot
-        .agents
-        .values()
-        .filter(|agent| &agent.project_id == project_id)
-    {
+    for agent in snapshot.agents.values().filter(|agent| {
+        agent.retired_at.is_some() && &agent.project_id == project_id
+            || current_project_id(snapshot, agent).as_ref() == Some(project_id)
+    }) {
         let member = project_member(agent.clone(), observer);
         if agent.cutex_session_id == authority.authorized_director_session {
             director_member = Some(member);
@@ -745,6 +1640,8 @@ fn project_workspace(
     Ok(CutexProjectWorkspace {
         project_id: project_id.clone(),
         authority_epoch: authority.authority_epoch,
+        lifecycle: effective_project_state(snapshot, authority).lifecycle,
+        project_revision: effective_project_state(snapshot, authority).revision,
         director: ProjectDirectorProjection {
             cutex_session_id: authority.authorized_director_session.clone(),
             member: director_member,
@@ -875,31 +1772,25 @@ fn summary(
 ) -> CutexProjectSummary {
     let mut active_member_count = 0;
     let mut retired_member_count = 0;
-    for agent in snapshot
-        .agents
-        .values()
-        .filter(|agent| agent.project_id == authority.project_id)
-    {
-        if agent.cutex_session_id == authority.authorized_director_session {
-            continue;
-        }
-        if snapshot
-            .operator_grants
-            .get(&authority.project_id)
-            .is_some_and(|grants| grants.contains_key(&agent.cutex_session_id))
-        {
-            continue;
-        }
+    for agent in snapshot.agents.values().filter(|agent| {
+        agent.retired_at.is_some() && agent.project_id == authority.project_id
+            || current_project_id(snapshot, agent).as_ref() == Some(&authority.project_id)
+    }) {
         if agent.retired_at.is_some() {
             retired_member_count += 1;
         } else {
             active_member_count += 1;
         }
     }
+    let state = effective_project_state(snapshot, authority);
     CutexProjectSummary {
         project_id: authority.project_id.clone(),
         authority_epoch: authority.authority_epoch,
         director_cutex_session_id: authority.authorized_director_session.clone(),
+        director_name: snapshot
+            .agents
+            .get(&authority.authorized_director_session)
+            .map(|agent| agent.spec.name.clone()),
         access_role,
         operator_count: snapshot
             .operator_grants
@@ -911,6 +1802,8 @@ fn summary(
         ),
         active_member_count,
         retired_member_count,
+        lifecycle: state.lifecycle,
+        project_revision: state.revision,
     }
 }
 
@@ -1598,6 +2491,223 @@ mod tests {
             ),
             Err(AgentManagementError::ProjectNotAuthorized)
         ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn human_project_membership_archive_restore_remove_are_fenced_and_replayable() {
+        let (provider, root, project_id) = provider_with_project();
+        let principal = HumanManagementPrincipal::authenticated();
+        provider
+            .director_seats
+            .bind(&crate::seat::SeatOccupancyBindRequest {
+                schema: crate::seat::SeatOccupancyCommandSchema::V1,
+                action_id: crate::task_service::ActionId::new("bind-project-director").unwrap(),
+                seat_id: crate::task_service::SeatId::new("cutex-director").unwrap(),
+                occupant_cutex_session: session("cutex.director"),
+            })
+            .unwrap();
+        let detach = HumanManagementProjectMutationRequest {
+            schema: HumanManagementProjectMutationSchema::V1,
+            action_id: AgentActionId::new("human-detach-worker").unwrap(),
+            project_id: project_id.clone(),
+            expected_authority_epoch: 7,
+            expected_project_revision: 0,
+            operation: HumanManagementProjectMutationKind::DetachMember {
+                cutex_session_id: session("cutex.worker-online"),
+            },
+        };
+        let no_tasks = |_: &ProjectId, _: Option<&CutexSessionId>| Ok(false);
+        let first = provider
+            .execute_project_mutation_for_management(&principal, &detach, &no_tasks)
+            .unwrap();
+        assert_eq!(first.project_revision, 1);
+        assert_eq!(
+            provider
+                .execute_project_mutation_for_management(&principal, &detach, &no_tasks)
+                .unwrap(),
+            first
+        );
+        let snapshot = provider.store().snapshot().unwrap();
+        assert_eq!(
+            snapshot.agents[&session("cutex.worker-online")].project_id,
+            project_id
+        );
+        assert_eq!(
+            snapshot.current_project_memberships[&session("cutex.worker-online")].project_id,
+            None
+        );
+
+        let archive = HumanManagementProjectMutationRequest {
+            schema: HumanManagementProjectMutationSchema::V1,
+            action_id: AgentActionId::new("human-archive-project").unwrap(),
+            project_id: project_id.clone(),
+            expected_authority_epoch: 7,
+            expected_project_revision: 1,
+            operation: HumanManagementProjectMutationKind::Archive,
+        };
+        let active_tasks = |_: &ProjectId, _: Option<&CutexSessionId>| Ok(true);
+        provider
+            .execute_project_mutation_for_management(&principal, &archive, &active_tasks)
+            .unwrap();
+        let collection = provider
+            .list_cutex_projects_for_management(&principal)
+            .unwrap();
+        assert!(collection.projects.is_empty());
+        assert_eq!(collection.archived_projects.len(), 1);
+        assert_eq!(
+            provider.update_project_presentation_for_management(
+                &principal,
+                &HumanManagementPresentationUpdateRequest {
+                    schema: crate::management::control_plane::HumanManagementPresentationSchema::V1,
+                    project_id: project_id.clone(),
+                    expected_authority_epoch: 7,
+                    expected_presentation_revision: 0,
+                    presentation: ProjectPresentationInput {
+                        display_name: "Archived write".to_string(),
+                        badge_label: "AW".to_string(),
+                        color: ProjectPaletteColor::Green,
+                    },
+                },
+            ),
+            Err(AgentManagementError::Conflict("project_is_archived"))
+        );
+
+        let restore = HumanManagementProjectMutationRequest {
+            schema: HumanManagementProjectMutationSchema::V1,
+            action_id: AgentActionId::new("human-restore-project").unwrap(),
+            project_id: project_id.clone(),
+            expected_authority_epoch: 7,
+            expected_project_revision: 2,
+            operation: HumanManagementProjectMutationKind::Restore,
+        };
+        provider
+            .execute_project_mutation_for_management(&principal, &restore, &no_tasks)
+            .unwrap();
+        let archive_again = HumanManagementProjectMutationRequest {
+            schema: HumanManagementProjectMutationSchema::V1,
+            action_id: AgentActionId::new("human-archive-project-again").unwrap(),
+            project_id: project_id.clone(),
+            expected_authority_epoch: 7,
+            expected_project_revision: 3,
+            operation: HumanManagementProjectMutationKind::Archive,
+        };
+        provider
+            .execute_project_mutation_for_management(&principal, &archive_again, &active_tasks)
+            .unwrap();
+
+        let blocked_remove = HumanManagementProjectMutationRequest {
+            schema: HumanManagementProjectMutationSchema::V1,
+            action_id: AgentActionId::new("human-remove-project").unwrap(),
+            project_id: project_id.clone(),
+            expected_authority_epoch: 7,
+            expected_project_revision: 4,
+            operation: HumanManagementProjectMutationKind::Remove,
+        };
+        assert_eq!(
+            provider.execute_project_mutation_for_management(
+                &principal,
+                &blocked_remove,
+                &active_tasks
+            ),
+            Err(AgentManagementError::Conflict("project_has_active_tasks"))
+        );
+        provider
+            .execute_project_mutation_for_management(&principal, &blocked_remove, &no_tasks)
+            .unwrap();
+        let snapshot = provider.store().snapshot().unwrap();
+        assert!(!snapshot.projects.contains_key(&project_id));
+        assert!(snapshot.project_tombstones.contains_key(&project_id));
+        assert_eq!(
+            snapshot.agents[&session("cutex.director")].project_id,
+            project_id
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn human_project_create_uses_pending_then_active_project_seat_and_exact_replay() {
+        let root =
+            std::env::temp_dir().join(format!("cutex-project-create-{}", uuid::Uuid::new_v4()));
+        let provider = AgentManagementProvider::open(&root).unwrap();
+        let historic = project("historic-project");
+        let director = agent(&historic, "cutex.new-director", false);
+        provider
+            .store()
+            .with_state(true, |mut state| {
+                state.current_project_memberships.insert(
+                    director.cutex_session_id.clone(),
+                    CurrentProjectMembership {
+                        cutex_session_id: director.cutex_session_id.clone(),
+                        project_id: None,
+                        revision: 1,
+                        updated_at: timestamp(),
+                    },
+                );
+                state
+                    .agents
+                    .insert(director.cutex_session_id.clone(), director);
+                Ok((state, (), true))
+            })
+            .unwrap();
+        let request = HumanManagementProjectMutationRequest {
+            schema: HumanManagementProjectMutationSchema::V1,
+            action_id: AgentActionId::new("human-create-project").unwrap(),
+            project_id: project("new-project"),
+            expected_authority_epoch: 0,
+            expected_project_revision: 0,
+            operation: HumanManagementProjectMutationKind::Create {
+                director_cutex_session_id: session("cutex.new-director"),
+                presentation: ProjectPresentationInput {
+                    display_name: "New Project".to_string(),
+                    badge_label: "NP".to_string(),
+                    color: ProjectPaletteColor::Rgb(0x12, 0x34, 0x56),
+                },
+            },
+        };
+        let no_tasks = |_: &ProjectId, _: Option<&CutexSessionId>| Ok(false);
+        let first = provider
+            .execute_project_mutation_for_management(
+                &HumanManagementPrincipal::authenticated(),
+                &request,
+                &no_tasks,
+            )
+            .unwrap();
+        assert_eq!(first.project_revision, 1);
+        assert_eq!(
+            provider
+                .execute_project_mutation_for_management(
+                    &HumanManagementPrincipal::authenticated(),
+                    &request,
+                    &no_tasks,
+                )
+                .unwrap(),
+            first
+        );
+        let seats = provider.director_seats.query().unwrap();
+        assert_eq!(
+            seats.project_director_states[&project("new-project")],
+            crate::seat::ProjectDirectorSeatState::Active
+        );
+        assert_eq!(
+            provider.store().snapshot().unwrap().project_presentations[&project("new-project")]
+                .color,
+            ProjectPaletteColor::Rgb(0x12, 0x34, 0x56)
+        );
+        provider
+            .director_seats
+            .transition_project_director(
+                &project("new-project"),
+                &session("cutex.new-director"),
+                crate::seat::ProjectDirectorSeatState::Active,
+                crate::seat::ProjectDirectorSeatState::Archived,
+            )
+            .unwrap();
+        let hidden = provider
+            .list_cutex_projects_for_management(&HumanManagementPrincipal::authenticated())
+            .unwrap();
+        assert!(hidden.projects.is_empty());
+        assert!(hidden.archived_projects.is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

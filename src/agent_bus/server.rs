@@ -2,7 +2,7 @@
 
 pub(crate) mod task_action_store;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::TcpStream;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
@@ -1440,6 +1440,24 @@ impl TaskWorkerActionHost {
                 "project_contract_invalid",
             );
         }
+        if !director_existing_work_seat_usable(seat_snapshot, session_id) {
+            return director_no_write(
+                request.action_id.clone(),
+                director_operation_name(&request.action),
+                "project_director_seat_not_usable",
+            );
+        }
+        if let Some(project_id) = director_new_work_project(request) {
+            if let Err(code) =
+                director_project_write_authorized(seat_snapshot, session_id, project_id)
+            {
+                return director_no_write(
+                    request.action_id.clone(),
+                    director_operation_name(&request.action),
+                    code,
+                );
+            }
+        }
         match &request.action {
             Operation::Query { selector } => {
                 // A v2 Director query is deliberately project-scoped.  The
@@ -1448,7 +1466,7 @@ impl TaskWorkerActionHost {
                 // workspace metadata participates in this authority lookup.
                 let project_scope =
                     if request.schema == crate::task_service::DirectorActionSchema::V2 {
-                        match director_exact_project_scope(session_id) {
+                        match director_exact_project_scope(seat_snapshot, session_id) {
                             Ok(scope) => Some(scope),
                             Err(code) => {
                                 return director_no_write(request.action_id.clone(), "query", code)
@@ -1552,6 +1570,17 @@ impl TaskWorkerActionHost {
         let Some(assignment) = snapshot.assignments.get(&decision.assignment_id) else {
             return director_no_write(request.action_id.clone(), operation, "not_found");
         };
+        if assignment.project_id.is_some()
+            || request.schema == crate::task_service::DirectorActionSchema::V2
+        {
+            if let Err(code) = director_existing_work_project_authorized(
+                seat_snapshot,
+                session_id,
+                assignment.project_id.as_ref(),
+            ) {
+                return director_no_write(request.action_id.clone(), operation, code);
+            }
+        }
         let context = worker_mechanical_context(&snapshot, assignment);
         if matches!(&request.action, Operation::Cancel(_)) {
             let is_coordinator = snapshot
@@ -2397,6 +2426,7 @@ impl TaskWorkerActionHost {
 /// heuristic fallback: inability to read the authority store fails the v2
 /// query closed.
 fn director_exact_project_scope(
+    seats: &crate::seat::SeatOccupancySnapshot,
     director_session: &crate::role_revision::CutexSessionId,
 ) -> Result<BTreeSet<crate::agent_management::ProjectId>, &'static str> {
     let snapshot = crate::agent_management::AgentManagementProvider::open_default()
@@ -2404,11 +2434,57 @@ fn director_exact_project_scope(
         .store()
         .snapshot()
         .map_err(|_| "project_authority_unavailable")?;
-    let projects = exact_project_scope_from_authorities(snapshot.projects, director_session);
+    let projects =
+        exact_project_scope_from_authorities(snapshot.projects.clone(), director_session);
+    let project_scoped = projects
+        .iter()
+        .filter(|project_id| {
+            seats
+                .project_director_occupancies
+                .get(*project_id)
+                .is_some_and(|occupancy| {
+                    occupancy.occupant_cutex_session == *director_session
+                        && matches!(
+                            seats
+                                .project_director_states
+                                .get(*project_id)
+                                .copied()
+                                .unwrap_or(crate::seat::ProjectDirectorSeatState::Active),
+                            crate::seat::ProjectDirectorSeatState::Active
+                                | crate::seat::ProjectDirectorSeatState::Archived
+                        )
+                })
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let projects = if project_scoped.is_empty()
+        && projects.len() == 1
+        && seats.occupancies.values().any(|occupancy| {
+            occupancy.seat_id.as_str() == "cutex-director"
+                && occupancy.occupant_cutex_session == *director_session
+        }) {
+        projects
+    } else {
+        project_scoped
+    };
     if projects.is_empty() {
         Err("project_authority_absent")
     } else {
         Ok(projects)
+    }
+}
+
+fn director_existing_work_project_authorized(
+    seats: &crate::seat::SeatOccupancySnapshot,
+    director_session: &crate::role_revision::CutexSessionId,
+    project_id: Option<&crate::agent_management::ProjectId>,
+) -> Result<(), &'static str> {
+    let scope = director_exact_project_scope(seats, director_session)?;
+    match project_id {
+        Some(project_id) if scope.contains(project_id) => Ok(()),
+        Some(_) => Err("project_authority_absent"),
+        None if scope.len() == 1 => Ok(()),
+        None => Err("project_scope_ambiguous"),
     }
 }
 
@@ -2442,68 +2518,93 @@ fn human_management_task_query_with_stores(
 ) -> anyhow::Result<crate::management::control_plane::HumanManagementTaskQueryResponse> {
     let director_seat = crate::task_service::SeatId::new("cutex-director")
         .map_err(|error| anyhow!("invalid Director seat identity: {error}"))?;
-    let initial = seats
+    let seat_snapshot = seats
         .query()
         .map_err(|error| anyhow!("Task Service seat authority unavailable: {error}"))?;
-    let occupant = initial
-        .occupancies
-        .get(&director_seat)
-        .map(|occupancy| occupancy.occupant_cutex_session.clone())
-        .ok_or_else(|| anyhow!("current cutex-director seat is not bound"))?;
-
-    seats
-        .with_current_principal_snapshot(&occupant, |_seated_principal, seat_snapshot| {
-            let occupancy = seat_snapshot
-                .occupancies
-                .get(&director_seat)
-                .filter(|occupancy| occupancy.occupant_cutex_session == occupant)
-                .ok_or_else(|| anyhow!("current cutex-director seat changed during query"))?;
-            let project_snapshot = management.store().snapshot().map_err(|error| {
-                anyhow!("Agent Management project authority unavailable: {error}")
-            })?;
-            let mut project_ids =
-                exact_project_scope_from_authorities(project_snapshot.projects.clone(), &occupant)
-                    .into_iter()
-                    .collect::<Vec<_>>();
-            project_ids.sort();
-            if project_ids.is_empty() {
-                anyhow::bail!(
-                    "current cutex-director seat has no exact Primary Director project authority"
-                );
-            }
-            let exact_scope = project_ids.iter().cloned().collect::<BTreeSet<_>>();
-            let project_presentations = project_ids
-                .iter()
-                .map(|project_id| {
-                    (
-                        project_id.clone(),
-                        crate::agent_management::effective_presentation(
-                            project_id,
-                            project_snapshot.project_presentations.get(project_id),
-                        ),
-                    )
+    let project_snapshot = management
+        .store()
+        .snapshot()
+        .map_err(|error| anyhow!("Agent Management project authority unavailable: {error}"))?;
+    let legacy = seat_snapshot.occupancies.get(&director_seat);
+    let mut director_seats = BTreeMap::new();
+    for (project_id, authority) in &project_snapshot.projects {
+        let occupancy =
+            if let Some(occupancy) = seat_snapshot.project_director_occupancies.get(project_id) {
+                let state = seat_snapshot
+                    .project_director_states
+                    .get(project_id)
+                    .copied()
+                    .unwrap_or(crate::seat::ProjectDirectorSeatState::Active);
+                matches!(
+                    state,
+                    crate::seat::ProjectDirectorSeatState::Active
+                        | crate::seat::ProjectDirectorSeatState::Archived
+                )
+                .then_some(occupancy)
+            } else {
+                legacy.filter(|occupancy| {
+                    occupancy.occupant_cutex_session == authority.authorized_director_session
+                        && exact_project_scope_from_authorities(
+                            project_snapshot.projects.clone(),
+                            &occupancy.occupant_cutex_session,
+                        )
+                        .len()
+                            == 1
                 })
-                .collect();
-            let receipt = TaskWorkerActionHost::director_query(
-                provider,
-                seat_snapshot,
-                Some(&director_seat),
-                request.action_id.clone(),
-                &request.selector,
-                Some(&exact_scope),
-            );
-            Ok(
-                crate::management::control_plane::HumanManagementTaskQueryResponse {
-                    schema: request.schema,
-                    director_seat_occupant: occupant.clone(),
-                    director_seat_epoch: occupancy.epoch,
-                    project_ids,
-                    project_presentations,
-                    receipt,
+            };
+        if let Some(occupancy) = occupancy.filter(|occupancy| {
+            occupancy.occupant_cutex_session == authority.authorized_director_session
+        }) {
+            director_seats.insert(
+                project_id.clone(),
+                crate::management::control_plane::HumanManagementDirectorSeat {
+                    project_id: project_id.clone(),
+                    occupant_cutex_session: occupancy.occupant_cutex_session.clone(),
+                    epoch: occupancy.epoch,
                 },
+            );
+        }
+    }
+    let (occupant, epoch) = director_seats
+        .values()
+        .next()
+        .map(|seat| (seat.occupant_cutex_session.clone(), seat.epoch))
+        .ok_or_else(|| {
+            anyhow!("no usable project Director seat matches Agent Management authority")
+        })?;
+    let project_ids = director_seats.keys().cloned().collect::<Vec<_>>();
+    let exact_scope = project_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let project_presentations = project_ids
+        .iter()
+        .map(|project_id| {
+            (
+                project_id.clone(),
+                crate::agent_management::effective_presentation(
+                    project_id,
+                    project_snapshot.project_presentations.get(project_id),
+                ),
             )
         })
-        .map_err(|error| anyhow!("Director seat authorization changed during query: {error}"))?
+        .collect();
+    let receipt = TaskWorkerActionHost::director_query(
+        provider,
+        &seat_snapshot,
+        Some(&director_seat),
+        request.action_id.clone(),
+        &request.selector,
+        Some(&exact_scope),
+    );
+    Ok(
+        crate::management::control_plane::HumanManagementTaskQueryResponse {
+            schema: request.schema,
+            director_seat_occupant: occupant,
+            director_seat_epoch: epoch,
+            director_seats,
+            project_ids,
+            project_presentations,
+            receipt,
+        },
+    )
 }
 
 fn exact_project_scope_from_authorities(
@@ -3675,11 +3776,108 @@ fn seat_for_session_in_snapshot(
     snapshot: &crate::seat::SeatOccupancySnapshot,
     session_id: &crate::role_revision::CutexSessionId,
 ) -> Option<crate::task_service::SeatId> {
-    snapshot
-        .occupancies
+    let mut project_seats = snapshot
+        .project_director_occupancies
         .values()
-        .find(|occupancy| &occupancy.occupant_cutex_session == session_id)
+        .filter(|occupancy| &occupancy.occupant_cutex_session == session_id);
+    let project_seat = project_seats.next();
+    if project_seats.next().is_some() {
+        return None;
+    }
+    project_seat
+        .or_else(|| {
+            snapshot
+                .occupancies
+                .values()
+                .find(|occupancy| &occupancy.occupant_cutex_session == session_id)
+        })
         .map(|occupancy| occupancy.seat_id.clone())
+}
+
+fn director_new_work_project(
+    request: &crate::task_service::DirectorActionRequest,
+) -> Option<&crate::agent_management::ProjectId> {
+    use crate::task_service::DirectorSemanticOperation as Operation;
+    match &request.action {
+        Operation::CreateRevision(request) => request.project_id.as_ref(),
+        Operation::Assign(request) => request.project_id.as_ref(),
+        Operation::CreateAndAssign {
+            create_revision, ..
+        } => create_revision.project_id.as_ref(),
+        _ => None,
+    }
+}
+
+fn director_existing_work_seat_usable(
+    seats: &crate::seat::SeatOccupancySnapshot,
+    director_session: &crate::role_revision::CutexSessionId,
+) -> bool {
+    let matching = seats
+        .project_director_occupancies
+        .iter()
+        .filter(|(_, occupancy)| &occupancy.occupant_cutex_session == director_session)
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [] => true,
+        [(project_id, _)] => matches!(
+            seats
+                .project_director_states
+                .get(project_id)
+                .copied()
+                .unwrap_or(crate::seat::ProjectDirectorSeatState::Active),
+            crate::seat::ProjectDirectorSeatState::Active
+                | crate::seat::ProjectDirectorSeatState::Archived
+        ),
+        _ => false,
+    }
+}
+
+fn director_project_write_authorized(
+    seats: &crate::seat::SeatOccupancySnapshot,
+    director_session: &crate::role_revision::CutexSessionId,
+    project_id: &crate::agent_management::ProjectId,
+) -> Result<(), &'static str> {
+    let management = crate::agent_management::AgentManagementProvider::open_default()
+        .map_err(|_| "project_authority_unavailable")?;
+    let snapshot = management
+        .store()
+        .snapshot()
+        .map_err(|_| "project_authority_unavailable")?;
+    let authority = snapshot
+        .projects
+        .get(project_id)
+        .filter(|authority| &authority.authorized_director_session == director_session)
+        .ok_or("project_authority_absent")?;
+    if authority.authority_epoch == 0 {
+        return Err("project_authority_invalid");
+    }
+    if snapshot
+        .project_states
+        .get(project_id)
+        .is_some_and(|state| state.lifecycle != crate::agent_management::ProjectLifecycle::Active)
+    {
+        return Err("project_not_active");
+    }
+    if let Some(occupancy) = seats.project_director_occupancies.get(project_id) {
+        let usable = seats
+            .project_director_states
+            .get(project_id)
+            .copied()
+            .unwrap_or(crate::seat::ProjectDirectorSeatState::Active)
+            == crate::seat::ProjectDirectorSeatState::Active;
+        return (usable && &occupancy.occupant_cutex_session == director_session)
+            .then_some(())
+            .ok_or("project_director_seat_changed");
+    }
+    let exact_projects = exact_project_scope_from_authorities(snapshot.projects, director_session);
+    let legacy_matches = exact_projects.len() == 1
+        && seats.occupancies.values().any(|occupancy| {
+            occupancy.seat_id.as_str() == "cutex-director"
+                && &occupancy.occupant_cutex_session == director_session
+        });
+    legacy_matches
+        .then_some(())
+        .ok_or("project_director_seat_migration_required")
 }
 
 fn director_operation_name(
@@ -4530,7 +4728,7 @@ mod tests {
         .unwrap_err();
         assert!(denied
             .to_string()
-            .contains("no exact Primary Director project authority"));
+            .contains("no usable project Director seat matches Agent Management authority"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -7770,8 +7968,11 @@ mod tests {
             &fixture.state,
             &scoped_v2,
         );
-        assert_eq!(scoped.status, DirectorActionStatus::Committed);
-        assert_eq!(scoped.project_id.as_ref(), Some(&project));
+        assert_eq!(scoped.status, DirectorActionStatus::NoWrite);
+        assert!(matches!(
+            scoped.code.as_deref(),
+            Some("project_authority_unavailable" | "project_authority_absent")
+        ));
         fs::remove_dir_all(fixture.root).unwrap();
     }
 

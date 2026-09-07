@@ -196,6 +196,8 @@ pub(super) struct RecentSessionsWorkspace {
     loading: bool,
     load_state: RecentLoadState,
     review: Option<AdoptionReview>,
+    query: String,
+    filter_focused: bool,
 }
 
 impl Default for RecentSessionsWorkspace {
@@ -208,6 +210,8 @@ impl Default for RecentSessionsWorkspace {
             loading: true,
             load_state: RecentLoadState::Loading,
             review: None,
+            query: String::new(),
+            filter_focused: false,
         }
     }
 }
@@ -216,8 +220,41 @@ impl RecentSessionsWorkspace {
     pub(super) fn rows(&self) -> &[RecentThreadRow] {
         &self.rows
     }
-    pub(super) fn selected(&self) -> usize {
-        self.selected
+    pub(super) fn visible_rows(&self) -> Vec<&RecentThreadRow> {
+        self.visible_indices()
+            .into_iter()
+            .filter_map(|index| self.rows.get(index))
+            .collect()
+    }
+    pub(super) fn selected_visible(&self) -> usize {
+        self.visible_indices()
+            .iter()
+            .position(|index| *index == self.selected)
+            .unwrap_or(0)
+    }
+    pub(super) fn query(&self) -> &str {
+        &self.query
+    }
+    pub(super) fn filter_focused(&self) -> bool {
+        self.filter_focused
+    }
+    pub(super) fn focus_filter(&mut self) {
+        self.filter_focused = true;
+    }
+    pub(super) fn blur_filter(&mut self) {
+        self.filter_focused = false;
+    }
+    pub(super) fn push_filter(&mut self, character: char) {
+        self.query.push(character);
+        self.select_first_visible();
+    }
+    pub(super) fn pop_filter(&mut self) {
+        self.query.pop();
+        self.select_first_visible();
+    }
+    pub(super) fn clear_filter(&mut self) {
+        self.query.clear();
+        self.select_first_visible();
     }
     pub(super) fn loading(&self) -> bool {
         self.loading
@@ -346,27 +383,41 @@ impl RecentSessionsWorkspace {
     }
 
     pub(super) fn move_selection(&mut self, direction: isize) {
-        if self.rows.is_empty() {
+        let visible = self.visible_indices();
+        if visible.is_empty() {
             return;
         }
-        self.selected = if direction < 0 {
-            if self.selected == 0 {
-                self.rows.len() - 1
+        let position = visible
+            .iter()
+            .position(|index| *index == self.selected)
+            .unwrap_or(0);
+        let next = if direction < 0 {
+            if position == 0 {
+                visible.len() - 1
             } else {
-                self.selected - 1
+                position - 1
             }
         } else {
-            (self.selected + 1) % self.rows.len()
+            (position + 1) % visible.len()
         };
+        self.selected = visible[next];
     }
 
     pub(super) fn select_edge(&mut self, last: bool) {
-        if !self.rows.is_empty() {
-            self.selected = if last { self.rows.len() - 1 } else { 0 };
+        let visible = self.visible_indices();
+        if let Some(index) = if last {
+            visible.last()
+        } else {
+            visible.first()
+        } {
+            self.selected = *index;
         }
     }
 
     pub(super) fn begin_review(&mut self) -> bool {
+        if !self.visible_indices().contains(&self.selected) {
+            return false;
+        }
         let Some(row) = self.rows.get(self.selected) else {
             return false;
         };
@@ -409,6 +460,40 @@ impl RecentSessionsWorkspace {
     pub(super) fn adoption_succeeded(&mut self, store: &CutexSessionStore) {
         self.reproject(store);
         self.review = None;
+    }
+
+    fn visible_indices(&self) -> Vec<usize> {
+        let query = self.query.trim().to_lowercase();
+        self.rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                let matches = query.is_empty()
+                    || row.title.to_lowercase().contains(&query)
+                    || row
+                        .managed_name
+                        .as_deref()
+                        .is_some_and(|name| name.to_lowercase().contains(&query))
+                    || row
+                        .cwd
+                        .as_deref()
+                        .is_some_and(|cwd| cwd.to_lowercase().contains(&query))
+                    || row.provider.to_lowercase().contains(&query)
+                    || row.source.to_lowercase().contains(&query)
+                    || row
+                        .project_id
+                        .as_deref()
+                        .is_some_and(|project| project.to_lowercase().contains(&query))
+                    || row.state.label().to_lowercase().contains(&query);
+                matches.then_some(index)
+            })
+            .collect()
+    }
+
+    fn select_first_visible(&mut self) {
+        if let Some(index) = self.visible_indices().first() {
+            self.selected = *index;
+        }
     }
 }
 
@@ -616,6 +701,44 @@ mod tests {
             &CutexSessionStore::default(),
         );
         assert_eq!(workspace.rows.len(), 3);
+    }
+
+    #[test]
+    fn filter_matches_project_provider_source_and_preserves_load_more_cursor() {
+        let mut workspace = RecentSessionsWorkspace::default();
+        let mut other = thread("other", "tree-b", 2);
+        other.project_id = Some("project-b".to_string());
+        other.model_provider = "local".to_string();
+        other.source = json!("ide");
+        workspace.receive(
+            CatalogReply::Page {
+                cursor: None,
+                result: Ok(ThreadPage {
+                    data: vec![thread("openai", "tree-a", 1), other],
+                    next_cursor: Some("next".to_string()),
+                    backwards_cursor: None,
+                }),
+            },
+            &CutexSessionStore::default(),
+        );
+
+        workspace.focus_filter();
+        for character in "project-a".chars() {
+            workspace.push_filter(character);
+        }
+        assert_eq!(workspace.visible_rows().len(), 1);
+        assert_eq!(workspace.visible_rows()[0].thread_id, "openai");
+        assert_eq!(workspace.next_cursor().as_deref(), Some("next"));
+        workspace.clear_filter();
+        for character in "ide".chars() {
+            workspace.push_filter(character);
+        }
+        assert_eq!(workspace.visible_rows()[0].thread_id, "other");
+        workspace.clear_filter();
+        for character in "no-match".chars() {
+            workspace.push_filter(character);
+        }
+        assert!(!workspace.begin_review());
     }
 
     #[test]

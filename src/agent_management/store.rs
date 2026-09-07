@@ -16,10 +16,13 @@ use super::{
     AgentActionId, AgentActionRecord, AgentManagementError, AgentManagementFailureEvent,
     AgentManagementPhaseEvent, AgentManagementStoreSchema, AgentOperatorAuditEvent,
     AgentOperatorGrant, AgentReservationReconciliationEvent, AgentReservationReconciliationReceipt,
-    LegacyDirectorOwnershipImportReceipt, ManagedAgentRecord, ProjectAuthority,
-    ProjectAuthorityReceipt, ProjectId,
+    CurrentProjectMembership, LegacyDirectorOwnershipImportReceipt, ManagedAgentRecord,
+    ProjectAuditEvent, ProjectAuthority, ProjectAuthorityReceipt, ProjectId, ProjectStateRecord,
+    ProjectTombstone,
 };
-use crate::management::control_plane::HumanManagementOperatorActionRecord;
+use crate::management::control_plane::{
+    HumanManagementOperatorActionRecord, HumanManagementProjectMutationActionRecord,
+};
 
 const STORE_FILE: &str = "agent-management-v1.json";
 const LOCK_FILE: &str = "agent-management-v1.lock";
@@ -45,6 +48,24 @@ pub struct AgentManagementSnapshot {
     #[serde(default)]
     pub human_management_operator_actions:
         BTreeMap<AgentActionId, HumanManagementOperatorActionRecord>,
+    /// Idempotent Human/Management Project structure mutations.
+    #[serde(default)]
+    pub human_management_project_mutations:
+        BTreeMap<AgentActionId, HumanManagementProjectMutationActionRecord>,
+    /// Additive current membership overrides. Missing entries retain the
+    /// historical ManagedAgentRecord.project_id interpretation for active
+    /// legacy Agents; writes never rewrite that historical provenance.
+    #[serde(default)]
+    pub current_project_memberships:
+        BTreeMap<crate::role_revision::CutexSessionId, CurrentProjectMembership>,
+    /// Lifecycle/CAS records for Project structure. Missing legacy records are
+    /// projected as active at revision zero without forcing a migration write.
+    #[serde(default)]
+    pub project_states: BTreeMap<ProjectId, ProjectStateRecord>,
+    #[serde(default)]
+    pub project_tombstones: BTreeMap<ProjectId, ProjectTombstone>,
+    #[serde(default)]
+    pub project_audit_events: BTreeMap<String, ProjectAuditEvent>,
     /// Non-authoritative UI metadata. Its map key is always the canonical
     /// provider-owned project identity; none of these values participate in
     /// authorization.
@@ -80,6 +101,11 @@ impl AgentManagementSnapshot {
             operator_grant_revisions: BTreeMap::new(),
             operator_audit_events: BTreeMap::new(),
             human_management_operator_actions: BTreeMap::new(),
+            human_management_project_mutations: BTreeMap::new(),
+            current_project_memberships: BTreeMap::new(),
+            project_states: BTreeMap::new(),
+            project_tombstones: BTreeMap::new(),
+            project_audit_events: BTreeMap::new(),
             project_presentations: BTreeMap::new(),
             agents: BTreeMap::new(),
             actions: BTreeMap::new(),

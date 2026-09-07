@@ -15,6 +15,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::agent_management::ProjectId;
 use crate::role_revision::Sha256 as TypedSha256;
 use crate::role_revision::{CutexSessionId, Rfc3339, MAX_JSON_SAFE_INTEGER};
 use crate::rotation::{
@@ -66,8 +67,16 @@ pub struct SeatOccupancyBindRequest {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct DirectorSeatTransferRequest {
     pub action_id: ActionId,
+    pub project_id: ProjectId,
     pub expected_predecessor_cutex_session: CutexSessionId,
     pub successor_cutex_session: CutexSessionId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ProjectDirectorPrepareRequest {
+    action_id: ActionId,
+    project_id: ProjectId,
+    occupant_cutex_session: CutexSessionId,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -89,6 +98,15 @@ pub struct SeatOccupancyReceipt {
     pub occupancy: SeatOccupancy,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectDirectorSeatState {
+    Pending,
+    Active,
+    Archived,
+    Removed,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SeatRotatingVacancy {
@@ -107,11 +125,20 @@ pub struct SeatOccupancySnapshot {
     pub store_revision: u64,
     pub occupancies: BTreeMap<SeatId, SeatOccupancy>,
     pub receipts: BTreeMap<ActionId, SeatOccupancyReceipt>,
+    /// Project-scoped Task Service Director seats. Legacy snapshots omit this
+    /// map and are resolved through the global Director seat until the first
+    /// exact project-scoped transfer or repair materializes an entry.
+    #[serde(default)]
+    pub project_director_occupancies: BTreeMap<ProjectId, SeatOccupancy>,
+    #[serde(default)]
+    pub(crate) project_director_states: BTreeMap<ProjectId, ProjectDirectorSeatState>,
     /// A Director transfer has changed seat authority but Agent Management has
     /// not yet acknowledged its project-authority commit. Administrative binds
     /// are fenced across that two-store boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_director_transfer: Option<ActionId>,
+    #[serde(default)]
+    pub active_project_director_transfers: BTreeMap<ProjectId, ActionId>,
     #[serde(default)]
     pub rotating_vacancies: BTreeMap<SeatId, SeatRotatingVacancy>,
     #[serde(default)]
@@ -127,7 +154,10 @@ impl SeatOccupancySnapshot {
             store_revision: 0,
             occupancies: BTreeMap::new(),
             receipts: BTreeMap::new(),
+            project_director_occupancies: BTreeMap::new(),
+            project_director_states: BTreeMap::new(),
             active_director_transfer: None,
+            active_project_director_transfers: BTreeMap::new(),
             rotating_vacancies: BTreeMap::new(),
             release_rotations: BTreeMap::new(),
             active_release_rotation: None,
@@ -210,7 +240,8 @@ impl SeatOccupancyStore {
             }
             if state.rotating_vacancies.contains_key(&request.seat_id)
                 || (request.seat_id.as_str() == "cutex-director"
-                    && state.active_director_transfer.is_some())
+                    && (state.active_director_transfer.is_some()
+                        || !state.active_project_director_transfers.is_empty()))
                 || (request.seat_id.as_str() == "cutex-release"
                     && state.active_release_rotation.is_some())
             {
@@ -253,12 +284,215 @@ impl SeatOccupancyStore {
         })
     }
 
+    pub(crate) fn prepare_project_director(
+        &self,
+        action_id: &ActionId,
+        project_id: &ProjectId,
+        occupant: &CutexSessionId,
+    ) -> Result<SeatOccupancyReceipt, SeatAuthorityError> {
+        let request = ProjectDirectorPrepareRequest {
+            action_id: action_id.clone(),
+            project_id: project_id.clone(),
+            occupant_cutex_session: occupant.clone(),
+        };
+        let digest = request_digest(&request)?;
+        self.with_locked_state(true, |mut state| {
+            if let Some(receipt) = state.receipts.get(action_id).cloned() {
+                return if receipt.request_sha256 == digest
+                    && state.project_director_occupancies.get(project_id)
+                        == Some(&receipt.occupancy)
+                {
+                    Ok((state, receipt, false))
+                } else {
+                    Err(SeatAuthorityError::Conflict("action_id_payload_conflict"))
+                };
+            }
+            if state.project_director_occupancies.contains_key(project_id) {
+                return Err(SeatAuthorityError::Conflict("project_director_seat_exists"));
+            }
+            if state
+                .project_director_occupancies
+                .iter()
+                .any(|(other, occupancy)| {
+                    other != project_id && &occupancy.occupant_cutex_session == occupant
+                })
+            {
+                return Err(SeatAuthorityError::Conflict(
+                    "session_already_directs_another_project",
+                ));
+            }
+            let revision = next_revision(state.store_revision)?;
+            let occupancy = SeatOccupancy {
+                seat_id: SeatId::new("cutex-director")
+                    .map_err(|_| SeatAuthorityError::InvalidStore)?,
+                occupant_cutex_session: occupant.clone(),
+                epoch: 1,
+                bound_at: now(),
+            };
+            let receipt = SeatOccupancyReceipt {
+                schema: SeatOccupancyReceiptSchema::V1,
+                action_id: action_id.clone(),
+                request_sha256: digest,
+                store_revision: revision,
+                occupancy: occupancy.clone(),
+            };
+            state.store_revision = revision;
+            state
+                .project_director_occupancies
+                .insert(project_id.clone(), occupancy);
+            state
+                .project_director_states
+                .insert(project_id.clone(), ProjectDirectorSeatState::Pending);
+            state.receipts.insert(action_id.clone(), receipt.clone());
+            Ok((state, receipt, true))
+        })
+    }
+
+    pub(crate) fn activate_project_director(
+        &self,
+        action_id: &ActionId,
+        project_id: &ProjectId,
+        occupant: &CutexSessionId,
+    ) -> Result<SeatOccupancyReceipt, SeatAuthorityError> {
+        let request = ProjectDirectorPrepareRequest {
+            action_id: action_id.clone(),
+            project_id: project_id.clone(),
+            occupant_cutex_session: occupant.clone(),
+        };
+        let digest = request_digest(&request)?;
+        self.with_locked_state(true, |mut state| {
+            let receipt = state
+                .receipts
+                .get(action_id)
+                .cloned()
+                .filter(|receipt| receipt.request_sha256 == digest)
+                .ok_or(SeatAuthorityError::Conflict(
+                    "project_director_prepare_not_found",
+                ))?;
+            if state.project_director_occupancies.get(project_id) != Some(&receipt.occupancy) {
+                return Err(SeatAuthorityError::Conflict(
+                    "project_director_seat_changed",
+                ));
+            }
+            match state.project_director_states.get(project_id).copied() {
+                Some(ProjectDirectorSeatState::Pending) => {
+                    state
+                        .project_director_states
+                        .insert(project_id.clone(), ProjectDirectorSeatState::Active);
+                    state.store_revision = next_revision(state.store_revision)?;
+                    Ok((state, receipt, true))
+                }
+                Some(ProjectDirectorSeatState::Active) => Ok((state, receipt, false)),
+                _ => Err(SeatAuthorityError::Conflict("project_director_not_pending")),
+            }
+        })
+    }
+
+    pub(crate) fn transition_project_director(
+        &self,
+        project_id: &ProjectId,
+        expected_occupant: &CutexSessionId,
+        from: ProjectDirectorSeatState,
+        to: ProjectDirectorSeatState,
+    ) -> Result<(), SeatAuthorityError> {
+        self.with_locked_state(true, |mut state| {
+            let mut materialized = false;
+            if !state.project_director_occupancies.contains_key(project_id) {
+                let legacy = director_occupancy(&state)?.clone();
+                if &legacy.occupant_cutex_session != expected_occupant {
+                    return Err(SeatAuthorityError::Conflict(
+                        "stale_director_seat_occupancy",
+                    ));
+                }
+                state
+                    .project_director_occupancies
+                    .insert(project_id.clone(), legacy);
+                state
+                    .project_director_states
+                    .insert(project_id.clone(), ProjectDirectorSeatState::Active);
+                materialized = true;
+            }
+            let occupancy = state
+                .project_director_occupancies
+                .get(project_id)
+                .ok_or(SeatAuthorityError::InvalidStore)?;
+            if &occupancy.occupant_cutex_session != expected_occupant {
+                return Err(SeatAuthorityError::Conflict(
+                    "stale_director_seat_occupancy",
+                ));
+            }
+            let current = state
+                .project_director_states
+                .get(project_id)
+                .copied()
+                .unwrap_or(ProjectDirectorSeatState::Active);
+            if current == to {
+                if materialized {
+                    state.store_revision = next_revision(state.store_revision)?;
+                }
+                return Ok((state, (), materialized));
+            }
+            if current != from {
+                return Err(SeatAuthorityError::Conflict(
+                    "project_director_state_conflict",
+                ));
+            }
+            state.project_director_states.insert(project_id.clone(), to);
+            state.store_revision = next_revision(state.store_revision)?;
+            Ok((state, (), true))
+        })
+    }
+
+    pub(crate) fn repair_project_director_from_legacy(
+        &self,
+        project_id: &ProjectId,
+        expected_occupant: &CutexSessionId,
+        expected_legacy_epoch: u64,
+    ) -> Result<(), SeatAuthorityError> {
+        self.with_locked_state(true, |mut state| {
+            if let Some(occupancy) = state.project_director_occupancies.get(project_id) {
+                return if &occupancy.occupant_cutex_session == expected_occupant
+                    && occupancy.epoch == expected_legacy_epoch
+                    && state
+                        .project_director_states
+                        .get(project_id)
+                        .copied()
+                        .unwrap_or(ProjectDirectorSeatState::Active)
+                        == ProjectDirectorSeatState::Active
+                {
+                    Ok((state, (), false))
+                } else {
+                    Err(SeatAuthorityError::Conflict(
+                        "project_director_repair_conflict",
+                    ))
+                };
+            }
+            let legacy = director_occupancy(&state)?.clone();
+            if &legacy.occupant_cutex_session != expected_occupant
+                || legacy.epoch != expected_legacy_epoch
+            {
+                return Err(SeatAuthorityError::Conflict(
+                    "legacy_director_evidence_changed",
+                ));
+            }
+            state
+                .project_director_occupancies
+                .insert(project_id.clone(), legacy);
+            state
+                .project_director_states
+                .insert(project_id.clone(), ProjectDirectorSeatState::Active);
+            state.store_revision = next_revision(state.store_revision)?;
+            Ok((state, (), true))
+        })
+    }
+
     /// Fail-closed preflight for Agent Management Director rotation. Before a
     /// successor exists, the seat must still name the exact predecessor. On
     /// recovery, only the exact durable transfer receipt may explain why it
     /// already names the known successor.
     pub(crate) fn preflight_director_transfer(
         &self,
+        project_id: &ProjectId,
         action_id: &ActionId,
         expected_predecessor: &CutexSessionId,
         replay: Option<&DirectorSeatTransferRequest>,
@@ -271,7 +505,7 @@ impl SeatOccupancyStore {
                 verify_director_transfer_receipt(&state, request, receipt)?;
                 return Ok((state, (), false));
             }
-            let current = director_occupancy(&state)?;
+            let current = project_director_occupancy(&state, project_id)?;
             if &current.occupant_cutex_session != expected_predecessor {
                 return Err(SeatAuthorityError::Conflict(
                     "stale_director_seat_occupancy",
@@ -299,20 +533,27 @@ impl SeatOccupancyStore {
                 verify_director_transfer_receipt(&state, request, &receipt)?;
                 return Ok((state, receipt, false));
             }
-            if state.active_director_transfer.is_some() {
+            if state
+                .active_project_director_transfers
+                .contains_key(&request.project_id)
+            {
                 return Err(SeatAuthorityError::Conflict(
                     "director_seat_rotation_in_progress",
                 ));
             }
-            if state.occupancies.iter().any(|(seat, occupancy)| {
-                seat.as_str() != "cutex-director"
-                    && occupancy.occupant_cutex_session == request.successor_cutex_session
-            }) {
+            if state
+                .project_director_occupancies
+                .iter()
+                .any(|(project_id, occupancy)| {
+                    project_id != &request.project_id
+                        && occupancy.occupant_cutex_session == request.successor_cutex_session
+                })
+            {
                 return Err(SeatAuthorityError::Conflict(
                     "session_already_occupies_another_seat",
                 ));
             }
-            let current = director_occupancy(&state)?.clone();
+            let current = project_director_occupancy(&state, &request.project_id)?.clone();
             if current.occupant_cutex_session != request.expected_predecessor_cutex_session {
                 return Err(SeatAuthorityError::Conflict(
                     "stale_director_seat_occupancy",
@@ -340,11 +581,15 @@ impl SeatOccupancyStore {
                 occupancy: occupancy.clone(),
             };
             state.store_revision = revision;
-            state.occupancies.insert(seat_id, occupancy);
+            state
+                .project_director_occupancies
+                .insert(request.project_id.clone(), occupancy);
             state
                 .receipts
                 .insert(request.action_id.clone(), receipt.clone());
-            state.active_director_transfer = Some(request.action_id.clone());
+            state
+                .active_project_director_transfers
+                .insert(request.project_id.clone(), request.action_id.clone());
             Ok((state, receipt, true))
         })
     }
@@ -361,9 +606,14 @@ impl SeatOccupancyStore {
                 SeatAuthorityError::Conflict("director_seat_transfer_not_found"),
             )?;
             verify_director_transfer_receipt(&state, request, &receipt)?;
-            match state.active_director_transfer.as_ref() {
+            match state
+                .active_project_director_transfers
+                .get(&request.project_id)
+            {
                 Some(active) if active == &request.action_id => {
-                    state.active_director_transfer = None;
+                    state
+                        .active_project_director_transfers
+                        .remove(&request.project_id);
                     state.store_revision = next_revision(state.store_revision)?;
                     Ok((state, receipt, true))
                 }
@@ -820,10 +1070,23 @@ impl SeatOccupancyStore {
         };
         lock.lock_shared()?;
         let snapshot = read_snapshot(&self.root)?;
-        let occupancy = snapshot
-            .occupancies
+        let mut project_occupancies = snapshot
+            .project_director_occupancies
             .values()
-            .find(|occupancy| &occupancy.occupant_cutex_session == cutex_session_id)
+            .filter(|occupancy| &occupancy.occupant_cutex_session == cutex_session_id);
+        let project_occupancy = project_occupancies.next();
+        if project_occupancies.next().is_some() {
+            return Err(SeatAuthorityError::Conflict(
+                "ambiguous_project_director_seat",
+            ));
+        }
+        let occupancy = project_occupancy
+            .or_else(|| {
+                snapshot
+                    .occupancies
+                    .values()
+                    .find(|occupancy| &occupancy.occupant_cutex_session == cutex_session_id)
+            })
             .ok_or(SeatAuthorityError::Unauthorized)?;
         let principal = AuthenticatedPrincipal::seated_session(
             cutex_session_id.clone(),
@@ -940,6 +1203,17 @@ fn director_occupancy(state: &SeatOccupancySnapshot) -> Result<&SeatOccupancy, S
         .ok_or(SeatAuthorityError::Conflict("director_seat_not_bound"))
 }
 
+fn project_director_occupancy<'a>(
+    state: &'a SeatOccupancySnapshot,
+    project_id: &ProjectId,
+) -> Result<&'a SeatOccupancy, SeatAuthorityError> {
+    state
+        .project_director_occupancies
+        .get(project_id)
+        .map(Ok)
+        .unwrap_or_else(|| director_occupancy(state))
+}
+
 fn verify_director_transfer_receipt(
     state: &SeatOccupancySnapshot,
     request: &DirectorSeatTransferRequest,
@@ -948,7 +1222,7 @@ fn verify_director_transfer_receipt(
     if receipt.request_sha256 != request_digest(request)? {
         return Err(SeatAuthorityError::Conflict("action_id_payload_conflict"));
     }
-    let current = director_occupancy(state)?;
+    let current = project_director_occupancy(state, &request.project_id)?;
     if receipt.occupancy.seat_id.as_str() != "cutex-director"
         || receipt.occupancy.occupant_cutex_session != request.successor_cutex_session
         || current != &receipt.occupancy
@@ -1018,6 +1292,7 @@ mod tests {
     ) -> DirectorSeatTransferRequest {
         DirectorSeatTransferRequest {
             action_id: ActionId::new(action).expect("action"),
+            project_id: ProjectId::new("project-main").expect("project"),
             expected_predecessor_cutex_session: CutexSessionId::new(predecessor)
                 .expect("predecessor"),
             successor_cutex_session: CutexSessionId::new(successor).expect("successor"),
@@ -1060,6 +1335,7 @@ mod tests {
 
         store
             .preflight_director_transfer(
+                &transfer.project_id,
                 &transfer.action_id,
                 &transfer.expected_predecessor_cutex_session,
                 None,
@@ -1077,6 +1353,7 @@ mod tests {
         );
         store
             .preflight_director_transfer(
+                &transfer.project_id,
                 &transfer.action_id,
                 &transfer.expected_predecessor_cutex_session,
                 Some(&transfer),
@@ -1107,6 +1384,72 @@ mod tests {
             .expect("snapshot")
             .active_director_transfer
             .is_none());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn project_director_seats_are_pending_until_activation_and_rotate_independently() {
+        let root = root("project-director-seats");
+        let store = SeatOccupancyStore::open(&root).expect("open");
+        let project_a = ProjectId::new("project-a").unwrap();
+        let project_b = ProjectId::new("project-b").unwrap();
+        let director_a = CutexSessionId::new("director-a").unwrap();
+        let director_b = CutexSessionId::new("director-b").unwrap();
+        let prepare_a = ActionId::new("prepare-project-a").unwrap();
+        let prepare_b = ActionId::new("prepare-project-b").unwrap();
+
+        store
+            .prepare_project_director(&prepare_a, &project_a, &director_a)
+            .unwrap();
+        assert_eq!(
+            store.query().unwrap().project_director_states[&project_a],
+            ProjectDirectorSeatState::Pending
+        );
+        assert_eq!(
+            store.prepare_project_director(&prepare_b, &project_b, &director_a),
+            Err(SeatAuthorityError::Conflict(
+                "session_already_directs_another_project"
+            ))
+        );
+        store
+            .activate_project_director(&prepare_a, &project_a, &director_a)
+            .unwrap();
+        store
+            .prepare_project_director(&prepare_b, &project_b, &director_b)
+            .unwrap();
+        store
+            .activate_project_director(&prepare_b, &project_b, &director_b)
+            .unwrap();
+
+        let transfer = DirectorSeatTransferRequest {
+            action_id: ActionId::new("rotate-project-a").unwrap(),
+            project_id: project_a.clone(),
+            expected_predecessor_cutex_session: director_a,
+            successor_cutex_session: CutexSessionId::new("director-a-next").unwrap(),
+        };
+        store
+            .preflight_director_transfer(
+                &project_a,
+                &transfer.action_id,
+                &transfer.expected_predecessor_cutex_session,
+                None,
+            )
+            .unwrap();
+        store.transfer_director(&transfer).unwrap();
+        store.finish_director_transfer(&transfer).unwrap();
+
+        let snapshot = store.query().unwrap();
+        assert_eq!(
+            snapshot.project_director_occupancies[&project_a]
+                .occupant_cutex_session
+                .as_str(),
+            "director-a-next"
+        );
+        assert_eq!(
+            snapshot.project_director_occupancies[&project_b].occupant_cutex_session,
+            director_b
+        );
+        assert!(snapshot.active_project_director_transfers.is_empty());
         fs::remove_dir_all(root).expect("cleanup");
     }
 

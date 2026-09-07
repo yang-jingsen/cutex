@@ -41,6 +41,7 @@ use tui_input::{Input, InputRequest};
 use uuid::Uuid;
 
 use super::management_control_plane::ManagementControlClient;
+use super::session_tui::footer_hints;
 use super::session_tui_workspace::{
     primary_panel_shortcut, primary_panel_tabs, PrimaryPanel, PrimaryPanelOutcome,
 };
@@ -671,7 +672,7 @@ fn handle_key(
         KeyCode::BackTab => model.detail = false,
         KeyCode::Up => model.move_selection(-1),
         KeyCode::Down => model.move_selection(1),
-        KeyCode::Enter | KeyCode::Char('a') => model.detail = model.selected_row().is_some(),
+        KeyCode::Enter => model.detail = model.selected_row().is_some(),
         KeyCode::Char('/') => model.filter_focused = true,
         _ => {}
     }
@@ -715,13 +716,31 @@ fn render(frame: &mut Frame<'_>, model: &TaskModel) {
     );
     render_filter(frame, chunks[2], model);
     render_table(frame, chunks[3], model);
-    let footer = if model.detail {
-        "←/BackTab/Tab/Esc close inspector  ↑/↓ select  F5 refresh"
+    let footer = if model.filter_focused {
+        footer_hints(&[
+            ("Type", "filter"),
+            ("Enter/Esc", "finish"),
+            ("Ctrl+A", "history"),
+        ])
+    } else if model.detail {
+        footer_hints(&[
+            ("←/BackTab/Tab/Esc", "close inspector"),
+            ("↑/↓", "select"),
+            ("F5", "refresh"),
+        ])
     } else {
-        "↑/↓ select  Enter/a/Tab inspect  ←/→ tabs  / filter  F5 refresh  Esc back"
+        footer_hints(&[
+            ("↑/↓", "select"),
+            ("Enter/Tab", "inspect"),
+            ("←/→", "tabs"),
+            ("/", "filter"),
+            ("Ctrl+A", "history"),
+            ("F5", "refresh"),
+            ("Esc", "back"),
+        ])
     };
     frame.render_widget(
-        Paragraph::new(footer).style(Style::new().fg(Color::DarkGray)),
+        Paragraph::new(Line::from(footer)).style(Style::new().fg(Color::DarkGray)),
         chunks[4],
     );
     if model.detail {
@@ -736,13 +755,18 @@ fn render_filter(frame: &mut Frame<'_>, area: Rect, model: &TaskModel) {
         " Filter tasks (active; Ctrl-A for all) "
     };
     frame.render_widget(
-        Paragraph::new(model.query.value()).block(
-            Block::bordered()
-                .title(title)
-                .border_style(Style::new().fg(Color::DarkGray)),
-        ),
+        Paragraph::new(model.query.value()).block(Block::bordered().title(title).border_style(
+            Style::new().fg(if model.filter_focused {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            }),
+        )),
         area,
     );
+    if model.filter_focused && model.warning.is_none() {
+        frame.set_cursor_position((area.x + 1 + model.query.visual_cursor() as u16, area.y + 1));
+    }
     if let Some(warning) = model.warning.as_deref() {
         let warning_area = Rect {
             x: area.x.saturating_add(1),

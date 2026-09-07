@@ -1344,6 +1344,21 @@ impl SelectorModel {
             }
             return SelectorControl::Continue;
         }
+        if self.recent.filter_focused() {
+            match event {
+                SelectorEvent::Insert(character) => self.recent.push_filter(character),
+                SelectorEvent::Backspace | SelectorEvent::Delete => self.recent.pop_filter(),
+                SelectorEvent::ClearInput => self.recent.clear_filter(),
+                SelectorEvent::Activate | SelectorEvent::Escape => self.recent.blur_filter(),
+                SelectorEvent::Up => self.recent.move_selection(-1),
+                SelectorEvent::Down => self.recent.move_selection(1),
+                SelectorEvent::First => self.recent.select_edge(false),
+                SelectorEvent::Last => self.recent.select_edge(true),
+                SelectorEvent::Back | SelectorEvent::OpenActions | SelectorEvent::OpenSettings => {}
+                SelectorEvent::Exit => return SelectorControl::Exit,
+            }
+            return SelectorControl::Continue;
+        }
         match event {
             SelectorEvent::Up => self.move_selection(-1),
             SelectorEvent::Down => self.move_selection(1),
@@ -1497,6 +1512,7 @@ impl SelectorModel {
             {
                 return SelectorControl::Recent(RecentCommand::LoadMore);
             }
+            SelectorEvent::Insert('/') => self.recent.focus_filter(),
             SelectorEvent::OpenActions => {
                 self.recent.begin_review();
             }
@@ -5796,7 +5812,7 @@ fn render_selector_contents(frame: &mut Frame<'_>, model: &SelectorModel) {
 fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
     let (view, count) = match &model.mode {
         SelectorMode::Agents => ("managed", model.visible_indices().len()),
-        SelectorMode::RecentSessions => ("recent sessions", model.recent.rows().len()),
+        SelectorMode::RecentSessions => ("recent sessions", model.recent.visible_rows().len()),
         SelectorMode::RetiredSessions { .. } => ("retired sessions", model.retired_rows.len()),
         SelectorMode::Actions { .. } => (
             "actions",
@@ -6070,6 +6086,26 @@ fn render_recent_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorMo
         );
         return;
     }
+    let [filter_area, table_area] =
+        Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).areas(area);
+    frame.render_widget(
+        Paragraph::new(model.recent.query()).block(
+            Block::bordered()
+                .title(" Filter loaded rows: title / name / cwd / provider / project / state  [/] ")
+                .border_style(Style::new().fg(if model.recent.filter_focused() {
+                    Color::Cyan
+                } else {
+                    Color::DarkGray
+                })),
+        ),
+        filter_area,
+    );
+    if model.recent.filter_focused() {
+        frame.set_cursor_position((
+            filter_area.x + 1 + model.recent.query().chars().count() as u16,
+            filter_area.y + 1,
+        ));
+    }
     match model.recent.load_state() {
         RecentLoadState::Loading
         | RecentLoadState::Empty
@@ -6080,11 +6116,12 @@ fn render_recent_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorMo
             frame.render_widget(
                 Paragraph::new("The catalog loads asynchronously. Press Enter to retry a failure.")
                     .block(Block::bordered()),
-                area,
+                table_area,
             );
         }
         _ => {
-            let rows = model.recent.rows().iter().map(|row| {
+            let visible_rows = model.recent.visible_rows();
+            let rows = visible_rows.iter().map(|row| {
                 Row::new([
                     Cell::from(row.primary_label().to_string()),
                     Cell::from(
@@ -6128,9 +6165,9 @@ fn render_recent_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorMo
             )
             .highlight_symbol("> ");
             let mut state = TableState::default().with_selected(
-                (!model.recent.rows().is_empty()).then_some(model.recent.selected()),
+                (!visible_rows.is_empty()).then_some(model.recent.selected_visible()),
             );
-            frame.render_stateful_widget(table, area, &mut state);
+            frame.render_stateful_widget(table, table_area, &mut state);
         }
     }
 }
@@ -7877,7 +7914,7 @@ fn lifecycle_style(state: CutexSessionLifecycleState) -> Style {
     }
 }
 
-fn footer_hints(hints: &[(&'static str, &'static str)]) -> Vec<Span<'static>> {
+pub(super) fn footer_hints(hints: &[(&'static str, &'static str)]) -> Vec<Span<'static>> {
     let mut spans = Vec::with_capacity(hints.len() * 4);
     let key_style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
     for (key, description) in hints {
@@ -8071,6 +8108,11 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
                 ("Up/Down", "choose"),
                 ("Enter", "confirm"),
                 ("Esc", "cancel"),
+            ]),
+            SelectorMode::RecentSessions if model.recent.filter_focused() => footer_hints(&[
+                ("Type", "filter loaded rows"),
+                ("Enter/Esc", "finish"),
+                ("Ctrl+U", "clear"),
             ]),
             SelectorMode::RecentSessions
                 if matches!(model.recent.load_state(), RecentLoadState::Failed(_)) =>
@@ -8576,6 +8618,11 @@ mod tests {
             operator_grant_revisions: BTreeMap::new(),
             operator_audit_events: BTreeMap::new(),
             human_management_operator_actions: BTreeMap::new(),
+            human_management_project_mutations: BTreeMap::new(),
+            current_project_memberships: BTreeMap::new(),
+            project_states: BTreeMap::new(),
+            project_tombstones: BTreeMap::new(),
+            project_audit_events: BTreeMap::new(),
             project_presentations: presentation
                 .map(|presentation| BTreeMap::from([(project_id, presentation)]))
                 .unwrap_or_default(),

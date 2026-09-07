@@ -216,7 +216,7 @@ impl AgentManagementPhaseObserver for NoopPhaseObserver {
 
 pub struct AgentManagementProvider {
     store: AgentManagementStore,
-    director_seats: SeatOccupancyStore,
+    pub(super) director_seats: SeatOccupancyStore,
     phase_observer: Arc<dyn AgentManagementPhaseObserver>,
     #[cfg(test)]
     fail_after_predecessor_close_once: Arc<AtomicBool>,
@@ -354,6 +354,9 @@ impl AgentManagementProvider {
                     .human_management_operator_actions
                     .contains_key(&request.action_id)
                 || state
+                    .human_management_project_mutations
+                    .contains_key(&request.action_id)
+                || state
                     .legacy_director_ownership_import_receipts
                     .contains_key(&request.action_id)
                 || state
@@ -453,6 +456,9 @@ impl AgentManagementProvider {
             if state.actions.contains_key(&request.action_id)
                 || state
                     .human_management_operator_actions
+                    .contains_key(&request.action_id)
+                || state
+                    .human_management_project_mutations
                     .contains_key(&request.action_id)
                 || state.authority_receipts.contains_key(&request.action_id)
                 || state
@@ -589,6 +595,9 @@ impl AgentManagementProvider {
                 if state.actions.contains_key(&request.action_id)
                     || state
                         .human_management_operator_actions
+                        .contains_key(&request.action_id)
+                    || state
+                        .human_management_project_mutations
                         .contains_key(&request.action_id)
                     || state.authority_receipts.contains_key(&request.action_id)
                     || state
@@ -976,6 +985,7 @@ impl AgentManagementProvider {
                 || legacy_ambiguous_sid_recovery_candidate(existing)
                 || legacy_offline_revision_conflict_candidate(existing)
             {
+                let seats = self.director_seats.query().map_err(seat_authority_error)?;
                 let role = authorize_operation(
                     &snapshot,
                     &invocation.caller_cutex_session,
@@ -989,6 +999,13 @@ impl AgentManagementProvider {
                         error
                     }
                 })?;
+                if !matches!(&request.operation, AgentOperation::DirectorRotate { .. })
+                    && !project_seat_is_composite_usable(&snapshot, &seats, &existing.project_id)
+                {
+                    return Err(AgentManagementError::Conflict(
+                        "project_director_seat_not_usable",
+                    ));
+                }
                 return Ok(AuthorizedAgentManagementRequest {
                     project_id: existing.project_id.clone(),
                     role,
@@ -1001,6 +1018,7 @@ impl AgentManagementProvider {
                 request,
             });
         }
+        let seats = self.director_seats.query().map_err(seat_authority_error)?;
         let authorized_projects = snapshot
             .projects
             .values()
@@ -1011,6 +1029,7 @@ impl AgentManagementProvider {
                     &authority.project_id,
                 )
                 .is_ok()
+                    && project_seat_is_composite_usable(&snapshot, &seats, &authority.project_id)
             })
             .map(|authority| authority.project_id.clone())
             .collect::<Vec<_>>();
@@ -1050,6 +1069,9 @@ impl AgentManagementProvider {
                 if state.authority_receipts.contains_key(&request.action_id)
                     || state
                         .human_management_operator_actions
+                        .contains_key(&request.action_id)
+                    || state
+                        .human_management_project_mutations
                         .contains_key(&request.action_id)
                     || state
                         .legacy_director_ownership_import_receipts
@@ -1275,7 +1297,9 @@ impl AgentManagementProvider {
                     .agents
                     .values()
                     .filter(|agent| {
-                        agent.project_id == request.project_id && agent.retired_at.is_none()
+                        super::projects::current_project_id(&snapshot, agent).as_ref()
+                            == Some(&request.project_id)
+                            && agent.retired_at.is_none()
                     })
                     .cloned()
                     .collect();
@@ -1484,12 +1508,14 @@ impl AgentManagementProvider {
                         .as_ref()
                         .map(|successor| DirectorSeatTransferRequest {
                             action_id: transfer_action_id.clone(),
+                            project_id: request.project_id.clone(),
                             expected_predecessor_cutex_session: expected_predecessor_cutex_session
                                 .clone(),
                             successor_cutex_session: successor.clone(),
                         });
                 self.director_seats
                     .preflight_director_transfer(
+                        &request.project_id,
                         &transfer_action_id,
                         expected_predecessor_cutex_session,
                         replay_transfer.as_ref(),
@@ -1758,7 +1784,7 @@ impl AgentManagementProvider {
                     "Agent has no explicit Agent Management ownership record".to_string(),
                 )
             })?;
-        if &agent.project_id != project_id {
+        if super::projects::current_project_id(&snapshot, &agent).as_ref() != Some(project_id) {
             return Err(AgentManagementError::Unauthorized);
         }
         if agent.retired_at.is_some() {
@@ -2492,7 +2518,9 @@ impl AgentManagementProvider {
                 .agents
                 .get(operator)
                 .filter(|agent| {
-                    agent.project_id == request.project_id && agent.retired_at.is_none()
+                    super::projects::current_project_id(&state, agent).as_ref()
+                        == Some(&request.project_id)
+                        && agent.retired_at.is_none()
                 })
                 .ok_or(AgentManagementError::Conflict(
                     "operator_must_be_active_managed_agent",
@@ -2643,6 +2671,7 @@ impl AgentManagementProvider {
     ) -> Result<AgentManagementResponse, AgentManagementError> {
         let seat_transfer = DirectorSeatTransferRequest {
             action_id: director_seat_transfer_action_id(&request.action_id)?,
+            project_id: request.project_id.clone(),
             expected_predecessor_cutex_session: predecessor.clone(),
             successor_cutex_session: created.agent.cutex_session_id.clone(),
         };
@@ -2868,6 +2897,7 @@ impl AgentManagementProvider {
         }
         let transfer = DirectorSeatTransferRequest {
             action_id: director_seat_transfer_action_id(&request.action_id)?,
+            project_id: request.project_id.clone(),
             expected_predecessor_cutex_session: expected_predecessor_cutex_session.clone(),
             successor_cutex_session: successor.cutex_session_id.clone(),
         };
@@ -2959,6 +2989,40 @@ impl AgentManagementProvider {
     }
 }
 
+fn project_seat_is_composite_usable(
+    management: &AgentManagementSnapshot,
+    seats: &crate::seat::SeatOccupancySnapshot,
+    project_id: &ProjectId,
+) -> bool {
+    let Some(authority) = management.projects.get(project_id) else {
+        return false;
+    };
+    let lifecycle = management
+        .project_states
+        .get(project_id)
+        .map(|state| state.lifecycle)
+        .unwrap_or(ProjectLifecycle::Active);
+    let expected = match lifecycle {
+        ProjectLifecycle::Active => crate::seat::ProjectDirectorSeatState::Active,
+        ProjectLifecycle::Archived => crate::seat::ProjectDirectorSeatState::Archived,
+        ProjectLifecycle::Removed => return false,
+    };
+    match (
+        seats.project_director_occupancies.get(project_id),
+        seats.project_director_states.get(project_id),
+    ) {
+        (Some(occupancy), state) => {
+            occupancy.occupant_cutex_session == authority.authorized_director_session
+                && state
+                    .copied()
+                    .unwrap_or(crate::seat::ProjectDirectorSeatState::Active)
+                    == expected
+        }
+        (None, Some(_)) => false,
+        (None, None) => true,
+    }
+}
+
 struct AuthorizedAgentManagementRequest<'a> {
     project_id: ProjectId,
     role: AgentManagementRole,
@@ -2979,6 +3043,14 @@ fn authorize_operation(
     project_id: &ProjectId,
     operation: &AgentOperation,
 ) -> Result<AgentManagementRole, AgentManagementError> {
+    if snapshot
+        .project_states
+        .get(project_id)
+        .is_some_and(|state| state.lifecycle != ProjectLifecycle::Active)
+        && !matches!(operation, AgentOperation::QueryManaged)
+    {
+        return Err(AgentManagementError::Conflict("project_archived"));
+    }
     let role = project_management_role(snapshot, caller, project_id)?;
     let authority = snapshot
         .projects
@@ -3038,7 +3110,10 @@ fn project_management_role(
     let agent = snapshot
         .agents
         .get(caller)
-        .filter(|agent| &agent.project_id == project_id && agent.retired_at.is_none())
+        .filter(|agent| {
+            super::projects::current_project_id(snapshot, agent).as_ref() == Some(project_id)
+                && agent.retired_at.is_none()
+        })
         .ok_or(AgentManagementError::ProjectNotAuthorized)?;
     debug_assert_eq!(&agent.cutex_session_id, caller);
     Ok(AgentManagementRole::Operator)
@@ -3138,7 +3213,7 @@ fn director_seat_transfer_action_id(
         .map_err(|_| AgentManagementError::InvalidStore)
 }
 
-fn seat_authority_error(error: SeatAuthorityError) -> AgentManagementError {
+pub(super) fn seat_authority_error(error: SeatAuthorityError) -> AgentManagementError {
     match error {
         SeatAuthorityError::InvalidRequest(reason) => AgentManagementError::InvalidRequest(reason),
         SeatAuthorityError::Conflict(reason) => AgentManagementError::Conflict(reason),
@@ -6956,13 +7031,13 @@ mod tests {
         let seat_snapshot = provider.director_seats.query().unwrap();
         assert_eq!(
             seat_snapshot
-                .occupancies
-                .get(&crate::task_service::SeatId::new("cutex-director").unwrap())
+                .project_director_occupancies
+                .get(&project())
                 .unwrap()
                 .occupant_cutex_session,
             successor.cutex_session_id
         );
-        assert!(seat_snapshot.active_director_transfer.is_none());
+        assert!(seat_snapshot.active_project_director_transfers.is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -7107,13 +7182,12 @@ mod tests {
         assert!(management.operator_grants.is_empty());
         let seats = provider.director_seats.query().unwrap();
         assert_eq!(
-            seats.occupancies[&crate::task_service::SeatId::new("cutex-director").unwrap()]
-                .occupant_cutex_session,
+            seats.project_director_occupancies[&project()].occupant_cutex_session,
             successor
         );
         assert_eq!(
-            seats.active_director_transfer,
-            Some(director_seat_transfer_action_id(&rotate.action_id).unwrap())
+            seats.active_project_director_transfers.get(&project()),
+            Some(&director_seat_transfer_action_id(&rotate.action_id).unwrap())
         );
         assert_eq!(lifecycle.bootstrap_count(), 2);
 
@@ -7148,17 +7222,16 @@ mod tests {
         assert!(recovered.operator_grants[&project()].contains_key(&predecessor.cutex_session_id));
         let seats = reopened.director_seats.query().unwrap();
         assert_eq!(
-            seats.occupancies[&crate::task_service::SeatId::new("cutex-director").unwrap()]
-                .occupant_cutex_session,
+            seats.project_director_occupancies[&project()].occupant_cutex_session,
             successor
         );
-        assert!(seats.active_director_transfer.is_none());
+        assert!(seats.active_project_director_transfers.is_empty());
         assert_eq!(lifecycle.bootstrap_count(), 2);
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn completed_director_rotation_replay_fails_closed_after_unrelated_seat_rebind() {
+    fn completed_project_director_rotation_replay_ignores_unrelated_legacy_seat_rebind() {
         let root = root("director-complete-seat-divergence");
         let provider = AgentManagementProvider::open(&root).unwrap();
         bind(&provider, "bind-bootstrap", "cutex.bootstrap", None);
@@ -7195,6 +7268,13 @@ mod tests {
             &rotate,
             &lifecycle,
         ));
+        let rotated_successor = provider
+            .director_seats
+            .query()
+            .unwrap()
+            .project_director_occupancies[&project()]
+            .occupant_cutex_session
+            .clone();
         provider
             .director_seats
             .bind(&crate::seat::SeatOccupancyBindRequest {
@@ -7211,9 +7291,17 @@ mod tests {
         );
         assert!(matches!(
             replay.outcome,
-            AgentManagementOutcome::NoWrite { ref detail, .. }
-                if detail.contains("director_seat_changed_after_transfer")
+            AgentManagementOutcome::Complete { .. }
         ));
+        assert_eq!(
+            provider
+                .director_seats
+                .query()
+                .unwrap()
+                .project_director_occupancies[&project()]
+                .occupant_cutex_session,
+            rotated_successor
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

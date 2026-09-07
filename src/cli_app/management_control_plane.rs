@@ -8,6 +8,7 @@ use cutex::agent_management::{CutexProjectWorkspace, ProjectId, ProjectPresentat
 use cutex::management::control_plane::{
     HumanManagementOperatorActionRequest, HumanManagementOperatorReceipt,
     HumanManagementPresentationUpdateRequest, HumanManagementProjectCollection,
+    HumanManagementProjectMutationReceipt, HumanManagementProjectMutationRequest,
     HumanManagementTaskQueryRequest, HumanManagementTaskQueryResponse,
 };
 use cutex::management::remote::management_http_json;
@@ -67,6 +68,17 @@ impl ManagementControlClient {
         self.request(
             "POST",
             "/v2/agent-management/operator-actions",
+            Some(&serde_json::to_vec(request)?),
+        )
+    }
+
+    pub(super) fn project_mutation(
+        &self,
+        request: &HumanManagementProjectMutationRequest,
+    ) -> anyhow::Result<HumanManagementProjectMutationReceipt> {
+        self.request(
+            "POST",
+            "/v2/agent-management/project-mutations",
             Some(&serde_json::to_vec(request)?),
         )
     }

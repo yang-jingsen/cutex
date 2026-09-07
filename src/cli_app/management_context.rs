@@ -33,6 +33,7 @@ pub(crate) fn management_request_context() -> ManagementRequestContext {
         read_management_project,
         update_management_project_presentation,
         execute_management_operator_action,
+        execute_management_project_mutation,
         query_management_tasks,
     }
 }
@@ -83,6 +84,43 @@ fn execute_management_operator_action(
     cutex::agent_management::AgentManagementError,
 > {
     management_agent_provider()?.execute_operator_action_for_management(principal, request)
+}
+
+fn execute_management_project_mutation(
+    principal: &cutex::management::control_plane::HumanManagementPrincipal,
+    request: &cutex::management::control_plane::HumanManagementProjectMutationRequest,
+) -> Result<
+    cutex::management::control_plane::HumanManagementProjectMutationReceipt,
+    cutex::agent_management::AgentManagementError,
+> {
+    management_agent_provider()?.execute_project_mutation_for_management(
+        principal,
+        request,
+        &ManagementProjectTaskInspector,
+    )
+}
+
+struct ManagementProjectTaskInspector;
+
+impl cutex::agent_management::ProjectTaskInspector for ManagementProjectTaskInspector {
+    fn has_active_tasks(
+        &self,
+        project_id: &cutex::agent_management::ProjectId,
+        member: Option<&cutex::role_revision::CutexSessionId>,
+    ) -> Result<bool, cutex::agent_management::AgentManagementError> {
+        use cutex::task_service::AssignmentState;
+
+        let root = cutex::task_delivery::provider_adapter::default_task_service_provider_root()
+            .map_err(|_| cutex::agent_management::AgentManagementError::PersistenceUnavailable)?;
+        let snapshot = cutex::task_service::TaskServiceProvider::open(root)
+            .and_then(|provider| provider.query())
+            .map_err(|_| cutex::agent_management::AgentManagementError::PersistenceUnavailable)?;
+        Ok(snapshot.assignments.values().any(|assignment| {
+            assignment.project_id.as_ref() == Some(project_id)
+                && assignment.state != AssignmentState::Closed
+                && member.is_none_or(|member| &assignment.assignee_cutex_session == member)
+        }))
+    }
 }
 
 fn query_management_tasks(

@@ -176,6 +176,7 @@ fn agent_management_admin_path(path: &str) -> bool {
             | "/v2/agent-management/projects"
             | "/v2/agent-management/project-presentation"
             | "/v2/agent-management/operator-actions"
+            | "/v2/agent-management/project-mutations"
             | "/v2/task-service/management-query"
     ) || management_project_id_from_path(path).is_some()
 }
@@ -261,6 +262,9 @@ fn handle_v2_request_with_repository(
         }
         ("POST", "/v2/agent-management/operator-actions") => {
             handle_management_operator_action(stream, request, context)
+        }
+        ("POST", "/v2/agent-management/project-mutations") => {
+            handle_management_project_mutation(stream, request, context)
         }
         ("POST", "/v2/task-service/management-query") => {
             handle_management_task_query(stream, request, context)
@@ -577,6 +581,33 @@ fn handle_management_operator_action(
         };
     let principal = crate::management::control_plane::HumanManagementPrincipal::authenticated();
     match (context.execute_management_operator_action)(&principal, &payload) {
+        Ok(response) => write_json_response(stream, 200, "OK", &serde_json::to_value(response)?),
+        Err(error) => write_agent_management_control_error(stream, error),
+    }
+}
+
+fn handle_management_project_mutation(
+    stream: &mut TcpStream,
+    request: &SimpleHttpRequest,
+    context: ManagementRequestContext,
+) -> anyhow::Result<()> {
+    let payload: crate::management::control_plane::HumanManagementProjectMutationRequest =
+        match serde_json::from_slice(&request.body) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return write_v2_error(
+                    stream,
+                    400,
+                    "Bad Request",
+                    "invalid_request",
+                    &format!("strict Management Project mutation request parsing failed: {error}"),
+                    false,
+                    json!({}),
+                )
+            }
+        };
+    let principal = crate::management::control_plane::HumanManagementPrincipal::authenticated();
+    match (context.execute_management_project_mutation)(&principal, &payload) {
         Ok(response) => write_json_response(stream, 200, "OK", &serde_json::to_value(response)?),
         Err(error) => write_agent_management_control_error(stream, error),
     }
@@ -4037,6 +4068,7 @@ mod tests {
             "/v2/agent-management/projects/cutex-stack-main",
             "/v2/agent-management/project-presentation",
             "/v2/agent-management/operator-actions",
+            "/v2/agent-management/project-mutations",
             "/v2/task-service/management-query",
         ] {
             assert!(agent_management_admin_path(path), "root scope: {path}");
