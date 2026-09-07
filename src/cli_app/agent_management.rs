@@ -1541,6 +1541,7 @@ fn native_bootstrap_plan(spec: &ManagedAgentSpec) -> anyhow::Result<NativeBootst
         "exec".to_string(),
         "--json".to_string(),
         "--skip-git-repo-check".to_string(),
+        "--cutex-top-level-session".to_string(),
         "Hi.".to_string(),
     ]);
     Ok(NativeBootstrapPlan {
@@ -1619,7 +1620,14 @@ fn captured_native_session_id(output: &Output) -> Result<String, LifecycleFailur
         })?;
         candidates.insert(thread_id.to_string());
     }
-    match candidates.into_iter().collect::<Vec<_>>().as_slice() {
+    let candidates = candidates.into_iter().collect::<Vec<_>>();
+    if candidates.is_empty() && required_top_level_flag_was_rejected(output) {
+        return Err(LifecycleFailure::definite(
+            "native_bootstrap_incompatible",
+            "cute-codex does not support the required --cutex-top-level-session flag; upgrade cute-codex before creating a managed Agent",
+        ));
+    }
+    match candidates.as_slice() {
         [session_id] if output.status.success() => Ok(session_id.clone()),
         [session_id] => Err(LifecycleFailure {
             code: "native_bootstrap_failed".to_string(),
@@ -1689,6 +1697,23 @@ fn sanitized_output_tail(value: &str) -> Option<String> {
         .rev()
         .collect::<String>();
     cutex::observability::sanitize_visible_output(&tail)
+}
+
+fn required_top_level_flag_was_rejected(output: &Output) -> bool {
+    if output.status.success() {
+        return false;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    stderr.contains("--cutex-top-level-session")
+        && [
+            "unexpected argument",
+            "unknown argument",
+            "unrecognized argument",
+            "unknown option",
+            "unrecognized option",
+        ]
+        .iter()
+        .any(|marker| stderr.contains(marker))
 }
 
 fn definite<E: std::fmt::Display>(code: &'static str) -> impl FnOnce(E) -> LifecycleFailure {
@@ -2022,7 +2047,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_plan_uses_normal_cutex_exec_hi_lifecycle() {
+    fn bootstrap_plan_marks_new_top_level_cutex_session_before_prompt() {
         let spec = spec();
         let plan = native_bootstrap_plan(&spec).unwrap();
         assert_eq!(plan.cwd, PathBuf::from(&spec.cwd));
@@ -2040,6 +2065,7 @@ mod tests {
                 "exec",
                 "--json",
                 "--skip-git-repo-check",
+                "--cutex-top-level-session",
                 "Hi."
             ]
         );
@@ -2182,6 +2208,21 @@ mod tests {
         assert_eq!(malformed.code, "native_bootstrap_output_malformed");
         assert!(malformed.detail.contains("not valid UTF-8"));
         assert!(malformed.outcome_unknown);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_top_level_flag_fails_clearly_without_fallback() {
+        let error = captured_native_session_id(&output(
+            2,
+            "",
+            "error: unexpected argument '--cutex-top-level-session' found\n",
+        ))
+        .unwrap_err();
+
+        assert_eq!(error.code, "native_bootstrap_incompatible");
+        assert!(!error.outcome_unknown);
+        assert!(error.detail.contains("upgrade cute-codex"));
     }
 
     #[test]

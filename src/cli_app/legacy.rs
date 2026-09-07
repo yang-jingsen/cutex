@@ -3270,7 +3270,7 @@ base_url = "https://api.deepseek.com/"
     }
 
     #[test]
-    fn host_launch_command_omits_agent_bus_envs_by_default() {
+    fn ordinary_exec_launch_omits_agent_bus_envs_and_top_level_marker() {
         let _guard = env_lock().lock().expect("env lock should not be poisoned");
         let temp_home = std::env::temp_dir().join(format!("cutex-home-{}", Uuid::new_v4()));
         let old_home = std::env::var_os("HOME");
@@ -3292,9 +3292,10 @@ base_url = "https://api.deepseek.com/"
         write_profile_files(&account, "{\"demo\":true}\n", None)
             .expect("profile files should be written");
 
-        let launch =
-            codex_launch_command(&account, &["resume".to_string()]).expect("launch should build");
+        let launch = codex_launch_command(&account, &["exec".to_string(), "Hi.".to_string()])
+            .expect("launch should build");
 
+        assert_eq!(launch.args, ["exec", "Hi."]);
         assert!(!launch
             .envs
             .iter()
