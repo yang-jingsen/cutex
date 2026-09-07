@@ -5,7 +5,10 @@ use std::time::Duration;
 
 use anyhow::Context;
 use crossterm::cursor::Show;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -40,7 +43,7 @@ type ProjectTerminal = Terminal<CrosstermBackend<Stdout>>;
 struct PresentationEditor {
     display_name: String,
     badge_label: String,
-    color: ProjectPaletteColor,
+    color: String,
     field: usize,
 }
 
@@ -214,7 +217,7 @@ impl CutexProjectsModel {
         self.editor = Some(PresentationEditor {
             display_name: details.presentation.display_name.clone(),
             badge_label: details.presentation.badge_label.clone(),
-            color: details.presentation.color,
+            color: details.presentation.color.token(),
             field: 0,
         });
         self.view = ProjectView::Editor;
@@ -331,6 +334,7 @@ fn save_editor(model: &mut CutexProjectsModel) -> anyhow::Result<()> {
         .details
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("project details are unavailable"))?;
+    let color = editor.color.parse::<ProjectPaletteColor>()?;
     let request = HumanManagementPresentationUpdateRequest {
         schema: HumanManagementPresentationSchema::V1,
         project_id: details.project_id.clone(),
@@ -339,7 +343,7 @@ fn save_editor(model: &mut CutexProjectsModel) -> anyhow::Result<()> {
         presentation: ProjectPresentationInput {
             display_name: editor.display_name.clone(),
             badge_label: editor.badge_label.clone(),
-            color: editor.color,
+            color,
         },
     };
     model
@@ -397,8 +401,13 @@ fn run_loop(
         if !event::poll(POLL_INTERVAL)? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
-            continue;
+        let key = match event::read()? {
+            Event::Key(key) => key,
+            Event::Paste(text) => {
+                handle_paste(model, &text);
+                continue;
+            }
+            _ => continue,
         };
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             continue;
@@ -406,6 +415,21 @@ fn run_loop(
         if let Some(outcome) = handle_key(model, key) {
             return Ok(outcome);
         }
+    }
+}
+
+fn handle_paste(model: &mut CutexProjectsModel, text: &str) {
+    if model.view != ProjectView::Editor {
+        return;
+    }
+    let Some(editor) = model.editor.as_mut() else {
+        return;
+    };
+    match editor.field {
+        0 => editor.display_name.push_str(text),
+        1 => editor.badge_label.push_str(text),
+        2 => editor.color.push_str(text),
+        _ => unreachable!(),
     }
 }
 
@@ -566,10 +590,10 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                 if let Some(editor) = model.editor.as_mut().filter(|editor| editor.field == 2) {
                     let index = ProjectPaletteColor::ALL
                         .iter()
-                        .position(|color| *color == editor.color)
-                        .unwrap_or(0);
-                    editor.color =
-                        ProjectPaletteColor::ALL[(index + 1) % ProjectPaletteColor::ALL.len()];
+                        .position(|color| color.token() == editor.color);
+                    editor.color = ProjectPaletteColor::ALL
+                        [index.map_or(0, |index| index + 1) % ProjectPaletteColor::ALL.len()]
+                    .token();
                 }
             }
             KeyCode::Backspace => {
@@ -581,7 +605,10 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                         1 => {
                             editor.badge_label.pop();
                         }
-                        _ => {}
+                        2 => {
+                            editor.color.pop();
+                        }
+                        _ => unreachable!(),
                     }
                 }
             }
@@ -594,7 +621,8 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                     match editor.field {
                         0 => editor.display_name.push(character),
                         1 => editor.badge_label.push(character),
-                        _ => {}
+                        2 => editor.color.push(character),
+                        _ => unreachable!(),
                     }
                 }
             }
@@ -1012,8 +1040,12 @@ fn render_editor(frame: &mut Frame<'_>, area: Rect, editor: Option<&Presentation
         Paragraph::new(vec![
             field(0, "Display name", editor.display_name.clone()),
             field(1, "Badge (1-2 cells)", editor.badge_label.clone()),
-            field(2, "Palette color", editor.color.token().to_string()),
+            field(2, "Color", editor.color.clone()),
             Line::from(""),
+            Line::from(Span::styled(
+                "Type cyan/blue/green/magenta/yellow/red or #RRGGBB · Space cycles palette",
+                Style::new().fg(Color::DarkGray),
+            )),
             Line::from(Span::styled(
                 "Human Management write: authority epoch + presentation revision CAS",
                 Style::new().fg(Color::DarkGray),
@@ -1093,6 +1125,7 @@ pub(super) fn palette_color(color: ProjectPaletteColor) -> Color {
         ProjectPaletteColor::Magenta => Color::LightMagenta,
         ProjectPaletteColor::Yellow => Color::Yellow,
         ProjectPaletteColor::Red => Color::LightRed,
+        ProjectPaletteColor::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
     }
 }
 
@@ -1115,7 +1148,8 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 fn open_terminal() -> anyhow::Result<(ProjectTerminal, TerminalRestore)> {
     enable_raw_mode().context("Failed to enable terminal raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("Failed to enter alternate screen")?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
+        .context("Failed to enter alternate screen")?;
     let terminal = Terminal::new(CrosstermBackend::new(stdout))
         .context("Failed to initialize Cutex Projects terminal")?;
     Ok((terminal, TerminalRestore))
@@ -1127,7 +1161,7 @@ impl Drop for TerminalRestore {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let mut stdout = io::stdout();
-        let _ = execute!(stdout, LeaveAlternateScreen, Show);
+        let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen, Show);
     }
 }
 
@@ -1214,14 +1248,14 @@ mod tests {
         model.editor = Some(PresentationEditor {
             display_name: "Draft Name".to_string(),
             badge_label: "DN".to_string(),
-            color: ProjectPaletteColor::Green,
+            color: ProjectPaletteColor::Green.token(),
             field: 2,
         });
         handle_key(&mut model, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         assert_eq!(model.editor.as_ref().map(|editor| editor.field), Some(1));
         assert_eq!(
-            model.editor.as_ref().map(|editor| editor.color),
-            Some(ProjectPaletteColor::Green)
+            model.editor.as_ref().map(|editor| editor.color.as_str()),
+            Some("green")
         );
         handle_key(
             &mut model,
@@ -1229,8 +1263,8 @@ mod tests {
         );
         assert_eq!(model.editor.as_ref().map(|editor| editor.field), Some(2));
         assert_eq!(
-            model.editor.as_ref().map(|editor| editor.color),
-            Some(ProjectPaletteColor::Green)
+            model.editor.as_ref().map(|editor| editor.color.as_str()),
+            Some("green")
         );
     }
 
@@ -1241,7 +1275,7 @@ mod tests {
         model.editor = Some(PresentationEditor {
             display_name: "Draft Name".to_string(),
             badge_label: "DN".to_string(),
-            color: ProjectPaletteColor::Green,
+            color: ProjectPaletteColor::Green.token(),
             field: 1,
         });
         model.view = ProjectView::Editor;
@@ -1270,7 +1304,7 @@ mod tests {
         model.editor = Some(PresentationEditor {
             display_name: "Uncommitted Draft".to_string(),
             badge_label: "UD".to_string(),
-            color: ProjectPaletteColor::Green,
+            color: ProjectPaletteColor::Green.token(),
             field: 1,
         });
         model.view = ProjectView::Editor;
@@ -1326,6 +1360,69 @@ mod tests {
         assert_eq!(style.fg, Some(Color::White));
         assert_eq!(style.bg, Some(Color::LightMagenta));
         assert!(rendered(&model_with_projects(), 90, 18).contains("CX"));
+    }
+
+    #[test]
+    fn custom_rgb_badge_uses_ratatui_rgb_background() {
+        let style = project_badge_style(ProjectPaletteColor::Rgb(0x12, 0x34, 0x56));
+        assert_eq!(style.fg, Some(Color::White));
+        assert_eq!(style.bg, Some(Color::Rgb(0x12, 0x34, 0x56)));
+    }
+
+    #[test]
+    fn editor_color_field_accepts_text_edits_and_keeps_palette_cycle_shortcut() {
+        let mut model = model_with_projects();
+        model.view = ProjectView::Editor;
+        model.editor = Some(PresentationEditor {
+            display_name: "Draft Name".to_string(),
+            badge_label: "CX".to_string(),
+            color: "#12345".to_string(),
+            field: 2,
+        });
+
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('6'), KeyModifiers::NONE),
+        );
+        assert_eq!(
+            model.editor.as_ref().map(|editor| editor.color.as_str()),
+            Some("#123456")
+        );
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        assert_eq!(
+            model.editor.as_ref().map(|editor| editor.color.as_str()),
+            Some("#12345")
+        );
+
+        model.editor.as_mut().unwrap().color.clear();
+        handle_paste(&mut model, "#12aB3c");
+        assert_eq!(
+            model.editor.as_ref().map(|editor| editor.color.as_str()),
+            Some("#12aB3c")
+        );
+
+        model.editor.as_mut().unwrap().color = "green".to_string();
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        );
+        assert_eq!(
+            model.editor.as_ref().map(|editor| editor.color.as_str()),
+            Some("magenta")
+        );
+
+        model.editor.as_mut().unwrap().color = "#123456".to_string();
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        );
+        assert_eq!(
+            model.editor.as_ref().map(|editor| editor.color.as_str()),
+            Some("cyan")
+        );
     }
 
     #[test]

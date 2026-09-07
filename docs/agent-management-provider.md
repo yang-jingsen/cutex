@@ -335,12 +335,13 @@ workspace records never select a project or grant access.
 
 Project presentation is a separate non-authoritative record keyed by canonical
 `ProjectId`. It contains only a display name, a one- or two-cell badge, a color
-from the finite high-contrast palette, update provenance, and an independent
-revision. Missing presentation records produce deterministic defaults without
-writing. Only the authenticated current Primary Director can update presentation, and
-the canonical ID and authority fields are absent from the editable payload.
-Optimistic presentation revisions prevent lost updates. Additive store and
-presentation fields survive presentation-only writes.
+from the existing high-contrast named palette or a custom `#RRGGBB` value,
+update provenance, and an independent revision. Missing presentation records
+produce deterministic defaults without writing. Only the authenticated current
+Primary Director can update presentation, and the canonical ID and authority
+fields are absent from the editable payload. Optimistic presentation revisions
+prevent lost updates. Additive store and presentation fields survive
+presentation-only writes.
 
 The terminal UI presents this projection as **Cutex Projects**. The unrelated
 native Codex catalog remains available as the secondary **Workspaces** entry

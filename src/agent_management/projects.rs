@@ -5,8 +5,10 @@
 //! deliberately non-authoritative and can never select or grant authority.
 
 use std::collections::BTreeMap;
+use std::fmt;
+use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use unicode_width::UnicodeWidthStr;
 
 use crate::management::control_plane::{
@@ -22,8 +24,7 @@ use super::{
     AgentOperatorGrant, AgentRuntimeObservation, ManagedAgentRecord, ProjectAuthority, ProjectId,
 };
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProjectPaletteColor {
     Cyan,
     Blue,
@@ -31,6 +32,7 @@ pub enum ProjectPaletteColor {
     Magenta,
     Yellow,
     Red,
+    Rgb(u8, u8, u8),
 }
 
 impl ProjectPaletteColor {
@@ -43,15 +45,79 @@ impl ProjectPaletteColor {
         Self::Red,
     ];
 
-    pub fn token(self) -> &'static str {
+    pub fn token(self) -> String {
         match self {
-            Self::Cyan => "cyan",
-            Self::Blue => "blue",
-            Self::Green => "green",
-            Self::Magenta => "magenta",
-            Self::Yellow => "yellow",
-            Self::Red => "red",
+            Self::Cyan => "cyan".to_string(),
+            Self::Blue => "blue".to_string(),
+            Self::Green => "green".to_string(),
+            Self::Magenta => "magenta".to_string(),
+            Self::Yellow => "yellow".to_string(),
+            Self::Red => "red".to_string(),
+            Self::Rgb(red, green, blue) => format!("#{red:02X}{green:02X}{blue:02X}"),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProjectColorParseError;
+
+impl fmt::Display for ProjectColorParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "invalid project badge color; expected cyan, blue, green, magenta, yellow, red, or #RRGGBB",
+        )
+    }
+}
+
+impl std::error::Error for ProjectColorParseError {}
+
+impl FromStr for ProjectPaletteColor {
+    type Err = ProjectColorParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "cyan" => Ok(Self::Cyan),
+            "blue" => Ok(Self::Blue),
+            "green" => Ok(Self::Green),
+            "magenta" => Ok(Self::Magenta),
+            "yellow" => Ok(Self::Yellow),
+            "red" => Ok(Self::Red),
+            value
+                if value.strip_prefix('#').is_some_and(|hex| {
+                    hex.len() == 6 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+                }) =>
+            {
+                let parse_component = |start| {
+                    u8::from_str_radix(&value[start..start + 2], 16)
+                        .map_err(|_| ProjectColorParseError)
+                };
+                Ok(Self::Rgb(
+                    parse_component(1)?,
+                    parse_component(3)?,
+                    parse_component(5)?,
+                ))
+            }
+            _ => Err(ProjectColorParseError),
+        }
+    }
+}
+
+impl Serialize for ProjectPaletteColor {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.token())
+    }
+}
+
+impl<'de> Deserialize<'de> for ProjectPaletteColor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(de::Error::custom)
     }
 }
 
@@ -1058,6 +1124,72 @@ mod tests {
         assert_eq!(provider.store().snapshot().unwrap().store_revision, before);
         std::fs::remove_dir_all(root).unwrap();
         let _ = project_id;
+    }
+
+    #[test]
+    fn project_colors_keep_legacy_json_tokens_and_round_trip_rgb() {
+        for (token, color) in [
+            ("cyan", ProjectPaletteColor::Cyan),
+            ("blue", ProjectPaletteColor::Blue),
+            ("green", ProjectPaletteColor::Green),
+            ("magenta", ProjectPaletteColor::Magenta),
+            ("yellow", ProjectPaletteColor::Yellow),
+            ("red", ProjectPaletteColor::Red),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<ProjectPaletteColor>(&format!("\"{token}\"")).unwrap(),
+                color
+            );
+            assert_eq!(
+                serde_json::to_string(&color).unwrap(),
+                format!("\"{token}\"")
+            );
+        }
+
+        let rgb = serde_json::from_str::<ProjectPaletteColor>("\"#12aBcF\"").unwrap();
+        assert_eq!(rgb, ProjectPaletteColor::Rgb(0x12, 0xab, 0xcf));
+        assert_eq!(serde_json::to_string(&rgb).unwrap(), "\"#12ABCF\"");
+        assert_eq!(
+            serde_json::from_str::<ProjectPaletteColor>(&serde_json::to_string(&rgb).unwrap())
+                .unwrap(),
+            rgb
+        );
+
+        let presentation: ProjectPresentationInput = serde_json::from_value(serde_json::json!({
+            "display_name": "RGB Project",
+            "badge_label": "CX",
+            "color": "#102A4F"
+        }))
+        .unwrap();
+        assert_eq!(
+            presentation.color,
+            ProjectPaletteColor::Rgb(0x10, 0x2a, 0x4f)
+        );
+        let encoded = serde_json::to_value(&presentation).unwrap();
+        assert_eq!(encoded["color"], "#102A4F");
+        assert_eq!(
+            serde_json::from_value::<ProjectPresentationInput>(encoded).unwrap(),
+            presentation
+        );
+    }
+
+    #[test]
+    fn project_color_rejects_non_rgb_hex_forms_with_a_clear_error() {
+        for invalid in [
+            "#123", "#12345", "#1234567", "123456", "#12GG56", "cyan ", "#12é45",
+        ] {
+            let error = invalid.parse::<ProjectPaletteColor>().unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "invalid project badge color; expected cyan, blue, green, magenta, yellow, red, or #RRGGBB"
+            );
+            assert!(
+                serde_json::from_str::<ProjectPaletteColor>(&format!("\"{invalid}\""))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("expected cyan, blue, green, magenta, yellow, red, or #RRGGBB")
+            );
+        }
     }
 
     #[test]

@@ -91,7 +91,9 @@ Project filtering matches canonical ID, display name, and badge. Appearance
 updates compare both authority epoch and presentation revision. Badges occupy
 one or two terminal cells; `CX` is valid, and the deterministic default for
 `cutex-stack-main` is `CS`. Both the Home Agent list and Projects panel render
-badge text in white on the configured project color.
+badge text in white on the configured project color. The editor accepts the
+six named palette colors or a custom `#RRGGBB` background; Space remains a
+shortcut for cycling the named palette.
 
 Tasks refresh on a one-second cadence and preserve selection across refreshes.
 Both Projects and Tasks have narrow-terminal and resize regression coverage.
