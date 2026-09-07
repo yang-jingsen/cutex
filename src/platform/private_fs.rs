@@ -24,11 +24,10 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     AclSizeInformation, AddAccessAllowedAceEx, EqualSid, GetAce, GetAclInformation, GetLengthSid,
-    GetSecurityDescriptorControl, GetTokenInformation, InitializeAcl, IsValidSid, TokenOwner,
-    TokenUser, ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE,
+    GetSecurityDescriptorControl, GetTokenInformation, InitializeAcl, IsValidSid, TokenUser,
+    ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE,
     DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED, TOKEN_OWNER, TOKEN_QUERY,
-    TOKEN_USER,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, DeleteFileW, FileAttributeTagInfo, FileIdInfo, FlushFileBuffers,
@@ -186,7 +185,7 @@ pub fn identity(file: &File) -> Result<FileIdentity, PrivateFsError> {
     })
 }
 
-fn current_token_sid(information_class: i32) -> Result<Vec<u8>, PrivateFsError> {
+fn current_user_sid() -> Result<Vec<u8>, PrivateFsError> {
     let mut token = null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
         return Err(io::Error::last_os_error().into());
@@ -194,7 +193,7 @@ fn current_token_sid(information_class: i32) -> Result<Vec<u8>, PrivateFsError> 
     let token = OwnedHandle(token);
     let mut required = 0;
     unsafe {
-        GetTokenInformation(token.0, information_class, null_mut(), 0, &mut required);
+        GetTokenInformation(token.0, TokenUser, null_mut(), 0, &mut required);
     }
     if required == 0 {
         return Err(io::Error::last_os_error().into());
@@ -203,7 +202,7 @@ fn current_token_sid(information_class: i32) -> Result<Vec<u8>, PrivateFsError> 
     if unsafe {
         GetTokenInformation(
             token.0,
-            information_class,
+            TokenUser,
             buffer.as_mut_ptr().cast(),
             required,
             &mut required,
@@ -212,13 +211,7 @@ fn current_token_sid(information_class: i32) -> Result<Vec<u8>, PrivateFsError> 
     {
         return Err(io::Error::last_os_error().into());
     }
-    let sid = if information_class == TokenUser {
-        unsafe { (*(buffer.as_ptr().cast::<TOKEN_USER>())).User.Sid }
-    } else if information_class == TokenOwner {
-        unsafe { (*(buffer.as_ptr().cast::<TOKEN_OWNER>())).Owner }
-    } else {
-        return Err(PrivateFsError::OwnerMismatch);
-    };
+    let sid = unsafe { (*(buffer.as_ptr().cast::<TOKEN_USER>())).User.Sid };
     if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
         return Err(PrivateFsError::OwnerMismatch);
     }
@@ -228,14 +221,6 @@ fn current_token_sid(information_class: i32) -> Result<Vec<u8>, PrivateFsError> 
         std::ptr::copy_nonoverlapping(sid.cast::<u8>(), owned.as_mut_ptr(), length);
     }
     Ok(owned)
-}
-
-fn current_user_sid() -> Result<Vec<u8>, PrivateFsError> {
-    current_token_sid(TokenUser)
-}
-
-fn current_owner_sid() -> Result<Vec<u8>, PrivateFsError> {
-    current_token_sid(TokenOwner)
 }
 
 struct SecurityDescriptor(*mut std::ffi::c_void);
@@ -271,7 +256,11 @@ fn security_info(file: &File) -> Result<(PSID, *mut ACL, SecurityDescriptor), Pr
 }
 
 fn validate_owner(file: &File) -> Result<(), PrivateFsError> {
-    let sid = current_owner_sid()?;
+    // The private DACL is bound to TokenUser, so ownership must be checked
+    // against that same stable identity. TokenOwner can become the built-in
+    // Administrators SID for an elevated token belonging to the same user,
+    // which incorrectly makes user-owned state unreadable after elevation.
+    let sid = current_user_sid()?;
     let (owner, _, _descriptor) = security_info(file)?;
     if owner.is_null() || unsafe { EqualSid(owner, sid.as_ptr() as PSID) } == 0 {
         return Err(PrivateFsError::OwnerMismatch);
@@ -325,7 +314,7 @@ fn secure_owned_handle(file: &File, directory: bool) -> Result<(), PrivateFsErro
 fn validate_private_acl(file: &File, directory: bool) -> Result<(), PrivateFsError> {
     let sid = current_user_sid()?;
     let sid_pointer = sid.as_ptr() as PSID;
-    let owner_sid = current_owner_sid()?;
+    let owner_sid = current_user_sid()?;
     let (owner, dacl, descriptor) = security_info(file)?;
     if owner.is_null() || unsafe { EqualSid(owner, owner_sid.as_ptr() as PSID) } == 0 {
         return Err(PrivateFsError::OwnerMismatch);
