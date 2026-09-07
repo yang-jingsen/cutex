@@ -1426,6 +1426,68 @@ mod tests {
     }
 
     #[test]
+    fn editor_text_fields_take_printable_keys_before_local_action_shortcuts() {
+        let mut model = model_with_projects();
+        model.view = ProjectView::Editor;
+        model.editor = Some(PresentationEditor {
+            display_name: String::new(),
+            badge_label: String::new(),
+            color: String::new(),
+            field: 1,
+        });
+
+        for character in ['C', 'X'] {
+            assert_eq!(
+                handle_key(
+                    &mut model,
+                    KeyEvent::new(KeyCode::Char(character), KeyModifiers::SHIFT),
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            model
+                .editor
+                .as_ref()
+                .map(|editor| editor.badge_label.as_str()),
+            Some("CX")
+        );
+
+        model.editor.as_mut().unwrap().field = 2;
+        assert_eq!(
+            handle_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Char('#'), KeyModifiers::SHIFT),
+            ),
+            None
+        );
+        for character in ['1', '2', 'a', 'B', '3', 'c'] {
+            handle_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            );
+        }
+        assert_eq!(
+            model.editor.as_ref().map(|editor| editor.color.as_str()),
+            Some("#12aB3c")
+        );
+
+        let before = model.editor.clone().unwrap();
+        assert_eq!(
+            handle_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT),
+            ),
+            Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Agents))
+        );
+        let after = model.editor.as_ref().unwrap();
+        assert_eq!(after.display_name, before.display_name);
+        assert_eq!(after.badge_label, before.badge_label);
+        assert_eq!(after.color, before.color);
+        assert_eq!(after.field, before.field);
+    }
+
+    #[test]
     fn narrow_terminal_and_resize_render_without_panicking() {
         let model = model_with_projects();
         let mut terminal = Terminal::new(TestBackend::new(38, 9)).unwrap();
