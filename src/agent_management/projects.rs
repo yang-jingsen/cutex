@@ -942,13 +942,30 @@ impl AgentManagementProvider {
                 _ => None,
             };
             if let Some((from, to)) = transition {
+                validate_project_director_authority_materialization(
+                    &before,
+                    authority,
+                    &request.project_id,
+                )?;
+                let materialization_action_id =
+                    project_authority_materialization_action_id(&request.action_id)?;
                 self.director_seats
-                    .transition_project_director(
+                    .materialize_project_director_from_authority(
+                        &materialization_action_id,
+                        &digest,
                         &request.project_id,
                         &authority.authorized_director_session,
+                        authority.authority_epoch,
                         from,
-                        to,
                     )
+                    .and_then(|_| {
+                        self.director_seats.transition_project_director(
+                            &request.project_id,
+                            &authority.authorized_director_session,
+                            from,
+                            to,
+                        )
+                    })
                     .map_err(super::provider::seat_authority_error)?;
             }
         }
@@ -1362,6 +1379,48 @@ fn project_seat_action_id(
     );
     crate::task_service::ActionId::new(format!("human-project-create-{digest:x}"))
         .map_err(|_| AgentManagementError::InvalidStore)
+}
+
+fn project_authority_materialization_action_id(
+    action_id: &super::AgentActionId,
+) -> Result<crate::task_service::ActionId, AgentManagementError> {
+    let digest = Sha256Digest::digest(
+        format!("project-authority-materialization:{}", action_id.as_str()).as_bytes(),
+    );
+    crate::task_service::ActionId::new(format!("human-project-materialize-{digest:x}"))
+        .map_err(|_| AgentManagementError::InvalidStore)
+}
+
+fn validate_project_director_authority_materialization(
+    snapshot: &super::AgentManagementSnapshot,
+    authority: &ProjectAuthority,
+    project_id: &ProjectId,
+) -> Result<(), AgentManagementError> {
+    if snapshot.projects.values().any(|other| {
+        &other.project_id != project_id
+            && other.authorized_director_session == authority.authorized_director_session
+            && effective_project_state(snapshot, other).lifecycle == ProjectLifecycle::Active
+    }) {
+        return Err(AgentManagementError::Conflict(
+            "director_authorizes_multiple_active_projects",
+        ));
+    }
+    let conflicting_membership = snapshot
+        .current_project_memberships
+        .get(&authority.authorized_director_session)
+        .and_then(|membership| membership.project_id.as_ref())
+        .is_some_and(|current| current != project_id)
+        || snapshot
+            .agents
+            .get(&authority.authorized_director_session)
+            .and_then(|agent| current_project_id(snapshot, agent))
+            .is_some_and(|current| &current != project_id);
+    if conflicting_membership {
+        return Err(AgentManagementError::Conflict(
+            "director_has_conflicting_active_membership",
+        ));
+    }
+    Ok(())
 }
 
 fn management_operator_grant_revision(
@@ -2504,7 +2563,7 @@ mod tests {
                 schema: crate::seat::SeatOccupancyCommandSchema::V1,
                 action_id: crate::task_service::ActionId::new("bind-project-director").unwrap(),
                 seat_id: crate::task_service::SeatId::new("cutex-director").unwrap(),
-                occupant_cutex_session: session("cutex.director"),
+                occupant_cutex_session: session("cutex.unrelated-global-director"),
             })
             .unwrap();
         let detach = HumanManagementProjectMutationRequest {
@@ -2622,6 +2681,196 @@ mod tests {
             snapshot.agents[&session("cutex.director")].project_id,
             project_id
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn distinct_legacy_projects_archive_from_their_own_authorities_not_the_global_seat() {
+        let root = std::env::temp_dir().join(format!(
+            "cutex-project-legacy-multi-archive-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let provider = AgentManagementProvider::open(&root).unwrap();
+        provider
+            .director_seats
+            .bind(&crate::seat::SeatOccupancyBindRequest {
+                schema: crate::seat::SeatOccupancyCommandSchema::V1,
+                action_id: crate::task_service::ActionId::new("bind-unrelated-global").unwrap(),
+                seat_id: crate::task_service::SeatId::new("cutex-director").unwrap(),
+                occupant_cutex_session: session("cutex.global-director"),
+            })
+            .unwrap();
+        let projects = [
+            (project("legacy-vce"), session("cutex.vce-director")),
+            (project("legacy-ops"), session("cutex.ops-director")),
+        ];
+        provider
+            .store()
+            .with_state(true, |mut state| {
+                for (project_id, director) in &projects {
+                    state.projects.insert(
+                        project_id.clone(),
+                        ProjectAuthority {
+                            project_id: project_id.clone(),
+                            authorized_director_session: director.clone(),
+                            authority_epoch: 1,
+                            updated_at: timestamp(),
+                        },
+                    );
+                    let record = agent(project_id, director.as_str(), false);
+                    state.agents.insert(director.clone(), record);
+                }
+                Ok((state, (), true))
+            })
+            .unwrap();
+        let principal = HumanManagementPrincipal::authenticated();
+        let no_tasks = |_: &ProjectId, _: Option<&CutexSessionId>| Ok(false);
+        let mut receipts = Vec::new();
+        for (index, (project_id, _)) in projects.iter().enumerate() {
+            let request = HumanManagementProjectMutationRequest {
+                schema: HumanManagementProjectMutationSchema::V1,
+                action_id: AgentActionId::new(format!("archive-legacy-{index}")).unwrap(),
+                project_id: project_id.clone(),
+                expected_authority_epoch: 1,
+                expected_project_revision: 0,
+                operation: HumanManagementProjectMutationKind::Archive,
+            };
+            let receipt = provider
+                .execute_project_mutation_for_management(&principal, &request, &no_tasks)
+                .unwrap();
+            assert_eq!(
+                provider
+                    .execute_project_mutation_for_management(&principal, &request, &no_tasks)
+                    .unwrap(),
+                receipt
+            );
+            receipts.push(receipt);
+        }
+        assert_eq!(receipts.len(), 2);
+        let management = provider.store().snapshot().unwrap();
+        let seats = provider.director_seats.query().unwrap();
+        for (project_id, director) in &projects {
+            assert_eq!(
+                management.project_states[project_id].lifecycle,
+                ProjectLifecycle::Archived
+            );
+            assert_eq!(
+                seats.project_director_occupancies[project_id].occupant_cutex_session,
+                *director
+            );
+            assert_eq!(
+                seats.project_director_states[project_id],
+                crate::seat::ProjectDirectorSeatState::Archived
+            );
+        }
+        assert_eq!(
+            seats.occupancies[&crate::task_service::SeatId::new("cutex-director").unwrap()]
+                .occupant_cutex_session,
+            session("cutex.global-director")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn conflicting_scoped_project_seat_fails_without_an_agent_management_write() {
+        let (provider, root, project_id) = provider_with_project();
+        let prepare = crate::task_service::ActionId::new("prepare-conflicting-seat").unwrap();
+        provider
+            .director_seats
+            .prepare_project_director(&prepare, &project_id, &session("cutex.wrong-director"))
+            .unwrap();
+        provider
+            .director_seats
+            .activate_project_director(&prepare, &project_id, &session("cutex.wrong-director"))
+            .unwrap();
+        let before = provider.store().snapshot().unwrap();
+        let request = HumanManagementProjectMutationRequest {
+            schema: HumanManagementProjectMutationSchema::V1,
+            action_id: AgentActionId::new("archive-conflicting-seat").unwrap(),
+            project_id: project_id.clone(),
+            expected_authority_epoch: 7,
+            expected_project_revision: 0,
+            operation: HumanManagementProjectMutationKind::Archive,
+        };
+        let no_tasks = |_: &ProjectId, _: Option<&CutexSessionId>| Ok(false);
+        assert_eq!(
+            provider.execute_project_mutation_for_management(
+                &HumanManagementPrincipal::authenticated(),
+                &request,
+                &no_tasks,
+            ),
+            Err(AgentManagementError::Conflict(
+                "stale_director_seat_occupancy"
+            ))
+        );
+        let after = provider.store().snapshot().unwrap();
+        assert_eq!(after.project_states, before.project_states);
+        assert_eq!(
+            after.human_management_project_mutations,
+            before.human_management_project_mutations
+        );
+        assert_eq!(after.project_audit_events, before.project_audit_events);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn one_director_cannot_materialize_multiple_active_legacy_projects() {
+        let root = std::env::temp_dir().join(format!(
+            "cutex-project-legacy-director-conflict-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let provider = AgentManagementProvider::open(&root).unwrap();
+        let director = session("cutex.shared-director");
+        let first = project("legacy-first");
+        let second = project("legacy-second");
+        provider
+            .store()
+            .with_state(true, |mut state| {
+                for project_id in [&first, &second] {
+                    state.projects.insert(
+                        project_id.clone(),
+                        ProjectAuthority {
+                            project_id: project_id.clone(),
+                            authorized_director_session: director.clone(),
+                            authority_epoch: 1,
+                            updated_at: timestamp(),
+                        },
+                    );
+                }
+                Ok((state, (), true))
+            })
+            .unwrap();
+        let request = HumanManagementProjectMutationRequest {
+            schema: HumanManagementProjectMutationSchema::V1,
+            action_id: AgentActionId::new("archive-shared-director").unwrap(),
+            project_id: first.clone(),
+            expected_authority_epoch: 1,
+            expected_project_revision: 0,
+            operation: HumanManagementProjectMutationKind::Archive,
+        };
+        let no_tasks = |_: &ProjectId, _: Option<&CutexSessionId>| Ok(false);
+        assert_eq!(
+            provider.execute_project_mutation_for_management(
+                &HumanManagementPrincipal::authenticated(),
+                &request,
+                &no_tasks,
+            ),
+            Err(AgentManagementError::Conflict(
+                "director_authorizes_multiple_active_projects"
+            ))
+        );
+        assert!(provider
+            .store()
+            .snapshot()
+            .unwrap()
+            .project_states
+            .is_empty());
+        assert!(provider
+            .director_seats
+            .query()
+            .unwrap()
+            .project_director_occupancies
+            .is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 

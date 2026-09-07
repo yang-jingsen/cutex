@@ -79,6 +79,16 @@ struct ProjectDirectorPrepareRequest {
     occupant_cutex_session: CutexSessionId,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ProjectDirectorAuthorityMaterializationRequest {
+    action_id: ActionId,
+    human_request_sha256: TypedSha256,
+    project_id: ProjectId,
+    occupant_cutex_session: CutexSessionId,
+    authority_epoch: u64,
+    initial_state: ProjectDirectorSeatState,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SeatOccupancy {
@@ -396,26 +406,9 @@ impl SeatOccupancyStore {
         to: ProjectDirectorSeatState,
     ) -> Result<(), SeatAuthorityError> {
         self.with_locked_state(true, |mut state| {
-            let mut materialized = false;
-            if !state.project_director_occupancies.contains_key(project_id) {
-                let legacy = director_occupancy(&state)?.clone();
-                if &legacy.occupant_cutex_session != expected_occupant {
-                    return Err(SeatAuthorityError::Conflict(
-                        "stale_director_seat_occupancy",
-                    ));
-                }
-                state
-                    .project_director_occupancies
-                    .insert(project_id.clone(), legacy);
-                state
-                    .project_director_states
-                    .insert(project_id.clone(), ProjectDirectorSeatState::Active);
-                materialized = true;
-            }
-            let occupancy = state
-                .project_director_occupancies
-                .get(project_id)
-                .ok_or(SeatAuthorityError::InvalidStore)?;
+            let occupancy = state.project_director_occupancies.get(project_id).ok_or(
+                SeatAuthorityError::Conflict("project_director_seat_not_materialized"),
+            )?;
             if &occupancy.occupant_cutex_session != expected_occupant {
                 return Err(SeatAuthorityError::Conflict(
                     "stale_director_seat_occupancy",
@@ -427,10 +420,7 @@ impl SeatOccupancyStore {
                 .copied()
                 .unwrap_or(ProjectDirectorSeatState::Active);
             if current == to {
-                if materialized {
-                    state.store_revision = next_revision(state.store_revision)?;
-                }
-                return Ok((state, (), materialized));
+                return Ok((state, (), false));
             }
             if current != from {
                 return Err(SeatAuthorityError::Conflict(
@@ -440,6 +430,109 @@ impl SeatOccupancyStore {
             state.project_director_states.insert(project_id.clone(), to);
             state.store_revision = next_revision(state.store_revision)?;
             Ok((state, (), true))
+        })
+    }
+
+    /// Materialize an absent legacy Project seat from the canonical Agent
+    /// Management authority selected by an exact Human mutation. The legacy
+    /// global singleton is deliberately ignored: it may belong to a different
+    /// Project. The action receipt makes a crash before the lifecycle
+    /// transition exactly replayable.
+    pub(crate) fn materialize_project_director_from_authority(
+        &self,
+        action_id: &ActionId,
+        human_request_sha256: &TypedSha256,
+        project_id: &ProjectId,
+        occupant: &CutexSessionId,
+        authority_epoch: u64,
+        initial_state: ProjectDirectorSeatState,
+    ) -> Result<SeatOccupancyReceipt, SeatAuthorityError> {
+        if authority_epoch == 0 || authority_epoch > MAX_JSON_SAFE_INTEGER {
+            return Err(SeatAuthorityError::InvalidRequest(
+                "invalid_project_authority_epoch",
+            ));
+        }
+        let request = ProjectDirectorAuthorityMaterializationRequest {
+            action_id: action_id.clone(),
+            human_request_sha256: human_request_sha256.clone(),
+            project_id: project_id.clone(),
+            occupant_cutex_session: occupant.clone(),
+            authority_epoch,
+            initial_state,
+        };
+        let digest = request_digest(&request)?;
+        self.with_locked_state(true, |mut state| {
+            if let Some(receipt) = state.receipts.get(action_id).cloned() {
+                return if receipt.request_sha256 == digest
+                    && state.project_director_occupancies.get(project_id)
+                        == Some(&receipt.occupancy)
+                {
+                    Ok((state, receipt, false))
+                } else {
+                    Err(SeatAuthorityError::Conflict("action_id_payload_conflict"))
+                };
+            }
+            if state
+                .project_director_occupancies
+                .iter()
+                .any(|(other, occupancy)| {
+                    other != project_id && &occupancy.occupant_cutex_session == occupant
+                })
+            {
+                return Err(SeatAuthorityError::Conflict(
+                    "session_already_directs_another_project",
+                ));
+            }
+            let occupancy = match state.project_director_occupancies.get(project_id) {
+                Some(occupancy) if &occupancy.occupant_cutex_session == occupant => {
+                    let current = state
+                        .project_director_states
+                        .get(project_id)
+                        .copied()
+                        .unwrap_or(ProjectDirectorSeatState::Active);
+                    if current != initial_state {
+                        return Err(SeatAuthorityError::Conflict(
+                            "project_director_state_conflict",
+                        ));
+                    }
+                    occupancy.clone()
+                }
+                Some(_) => {
+                    return Err(SeatAuthorityError::Conflict(
+                        "stale_director_seat_occupancy",
+                    ))
+                }
+                None if state.project_director_states.contains_key(project_id) => {
+                    return Err(SeatAuthorityError::InvalidStore)
+                }
+                None => {
+                    let occupancy = SeatOccupancy {
+                        seat_id: SeatId::new("cutex-director")
+                            .map_err(|_| SeatAuthorityError::InvalidStore)?,
+                        occupant_cutex_session: occupant.clone(),
+                        epoch: authority_epoch,
+                        bound_at: now(),
+                    };
+                    state
+                        .project_director_occupancies
+                        .insert(project_id.clone(), occupancy.clone());
+                    state
+                        .project_director_states
+                        .insert(project_id.clone(), initial_state);
+                    occupancy
+                }
+            };
+            let revision = next_revision(state.store_revision)?;
+            let receipt = SeatOccupancyReceipt {
+                schema: SeatOccupancyReceiptSchema::V1,
+                action_id: action_id.clone(),
+                request_sha256: digest,
+                store_revision: revision,
+                occupancy,
+            };
+            state.store_revision = revision;
+            state.receipts.insert(action_id.clone(), receipt.clone());
+            Ok((state, receipt, true))
         })
     }
 
@@ -1450,6 +1543,100 @@ mod tests {
             director_b
         );
         assert!(snapshot.active_project_director_transfers.is_empty());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn authority_materialization_ignores_unrelated_global_seat_and_is_exactly_replayable() {
+        let root = root("authority-materialization");
+        let store = SeatOccupancyStore::open(&root).expect("open");
+        store
+            .bind(&bind(
+                "bind-unrelated-global",
+                "cutex-director",
+                "global-director",
+            ))
+            .unwrap();
+        let project = ProjectId::new("legacy-vce").unwrap();
+        let director = CutexSessionId::new("vce-director").unwrap();
+        let action = ActionId::new("materialize-legacy-vce").unwrap();
+        let human_digest = TypedSha256::new("a".repeat(64)).unwrap();
+        let first = store
+            .materialize_project_director_from_authority(
+                &action,
+                &human_digest,
+                &project,
+                &director,
+                4,
+                ProjectDirectorSeatState::Active,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .materialize_project_director_from_authority(
+                    &action,
+                    &human_digest,
+                    &project,
+                    &director,
+                    4,
+                    ProjectDirectorSeatState::Active,
+                )
+                .unwrap(),
+            first
+        );
+        let snapshot = store.query().unwrap();
+        assert_eq!(snapshot.project_director_occupancies[&project].epoch, 4);
+        assert_eq!(
+            snapshot.occupancies[&SeatId::new("cutex-director").unwrap()]
+                .occupant_cutex_session
+                .as_str(),
+            "global-director"
+        );
+        store
+            .transition_project_director(
+                &project,
+                &director,
+                ProjectDirectorSeatState::Active,
+                ProjectDirectorSeatState::Archived,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .materialize_project_director_from_authority(
+                    &action,
+                    &human_digest,
+                    &project,
+                    &director,
+                    4,
+                    ProjectDirectorSeatState::Active,
+                )
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            store.materialize_project_director_from_authority(
+                &action,
+                &TypedSha256::new("b".repeat(64)).unwrap(),
+                &project,
+                &CutexSessionId::new("changed-director").unwrap(),
+                4,
+                ProjectDirectorSeatState::Active,
+            ),
+            Err(SeatAuthorityError::Conflict("action_id_payload_conflict"))
+        );
+        assert_eq!(
+            store.materialize_project_director_from_authority(
+                &ActionId::new("materialize-other").unwrap(),
+                &TypedSha256::new("c".repeat(64)).unwrap(),
+                &ProjectId::new("other-project").unwrap(),
+                &director,
+                1,
+                ProjectDirectorSeatState::Active,
+            ),
+            Err(SeatAuthorityError::Conflict(
+                "session_already_directs_another_project"
+            ))
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 
