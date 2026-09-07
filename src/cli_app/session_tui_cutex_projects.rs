@@ -249,12 +249,23 @@ pub(super) fn run(
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         anyhow::bail!("Cutex Projects requires an interactive terminal");
     }
+    let needs_initial_load = previous_model.is_none();
     let mut model = previous_model.unwrap_or_else(|| {
-        load_model().unwrap_or_else(|error| {
-            CutexProjectsModel::empty_with_failure(format!("Cutex Projects unavailable: {error:#}"))
-        })
+        let mut loading = CutexProjectsModel::empty_with_failure("");
+        loading.failure = None;
+        loading.notice = Some("Loading Cutex Projects…".to_string());
+        loading
     });
     let (mut terminal, restore) = open_terminal()?;
+    if needs_initial_load {
+        // Draw a complete first frame before any synchronous service discovery
+        // or authenticated request. A slow or failed Management start must not
+        // leave the user looking at a cleared terminal with no explanation.
+        terminal.draw(|frame| render(frame, &model))?;
+        model = load_model().unwrap_or_else(|error| {
+            CutexProjectsModel::empty_with_failure(format!("Cutex Projects unavailable: {error:#}"))
+        });
+    }
     let result = run_loop(&mut terminal, &mut model);
     drop(terminal);
     drop(restore);
