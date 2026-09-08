@@ -676,6 +676,8 @@ fn recent_row(
         })
         .collect();
     let view = AgentSessionView {
+        badge: None,
+        project_id: None,
         subject: if records.len() == 1 && state != RecentThreadState::Ambiguous {
             SubjectRef::Managed(records[0].cutex_session_id.clone())
         } else {
@@ -699,6 +701,7 @@ fn recent_row(
         effective_profile: Observation::Unavailable("effective profile not observed".into()),
         role: String::new(),
         activity: String::new(),
+        activity_details: None,
         updated: thread
             .recency_at
             .or(thread.updated_at)
@@ -984,6 +987,33 @@ mod tests {
         }
         store.sessions.insert("cutex-test".to_string(), record);
         store
+    }
+
+    #[test]
+    fn visual_restoration_recent_badge_requires_durable_and_native_match() {
+        let mut workspace = RecentSessionsWorkspace::default();
+        workspace.receive(
+            CatalogReply::Page {
+                cursor: None,
+                result: Ok(ThreadPage {
+                    data: vec![thread("thread-1", "native title", 1)],
+                    next_cursor: None,
+                    backwards_cursor: None,
+                }),
+            },
+            &store_with("thread-1", true, false),
+        );
+        let mut managed = workspace.rows[0].view.clone();
+        managed.badge = Some(super::super::session_tui_view::ProjectBadge {
+            label: "CX".into(),
+            color: cutex::agent_management::ProjectPaletteColor::Cyan,
+        });
+        managed.native_thread = Some("wrong-native".into());
+        workspace.enrich_views(&[managed.clone()]);
+        assert!(workspace.rows[0].view.badge.is_none());
+        managed.native_thread = Some("thread-1".into());
+        workspace.enrich_views(&[managed]);
+        assert_eq!(workspace.rows[0].view.badge.as_ref().unwrap().label, "CX");
     }
 
     #[test]

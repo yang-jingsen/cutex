@@ -67,7 +67,6 @@ use super::profile_settings::ProfileSettingsPatch;
 use super::session_tui_actions::{
     session_tui_actions_for_record, SessionTuiAction, SessionTuiActionItem,
 };
-use super::session_tui_cutex_projects::palette_color as project_palette_color;
 use super::session_tui_input::{self as input_policy, Command, Gate, Help, LeaveReview};
 use super::session_tui_profile_settings::{
     ProfileSettingsDraft, ProfileSettingsField, ProfileSettingsSnapshot,
@@ -4678,6 +4677,8 @@ fn initial_selector_model(refreshing: bool) -> anyhow::Result<SelectorModel> {
             view.runtime = Observation::Unavailable("initial runtime snapshot pending".into());
             row.lifecycle = None;
             if let Some(error) = &project_warning {
+                view.badge = None;
+                view.project_id = None;
                 view.project = Observation::Unavailable(error.clone());
             }
         }
@@ -4785,6 +4786,8 @@ fn load_live_snapshot() -> anyhow::Result<SelectorSnapshot> {
                 row.lifecycle = None;
             }
             if let Some(error) = &project_warning {
+                view.badge = None;
+                view.project_id = None;
                 view.project = Observation::Unavailable(error.clone());
             }
         }
@@ -4824,6 +4827,9 @@ fn apply_provider_views(
         };
         match provider {
             Err(error) => {
+                view.badge = None;
+                view.project_id = None;
+                view.role.clear();
                 view.project =
                     Observation::Unavailable(format!("Project provider unavailable: {error:#}"))
             }
@@ -4841,11 +4847,39 @@ fn apply_provider_views(
                         .and_then(|r| r.formal_agent_name.clone())
                         .unwrap_or_else(|| agent.spec.name.clone());
                     row.agent = view.name.clone();
+                    let project_id = cutex::agent_management::current_project_id(snapshot, agent);
+                    view.project_id = project_id.as_ref().map(ToString::to_string);
+                    let presentation = project_id.as_ref().map(|id| {
+                        effective_presentation(id, snapshot.project_presentations.get(id))
+                    });
+                    view.badge = presentation.as_ref().map(|p| views::ProjectBadge {
+                        label: p.badge_label.clone(),
+                        color: p.color,
+                    });
                     view.project = Observation::Known(
-                        cutex::agent_management::current_project_id(snapshot, agent)
-                            .map(|p| p.to_string())
-                            .unwrap_or_else(|| "unassigned".into()),
+                        presentation
+                            .map(|p| p.display_name)
+                            .unwrap_or_else(|| "-".into()),
                     );
+                    let mut roles = Vec::new();
+                    if snapshot
+                        .projects
+                        .values()
+                        .any(|p| p.authorized_director_session.as_str() == id)
+                    {
+                        roles.push("Director");
+                    }
+                    if snapshot
+                        .operator_grants
+                        .values()
+                        .any(|grants| grants.keys().any(|sid| sid.as_str() == id))
+                    {
+                        roles.push("Operator");
+                    }
+                    if roles.is_empty() && project_id.is_some() {
+                        roles.push("Member");
+                    }
+                    view.role = roles.join("/");
                     if agent.retired_at.is_some() {
                         view.retirement_note =
                             Some("Permanently retired roster history; not restorable".into());
@@ -4854,7 +4888,10 @@ fn apply_provider_views(
                             Some("Reversibly archived; current Project membership retained".into());
                     }
                 } else {
-                    view.project = Observation::Known("unassigned (not in roster)".into());
+                    view.badge = None;
+                    view.project_id = None;
+                    view.role.clear();
+                    view.project = Observation::Known("-".into());
                 }
             }
         }
@@ -5121,7 +5158,7 @@ fn selector_rows_from_store(
             row.view.as_mut().unwrap().cwd = record
                 .managed_cwd
                 .clone()
-                .unwrap_or_else(|| "Unavailable".into());
+                .unwrap_or_else(|| record.cwd.clone());
             let observations: Vec<_> = live_agents
                 .iter()
                 .filter(|agent| {
@@ -8022,6 +8059,7 @@ fn render_managed_list_pane(
 
 fn render_agent_inspector(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
     let active = model.inspector_is_focused();
+    let overview = matches!(model.mode, SelectorMode::Agents);
     let block = Block::bordered()
         .title(" Inspector ")
         .border_style(Style::new().fg(if active { Color::Cyan } else { Color::DarkGray }));
@@ -8032,7 +8070,7 @@ fn render_agent_inspector(frame: &mut Frame<'_>, area: Rect, model: &SelectorMod
     }
     let chunks = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(2),
+        Constraint::Length(if overview { 0 } else { 2 }),
         Constraint::Min(1),
     ])
     .split(inner);
@@ -8072,25 +8110,27 @@ fn render_agent_inspector(frame: &mut Frame<'_>, area: Rect, model: &SelectorMod
         .lifecycle
         .map(CutexSessionLifecycleState::label)
         .unwrap_or("-");
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(
-                row.agent.as_str(),
-                Style::new().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(vec![
-                Span::styled(
-                    lifecycle,
-                    row.lifecycle.map(lifecycle_style).unwrap_or_default(),
-                ),
-                Span::styled(
-                    format!("  {}  {}", row.host, row.backend),
-                    Style::new().fg(Color::DarkGray),
-                ),
+    if !overview {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    row.agent.as_str(),
+                    Style::new().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(vec![
+                    Span::styled(
+                        lifecycle,
+                        row.lifecycle.map(lifecycle_style).unwrap_or_default(),
+                    ),
+                    Span::styled(
+                        format!("  {}  {}", row.host, row.backend),
+                        Style::new().fg(Color::DarkGray),
+                    ),
+                ]),
             ]),
-        ]),
-        chunks[1],
-    );
+            chunks[1],
+        );
+    }
 
     match &model.mode {
         SelectorMode::Agents => render_inspector_overview(frame, chunks[2], model, row),
@@ -8127,7 +8167,8 @@ fn render_inspector_overview(
     view.name = row.agent.clone();
     view.configured_profile = row.configured_profile.clone();
     view.native_title = row.thread_title.clone();
-    views::render_inspector(frame, area, &view, &model.detail_scroll);
+    view.activity_details = selector_activity_details(row.activity.as_ref());
+    views::render_inspector_body(frame, area, &view, &model.detail_scroll);
 }
 
 fn render_inspector_settings(
@@ -8142,10 +8183,7 @@ fn render_inspector_settings(
             Paragraph::new(Line::from(vec![
                 Span::styled(
                     format!(" {} ", project.badge_label),
-                    Style::new()
-                        .fg(Color::White)
-                        .bg(project_palette_color(project.color))
-                        .add_modifier(Modifier::BOLD),
+                    super::session_tui_cutex_projects::project_badge_style(project.color),
                 ),
                 Span::raw(format!(" {}  ", project.display_name)),
                 Span::styled("Alt+P edit", Style::new().fg(Color::Cyan)),
@@ -8171,6 +8209,8 @@ fn render_filter(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel, focus
 
 fn selector_view(row: &SelectorRow, _default_profile: Option<&str>) -> AgentSessionView {
     AgentSessionView {
+        badge: row.project.as_ref().map(|p| views::ProjectBadge { label: p.badge_label.clone(), color: p.color }),
+        project_id: row.project.as_ref().map(|p| p.project_id.clone()),
         subject: SubjectRef::Managed(
             row.activity_session_id
                 .clone()
@@ -8195,6 +8235,7 @@ fn selector_view(row: &SelectorRow, _default_profile: Option<&str>) -> AgentSess
         effective_profile: Observation::Unavailable("effective runtime profile not observed; configured/default profile is next-launch configuration".into()),
         role: String::new(),
         activity: format_selector_activity(row.activity.as_ref(), Utc::now()),
+        activity_details: selector_activity_details(row.activity.as_ref()),
         updated: "—".into(),
         cwd: row.managed_path.clone(),
         retirement_note: None,
@@ -8934,6 +8975,17 @@ fn homepage_action_label(action: SessionTuiAction) -> &'static str {
     }
 }
 
+fn selector_activity_details(value: Option<&SelectorActivity>) -> Option<String> {
+    value.map(|v| {
+        format!(
+            "{}{} · {}",
+            v.class.label(),
+            if v.failed { " (failed)" } else { "" },
+            v.updated_at
+        )
+    })
+}
+
 fn format_selector_activity(value: Option<&SelectorActivity>, now: DateTime<Utc>) -> String {
     let Some(value) = value else {
         return "-".to_string();
@@ -8943,16 +8995,21 @@ fn format_selector_activity(value: Option<&SelectorActivity>, now: DateTime<Utc>
     };
     let elapsed = now.signed_duration_since(timestamp);
     let seconds = elapsed.num_seconds().max(0);
+    if seconds >= 604_800 {
+        return timestamp.format("%Y-%m-%d").to_string();
+    }
+    // Actual classes are OUT/CMD/MCP/TOOL/AGT/EDIT/IMG (max 4), plus !.
+    // Existing thresholds bound numeric fields to 59; keep units in cell 8.
     let age = match seconds {
         0..=4 => "now".to_string(),
-        5..=59 => format!("{seconds}s"),
-        60..=3_599 => format!("{}m", seconds / 60),
-        3_600..=86_399 => format!("{}h", seconds / 3_600),
-        86_400..=604_799 => format!("{}d", seconds / 86_400),
-        _ => timestamp.format("%Y-%m-%d").to_string(),
+        5..=59 => format!("{seconds:>2}s"),
+        60..=3_599 => format!("{:>2}m", seconds / 60),
+        3_600..=86_399 => format!("{:>2}h", seconds / 3_600),
+        _ => format!("{:>2}d", seconds / 86_400),
     };
     let failed = if value.failed { "!" } else { "" };
-    format!("{}{failed} {age}", value.class.label())
+    let action = format!("{}{failed}", value.class.label());
+    format!("{action:>5} {age} ")
 }
 
 #[cfg(test)]
@@ -9554,7 +9611,11 @@ mod tests {
     #[ignore = "scripts/tui-e1-pty.py owns the real private PTY; no services"]
     fn ui_contract_e1_terminal_resize_detail_child() {
         use std::io::Write;
-        let mut model = editable_model(&editable_record());
+        let inspect = std::env::var_os("CUTEX_UI_PTY_INSPECTOR").is_some();
+        let mut record = editable_record();
+        record.registration_class = AgentRegistrationClass::Persistent;
+        record.managed_cwd = Some(format!("/private/{}TAIL", "中文/e\u{301}/👩‍💻/".repeat(80)));
+        let mut model = editable_model(&record);
         model.warning = Some(format!("{}FINAL-ERROR", "long error ".repeat(200)));
         let selected = model.selected_target();
         let mut shell = TerminalShell::open().unwrap();
@@ -9576,8 +9637,16 @@ mod tests {
                 }
                 Some(Event::Key(key)) => {
                     route_selector_key(&mut model, key);
-                    if key.code == KeyCode::F(2) {
-                        opened = model.details.is_some();
+                    if key.code == KeyCode::F(2)
+                        || (inspect
+                            && key.code == KeyCode::Char('i')
+                            && key.modifiers.contains(KeyModifiers::ALT))
+                    {
+                        opened = if inspect {
+                            model.inspector_overview_focused
+                        } else {
+                            model.details.is_some()
+                        };
                         println!("E1_DETAILS");
                         io::stdout().flush().unwrap();
                     }
@@ -9594,6 +9663,7 @@ mod tests {
         }
         assert!(opened && resized);
         assert!(model.details.is_none());
+        assert!(!model.inspector_overview_focused);
         assert_eq!(model.selected_target(), selected);
         drop(shell);
         println!("E1_COOKED");
@@ -10271,6 +10341,13 @@ mod tests {
         assert_eq!(rows[0].cwd, rows[1].cwd);
         assert_ne!(rows[0].subject, rows[1].subject);
         assert_eq!(rows[0].role, "Director/Operator/Member");
+        assert!(rows
+            .iter()
+            .all(|r| r.badge.as_ref().unwrap().label == project.presentation.badge_label));
+        assert_eq!(
+            rows[0].project,
+            Observation::Known(project.presentation.display_name.clone())
+        );
         assert!(matches!(rows[0].runtime, Observation::Unavailable(_)));
         assert!(matches!(
             rows[0].effective_profile,
@@ -10402,6 +10479,38 @@ mod tests {
             matches!(model.mode,SelectorMode::Settings{target:SelectorTarget::Agent(ref id),..} if id=="id")
         );
         assert!(model.settings_navigation.is_none());
+    }
+
+    #[test]
+    fn visual_restoration_provider_badge_uses_exact_membership_not_name_or_cwd() {
+        let mut agent = row(
+            "cutex.one",
+            "worker-zeta",
+            CutexSessionLifecycleState::Offline,
+            false,
+            true,
+        );
+        agent.view = Some(selector_view(&agent, None));
+        let mut other = agent.clone();
+        other.view.as_mut().unwrap().subject = SubjectRef::Managed("cutex.other".into());
+        let mut rows = vec![agent, other];
+        let provider = project_snapshot("cutex.one", "alpha", Some(stored_project_presentation()));
+        apply_provider_views(&mut rows, &CutexSessionStore::default(), &Ok(provider));
+        let assigned = rows[0].view.as_ref().unwrap();
+        assert_eq!(assigned.badge.as_ref().unwrap().label, "NX");
+        assert_eq!(
+            assigned.project,
+            Observation::Known("Nova Operations".into())
+        );
+        assert_eq!(assigned.role, "Member");
+        assert!(rows[1].view.as_ref().unwrap().badge.is_none());
+        apply_provider_views(
+            &mut rows,
+            &CutexSessionStore::default(),
+            &Err(anyhow::anyhow!("unavailable")),
+        );
+        assert!(rows.iter().all(|r| r.view.as_ref().unwrap().badge.is_none()
+            && r.view.as_ref().unwrap().role.is_empty()));
     }
 
     #[test]
@@ -14710,7 +14819,7 @@ mod tests {
         }
         let mut inspected = model;
         selector_command(&mut inspected, Command::Inspect);
-        assert!(rendered_text_at(80, 30, &inspected).contains("Path:"));
+        assert!(rendered_text_at(80, 30, &inspected).contains("Full path:"));
     }
 
     #[test]
@@ -14729,7 +14838,7 @@ mod tests {
                 }),
                 now,
             ),
-            "OUT now"
+            "  OUT now "
         );
         assert_eq!(
             format_selector_activity(
@@ -14740,7 +14849,7 @@ mod tests {
                 }),
                 now,
             ),
-            "CMD! 42s"
+            " CMD! 42s "
         );
         assert_eq!(
             format_selector_activity(
@@ -14751,7 +14860,7 @@ mod tests {
                 }),
                 now,
             ),
-            "EDIT 8m"
+            " EDIT  8m "
         );
         assert_eq!(
             format_selector_activity(
@@ -14762,7 +14871,7 @@ mod tests {
                 }),
                 now,
             ),
-            "IMG 4h"
+            "  IMG  4h "
         );
         assert_eq!(
             format_selector_activity(
@@ -14773,7 +14882,7 @@ mod tests {
                 }),
                 now,
             ),
-            "MCP 3d"
+            "  MCP  3d "
         );
         assert_eq!(
             format_selector_activity(
@@ -14784,7 +14893,7 @@ mod tests {
                 }),
                 now,
             ),
-            "AGT 2026-08-01"
+            "2026-08-01"
         );
         assert_eq!(
             format_selector_activity(
@@ -14797,6 +14906,69 @@ mod tests {
             ),
             "-"
         );
+    }
+
+    #[test]
+    fn visual_restoration_activity_subfields_and_thresholds() {
+        let now = DateTime::parse_from_rfc3339("2026-09-09T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for class in [
+            SelectorActivityClass::Output,
+            SelectorActivityClass::Command,
+            SelectorActivityClass::Mcp,
+            SelectorActivityClass::Tool,
+            SelectorActivityClass::Agent,
+            SelectorActivityClass::Edit,
+            SelectorActivityClass::Image,
+        ] {
+            for (seconds, number, unit) in [
+                (5, 5, 's'),
+                (27, 27, 's'),
+                (59, 59, 's'),
+                (60, 1, 'm'),
+                (120, 2, 'm'),
+                (3599, 59, 'm'),
+                (3600, 1, 'h'),
+                (21600, 6, 'h'),
+                (25200, 7, 'h'),
+                (79200, 22, 'h'),
+                (86399, 23, 'h'),
+                (86400, 1, 'd'),
+                (604799, 6, 'd'),
+            ] {
+                for failed in [false, true] {
+                    let value = SelectorActivity {
+                        class,
+                        updated_at: (now - chrono::Duration::seconds(seconds)).to_rfc3339(),
+                        failed,
+                    };
+                    let label = format_selector_activity(Some(&value), now);
+                    assert_eq!(label.len(), 10);
+                    assert_eq!(&label[6..8], format!("{number:>2}"));
+                    assert_eq!(label.chars().nth(8), Some(unit));
+                }
+            }
+            for seconds in [0, 4, 604800, 9999999] {
+                let value = SelectorActivity {
+                    class,
+                    updated_at: (now - chrono::Duration::seconds(seconds)).to_rfc3339(),
+                    failed: false,
+                };
+                let label = format_selector_activity(Some(&value), now);
+                assert_eq!(label.len(), 10);
+                if seconds < 5 {
+                    assert_eq!(&label[6..9], "now");
+                } else {
+                    assert_eq!(
+                        label,
+                        (now - chrono::Duration::seconds(seconds))
+                            .format("%Y-%m-%d")
+                            .to_string()
+                    );
+                }
+            }
+        }
     }
 
     #[test]

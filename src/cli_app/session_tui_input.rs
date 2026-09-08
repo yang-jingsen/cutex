@@ -229,15 +229,24 @@ pub(super) const BINDINGS: &[Binding] = &[
     },
 ];
 pub(super) fn footer(entries: &[(Command, Option<&'static str>)]) -> Line<'static> {
-    Line::from(
-        entries
-            .iter()
-            .filter(|(_, reason)| reason.is_none())
-            .filter_map(|(c, _)| BINDINGS.iter().find(|b| b.command == *c))
-            .map(|b| format!("{} {}", b.hint, b.label))
-            .collect::<Vec<_>>()
-            .join(" · "),
-    )
+    let mut spans = Vec::new();
+    for binding in entries
+        .iter()
+        .filter(|(_, reason)| reason.is_none())
+        .filter_map(|(c, _)| BINDINGS.iter().find(|b| b.command == *c))
+    {
+        if !spans.is_empty() {
+            spans.push(ratatui::text::Span::raw(" · "));
+        }
+        spans.push(ratatui::text::Span::styled(
+            binding.hint,
+            ratatui::style::Style::new()
+                .fg(ratatui::style::Color::Cyan)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ));
+        spans.push(ratatui::text::Span::raw(format!(" {}", binding.label)));
+    }
+    Line::from(spans)
 }
 pub(super) fn resolve(key: KeyEvent) -> Option<Command> {
     if key.kind != KeyEventKind::Press {
@@ -401,6 +410,30 @@ fn overlay(frame: &mut Frame<'_>, title: &str, lines: Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn visual_restoration_shortcuts_have_semantic_style_and_same_commands() {
+        use ratatui::style::{Color, Modifier};
+        let line = footer(&[(Command::Help, None), (Command::Settings, None)]);
+        assert!(line.spans.iter().any(|s| s.content == "F1"
+            && s.style.fg == Some(Color::Cyan)
+            && s.style.add_modifier.contains(Modifier::BOLD)));
+        assert!(line.to_string().contains("Alt+S"));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(ratatui::widgets::Paragraph::new(line.clone()), frame.area())
+            })
+            .unwrap();
+        let cell = &terminal.backend().buffer()[(0, 0)];
+        assert_eq!(cell.symbol(), "F");
+        assert_eq!(cell.fg, Color::Cyan);
+        assert!(cell.modifier.contains(Modifier::BOLD));
+        assert_eq!(
+            resolve(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)),
+            Some(Command::Help)
+        );
+    }
     #[test]
     fn ui_contract_b1_bindings_help_and_repeat_use_one_source() {
         for binding in BINDINGS {

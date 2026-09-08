@@ -1716,26 +1716,21 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
             ]),
             ProjectView::List => footer_hints(&[
                 ("↑/↓", "select"),
-                ("Enter/Tab", "details"),
-                ("←/→", "tabs"),
-                ("Alt+A", "actions/create"),
-                ("Alt+E", "appearance"),
-                ("Alt+T", "tasks"),
-                ("/", "filter"),
-                ("Ctrl+H", "archived"),
-                ("F5", "refresh"),
-                ("Esc", "back"),
+                ("Enter", "details"),
+                ("Alt+N", "create"),
+                ("F1", "commands"),
+            ]),
+            ProjectView::Details if model.member_inspecting => footer_hints(&[
+                ("↑/↓", "scroll"),
+                ("PgUp/Dn", "page"),
+                ("Esc", "members"),
+                ("F1", "commands"),
             ]),
             ProjectView::Details => footer_hints(&[
                 ("←/→/Tab", "section"),
-                ("BackTab", "list"),
-                ("↑/↓", "select"),
-                ("Enter", "primary"),
                 ("Alt+A", "actions"),
-                ("Alt+E", "appearance"),
-                ("Alt+T", "tasks"),
-                ("F5", "refresh"),
                 ("Esc", "list"),
+                ("F1", "commands"),
             ]),
             ProjectView::Editor => footer_hints(&[
                 ("Tab/←/→", "field"),
@@ -1840,13 +1835,8 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
             true,
         );
     }
-    if model.view == ProjectView::List && !model.filter_focused {
-        frame.render_widget(
-            Paragraph::new(input_policy::footer(&project_commands(model)))
-                .wrap(Wrap { trim: true }),
-            areas[4],
-        );
-    }
+    // Context footer above is deliberately compact. Full actionable command
+    // inventory remains in F1; do not overwrite it with every global binding.
     if let Some(help) = &model.help {
         help.render(frame, &project_commands(model));
     }
@@ -2414,9 +2404,35 @@ pub(super) fn palette_color(color: ProjectPaletteColor) -> Color {
     }
 }
 
-fn project_badge_style(color: ProjectPaletteColor) -> Style {
+pub(super) fn project_badge_style(color: ProjectPaletteColor) -> Style {
+    // Historical badges used fixed White. This approved addition compares
+    // black/white contrast using sRGB relative luminance. ANSI colors retain
+    // their existing palette mapping (actual terminal palettes may differ).
+    let rgb = match color {
+        ProjectPaletteColor::Cyan => (0, 128, 128),
+        ProjectPaletteColor::Blue => (0, 0, 255),
+        ProjectPaletteColor::Green => (0, 255, 0),
+        ProjectPaletteColor::Magenta => (255, 0, 255),
+        ProjectPaletteColor::Yellow => (128, 128, 0),
+        ProjectPaletteColor::Red => (255, 0, 0),
+        ProjectPaletteColor::Rgb(r, g, b) => (r, g, b),
+    };
+    let linear = |v: u8| {
+        let v = f64::from(v) / 255.0;
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let luminance = 0.2126 * linear(rgb.0) + 0.7152 * linear(rgb.1) + 0.0722 * linear(rgb.2);
+    let foreground = if (luminance + 0.05) / 0.05 >= 1.05 / (luminance + 0.05) {
+        Color::Black
+    } else {
+        Color::White
+    };
     Style::new()
-        .fg(Color::White)
+        .fg(foreground)
         .bg(palette_color(color))
         .add_modifier(Modifier::BOLD)
 }
@@ -3636,10 +3652,10 @@ mod tests {
     }
 
     #[test]
-    fn badge_style_is_white_on_project_color_and_cx_is_two_cells() {
+    fn badge_style_contrasts_project_color_and_cx_is_two_cells() {
         assert_eq!(unicode_width::UnicodeWidthStr::width("CX"), 2);
         let style = project_badge_style(ProjectPaletteColor::Magenta);
-        assert_eq!(style.fg, Some(Color::White));
+        assert_eq!(style.fg, Some(Color::Black));
         assert_eq!(style.bg, Some(Color::LightMagenta));
         assert!(rendered(&model_with_projects(), 90, 18).contains("Render Lab"));
     }
@@ -3649,6 +3665,38 @@ mod tests {
         let style = project_badge_style(ProjectPaletteColor::Rgb(0x12, 0x34, 0x56));
         assert_eq!(style.fg, Some(Color::White));
         assert_eq!(style.bg, Some(Color::Rgb(0x12, 0x34, 0x56)));
+    }
+
+    #[test]
+    fn visual_restoration_badge_contrast_palette_and_rgb() {
+        for (color, foreground) in [
+            (ProjectPaletteColor::Rgb(255, 255, 255), Color::Black),
+            (ProjectPaletteColor::Rgb(0, 0, 0), Color::White),
+            (ProjectPaletteColor::Rgb(240, 220, 90), Color::Black),
+            (ProjectPaletteColor::Rgb(18, 52, 86), Color::White),
+            (ProjectPaletteColor::Cyan, Color::White),
+            (ProjectPaletteColor::Blue, Color::White),
+            (ProjectPaletteColor::Green, Color::Black),
+            (ProjectPaletteColor::Magenta, Color::Black),
+            (ProjectPaletteColor::Yellow, Color::Black),
+            (ProjectPaletteColor::Red, Color::Black),
+        ] {
+            let style = project_badge_style(color);
+            assert_eq!(style.fg, Some(foreground));
+            assert_eq!(style.bg, Some(palette_color(color)));
+        }
+    }
+
+    #[test]
+    fn visual_restoration_projects_footer_primary_and_f1_inventory() {
+        let model = model_with_projects();
+        let output = rendered(&model, 80, 24);
+        assert!(output.contains("F1"));
+        let bottom = output.lines().rev().take(2).collect::<Vec<_>>().join("\n");
+        assert!(!bottom.contains("Alt+M") && !bottom.contains("Alt+T"));
+        assert!(project_commands(&model)
+            .iter()
+            .any(|(c, reason)| *c == Command::Settings && reason.is_none()));
     }
 
     #[test]

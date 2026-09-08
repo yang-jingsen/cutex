@@ -1,0 +1,30 @@
+┌ Inspector · read only ───────────────────────────────────┐
+│Agent                                                     │
+│ CX  cutex.019fd081-8805-7a53-94c2-bcdea1f8eeb9           │
+│Status: Online                                            │
+│Cutex Project: Cutex Platform                             │
+│Role: Director                                            │
+│Activity: OUT · 2026-08-12T12:00:00Z                      │
+│                                                          │
+│Profile                                                   │
+│Configured: inherit                                       │
+│Effective: aemeath                                        │
+│                                                          │
+│Context                                                   │
+│Full path: /private/Projects/IFM/agent-home/ifm-ema-figure│
+│s/中文/é/👩‍💻/UNIQUE-END                                    │
+│Native workspace: not observed                            │
+│Native title: 查询 senxiu 的 ifm+gears · 中文é👩‍💻          │
+│                                                          │
+│Technical identifiers                                     │
+│Project ID: cutex-platform                                │
+│Durable ID: cutex.019fd081-8805-7a53-94c2-bcdea1f8eeb9    │
+│Native ID: 019fd081-8805-7a53-94c2-bcdea1f8eeb9           │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│↑↓ PgUp/Dn Home/End · Esc back · 1/21                     │
+└──────────────────────────────────────────────────────────┘
