@@ -118,6 +118,9 @@ struct ProjectMutationTarget {
 
 #[derive(Debug)]
 pub(super) struct CutexProjectsModel {
+    details_text: Option<String>,
+    status_scroll: views::DetailScroll,
+    detail_scroll: views::DetailScroll,
     member_selected: Option<SubjectRef>,
     member_index: usize,
     member_inspecting: bool,
@@ -161,6 +164,9 @@ impl CutexProjectsModel {
             member_selected: None,
             member_index: 0,
             member_inspecting: false,
+            detail_scroll: Default::default(),
+            details_text: None,
+            status_scroll: Default::default(),
             member_table: Default::default(),
             table_state: Default::default(),
             help: None,
@@ -482,6 +488,9 @@ fn load_model() -> anyhow::Result<CutexProjectsModel> {
         member_selected: None,
         member_index: 0,
         member_inspecting: false,
+        detail_scroll: Default::default(),
+        details_text: None,
+        status_scroll: Default::default(),
         member_table: Default::default(),
         table_state: Default::default(),
         help: None,
@@ -960,6 +969,9 @@ fn project_text_field(model: &mut CutexProjectsModel) -> Option<(&mut String, &m
     Some((value, &mut model.text_cursors[field]))
 }
 fn handle_paste(model: &mut CutexProjectsModel, text: &str) {
+    if model.details_text.is_some() {
+        return;
+    }
     if model.help.is_some() || model.leave_review.is_some() {
         return;
     }
@@ -1020,6 +1032,11 @@ fn project_command(
     model: &mut CutexProjectsModel,
     command: Command,
 ) -> Option<PrimaryPanelOutcome> {
+    if command == Command::Details {
+        model.status_scroll.reset();
+        model.details_text = Some(format!("Error: {}\nNotice: {}\nImport review: {:?}\nProject review: {:?}\nOperator review: {:?}", model.failure.as_deref().unwrap_or("None"), model.notice.as_deref().unwrap_or("None"), model.import_request, model.pending_project_mutation, model.pending_operator));
+        return None;
+    }
     if model.view == ProjectView::Details
         && model.section == ProjectSection::Members
         && matches!(command, Command::Actions | Command::Edit)
@@ -1106,6 +1123,7 @@ fn project_command(
         Command::Inspect
             if model.view == ProjectView::Details && model.section == ProjectSection::Members =>
         {
+            model.detail_scroll.reset();
             model.member_inspecting = selected_member(model).is_some();
             None
         }
@@ -1146,6 +1164,17 @@ fn project_command(
     }
 }
 fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPanelOutcome> {
+    if model.details_text.is_some() {
+        if key.kind != KeyEventKind::Release && key.code == KeyCode::Esc {
+            model.details_text = None;
+        } else {
+            model.status_scroll.handle(key);
+        }
+        return None;
+    }
+    if key.kind == KeyEventKind::Press && input_policy::resolve(key) == Some(Command::Details) {
+        return project_command(model, Command::Details);
+    }
     let text = (model.view == ProjectView::List && model.filter_focused)
         || (model.view == ProjectView::ConfirmImport && model.import_name_focused)
         || matches!(model.view, ProjectView::Editor | ProjectView::Create);
@@ -1229,6 +1258,12 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
             }
             return None;
         }
+    }
+    if model.view == ProjectView::Details
+        && model.member_inspecting
+        && model.detail_scroll.handle(key)
+    {
+        return None;
     }
     let palette = model.view == ProjectView::Editor
         && model.editor.as_ref().is_some_and(|e| e.field == 2)
@@ -1606,6 +1641,16 @@ fn handle_project_widget_key(
 }
 
 fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
+    if let Some(text) = &model.details_text {
+        views::render_details(
+            frame,
+            frame.area(),
+            " CUTEX · Status / review details · read only ",
+            text,
+            &model.status_scroll,
+        );
+        return;
+    }
     let areas = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -1732,13 +1777,14 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
         areas[4],
     );
     frame.render_widget(
-        Paragraph::new(
+        Paragraph::new(format!(
+            "F2 details · {}",
             model
                 .failure
                 .as_deref()
                 .or(model.notice.as_deref())
                 .unwrap_or("Ready"),
-        )
+        ))
         .style(Style::new().fg(if model.failure.is_some() {
             super::session_tui_layout::ERROR
         } else {
@@ -1806,6 +1852,29 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
     }
     if let Some(review) = &model.leave_review {
         review.render(frame);
+    }
+    if matches!(
+        model.view,
+        ProjectView::ConfirmImport
+            | ProjectView::ConfirmOperator
+            | ProjectView::ConfirmProjectMutation
+    ) && !model.import_name_focused
+        && model.help.is_none()
+        && model.leave_review.is_none()
+    {
+        frame.render_widget(
+            Paragraph::new(if model.confirm_selected {
+                "Cancel  [Confirm] · Enter selected · F2 details"
+            } else {
+                "[Cancel]  Confirm · Enter selected · F2 details"
+            })
+            .style(Style::new().add_modifier(Modifier::BOLD)),
+            Rect {
+                y: areas[2].bottom().saturating_sub(1),
+                height: 1,
+                ..areas[2]
+            },
+        );
     }
 }
 
@@ -1947,7 +2016,7 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel)
             let members = visible_members(model);
             if model.member_inspecting {
                 if let Some(member) = selected_member(model) {
-                    views::render_inspector(frame, chunks[1], &member);
+                    views::render_inspector(frame, chunks[1], &member, &model.detail_scroll);
                 }
             } else {
                 let mut state = model.member_table.borrow_mut();
@@ -2364,6 +2433,39 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn ui_contract_e1_project_details_modal_preserves_input_and_small_confirm_choices() {
+        let mut model = model_with_projects();
+        model.query = Input::new("draft query".into());
+        model.filter_focused = true;
+        model.failure = Some(format!("{}FINAL-ERROR", "long error ".repeat(200)));
+        handle_key(&mut model, KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        handle_paste(&mut model, "DO NOT EDIT");
+        assert_eq!(model.query.value(), "draft query");
+        rendered(&model, 60, 18);
+        handle_key(&mut model, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert!(rendered(&model, 60, 18).contains("FINAL-ERROR"));
+        handle_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(model.filter_focused);
+        model.view = ProjectView::ConfirmOperator;
+        model.confirm_selected = false;
+        for (w, h) in [
+            (60, 18),
+            (80, 24),
+            (100, 30),
+            (120, 36),
+            (160, 48),
+            (240, 50),
+        ] {
+            let screen = rendered(&model, w, h);
+            assert!(screen.contains("[Cancel]"));
+            assert!(screen.contains("F2 details"));
+        }
+        let entries = project_commands(&model);
+        assert!(entries
+            .iter()
+            .any(|(command, reason)| *command == Command::Details && reason.is_none()));
+    }
+    #[test]
     fn ui_contract_d11_no_candidate_saved_recent_roundtrip_keeps_draft() {
         let mut model = model_with_projects();
         model.available_agents.clear();
@@ -2624,6 +2726,14 @@ mod tests {
         project_command(&mut model, Command::Inspect);
         assert!(model.member_inspecting);
         assert!(rendered(&model, 80, 30).contains("Inspector"));
+        let selected_member = model.member_selected.clone();
+        let offset = model.member_table.borrow().offset();
+        for key in [KeyCode::End, KeyCode::PageUp, KeyCode::Home] {
+            handle_key(&mut model, KeyEvent::new(key, KeyModifiers::NONE));
+            assert!(model.member_inspecting);
+            assert_eq!(model.member_selected, selected_member);
+            assert_eq!(model.member_table.borrow().offset(), offset);
+        }
         handle_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!model.member_inspecting);
         assert_eq!(model.view, ProjectView::Details);

@@ -93,14 +93,6 @@ pub(crate) fn cmd_session_duplicate_check(id: &str, json: bool) -> anyhow::Resul
     super::session_runtime::cmd_session_duplicate_check(id, json)
 }
 
-pub(crate) fn retire_session(id: &str) -> anyhow::Result<()> {
-    super::session_archive::retire(id, None).map(|_| ())
-}
-
-pub(crate) fn restore_session(id: &str) -> anyhow::Result<()> {
-    super::session_archive::restore(id).map(|_| ())
-}
-
 pub(crate) fn repair_interrupted_history(
     id: &str,
 ) -> anyhow::Result<cutex::runtime::codex_home::InterruptedHistoryRepair> {
