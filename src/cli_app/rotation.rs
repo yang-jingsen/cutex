@@ -214,6 +214,7 @@ impl ReleaseRotationLifecycle for CutexReleaseRotationLifecycle {
         )?;
         record.thread_name = Some(template.successor_name.clone());
         record.display_name_hint = Some(template.successor_name.clone());
+        record.formal_agent_name = Some(template.successor_name.clone());
         record.managed_cwd = template.managed_cwd.clone();
         record.runtime_backend = template.runtime_backend;
         record.agent_enabled = true;

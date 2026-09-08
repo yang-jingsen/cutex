@@ -349,7 +349,10 @@ impl AgentManagementProvider {
         }
         let digest = request_sha256(request)?;
         self.store.with_state(true, |mut state| {
-            if state.actions.contains_key(&request.action_id)
+            if state
+                .durable_import_actions
+                .contains_key(&request.action_id)
+                || state.actions.contains_key(&request.action_id)
                 || state
                     .human_management_operator_actions
                     .contains_key(&request.action_id)
@@ -453,7 +456,10 @@ impl AgentManagementProvider {
         }
         let digest = request_sha256(request)?;
         self.store.with_state(true, |mut state| {
-            if state.actions.contains_key(&request.action_id)
+            if state
+                .durable_import_actions
+                .contains_key(&request.action_id)
+                || state.actions.contains_key(&request.action_id)
                 || state
                     .human_management_operator_actions
                     .contains_key(&request.action_id)
@@ -498,7 +504,7 @@ impl AgentManagementProvider {
                 ));
             }
             if let Some(existing) = state.agents.get(&request.director_cutex_session_id) {
-                let reason = if existing.project_id != request.project_id {
+                let reason = if existing.project_id.as_ref() != Some(&request.project_id) {
                     "director_owned_by_another_project"
                 } else if existing.retired_at.is_some() {
                     "director_ownership_record_retired"
@@ -540,8 +546,8 @@ impl AgentManagementProvider {
             }
 
             let agent = ManagedAgentRecord {
-                project_id: request.project_id.clone(),
-                created_by_director_session: request.director_cutex_session_id.clone(),
+                project_id: Some(request.project_id.clone()),
+                created_by_director_session: Some(request.director_cutex_session_id.clone()),
                 created_by_operator_session: None,
                 cutex_session_id: request.director_cutex_session_id.clone(),
                 native_session_id: evidence.native_session_id,
@@ -592,7 +598,10 @@ impl AgentManagementProvider {
         let digest = request_sha256(request)?;
         let (receipt, replayed, phase_event) =
             self.store.with_state(true, |mut state| {
-                if state.actions.contains_key(&request.action_id)
+                if state
+                    .durable_import_actions
+                    .contains_key(&request.action_id)
+                    || state.actions.contains_key(&request.action_id)
                     || state
                         .human_management_operator_actions
                         .contains_key(&request.action_id)
@@ -1066,7 +1075,10 @@ impl AgentManagementProvider {
     ) -> Result<BeginAction, AgentManagementError> {
         self.store
             .with_state(true, |mut state| {
-                if state.authority_receipts.contains_key(&request.action_id)
+                if state
+                    .durable_import_actions
+                    .contains_key(&request.action_id)
+                    || state.authority_receipts.contains_key(&request.action_id)
                     || state
                         .human_management_operator_actions
                         .contains_key(&request.action_id)
@@ -1187,7 +1199,8 @@ impl AgentManagementProvider {
                                 "Agent has no explicit Agent Management ownership record"
                                     .to_string(),
                             ))?;
-                        if predecessor.project_id != request.project_id
+                        if super::projects::current_project_id(&state, predecessor).as_ref()
+                            != Some(&request.project_id)
                             || predecessor.retired_at.is_some()
                         {
                             return Err(AgentManagementError::OwnerActionRequired(
@@ -1949,7 +1962,9 @@ impl AgentManagementProvider {
                 "expected predecessor ownership record is unavailable".to_string(),
             ),
         )?;
-        if expected.project_id != request.project_id {
+        if super::projects::current_project_id(&snapshot, &expected).as_ref()
+            != Some(&request.project_id)
+        {
             return Err(AgentManagementError::Unauthorized);
         }
         let observation = lifecycle
@@ -2019,13 +2034,15 @@ impl AgentManagementProvider {
             {
                 return Err(AgentManagementError::InvalidStore);
             }
+            if super::projects::current_project_id(&state, expected).as_ref()
+                != Some(&request.project_id)
+            {
+                return Err(AgentManagementError::Unauthorized);
+            }
             let record = state
                 .agents
                 .get_mut(&expected.cutex_session_id)
                 .ok_or(AgentManagementError::InvalidStore)?;
-            if record.project_id != request.project_id {
-                return Err(AgentManagementError::Unauthorized);
-            }
             if record != expected || record.retired_at.is_some() {
                 return Err(AgentManagementError::OwnerActionRequired(
                     "predecessor ownership changed during close reconciliation".to_string(),
@@ -2242,7 +2259,7 @@ impl AgentManagementProvider {
                 }
             }
             if let Some(existing) = state.agents.get(cutex_session_id) {
-                if existing.project_id != request.project_id
+                if existing.project_id.as_ref() != Some(&request.project_id)
                     || existing.native_session_id != native_session_id
                     || existing.spec != *spec
                 {
@@ -2259,8 +2276,8 @@ impl AgentManagementProvider {
                 state.agents.insert(
                     cutex_session_id.clone(),
                     ManagedAgentRecord {
-                        project_id: request.project_id.clone(),
-                        created_by_director_session: primary_director,
+                        project_id: Some(request.project_id.clone()),
+                        created_by_director_session: Some(primary_director),
                         created_by_operator_session: (request.role
                             == AgentManagementRole::Operator)
                             .then(|| invocation.caller_cutex_session.clone()),
@@ -4596,7 +4613,7 @@ mod tests {
         ManagedAgentSpec {
             name: name.to_string(),
             cwd: test_agent_cwd(name),
-            profile: "aemeath".to_string(),
+            profile: Some("aemeath".to_string()),
             runtime_backend: "cute_alden".to_string(),
             model: "gpt-5.6-sol".to_string(),
             reasoning: "high".to_string(),
@@ -4621,7 +4638,7 @@ mod tests {
             native_session_id: native_session_id.to_string(),
             active,
             cwd: spec.cwd.clone(),
-            profile: spec.profile.clone(),
+            profile: spec.profile.clone().unwrap_or_default(),
             runtime_backend: spec.runtime_backend.clone(),
             model: spec.model.clone(),
             reasoning: spec.reasoning.clone(),
@@ -5134,7 +5151,7 @@ mod tests {
         assert_eq!(receipt.agent.cutex_session_id, session("cutex.director"));
         assert_eq!(
             receipt.agent.created_by_director_session,
-            session("cutex.director")
+            Some(session("cutex.director"))
         );
 
         let lifecycle = FakeLifecycle::default();
@@ -5345,8 +5362,8 @@ mod tests {
                     state.agents.insert(
                         session("cutex.director"),
                         ManagedAgentRecord {
-                            project_id: ProjectId::new(owned_project).unwrap(),
-                            created_by_director_session: session("cutex.director"),
+                            project_id: Some(ProjectId::new(owned_project).unwrap()),
+                            created_by_director_session: Some(session("cutex.director")),
                             created_by_operator_session: None,
                             cutex_session_id: session("cutex.director"),
                             native_session_id: evidence.native_session_id.clone(),
@@ -5371,8 +5388,8 @@ mod tests {
     #[test]
     fn readiness_accepts_only_the_cwd_derived_project_group_delta() {
         let agent = ManagedAgentRecord {
-            project_id: project(),
-            created_by_director_session: session("cutex.director"),
+            project_id: Some(project()),
+            created_by_director_session: Some(session("cutex.director")),
             created_by_operator_session: None,
             cutex_session_id: session("cutex.worker"),
             native_session_id: "native-worker".to_string(),
@@ -5395,8 +5412,8 @@ mod tests {
     #[test]
     fn readiness_keeps_identity_defaults_and_sole_endpoint_strict() {
         let agent = ManagedAgentRecord {
-            project_id: project(),
-            created_by_director_session: session("cutex.director"),
+            project_id: Some(project()),
+            created_by_director_session: Some(session("cutex.director")),
             created_by_operator_session: None,
             cutex_session_id: session("cutex.worker"),
             native_session_id: "native-worker".to_string(),
@@ -5439,8 +5456,8 @@ mod tests {
     #[test]
     fn profile_is_not_identity_for_recovery_managed_observation_or_readiness() {
         let agent = ManagedAgentRecord {
-            project_id: project(),
-            created_by_director_session: session("cutex.director"),
+            project_id: Some(project()),
+            created_by_director_session: Some(session("cutex.director")),
             created_by_operator_session: None,
             cutex_session_id: session("cutex.worker"),
             native_session_id: "native-worker".to_string(),
@@ -5448,7 +5465,7 @@ mod tests {
             created_at: now(),
             retired_at: None,
         };
-        assert_eq!(agent.spec.profile, "aemeath");
+        assert_eq!(agent.spec.profile.as_deref(), Some("aemeath"));
 
         for observed_profile in ["", "octobre"] {
             let mut observed = ready_observation(&agent);
@@ -5760,7 +5777,7 @@ mod tests {
             } => {
                 assert_eq!(authority.authority_epoch, 2);
                 assert_eq!(agents.len(), 1);
-                assert_eq!(agents[0].project_id, project());
+                assert_eq!(agents[0].project_id, Some(project()));
             }
             other => panic!("unexpected query: {other:?}"),
         }
@@ -5813,6 +5830,113 @@ mod tests {
             }
             other => panic!("unexpected close: {other:?}"),
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn durable_import_nullable_provenance_and_profile_support_normal_lifecycle() {
+        use crate::management::control_plane::*;
+        use crate::session::{model::CutexSessionRecord, store::save_cutex_session_store_to_path};
+        let root = root("import-lifecycle");
+        let provider = AgentManagementProvider::open(&root).unwrap();
+        bind(&provider, "bind", "cutex.director", None);
+        let path = root.join("sessions.json");
+        let id = session("cutex.imported");
+        let config = spec("imported");
+        let mut record = CutexSessionRecord::new(
+            id.as_str().into(),
+            Some("native-imported".into()),
+            crate::platform::host::current_host_name(),
+            config.cwd.clone(),
+            None,
+        )
+        .unwrap();
+        crate::session::runtime_defaults::apply_managed_session_defaults(
+            &mut record,
+            Some(&config.name),
+            Some(config.cwd.clone()),
+            config.groups.clone(),
+            true,
+            false,
+        );
+        record.runtime_backend = crate::session::model::CutexSessionRuntimeBackend::CuteAlden;
+        record.model_defaults = Some(config.model.clone());
+        record.reasoning_defaults = Some(config.reasoning.clone());
+        record.permission_defaults = Some(config.permissions.clone());
+        record.approval_policy = Some(config.approval_policy.clone());
+        record.sandbox_mode = Some(config.sandbox_mode.clone());
+        let mut sessions = crate::session::model::CutexSessionStore::default();
+        sessions.sessions.insert(id.as_str().into(), record);
+        save_cutex_session_store_to_path(&path, &sessions).unwrap();
+        let principal = HumanManagementPrincipal::authenticated();
+        let candidate = provider
+            .durable_agent_candidates(&principal, &path)
+            .unwrap()
+            .remove(0);
+        let request = DurableImportRequest {
+            action_id: action("import"),
+            confirmed_formal_name: config.name.clone(),
+            candidate,
+            detach: None,
+            assignment: Some(HumanManagementProjectMutationRequest {
+                schema: HumanManagementProjectMutationSchema::V1,
+                action_id: action("import-add"),
+                project_id: project(),
+                expected_authority_epoch: 1,
+                expected_project_revision: 0,
+                operation: HumanManagementProjectMutationKind::AddMember {
+                    cutex_session_id: id.clone(),
+                },
+            }),
+        };
+        let receipt = provider
+            .import_durable_agent(&principal, &path, &request, &|_: &ProjectId,
+                                                                 _: Option<
+                &CutexSessionId,
+            >| Ok(false))
+            .unwrap();
+        assert!(receipt.complete, "{:?}", receipt.error);
+        let imported = receipt.imported_agent.unwrap();
+        assert!(
+            imported.project_id.is_none()
+                && imported.created_by_director_session.is_none()
+                && imported.spec.profile.is_none()
+        );
+        let lifecycle = FakeLifecycle::default();
+        lifecycle.insert_agent(&id, &imported.native_session_id, &imported.spec);
+        lifecycle.set_profile(&id, "changed-profile");
+        for (action_id, operation) in [
+            (
+                "restart",
+                AgentOperation::Restart {
+                    cutex_session_id: id.clone(),
+                },
+            ),
+            (
+                "close",
+                AgentOperation::Close {
+                    cutex_session_id: id.clone(),
+                },
+            ),
+        ] {
+            let result = completed(provider.execute(
+                &invocation("cutex.director"),
+                &AgentManagementRequest {
+                    schema: AgentManagementSchema::V1,
+                    action_id: action(action_id),
+                    project_id: Some(project()),
+                    operation,
+                },
+                &lifecycle,
+            ));
+            assert!(matches!(
+                result.result,
+                AgentManagementResult::Lifecycle { .. }
+            ));
+        }
+        assert!(provider.store().snapshot().unwrap().agents[&id]
+            .retired_at
+            .is_some());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -6294,7 +6418,7 @@ mod tests {
                 &create_request("create", "worker", AgentStartMode::BootstrapOnly),
                 &lifecycle,
             )));
-            assert_eq!(created.spec.profile, "aemeath");
+            assert_eq!(created.spec.profile.as_deref(), Some("aemeath"));
             let generation = lifecycle
                 .observe(&created.cutex_session_id)
                 .unwrap()
@@ -6991,14 +7115,14 @@ mod tests {
         );
         assert_eq!(
             snapshot.agents[&director.cutex_session_id].project_id,
-            project()
+            Some(project())
         );
         assert!(snapshot.agents[&director.cutex_session_id]
             .retired_at
             .is_some());
         assert_eq!(
             snapshot.agents[&successor.cutex_session_id].project_id,
-            project()
+            Some(project())
         );
         let query = AgentManagementRequest {
             schema: AgentManagementSchema::V1,
@@ -8662,8 +8786,8 @@ mod tests {
                             state.agents.insert(
                                 cutex_session_id.clone(),
                                 ManagedAgentRecord {
-                                    project_id: project(),
-                                    created_by_director_session: session("cutex.director"),
+                                    project_id: Some(project()),
+                                    created_by_director_session: Some(session("cutex.director")),
                                     created_by_operator_session: None,
                                     cutex_session_id,
                                     native_session_id: "native-existing-r5".to_string(),
@@ -8807,7 +8931,7 @@ mod tests {
         )));
         assert_eq!(
             managed.created_by_director_session,
-            session("cutex.director")
+            Some(session("cutex.director"))
         );
         assert_eq!(
             managed.created_by_operator_session,

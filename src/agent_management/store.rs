@@ -32,6 +32,10 @@ const MUTATION_LOCK_FILE: &str = "agent-management-mutation-v1.lock";
 pub struct AgentManagementSnapshot {
     pub schema: AgentManagementStoreSchema,
     pub store_revision: u64,
+    #[serde(default)]
+    pub durable_import_actions: BTreeMap<AgentActionId, super::DurableImportReceipt>,
+    #[serde(default)]
+    pub durable_import_audit: BTreeMap<String, super::DurableImportAuditEvent>,
     pub projects: BTreeMap<ProjectId, ProjectAuthority>,
     /// Exact project/session keyed Agent Operator grants. Missing on legacy v1
     /// stores and therefore migrated as an empty grant set.
@@ -96,6 +100,8 @@ impl AgentManagementSnapshot {
         Self {
             schema: AgentManagementStoreSchema::V1,
             store_revision: 0,
+            durable_import_actions: BTreeMap::new(),
+            durable_import_audit: BTreeMap::new(),
             projects: BTreeMap::new(),
             operator_grants: BTreeMap::new(),
             operator_grant_revisions: BTreeMap::new(),

@@ -182,11 +182,26 @@ pub fn parse_cutex_session_quick_action_mode(
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct CutexSessionStore {
+    /// Exact receipts for Human import naming; committed atomically with the name.
+    #[serde(default)]
+    pub formal_name_receipts: std::collections::BTreeMap<String, FormalAgentNameReceipt>,
     /// Internal compare-and-swap generation for cross-process writers.
     #[serde(default, rename = "storeRevision")]
     pub store_revision: Cell<u64>,
     #[serde(default)]
     pub sessions: HashMap<String, CutexSessionRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FormalAgentNameReceipt {
+    pub request_sha256: crate::role_revision::Sha256,
+    pub cutex_session_id: String,
+    pub name: String,
+    pub previous_revision: u64,
+    pub revision: u64,
+    pub previous_updated_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -216,6 +231,9 @@ pub struct CutexSessionRecord {
     pub thread_name: Option<String>,
     #[serde(default)]
     pub display_name_hint: Option<String>,
+    /// Explicit Cutex Agent name. Never inferred from native thread metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formal_agent_name: Option<String>,
     pub host_id: String,
     pub cwd: String,
     #[serde(default)]
@@ -312,6 +330,7 @@ impl CutexSessionRecord {
             app_server_launch_claim_id: None,
             thread_name: None,
             display_name_hint: None,
+            formal_agent_name: None,
             host_id,
             cwd,
             managed_cwd: None,

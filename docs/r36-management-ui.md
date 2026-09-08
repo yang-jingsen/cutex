@@ -74,8 +74,9 @@ Every workspace model is retained across a direct switch, including its
 selection, filter, scroll anchor, and view mode. Modal and editor input is also
 retained rather than discarded by a global shortcut.
 
-Managed Agent rows take their stable primary label only from
-`ManagedAgentRecord.spec.name`. Pressing `Alt+V` toggles an optional secondary
+Managed Agent rows take their primary label from the current durable formal
+Agent name by exact durable ID, falling back to `ManagedAgentRecord.spec.name`
+for historical records. Neither name is identity. Pressing `Alt+V` toggles an optional secondary
 native thread-title line. It changes no stored value, and no title-only mode is
 offered. Unmanaged Recent rows may continue to use the native thread title.
 

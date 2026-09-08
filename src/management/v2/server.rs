@@ -171,6 +171,8 @@ fn agent_management_admin_path(path: &str) -> bool {
     matches!(
         path,
         "/v2/agent-management/authority"
+            | "/v2/agent-management/durable-candidates"
+            | "/v2/agent-management/durable-import"
             | "/v2/agent-management/legacy-director-ownership-import"
             | "/v2/agent-management/reservation-reconciliation"
             | "/v2/agent-management/projects"
@@ -251,6 +253,41 @@ fn handle_v2_request_with_repository(
         }
         ("GET", "/v2/agent-management/projects") => {
             handle_management_project_collection(stream, context)
+        }
+        ("GET", "/v2/agent-management/durable-candidates") => {
+            let principal =
+                crate::management::control_plane::HumanManagementPrincipal::authenticated();
+            match (context.durable_agent_candidates)(&principal) {
+                Ok(response) => {
+                    write_json_response(stream, 200, "OK", &serde_json::to_value(response)?)
+                }
+                Err(error) => write_agent_management_control_error(stream, error),
+            }
+        }
+        ("POST", "/v2/agent-management/durable-import") => {
+            let payload: crate::agent_management::DurableImportRequest =
+                match serde_json::from_slice(&request.body) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        return write_v2_error(
+                            stream,
+                            400,
+                            "Bad Request",
+                            "invalid_request",
+                            &format!("strict durable import request: {error}"),
+                            false,
+                            json!({}),
+                        )
+                    }
+                };
+            let principal =
+                crate::management::control_plane::HumanManagementPrincipal::authenticated();
+            match (context.import_durable_agent)(&principal, &payload) {
+                Ok(response) => {
+                    write_json_response(stream, 200, "OK", &serde_json::to_value(response)?)
+                }
+                Err(error) => write_agent_management_control_error(stream, error),
+            }
         }
         ("GET", path) if management_project_id_from_path(path).is_some() => {
             let project_id = management_project_id_from_path(path)
@@ -4064,6 +4101,8 @@ mod tests {
     #[test]
     fn human_management_projects_tasks_and_writes_require_the_dedicated_root_credential() {
         for path in [
+            "/v2/agent-management/durable-candidates",
+            "/v2/agent-management/durable-import",
             "/v2/agent-management/projects",
             "/v2/agent-management/projects/cutex-stack-main",
             "/v2/agent-management/project-presentation",

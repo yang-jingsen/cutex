@@ -485,11 +485,13 @@ fn legacy_director_ownership_evidence_from_record(
     let spec = ManagedAgentSpec {
         name: name.to_string(),
         cwd: cwd.to_string(),
-        profile: required_record_field(
-            record.profile.as_deref(),
-            "durable_director_profile_missing",
-        )?
-        .to_string(),
+        profile: Some(
+            required_record_field(
+                record.profile.as_deref(),
+                "durable_director_profile_missing",
+            )?
+            .to_string(),
+        ),
         runtime_backend,
         model: required_record_field(
             record.model_defaults.as_deref(),
@@ -653,8 +655,10 @@ impl AgentLifecycle for CutexAgentLifecycle {
         // Validate the selected profile and its materialized credential/config
         // files in this process. A failure here is provably before Command::output
         // can spawn the native runtime and is therefore safe for exact retry.
-        super::launch::resolve_launch_profile_override(&spec.profile)
-            .map_err(definite("native_bootstrap_preflight_failed"))?;
+        super::launch::resolve_launch_profile_override(spec.profile.as_deref().ok_or_else(
+            || LifecycleFailure::definite("invalid_profile", "Create requires an explicit profile"),
+        )?)
+        .map_err(definite("native_bootstrap_preflight_failed"))?;
         let plan = native_bootstrap_plan(spec).map_err(definite("bootstrap_plan_failed"))?;
         let output = plan
             .command()
@@ -669,8 +673,12 @@ impl AgentLifecycle for CutexAgentLifecycle {
         started_at: &Rfc3339,
         failed_at: &Rfc3339,
     ) -> Result<NativeBootstrapReconciliation, LifecycleFailure> {
-        let resolved = super::launch::resolve_launch_profile_override(&spec.profile)
-            .map_err(unknown("native_bootstrap_reconciliation_unavailable"))?;
+        let resolved = super::launch::resolve_launch_profile_override(
+            spec.profile.as_deref().ok_or_else(|| {
+                LifecycleFailure::definite("invalid_profile", "Create requires an explicit profile")
+            })?,
+        )
+        .map_err(unknown("native_bootstrap_reconciliation_unavailable"))?;
         let expected_agent_name = cutex::agent_bus::identity::account_agent_name(&resolved.account);
         let expected_alden_name =
             cutex::runtime::managed_launch::default_managed_session_name_for_cwd(
@@ -798,8 +806,12 @@ impl AgentLifecycle for CutexAgentLifecycle {
         started_at: &Rfc3339,
         failed_at: &Rfc3339,
     ) -> Result<NativeBootstrapIdentityReconciliation, LifecycleFailure> {
-        let resolved = super::launch::resolve_launch_profile_override(&spec.profile)
-            .map_err(unknown("native_bootstrap_reconciliation_unavailable"))?;
+        let resolved = super::launch::resolve_launch_profile_override(
+            spec.profile.as_deref().ok_or_else(|| {
+                LifecycleFailure::definite("invalid_profile", "Create requires an explicit profile")
+            })?,
+        )
+        .map_err(unknown("native_bootstrap_reconciliation_unavailable"))?;
         let expected_agent_name = cutex::agent_bus::identity::account_agent_name(&resolved.account);
         let expected_alden_name =
             cutex::runtime::managed_launch::default_managed_session_name_for_cwd(
@@ -1004,7 +1016,7 @@ impl AgentLifecycle for CutexAgentLifecycle {
             CutexSessionEnsureSeed {
                 host_id: cutex::platform::host::current_host_name(),
                 cwd: spec.cwd.clone(),
-                profile: Some(spec.profile.clone()),
+                profile: spec.profile.clone(),
             },
             CutexSessionAdoptOptions {
                 display_name: Some(&spec.name),
@@ -1045,8 +1057,9 @@ impl AgentLifecycle for CutexAgentLifecycle {
         }
         record.thread_name = Some(spec.name.clone());
         record.display_name_hint = Some(spec.name.clone());
+        record.formal_agent_name = Some(spec.name.clone());
         record.managed_cwd = Some(spec.cwd.clone());
-        record.profile = Some(spec.profile.clone());
+        record.profile = spec.profile.clone();
         record.runtime_backend = parse_cutex_session_runtime_backend(&spec.runtime_backend)
             .map_err(definite("invalid_runtime_backend"))?;
         record.agent_enabled = true;
@@ -1387,7 +1400,7 @@ fn load_record(
         .ok_or_else(|| LifecycleFailure::definite("session_not_found", "managed Agent disappeared"))
 }
 
-fn validate_managed_recovery_record(
+pub(super) fn validate_managed_recovery_record(
     record: &CutexSessionRecord,
     cutex_session_id: &CutexSessionId,
     native_session_id: &str,
@@ -1421,15 +1434,23 @@ fn validate_managed_recovery_record(
         Some("host_id")
     } else if record.codex_session_id.as_deref() != Some(native_session_id) {
         Some("native_session_id")
-    } else if record.managed_cwd.as_deref() != Some(spec.cwd.as_str()) {
+    } else if record
+        .managed_cwd
+        .as_deref()
+        .is_some_and(|cwd| cwd != spec.cwd)
+    {
         Some("managed_cwd")
     } else if cutex_session_launch_cwd(record) != spec.cwd {
         Some("launch_cwd")
     } else if record.runtime_backend != backend {
         Some("runtime_backend")
-    } else if record.thread_name.as_deref() != Some(spec.name.as_str()) {
+    } else if record.formal_agent_name.is_none()
+        && record.thread_name.as_deref() != Some(spec.name.as_str())
+    {
         Some("thread_name")
-    } else if record.display_name_hint.as_deref() != Some(spec.name.as_str()) {
+    } else if record.formal_agent_name.is_none()
+        && record.display_name_hint.as_deref() != Some(spec.name.as_str())
+    {
         Some("display_name_hint")
     } else if !record.agent_enabled {
         Some("agent_enabled")
@@ -1441,15 +1462,15 @@ fn validate_managed_recovery_record(
         Some("expose_to_im")
     } else if record.quick_action != quick_action {
         Some("pin")
-    } else if record.permission_defaults.as_deref() != Some(spec.permissions.as_str()) {
+    } else if record.permission_defaults.as_deref().unwrap_or_default() != spec.permissions {
         Some("permissions")
-    } else if record.approval_policy.as_deref() != Some(spec.approval_policy.as_str()) {
+    } else if record.approval_policy.as_deref().unwrap_or_default() != spec.approval_policy {
         Some("approval_policy")
-    } else if record.sandbox_mode.as_deref() != Some(spec.sandbox_mode.as_str()) {
+    } else if record.sandbox_mode.as_deref().unwrap_or_default() != spec.sandbox_mode {
         Some("sandbox_mode")
-    } else if record.model_defaults.as_deref() != Some(spec.model.as_str()) {
+    } else if record.model_defaults.as_deref().unwrap_or_default() != spec.model {
         Some("model")
-    } else if record.reasoning_defaults.as_deref() != Some(spec.reasoning.as_str()) {
+    } else if record.reasoning_defaults.as_deref().unwrap_or_default() != spec.reasoning {
         Some("reasoning")
     } else {
         None
@@ -1529,7 +1550,10 @@ fn native_bootstrap_plan(spec: &ManagedAgentSpec) -> anyhow::Result<NativeBootst
     let executable = std::env::current_exe().context("failed to resolve Cutex executable")?;
     let mut args = vec![
         "run".to_string(),
-        spec.profile.clone(),
+        spec.profile
+            .as_deref()
+            .context("Create requires an explicit profile")?
+            .to_string(),
         "--agent".to_string(),
     ];
     for group in &spec.groups {
@@ -1819,7 +1843,7 @@ mod tests {
                 "/tmp/project/agent-home/worker-r1"
             }
             .to_string(),
-            profile: "aemeath".to_string(),
+            profile: Some("aemeath".to_string()),
             runtime_backend: "cute_alden".to_string(),
             model: "gpt-5.6-sol".to_string(),
             reasoning: "high".to_string(),
@@ -1838,7 +1862,7 @@ mod tests {
             Some("01a041ba-47f6-7e31-bb09-1462cd309ae4".to_string()),
             cutex::platform::host::current_host_name(),
             spec.cwd.clone(),
-            Some(spec.profile.clone()),
+            spec.profile.clone(),
             "2026-08-29T00:00:00Z".to_string(),
         )
         .expect("managed recovery record");
@@ -1847,6 +1871,7 @@ mod tests {
             parse_cutex_session_runtime_backend(&spec.runtime_backend).unwrap();
         record.thread_name = Some(spec.name.clone());
         record.display_name_hint = Some(spec.name.clone());
+        record.formal_agent_name = Some(spec.name.clone());
         record.agent_enabled = true;
         record.agent_groups = spec.groups.clone();
         record.registration_class = AgentRegistrationClass::Persistent;
@@ -1982,9 +2007,16 @@ mod tests {
         reject_record_change!("managed cwd", |value: &mut CutexSessionRecord| {
             value.managed_cwd = Some("/tmp/other-managed-cwd".to_string())
         });
-        reject_record_change!("name", |value: &mut CutexSessionRecord| {
-            value.thread_name = Some("other-worker".to_string())
-        });
+        let mut renamed_title = record.clone();
+        renamed_title.thread_name = Some("other native title".to_string());
+        renamed_title.formal_agent_name = Some("Renamed formal Agent".into());
+        validate_managed_recovery_record(
+            &renamed_title,
+            &cutex_session_id,
+            native_session_id,
+            &spec,
+        )
+        .expect("formal rename and native title do not change identity");
         reject_record_change!("groups", |value: &mut CutexSessionRecord| {
             value.agent_groups.push("unexpected-authority".to_string())
         });

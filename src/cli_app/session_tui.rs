@@ -4437,7 +4437,22 @@ fn project_contexts_with_warning() -> (HashMap<String, SelectorProjectContext>, 
     match AgentManagementStore::open_default()
         .and_then(|store| store.snapshot().map_err(anyhow::Error::new))
     {
-        Ok(snapshot) => (selector_project_contexts(&snapshot), None),
+        Ok(snapshot) => {
+            let mut contexts = selector_project_contexts(&snapshot);
+            if let Ok(sessions) = load_cutex_session_store() {
+                for (id, context) in &mut contexts {
+                    if let Some(name) = sessions
+                        .sessions
+                        .get(id)
+                        .filter(|record| &record.cutex_session_id == id)
+                        .and_then(|record| record.formal_agent_name.as_ref())
+                    {
+                        context.agent_name = name.clone();
+                    }
+                }
+            }
+            (contexts, None)
+        }
         Err(error) => (
             HashMap::new(),
             Some(format!("Project context unavailable: {error:#}")),
@@ -4451,21 +4466,22 @@ fn selector_project_contexts(
     snapshot
         .agents
         .iter()
-        .map(|(cutex_session_id, agent)| {
+        .filter_map(|(cutex_session_id, agent)| {
+            let project_id = cutex::agent_management::current_project_id(snapshot, agent)?;
             let presentation = effective_presentation(
-                &agent.project_id,
-                snapshot.project_presentations.get(&agent.project_id),
+                &project_id,
+                snapshot.project_presentations.get(&project_id),
             );
-            (
+            Some((
                 cutex_session_id.as_str().to_string(),
                 SelectorProjectContext {
                     agent_name: agent.spec.name.clone(),
-                    project_id: agent.project_id.as_str().to_string(),
+                    project_id: project_id.as_str().to_string(),
                     display_name: presentation.display_name,
                     badge_label: presentation.badge_label,
                     color: presentation.color,
                 },
-            )
+            ))
         })
         .collect()
 }
@@ -4474,10 +4490,23 @@ fn managed_names_by_native_session_id() -> HashMap<String, String> {
     AgentManagementStore::open_default()
         .and_then(|store| store.snapshot().map_err(anyhow::Error::new))
         .map(|snapshot| {
+            let sessions = load_cutex_session_store().unwrap_or_default();
             snapshot
                 .agents
                 .values()
-                .map(|agent| (agent.native_session_id.clone(), agent.spec.name.clone()))
+                .map(|agent| {
+                    (
+                        agent.native_session_id.clone(),
+                        sessions
+                            .sessions
+                            .get(agent.cutex_session_id.as_str())
+                            .filter(|record| {
+                                record.cutex_session_id == agent.cutex_session_id.as_str()
+                            })
+                            .and_then(|record| record.formal_agent_name.clone())
+                            .unwrap_or_else(|| agent.spec.name.clone()),
+                    )
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -4594,13 +4623,14 @@ fn selector_rows_from_store(
                 if let Some(context) = project_contexts.get(&record.cutex_session_id) {
                     // Managed identity is owned by Agent Management. Native
                     // thread titles remain optional secondary presentation.
-                    row.agent = context.agent_name.clone();
+                    row.agent = record
+                        .formal_agent_name
+                        .clone()
+                        .unwrap_or_else(|| context.agent_name.clone());
                     row.project = Some(context.clone());
                 } else {
-                    // Agent Management persists the formal name in the durable
-                    // display-name hint. Keep using it while a remote project's
-                    // local projection is unavailable, but never substitute a
-                    // mutable native thread title for managed identity.
+                    // Explicit durable formal names survive missing membership
+                    // projections. Legacy hints remain display-only fallback.
                     row.agent = managed_session_fallback_name(record);
                 }
             }
@@ -4643,8 +4673,10 @@ fn retired_selector_row(
 ) -> SelectorRow {
     SelectorRow {
         target: SelectorTarget::RetiredAgent(key.to_string()),
-        agent: context
-            .map(|context| context.agent_name.clone())
+        agent: record
+            .formal_agent_name
+            .clone()
+            .or_else(|| context.map(|context| context.agent_name.clone()))
             .unwrap_or_else(|| managed_session_fallback_name(record)),
         thread_title: record.thread_name.clone(),
         project: context.cloned(),
@@ -4677,8 +4709,9 @@ fn retired_selector_row(
 
 fn managed_session_fallback_name(record: &CutexSessionRecord) -> String {
     record
-        .display_name_hint
+        .formal_agent_name
         .as_deref()
+        .or(record.display_name_hint.as_deref())
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .map(str::to_string)
@@ -5353,13 +5386,18 @@ fn adopt_recent_thread(request: &RecentAdoptionRequest) -> anyhow::Result<Recent
             profile: None,
         },
         CutexSessionAdoptOptions {
-            display_name: Some(&request.title),
+            // Recent supplies a native title, not an explicit Cutex Agent name.
+            display_name: None,
             managed_cwd: None,
             groups: Vec::new(),
             expose_to_im: false,
             pin: false,
         },
     )?;
+    if let Some(record) = store.sessions.get_mut(&outcome.key) {
+        record.thread_name = Some(request.title.clone());
+        record.display_name_hint = Some(request.title.clone());
+    }
     persist_cutex_session_store_and_im_record(&store, &outcome.key)?;
     Ok(RecentAdoptionResult {
         store,
@@ -8588,15 +8626,15 @@ mod tests {
         let project_id = ProjectId::new(project_id).expect("project id");
         let timestamp = Rfc3339::new("2026-09-03T00:00:00Z").expect("timestamp");
         let agent = ManagedAgentRecord {
-            project_id: project_id.clone(),
-            created_by_director_session: CutexSessionId::new("cutex.director").unwrap(),
+            project_id: Some(project_id.clone()),
+            created_by_director_session: Some(CutexSessionId::new("cutex.director").unwrap()),
             created_by_operator_session: None,
             cutex_session_id: cutex_session_id.clone(),
             native_session_id: "native-worker".to_string(),
             spec: ManagedAgentSpec {
                 name: "worker-zeta".to_string(),
                 cwd: "/tmp/canonical-worker".to_string(),
-                profile: "default".to_string(),
+                profile: Some("default".to_string()),
                 runtime_backend: "app_server".to_string(),
                 model: "gpt-test".to_string(),
                 reasoning: "medium".to_string(),
@@ -8613,6 +8651,8 @@ mod tests {
         AgentManagementSnapshot {
             schema: AgentManagementStoreSchema::V1,
             store_revision: 1,
+            durable_import_actions: BTreeMap::new(),
+            durable_import_audit: BTreeMap::new(),
             projects: BTreeMap::new(),
             operator_grants: BTreeMap::new(),
             operator_grant_revisions: BTreeMap::new(),

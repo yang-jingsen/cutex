@@ -688,7 +688,10 @@ impl AgentManagementProvider {
                     Err(AgentManagementError::Conflict("action_id_payload_conflict"))
                 };
             }
-            if state.actions.contains_key(&request.action_id)
+            if state
+                .durable_import_actions
+                .contains_key(&request.action_id)
+                || state.actions.contains_key(&request.action_id)
                 || state.authority_receipts.contains_key(&request.action_id)
                 || state
                     .human_management_project_mutations
@@ -844,6 +847,18 @@ impl AgentManagementProvider {
         request: &HumanManagementProjectMutationRequest,
         tasks: &dyn ProjectTaskInspector,
     ) -> Result<HumanManagementProjectMutationReceipt, AgentManagementError> {
+        let _execution = super::provider::provider_execution_lock()
+            .lock()
+            .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
+        let _mutation = self.store().lock_mutations()?;
+        self.execute_project_mutation_locked(request, tasks)
+    }
+
+    pub(super) fn execute_project_mutation_locked(
+        &self,
+        request: &HumanManagementProjectMutationRequest,
+        tasks: &dyn ProjectTaskInspector,
+    ) -> Result<HumanManagementProjectMutationReceipt, AgentManagementError> {
         if let HumanManagementProjectMutationKind::Create {
             director_cutex_session_id,
             presentation,
@@ -863,10 +878,6 @@ impl AgentManagementProvider {
                 "invalid_project_mutation_cas",
             ));
         }
-        let _execution = super::provider::provider_execution_lock()
-            .lock()
-            .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
-        let _mutation = self.store().lock_mutations()?;
         let digest = super::store::request_sha256(request)?;
         let before = self.store().snapshot()?;
         if !before
@@ -1212,10 +1223,6 @@ impl AgentManagementProvider {
             ));
         }
         presentation.validate()?;
-        let _execution = super::provider::provider_execution_lock()
-            .lock()
-            .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
-        let _mutation = self.store().lock_mutations()?;
         let digest = super::store::request_sha256(request)?;
         let seat_action_id = project_seat_action_id(&request.action_id, &digest)?;
         let before = self.store().snapshot()?;
@@ -1467,7 +1474,8 @@ fn reject_project_action_id_domain_collision(
     state: &super::AgentManagementSnapshot,
     action_id: &super::AgentActionId,
 ) -> Result<(), AgentManagementError> {
-    if state.actions.contains_key(action_id)
+    if state.durable_import_actions.contains_key(action_id)
+        || state.actions.contains_key(action_id)
         || state.authority_receipts.contains_key(action_id)
         || state
             .human_management_operator_actions
@@ -1571,7 +1579,7 @@ fn require_state_lifecycle(
     }
 }
 
-pub(crate) fn current_project_id(
+pub fn current_project_id(
     snapshot: &super::AgentManagementSnapshot,
     agent: &ManagedAgentRecord,
 ) -> Option<ProjectId> {
@@ -1580,7 +1588,7 @@ pub(crate) fn current_project_id(
         .get(&agent.cutex_session_id)
     {
         Some(membership) => membership.project_id.clone(),
-        None if agent.retired_at.is_none() => Some(agent.project_id.clone()),
+        None if agent.retired_at.is_none() => agent.project_id.clone(),
         None => None,
     }
 }
@@ -1660,7 +1668,7 @@ fn project_workspace(
     let mut agent_operators = Vec::new();
     let mut director_member = None;
     for agent in snapshot.agents.values().filter(|agent| {
-        agent.retired_at.is_some() && &agent.project_id == project_id
+        agent.retired_at.is_some() && agent.project_id.as_ref() == Some(project_id)
             || current_project_id(snapshot, agent).as_ref() == Some(project_id)
     }) {
         let member = project_member(agent.clone(), observer);
@@ -1745,7 +1753,8 @@ fn legacy_operator_repair_candidates(
             let successor = event.successor_cutex_session_id.as_ref()?;
             let rotation_mode = event.rotation_mode?;
             let active_owned = snapshot.agents.get(predecessor).is_some_and(|agent| {
-                agent.project_id == authority.project_id && agent.retired_at.is_none()
+                current_project_id(snapshot, agent).as_ref() == Some(&authority.project_id)
+                    && agent.retired_at.is_none()
             });
             let already_operator = snapshot
                 .operator_grants
@@ -1816,7 +1825,10 @@ fn project_access_role(
     let active_owned = snapshot
         .agents
         .get(&invocation.caller_cutex_session)
-        .is_some_and(|agent| &agent.project_id == project_id && agent.retired_at.is_none());
+        .is_some_and(|agent| {
+            current_project_id(snapshot, agent).as_ref() == Some(project_id)
+                && agent.retired_at.is_none()
+        });
     if has_grant && active_owned {
         Ok(ProjectAccessRole::AgentOperator)
     } else {
@@ -1832,7 +1844,7 @@ fn summary(
     let mut active_member_count = 0;
     let mut retired_member_count = 0;
     for agent in snapshot.agents.values().filter(|agent| {
-        agent.retired_at.is_some() && agent.project_id == authority.project_id
+        agent.retired_at.is_some() && agent.project_id.as_ref() == Some(&authority.project_id)
             || current_project_id(snapshot, agent).as_ref() == Some(&authority.project_id)
     }) {
         if agent.retired_at.is_some() {
@@ -1980,15 +1992,15 @@ mod tests {
 
     fn agent(project_id: &ProjectId, value: &str, retired: bool) -> ManagedAgentRecord {
         ManagedAgentRecord {
-            project_id: project_id.clone(),
-            created_by_director_session: session("cutex.director"),
+            project_id: Some(project_id.clone()),
+            created_by_director_session: Some(session("cutex.director")),
             created_by_operator_session: None,
             cutex_session_id: session(value),
             native_session_id: format!("native-{value}"),
             spec: ManagedAgentSpec {
                 name: value.to_string(),
                 cwd: format!("/tmp/{value}"),
-                profile: "default".to_string(),
+                profile: Some("default".to_string()),
                 runtime_backend: "app_server".to_string(),
                 model: "gpt-test".to_string(),
                 reasoning: "medium".to_string(),
@@ -2590,7 +2602,7 @@ mod tests {
         let snapshot = provider.store().snapshot().unwrap();
         assert_eq!(
             snapshot.agents[&session("cutex.worker-online")].project_id,
-            project_id
+            Some(project_id.clone())
         );
         assert_eq!(
             snapshot.current_project_memberships[&session("cutex.worker-online")].project_id,
@@ -2679,7 +2691,7 @@ mod tests {
         assert!(snapshot.project_tombstones.contains_key(&project_id));
         assert_eq!(
             snapshot.agents[&session("cutex.director")].project_id,
-            project_id
+            Some(project_id)
         );
         std::fs::remove_dir_all(root).unwrap();
     }

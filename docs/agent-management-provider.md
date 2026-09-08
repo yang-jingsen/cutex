@@ -366,3 +366,8 @@ Operator repair candidates when their exact successor and authority epoch are
 still current. Projection is read-only: the only repair path is an explicit
 confirmed Human grant through the normal CAS and audit boundary. See
 [r36-management-ui.md](r36-management-ui.md).
+
+Persistent durable Agents, including Offline Agents, can now be explicitly
+imported through the Human/Management boundary and confirmed for Create/Add or
+guarded Detach then Move. See [durable-agent-import-design.md](durable-agent-import-design.md)
+for formal-name provenance, eligibility, nullable profile, locking and recovery.

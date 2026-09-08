@@ -220,6 +220,7 @@ pub fn set_cutex_session_display_name_by_key(
         anyhow::bail!("cutex session is retired: {key}");
     }
     record.display_name_hint = Some(display_name.to_string());
+    record.formal_agent_name = Some(display_name.to_string());
     record.bump_durable_revision()?;
     record.updated_at = chrono::Utc::now().to_rfc3339();
     Ok(CutexSessionUpdateOutcome {

@@ -130,6 +130,7 @@ pub fn apply_managed_session_defaults(
         .filter(|value| !value.is_empty())
     {
         record.display_name_hint = Some(display_name.to_string());
+        record.formal_agent_name = Some(display_name.to_string());
     } else if record.display_name_hint.is_none() {
         record.display_name_hint = record.thread_name.clone();
     }

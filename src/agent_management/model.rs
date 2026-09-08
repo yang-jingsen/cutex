@@ -210,7 +210,9 @@ pub struct AgentOperatorAuditEvent {
 pub struct ManagedAgentSpec {
     pub name: String,
     pub cwd: String,
-    pub profile: String,
+    /// Configured profile intent; None inherits the effective next-launch profile.
+    /// Create requests still require an explicit nonempty profile.
+    pub profile: Option<String>,
     pub runtime_backend: String,
     pub model: String,
     pub reasoning: String,
@@ -226,10 +228,16 @@ pub struct ManagedAgentSpec {
 
 impl ManagedAgentSpec {
     pub fn validate(&self) -> Result<(), AgentManagementError> {
+        if self
+            .profile
+            .as_deref()
+            .is_none_or(|profile| profile.trim().is_empty())
+        {
+            return Err(AgentManagementError::InvalidRequest("invalid_profile"));
+        }
         for (value, code) in [
             (&self.name, "invalid_agent_name"),
             (&self.cwd, "invalid_agent_cwd"),
-            (&self.profile, "invalid_profile"),
             (&self.runtime_backend, "invalid_runtime_backend"),
             (&self.model, "invalid_model"),
             (&self.reasoning, "invalid_reasoning"),
@@ -596,9 +604,11 @@ pub struct ProjectAuthority {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedAgentRecord {
-    pub project_id: ProjectId,
-    /// Backward-compatible Primary Director provenance.
-    pub created_by_director_session: CutexSessionId,
+    /// Historical creation provenance, absent for explicit Human durable import.
+    /// Current membership is authoritative and is stored separately.
+    pub project_id: Option<ProjectId>,
+    /// Historical Primary Director provenance; Human import impersonates none.
+    pub created_by_director_session: Option<CutexSessionId>,
     /// Present when creation was requested by a delegated Agent Operator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by_operator_session: Option<CutexSessionId>,

@@ -24,6 +24,29 @@ pub(super) struct ManagementControlClient {
 }
 
 impl ManagementControlClient {
+    #[cfg(test)]
+    pub(super) fn test_endpoint(base_url: String, root_bearer: String) -> Self {
+        Self {
+            base_url,
+            root_bearer,
+        }
+    }
+    pub(super) fn durable_candidates(
+        &self,
+    ) -> anyhow::Result<Vec<cutex::agent_management::DurableAgentCandidate>> {
+        self.request("GET", "/v2/agent-management/durable-candidates", None)
+    }
+
+    pub(super) fn import_durable_agent(
+        &self,
+        request: &cutex::agent_management::DurableImportRequest,
+    ) -> anyhow::Result<cutex::agent_management::DurableImportReceipt> {
+        self.request(
+            "POST",
+            "/v2/agent-management/durable-import",
+            Some(&serde_json::to_vec(request)?),
+        )
+    }
     pub(super) fn connect() -> anyhow::Result<Self> {
         let config = cutex::config::store::load_codez_config();
         Self::connect_with_config(&config)

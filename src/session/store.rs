@@ -121,6 +121,38 @@ fn open_store_lock(path: &Path) -> anyhow::Result<File> {
     })
 }
 
+/// Holds the same cross-process fence used by ordinary durable session saves.
+/// The callback may commit a related provider receipt before releasing it.
+pub(crate) fn with_locked_session_store<T>(
+    path: &Path,
+    operation: impl FnOnce(&mut CutexSessionStore) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let parent = path.parent().context("session store has no parent")?;
+    fs::create_dir_all(parent)?;
+    let lock = open_store_lock(&parent.join(CUTEX_SESSIONS_LOCK_FILE))?;
+    FileExt::lock_exclusive(&lock)?;
+    let mut store = load_cutex_session_store_from_path(path)?;
+    operation(&mut store)
+}
+
+/// Caller must hold `with_locked_session_store`; never reacquire its lock.
+pub(crate) fn save_locked_session_store(
+    path: &Path,
+    store: &CutexSessionStore,
+) -> anyhow::Result<()> {
+    let previous = store.store_revision.get();
+    store.store_revision.set(
+        previous
+            .checked_add(1)
+            .context("session revision overflow")?,
+    );
+    if let Err(error) = write_pretty_json_atomic(path, store, "cutex session store") {
+        store.store_revision.set(previous);
+        return Err(error);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

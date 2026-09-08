@@ -46,8 +46,9 @@ fn user_home_dir_string() -> Option<String> {
 
 pub fn cutex_session_display_name(record: &CutexSessionRecord) -> String {
     record
-        .display_name_hint
+        .formal_agent_name
         .clone()
+        .or_else(|| record.display_name_hint.clone())
         .or_else(|| record.thread_name.clone())
         .or_else(|| record.codex_session_id.clone())
         .unwrap_or_else(|| record.cutex_session_id.clone())
