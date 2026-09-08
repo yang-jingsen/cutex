@@ -200,7 +200,7 @@ impl AgentBusMessageRepository {
                 }
                 anyhow::bail!("agent-bus messageId was reused with different canonical content");
             }
-            if record_management_event {
+            if record_management_event && message.from_cutex_session_id.is_some() {
                 append_event(
                     &message.owner_cutex_session_id,
                     &message.message_id,
@@ -263,23 +263,25 @@ impl AgentBusMessageRepository {
             }
             anyhow::bail!("agent-bus message A4 receipt changed after delivery");
         }
-        append_event(
-            owner_cutex_session_id,
-            message_id,
-            "cutex/agentBus/messageDelivered",
-            json!({
-                "messageId": message_id,
-                "fromCutexSessionId": stored.snapshot.from_cutex_session_id,
-                "toCutexSessionId": stored.snapshot.to_cutex_session_id,
-                "fromRuntimeAgentId": stored.from_runtime_agent_id,
-                "toRuntimeAgentId": stored.to_runtime_agent_id,
-                // Keep the frozen management-event schema stable. The v2
-                // ledger above is the authoritative home of the complete A4
-                // receipt; this legacy projection carries its stable identity.
-                "nativeSubmissionId": receipt.receipt_id,
-                "deliveredAt": delivered_at.to_rfc3339(),
-            }),
-        )?;
+        if stored.snapshot.from_cutex_session_id.is_some() {
+            append_event(
+                owner_cutex_session_id,
+                message_id,
+                "cutex/agentBus/messageDelivered",
+                json!({
+                    "messageId": message_id,
+                    "fromCutexSessionId": stored.snapshot.from_cutex_session_id,
+                    "toCutexSessionId": stored.snapshot.to_cutex_session_id,
+                    "fromRuntimeAgentId": stored.from_runtime_agent_id,
+                    "toRuntimeAgentId": stored.to_runtime_agent_id,
+                    // Keep the frozen management-event schema stable. The v2
+                    // ledger above is the authoritative home of the complete A4
+                    // receipt; this legacy projection carries its stable identity.
+                    "nativeSubmissionId": receipt.receipt_id,
+                    "deliveredAt": delivered_at.to_rfc3339(),
+                }),
+            )?;
+        }
         self.mutate(|store| {
             let stored = store.messages.get_mut(message_id).with_context(|| {
                 format!("agent-bus v2 message state disappeared for {message_id}")
@@ -392,20 +394,22 @@ impl AgentBusMessageRepository {
         let Some(stored) = self.get(message_id)? else {
             return Ok(false);
         };
-        append_event(
-            owner_cutex_session_id,
-            message_id,
-            "cutex/agentBus/messageFailed",
-            json!({
-                "messageId": message_id,
-                "fromCutexSessionId": stored.snapshot.from_cutex_session_id,
-                "toCutexSessionId": stored.snapshot.to_cutex_session_id,
-                "fromRuntimeAgentId": stored.from_runtime_agent_id,
-                "toRuntimeAgentId": stored.to_runtime_agent_id,
-                "error": error,
-                "failedAt": failed_at.to_rfc3339(),
-            }),
-        )?;
+        if stored.snapshot.from_cutex_session_id.is_some() {
+            append_event(
+                owner_cutex_session_id,
+                message_id,
+                "cutex/agentBus/messageFailed",
+                json!({
+                    "messageId": message_id,
+                    "fromCutexSessionId": stored.snapshot.from_cutex_session_id,
+                    "toCutexSessionId": stored.snapshot.to_cutex_session_id,
+                    "fromRuntimeAgentId": stored.from_runtime_agent_id,
+                    "toRuntimeAgentId": stored.to_runtime_agent_id,
+                    "error": error,
+                    "failedAt": failed_at.to_rfc3339(),
+                }),
+            )?;
+        }
         self.mutate(|store| {
             let stored = store.messages.get_mut(message_id).with_context(|| {
                 format!("agent-bus v2 message state disappeared for {message_id}")

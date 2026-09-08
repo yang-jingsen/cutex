@@ -62,13 +62,17 @@ runtime/thread is not reused. Offline targets remain durable pending. A later
 runtime of the same durable identity can receive the message; a replacement
 durable identity and Director rotation cannot inherit it.
 
-The accepted base exposes only `active` and reversibly `retired` archive state.
-This lane therefore treats `retired` as archived: it persists but does not
-enqueue or auto-online the target, and restore permits the normal registration
-redrive. The base has no distinct permanent-retirement tombstone. JS3B or the
-combined lifecycle integration must add/consume such a durable distinction
-before claiming permanent-retirement `orphaned` behavior; absent that marker,
-an unknown durable ID is rejected with `target_not_found` and no write.
+Target classification combines two existing exact-ID authoritative reads.
+Agent Management roster `retired_at` means permanent Management Close and
+terminally orphans the completion. The durable session's legacy `Retired`
+spelling means reversible archive only when the roster is not permanently
+retired: the lane persists but does not enqueue or auto-online it, and explicit
+restore permits normal registration redrive. A successfully read roster with
+no exact entry plus a valid persistent durable Agent is supported as
+durable-only. Reader failure, missing/malformed durable state, and nonpersistent
+records are classification-unavailable and fail closed; they are never treated
+as confirmed roster absence. Classification is refreshed immediately before
+enqueue and on every redrive.
 
 Completion metadata has no Project or Task identifiers and carries no Task
 authority. Delivered values are explicitly labeled untrusted data. Full job

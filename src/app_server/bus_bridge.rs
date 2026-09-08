@@ -1869,6 +1869,33 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::Condvar;
 
+    #[test]
+    fn isolated_private_home_exercises_real_a4_repository_boundary() {
+        const CHILD: &str = "CUTEX_JS3A_A4_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            stable_recipient_digest_delivers_once_with_a4_and_one_ack();
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("cutex-js3a-a4-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(
+            root.join(".cutex-test-private-home"),
+            b"js3a isolated test\n",
+        )
+        .unwrap();
+        let test_name =
+            "app_server::bus_bridge::tests::isolated_private_home_exercises_real_a4_repository_boundary";
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env("HOME", &root)
+            .env("CUTEX_TEST_PRIVATE_HOME", &root)
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(status.success());
+    }
+
     #[derive(Default)]
     struct FakeBus {
         events: Mutex<Vec<String>>,

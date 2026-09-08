@@ -33,8 +33,8 @@ use cutex::agent_bus::server::{
 use cutex::agent_bus::service::{agent_bus_health_url, agent_bus_port, validate_agent_bus_port};
 use cutex::agent_bus::store::{load_agent_bus_state_from_registry, AgentBusState};
 use cutex::agent_management::{
-    AgentManagementMessageMetadata, AGENT_MANAGEMENT_START_CONTROL_TYPE,
-    AGENT_MANAGEMENT_SYSTEM_SENDER,
+    AgentManagementMessageMetadata, AgentManagementSnapshot, AgentManagementStore,
+    AGENT_MANAGEMENT_START_CONTROL_TYPE, AGENT_MANAGEMENT_SYSTEM_SENDER,
 };
 use cutex::config::paths::runtime_dir;
 use cutex::config::store::load_codez_config;
@@ -66,6 +66,53 @@ const TASK_SEAT_AUTHORITY_ROOT: &str = "seat-authority-v1";
 const JOB_SERVICE_COMPLETION_TOKEN_FILE: &str = "job-service-completion.token";
 const JOB_SERVICE_SYSTEM_SENDER: &str = "cutex-job-service";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionTargetClass {
+    Active,
+    Archived,
+    PermanentlyRetired,
+}
+
+fn classify_completion_target(
+    sessions: &CutexSessionStore,
+    roster: &AgentManagementSnapshot,
+    target: &CutexSessionId,
+) -> anyhow::Result<CompletionTargetClass> {
+    let record = sessions
+        .sessions
+        .get(target.as_str())
+        .filter(|record| record.cutex_session_id == target.as_str())
+        .context("exact durable target record is unavailable")?;
+    if !record.agent_enabled
+        || record.registration_class != cutex::agent_bus::model::AgentRegistrationClass::Persistent
+    {
+        anyhow::bail!("exact durable target is not a persistent Agent");
+    }
+    if roster
+        .agents
+        .get(target)
+        .is_some_and(|managed| managed.retired_at.is_some())
+    {
+        return Ok(CompletionTargetClass::PermanentlyRetired);
+    }
+    if record.is_retired() {
+        return Ok(CompletionTargetClass::Archived);
+    }
+    Ok(CompletionTargetClass::Active)
+}
+
+fn load_completion_target_classification(
+    target: &CutexSessionId,
+) -> anyhow::Result<(CompletionTargetClass, CutexSessionStore)> {
+    let sessions = load_cutex_session_store().context("durable session reader unavailable")?;
+    let roster = AgentManagementStore::open_default()
+        .context("Agent Management roster reader unavailable")?
+        .snapshot()
+        .map_err(|_| anyhow::anyhow!("Agent Management roster snapshot unavailable"))?;
+    let classification = classify_completion_target(&sessions, &roster, target)?;
+    Ok((classification, sessions))
+}
+
 struct OwnedTaskWorkerActionHost {
     host: Arc<TaskWorkerActionHost>,
     _ownership_lock: File,
@@ -75,6 +122,7 @@ struct OwnedTaskWorkerActionHost {
 #[cfg(test)]
 mod job_service_completion_lane_tests {
     use super::*;
+    use std::io::{Read, Write};
 
     fn request() -> JobServiceCompletionRequest {
         JobServiceCompletionRequest {
@@ -88,6 +136,227 @@ mod job_service_completion_lane_tests {
             summary: None,
             output_reference: None,
         }
+    }
+
+    fn target_fixtures() -> (CutexSessionId, CutexSessionStore, AgentManagementSnapshot) {
+        let target = CutexSessionId::new("cutex.11111111-1111-4111-8111-111111111111").unwrap();
+        let mut sessions = CutexSessionStore::default();
+        let mut record = cutex::session::model::CutexSessionRecord::new_at(
+            target.as_str().to_string(),
+            Some("11111111-1111-4111-8111-111111111111".to_string()),
+            "test-host".to_string(),
+            "/tmp/js3a".to_string(),
+            None,
+            "2026-09-09T00:00:00Z".to_string(),
+        )
+        .unwrap();
+        record.agent_enabled = true;
+        record.registration_class = cutex::agent_bus::model::AgentRegistrationClass::Persistent;
+        sessions
+            .sessions
+            .insert(target.as_str().to_string(), record);
+        let root = std::env::temp_dir().join(format!("cutex-js3a-roster-{}", uuid::Uuid::new_v4()));
+        let roster = AgentManagementStore::open(&root)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        fs::remove_dir_all(root).unwrap();
+        (target, sessions, roster)
+    }
+
+    #[test]
+    fn authoritative_roster_retirement_is_distinct_from_reversible_archive() {
+        let (target, mut sessions, mut roster) = target_fixtures();
+        assert_eq!(
+            classify_completion_target(&sessions, &roster, &target).unwrap(),
+            CompletionTargetClass::Active
+        );
+        sessions
+            .sessions
+            .get_mut(target.as_str())
+            .unwrap()
+            .archive_state = cutex::session::model::CutexSessionArchiveState::Retired;
+        assert_eq!(
+            classify_completion_target(&sessions, &roster, &target).unwrap(),
+            CompletionTargetClass::Archived
+        );
+        let managed: cutex::agent_management::ManagedAgentRecord =
+            serde_json::from_value(serde_json::json!({
+                "project_id": null,
+                "created_by_director_session": null,
+                "cutex_session_id": target.as_str(),
+                "native_session_id": "11111111-1111-4111-8111-111111111111",
+                "spec": {
+                    "name": "worker",
+                    "cwd": "/tmp/js3a",
+                    "profile": null,
+                    "runtime_backend": "app_server",
+                    "model": "gpt-test",
+                    "reasoning": "medium",
+                    "permissions": "default",
+                    "approval_policy": "never",
+                    "sandbox_mode": "workspace-write",
+                    "groups": [],
+                    "expose_to_im": false,
+                    "pin": false
+                },
+                "created_at": "2026-09-09T00:00:00Z",
+                "retired_at": "2026-09-09T00:01:00Z"
+            }))
+            .unwrap();
+        roster.agents.insert(target.clone(), managed);
+        assert_eq!(
+            classify_completion_target(&sessions, &roster, &target).unwrap(),
+            CompletionTargetClass::PermanentlyRetired
+        );
+    }
+
+    fn post_json(
+        port: u16,
+        path: &str,
+        token: &str,
+        body: &serde_json::Value,
+    ) -> serde_json::Value {
+        let body = serde_json::to_vec(body).unwrap();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(
+            stream,
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        stream.write_all(&body).unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        assert!(
+            response.starts_with(b"HTTP/1.1 200 OK"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        let body_at = response
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        serde_json::from_slice(&response[body_at..]).unwrap()
+    }
+
+    #[test]
+    fn actual_http_submit_query_replay_and_conflict_use_private_durable_repository() {
+        const CHILD: &str = "CUTEX_JS3A_HTTP_CHILD";
+        const PORT: &str = "CUTEX_JS3A_HTTP_PORT";
+        let action_root_suffix = Path::new("service").join(TASK_WORKER_ACTION_ROOT);
+        if std::env::var_os(CHILD).is_some() {
+            let root = PathBuf::from(std::env::var_os("HOME").unwrap());
+            let (_, sessions, _) = target_fixtures();
+            cutex::session::store::save_cutex_session_store(&sessions).unwrap();
+            let mut config = CodezConfig::default();
+            config.agent_bus_port = Some(std::env::var(PORT).unwrap().parse().unwrap());
+            config.agent_bus_token = Some("ordinary-agent-bus-token".to_string());
+            run_agent_bus_with_task_action_root(
+                config,
+                request_handlers(),
+                &root.join(action_root_suffix),
+            )
+            .unwrap();
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!("cutex-js3a-http-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        fs::write(
+            root.join(".cutex-test-private-home"),
+            b"js3a isolated test\n",
+        )
+        .unwrap();
+        let port = (24000..=24999)
+            .find(|port| TcpListener::bind(("127.0.0.1", *port)).is_ok())
+            .unwrap();
+        let test_name = "cli_app::agent_bus_server::job_service_completion_lane_tests::actual_http_submit_query_replay_and_conflict_use_private_durable_repository";
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env("HOME", &root)
+            .env("CUTEX_TEST_PRIVATE_HOME", &root)
+            .env(CHILD, "1")
+            .env(PORT, port.to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let token_path = root.join("service").join(JOB_SERVICE_COMPLETION_TOKEN_FILE);
+        let ready = (0..100).any(|_| {
+            if token_path.is_file() && std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                false
+            }
+        });
+        assert!(ready, "isolated Job Service completion route did not start");
+        let token = fs::read_to_string(&token_path).unwrap();
+        let submit = serde_json::json!({
+            "schema": JOB_SERVICE_COMPLETION_SCHEMA,
+            "eventId": "event-http-1",
+            "jobId": "job-http-1",
+            "jobRevision": 1,
+            "terminalStatus": "exited",
+            "resultSha256": "a".repeat(64),
+            "targetCutexSessionId": "cutex.11111111-1111-4111-8111-111111111111",
+            "summary": "done",
+            "outputReference": "job-output:job-http-1"
+        });
+        let first = post_json(
+            port,
+            "/api/job-service/v1/completions",
+            token.trim(),
+            &submit,
+        );
+        assert_eq!(first["status"], "committed");
+        assert_eq!(first["disposition"], "pending");
+        assert_eq!(first["deduplicated"], false);
+        let replay = post_json(
+            port,
+            "/api/job-service/v1/completions",
+            token.trim(),
+            &submit,
+        );
+        assert_eq!(replay["status"], "committed");
+        assert_eq!(replay["deduplicated"], true);
+        let query = post_json(
+            port,
+            "/api/job-service/v1/completions/query",
+            token.trim(),
+            &serde_json::json!({"schema": JOB_SERVICE_COMPLETION_SCHEMA, "eventId": "event-http-1"}),
+        );
+        assert_eq!(query["disposition"], "pending");
+        let mut changed = submit;
+        changed["resultSha256"] = serde_json::json!("b".repeat(64));
+        let conflict = post_json(
+            port,
+            "/api/job-service/v1/completions",
+            token.trim(),
+            &changed,
+        );
+        assert_eq!(conflict["status"], "no_write");
+        assert_eq!(conflict["errorCode"], "event_conflict");
+        let persisted: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join(".cutex/runtime/management-v2/agent-bus-message-state.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted["messages"].as_object().unwrap().len(), 1);
+        assert!(persisted["messages"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()["snapshot"]["fromCutexSessionId"]
+            .is_null());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -228,16 +497,27 @@ fn query_job_service_completion(
             Some("not_found".to_string()),
         ));
     };
+    let target = CutexSessionId::new(snapshot.to_cutex_session_id.clone()).ok();
+    let classification = target
+        .as_ref()
+        .map(load_completion_target_classification)
+        .transpose();
     let disposition = match snapshot.state.as_str() {
         "delivered" => JobServiceCompletionDisposition::Delivered,
         "failed" => JobServiceCompletionDisposition::Orphaned,
-        _ if load_cutex_session_store().ok().is_some_and(|sessions| {
-            sessions.sessions.values().any(|record| {
-                record.cutex_session_id == snapshot.to_cutex_session_id && record.is_retired()
-            })
-        }) =>
+        _ if matches!(
+            classification.as_ref(),
+            Ok(Some((CompletionTargetClass::Archived, _)))
+        ) =>
         {
             JobServiceCompletionDisposition::Archived
+        }
+        _ if matches!(
+            classification.as_ref(),
+            Ok(Some((CompletionTargetClass::PermanentlyRetired, _)))
+        ) =>
+        {
+            JobServiceCompletionDisposition::Orphaned
         }
         _ => JobServiceCompletionDisposition::Pending,
     };
@@ -260,23 +540,22 @@ fn submit_job_service_completion(
         anyhow::bail!("Job Service system principal authentication failed");
     }
     validate_completion_request(&request)?;
-    let sessions = load_cutex_session_store()?;
-    let Some(session) = sessions
-        .sessions
-        .values()
-        .find(|record| record.cutex_session_id == request.target_cutex_session_id)
-    else {
-        return Ok(completion_receipt(
-            request.event_id,
-            None,
-            JobServiceCompletionDisposition::NotFound,
-            false,
-            None,
-            Some("target_not_found".to_string()),
-        ));
+    let target = CutexSessionId::new(request.target_cutex_session_id.clone())
+        .map_err(|_| anyhow::anyhow!("Job Service target durable identity is invalid"))?;
+    let (initial_class, sessions) = match load_completion_target_classification(&target) {
+        Ok(classification) => classification,
+        Err(_) => {
+            return Ok(completion_receipt(
+                request.event_id,
+                None,
+                JobServiceCompletionDisposition::NotFound,
+                false,
+                None,
+                Some("target_classification_unavailable".to_string()),
+            ));
+        }
     };
-    let archived = session.is_retired();
-    let target_id = if archived {
+    let target_id = if initial_class != CompletionTargetClass::Active {
         None
     } else {
         resolve_agent_target_for_sender_with_sessions(
@@ -395,7 +674,49 @@ fn submit_job_service_completion(
             },
         );
     }
-    if let Some(target_id) = target_id {
+    let refreshed = load_completion_target_classification(&target);
+    if matches!(
+        refreshed,
+        Ok((CompletionTargetClass::PermanentlyRetired, _))
+    ) {
+        repository.record_failed(
+            target.as_str(),
+            &message_id,
+            serde_json::json!({
+                "code": "target_permanently_retired",
+                "message": "Job Service completion target was permanently retired",
+                "retryable": false
+            }),
+            Utc::now(),
+        )?;
+        let snapshot = repository.snapshot_by_message_id(&message_id)?;
+        return Ok(completion_receipt(
+            request.event_id,
+            Some(message_id),
+            JobServiceCompletionDisposition::Orphaned,
+            false,
+            snapshot,
+            None,
+        ));
+    }
+    if let Ok((CompletionTargetClass::Active, refreshed_sessions)) = &refreshed {
+        let Some(target_id) = resolve_agent_target_for_sender_with_sessions(
+            state,
+            target.as_str(),
+            None,
+            true,
+            Some(refreshed_sessions),
+        )
+        .ok() else {
+            return Ok(completion_receipt(
+                request.event_id,
+                Some(message_id),
+                JobServiceCompletionDisposition::Pending,
+                false,
+                None,
+                None,
+            ));
+        };
         let target_name = cutex::agent_bus::groups::resolve_agent_display_name(state, &target_id)
             .unwrap_or_else(|| target_id.clone());
         let outcome = cutex::agent_bus::queue::enqueue_agent_bus_message_once_with_id(
@@ -425,7 +746,7 @@ fn submit_job_service_completion(
     Ok(completion_receipt(
         request.event_id,
         Some(message_id),
-        if archived {
+        if matches!(refreshed, Ok((CompletionTargetClass::Archived, _))) {
             JobServiceCompletionDisposition::Archived
         } else {
             JobServiceCompletionDisposition::Pending
@@ -454,12 +775,42 @@ fn redrive_ordinary_messages_with(
     }
     let mut redriven = 0usize;
     for record in pending {
+        let mut refreshed_sessions = None;
+        if record
+            .canonical_envelope
+            .sender_kind
+            .is_job_service_system()
+        {
+            let target = match CutexSessionId::new(record.target_cutex_session_id.clone()) {
+                Ok(target) => target,
+                Err(_) => continue,
+            };
+            match load_completion_target_classification(&target) {
+                Ok((CompletionTargetClass::Active, current_sessions)) => {
+                    refreshed_sessions = Some(current_sessions);
+                }
+                Ok((CompletionTargetClass::Archived, _)) | Err(_) => continue,
+                Ok((CompletionTargetClass::PermanentlyRetired, _)) => {
+                    repository.record_failed(
+                        target.as_str(),
+                        &record.canonical_envelope.id,
+                        serde_json::json!({
+                            "code": "target_permanently_retired",
+                            "message": "Job Service completion target was permanently retired",
+                            "retryable": false
+                        }),
+                        Utc::now(),
+                    )?;
+                    continue;
+                }
+            }
+        }
         let target_id = match resolve_agent_target_for_sender_with_sessions(
             state,
             &record.target_cutex_session_id,
             None,
             true,
-            Some(sessions),
+            Some(refreshed_sessions.as_ref().unwrap_or(sessions)),
         ) {
             Ok(target) => target,
             Err(_) => continue,
