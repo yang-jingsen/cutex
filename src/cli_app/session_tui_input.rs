@@ -77,6 +77,21 @@ pub(super) fn render_input(
     title: &str,
     focused: bool,
 ) {
+    if area.height < 3 {
+        let width = usize::from(area.width);
+        let scroll = input.visual_scroll(width.saturating_sub(1).max(1));
+        frame.render_widget(
+            Paragraph::new(input.value()).scroll((0, scroll.min(u16::MAX as usize) as u16)),
+            area,
+        );
+        if focused && width > 0 && area.height > 0 {
+            frame.set_cursor_position((
+                area.x + input.visual_cursor().saturating_sub(scroll).min(width - 1) as u16,
+                area.y,
+            ));
+        }
+        return;
+    }
     let width = area.width.saturating_sub(2) as usize;
     let scroll = input.visual_scroll(width.saturating_sub(1).max(1));
     frame.render_widget(
@@ -86,9 +101,9 @@ pub(super) fn render_input(
                 Block::bordered()
                     .title(title)
                     .border_style(ratatui::style::Style::new().fg(if focused {
-                        ratatui::style::Color::Cyan
+                        super::session_tui_layout::FOCUS
                     } else {
-                        ratatui::style::Color::DarkGray
+                        super::session_tui_layout::MUTED
                     })),
             ),
         area,
@@ -116,6 +131,10 @@ pub(super) enum Command {
     Back,
     Help,
     Archived,
+    Profiles,
+    Workspaces,
+    Archive,
+    Appearance,
 }
 #[derive(Clone, Copy)]
 pub(super) struct Binding {
@@ -149,6 +168,20 @@ pub(super) const BINDINGS: &[Binding] = &[
         label: "Commands",
         hint: "F1",
     },
+    alt(Command::Profiles, 'g', "Profiles", "Alt+G"),
+    alt(
+        Command::Workspaces,
+        'w',
+        "Workspaces (Native catalog)",
+        "Alt+W",
+    ),
+    alt(Command::Archive, 'z', "Agent Archive", "Alt+Z"),
+    alt(
+        Command::Appearance,
+        'b',
+        "Appearance: toggle Inspector",
+        "Alt+B",
+    ),
     alt(Command::Page(PrimaryPanel::Agents), 'm', "Managed", "Alt+M"),
     alt(Command::Page(PrimaryPanel::Recent), 'r', "Recent", "Alt+R"),
     alt(

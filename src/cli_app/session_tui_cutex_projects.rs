@@ -1,18 +1,9 @@
 //! Human-authenticated Cutex Project management workspace.
 
 use std::io::{self, IsTerminal, Stdout};
-use std::time::Duration;
 
 use anyhow::Context;
-use crossterm::cursor::Show;
-use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
-};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use cutex::agent_management::{
     AgentActionId, CutexProjectSummary, CutexProjectWorkspace, ProjectAccessRole,
     ProjectAgentChoice, ProjectMemberLifecycle, ProjectPaletteColor, ProjectPresentationInput,
@@ -35,10 +26,14 @@ use uuid::Uuid;
 use super::management_control_plane::ManagementControlClient;
 use super::session_tui::footer_hints;
 use super::session_tui_input::{self as input_policy, Command, Gate, Help, LeaveReview};
-use super::session_tui_workspace::{primary_panel_tabs, PrimaryPanel, PrimaryPanelOutcome};
+use super::session_tui_workspace::{PrimaryPanel, PrimaryPanelOutcome};
 
-const POLL_INTERVAL: Duration = Duration::from_millis(80);
 type ProjectTerminal = Terminal<CrosstermBackend<Stdout>>;
+
+#[cfg(test)]
+pub(super) fn terminal_fixture() -> CutexProjectsModel {
+    CutexProjectsModel::empty_with_failure("isolated empty fixture; no provider access")
+}
 
 #[derive(Debug, Clone)]
 struct PresentationEditor {
@@ -122,6 +117,7 @@ struct ProjectMutationTarget {
 
 #[derive(Debug)]
 pub(super) struct CutexProjectsModel {
+    table_state: std::cell::RefCell<TableState>,
     help: Option<Help>,
     leave_review: Option<LeaveReview>,
     text_cursors: [Option<usize>; 4],
@@ -155,6 +151,7 @@ pub(super) struct CutexProjectsModel {
 impl CutexProjectsModel {
     fn empty_with_failure(error: impl Into<String>) -> Self {
         Self {
+            table_state: Default::default(),
             help: None,
             leave_review: None,
             text_cursors: [None; 4],
@@ -388,6 +385,8 @@ fn operation_rank(operation: HumanManagementOperatorKind) -> u8 {
 }
 
 pub(super) fn run(
+    terminal: &mut ProjectTerminal,
+    events: &mut super::session_tui::ShellEvents,
     previous_model: Option<CutexProjectsModel>,
 ) -> anyhow::Result<(PrimaryPanelOutcome, CutexProjectsModel)> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -400,7 +399,6 @@ pub(super) fn run(
         loading.notice = Some("Loading Cutex Projects…".to_string());
         loading
     });
-    let (mut terminal, restore) = open_terminal()?;
     if needs_initial_load {
         // Draw a complete first frame before any synchronous service discovery
         // or authenticated request. A slow or failed Management start must not
@@ -410,9 +408,7 @@ pub(super) fn run(
             CutexProjectsModel::empty_with_failure(format!("Cutex Projects unavailable: {error:#}"))
         });
     }
-    let result = run_loop(&mut terminal, &mut model);
-    drop(terminal);
-    drop(restore);
+    let result = run_loop(terminal, events, &mut model);
     Ok((result?, model))
 }
 
@@ -426,6 +422,7 @@ fn load_model() -> anyhow::Result<CutexProjectsModel> {
     let durable_candidates = client.durable_candidates()?;
     let available_agents = candidate_choices(&durable_candidates);
     Ok(CutexProjectsModel {
+        table_state: Default::default(),
         help: None,
         leave_review: None,
         text_cursors: [None; 4],
@@ -777,14 +774,15 @@ fn execute_project_mutation(model: &mut CutexProjectsModel) -> anyhow::Result<()
 
 fn run_loop(
     terminal: &mut ProjectTerminal,
+    events: &mut super::session_tui::ShellEvents,
     model: &mut CutexProjectsModel,
 ) -> anyhow::Result<PrimaryPanelOutcome> {
     loop {
         terminal.draw(|frame| render(frame, model))?;
-        if !event::poll(POLL_INTERVAL)? {
+        let Some(event) = events.next()? else {
             continue;
-        }
-        let key = match event::read()? {
+        };
+        let key = match event {
             Event::Key(key) => key,
             Event::Paste(text) => {
                 handle_paste(model, &text);
@@ -861,6 +859,12 @@ fn project_commands(model: &CutexProjectsModel) -> Vec<(Command, Option<&'static
         .iter()
         .map(|b| {
             let reason = match b.command {
+                Command::Profiles
+                | Command::Workspaces
+                | Command::Archive
+                | Command::Appearance => {
+                    Some("Open Settings (Alt+S), then F1 management navigation")
+                }
                 Command::NewProject | Command::Archived if model.view != ProjectView::List => {
                     Some("Return to the Project list")
                 }
@@ -1410,11 +1414,15 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(3),
+        Constraint::Length(1),
         Constraint::Length(2),
     ])
     .split(frame.area());
     frame.render_widget(
-        Paragraph::new(primary_panel_tabs(PrimaryPanel::Projects)),
+        Paragraph::new(super::session_tui_layout::tabs(
+            PrimaryPanel::Projects,
+            frame.area().width,
+        )),
         areas[0],
     );
     frame.render_widget(
@@ -1452,9 +1460,7 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
             render_operator_confirmation(frame, areas[2], model);
         }
     }
-    let footer = if let Some(message) = model.failure.as_deref().or(model.notice.as_deref()) {
-        vec![Span::raw(message.to_string())]
-    } else {
+    let footer = {
         match model.view {
             ProjectView::ConfirmImport => footer_hints(&[
                 ("Type", "formal name if required"),
@@ -1527,6 +1533,21 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
             } else {
                 Color::DarkGray
             })),
+        areas[4],
+    );
+    frame.render_widget(
+        Paragraph::new(
+            model
+                .failure
+                .as_deref()
+                .or(model.notice.as_deref())
+                .unwrap_or("Ready"),
+        )
+        .style(Style::new().fg(if model.failure.is_some() {
+            super::session_tui_layout::ERROR
+        } else {
+            super::session_tui_layout::MUTED
+        })),
         areas[3],
     );
     let field = match model.view {
@@ -1577,15 +1598,11 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
             true,
         );
     }
-    if model.view == ProjectView::List
-        && !model.filter_focused
-        && model.failure.is_none()
-        && model.notice.is_none()
-    {
+    if model.view == ProjectView::List && !model.filter_focused {
         frame.render_widget(
             Paragraph::new(input_policy::footer(&project_commands(model)))
                 .wrap(Wrap { trim: true }),
-            areas[3],
+            areas[4],
         );
     }
     if let Some(help) = &model.help {
@@ -1597,7 +1614,11 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
 }
 
 fn render_list(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel) {
-    let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(area);
+    let chunks = Layout::vertical([
+        Constraint::Length(if area.height < 7 { 1 } else { 3 }),
+        Constraint::Min(1),
+    ])
+    .split(area);
     let filter_title = if model.filter_focused {
         " Filter (typing) "
     } else {
@@ -1682,8 +1703,8 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel) {
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("> ");
-    let mut state =
-        TableState::default().with_selected((!visible.is_empty()).then_some(model.selected));
+    let mut state = model.table_state.borrow_mut();
+    state.select((!visible.is_empty()).then_some(model.selected));
     frame.render_stateful_widget(table, chunks[1], &mut state);
     if visible.is_empty() && chunks[1].height > 3 {
         frame.render_widget(
@@ -2194,29 +2215,10 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     }
 }
 
-fn open_terminal() -> anyhow::Result<(ProjectTerminal, TerminalRestore)> {
-    enable_raw_mode().context("Failed to enable terminal raw mode")?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
-        .context("Failed to enter alternate screen")?;
-    let terminal = Terminal::new(CrosstermBackend::new(stdout))
-        .context("Failed to initialize Cutex Projects terminal")?;
-    Ok((terminal, TerminalRestore))
-}
-
-struct TerminalRestore;
-
-impl Drop for TerminalRestore {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let mut stdout = io::stdout();
-        let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen, Show);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn ui_contract_production_durable_import_http_tui_create_add_cancel_auth_and_rename() {

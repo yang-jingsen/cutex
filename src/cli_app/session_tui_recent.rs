@@ -1,8 +1,10 @@
 //! Native recent-thread catalog workspace for the session TUI.
 //!
 //! The catalog worker owns its app-server connection for the lifetime of one
-//! TUI cycle.  It deliberately never inspects Codex provider storage.
+//! shell (including ordinary page switches). It deliberately never inspects
+//! Codex provider storage. Request generations fence superseded replies.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
@@ -94,7 +96,11 @@ struct AdoptionReview {
 
 #[derive(Debug)]
 enum CatalogCommand {
-    Load { cursor: Option<String>, retry: bool },
+    Load {
+        request: u64,
+        cursor: Option<String>,
+        retry: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -110,7 +116,9 @@ pub(super) enum CatalogReply {
 #[derive(Debug)]
 pub(super) struct RecentCatalog {
     commands: Sender<CatalogCommand>,
-    replies: Receiver<CatalogReply>,
+    replies: Receiver<(u64, CatalogReply)>,
+    request: Cell<u64>,
+    disconnected: Cell<bool>,
 }
 
 impl RecentCatalog {
@@ -123,16 +131,25 @@ impl RecentCatalog {
             .map_err(|error| anyhow::anyhow!("failed to start recent catalog worker: {error}"))?;
         commands
             .send(CatalogCommand::Load {
+                request: 0,
                 cursor: None,
                 retry: false,
             })
             .map_err(|_| anyhow::anyhow!("recent catalog worker stopped before loading"))?;
-        Ok(Self { commands, replies })
+        Ok(Self {
+            commands,
+            replies,
+            request: Cell::new(0),
+            disconnected: Cell::new(false),
+        })
     }
 
     pub(super) fn request(&self, command: RecentCommand, cursor: Option<String>) -> bool {
+        let request = self.request.get().wrapping_add(1);
+        self.request.set(request);
         self.commands
             .send(CatalogCommand::Load {
+                request,
                 cursor,
                 retry: command == RecentCommand::Retry,
             })
@@ -140,16 +157,36 @@ impl RecentCatalog {
     }
 
     pub(super) fn poll(&self) -> Option<CatalogReply> {
-        match self.replies.try_recv() {
-            Ok(reply) => Some(reply),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
+        loop {
+            match self.replies.try_recv() {
+                Ok((request, reply)) if request == self.request.get() => return Some(reply),
+                Ok(_) => continue,
+                Err(TryRecvError::Empty) => return None,
+                Err(TryRecvError::Disconnected) => {
+                    return if self.disconnected.replace(true) {
+                        None
+                    } else {
+                        Some(CatalogReply::Page {
+                            cursor: None,
+                            result: Err(CatalogError::Transport(
+                                "Recent catalog worker stopped; reopen TUI to reconnect".into(),
+                            )),
+                        })
+                    }
+                }
+            }
         }
     }
 }
 
-fn catalog_worker(commands: Receiver<CatalogCommand>, replies: Sender<CatalogReply>) {
+fn catalog_worker(commands: Receiver<CatalogCommand>, replies: Sender<(u64, CatalogReply)>) {
     let mut client = CatalogClient::spawn_local();
-    while let Ok(CatalogCommand::Load { cursor, retry }) = commands.recv() {
+    while let Ok(CatalogCommand::Load {
+        request,
+        cursor,
+        retry,
+    }) = commands.recv()
+    {
         if retry && client.is_err() {
             client = CatalogClient::spawn_local();
         }
@@ -164,7 +201,10 @@ fn catalog_worker(commands: Receiver<CatalogCommand>, replies: Sender<CatalogRep
             let error = result.as_ref().expect_err("transport result is an error");
             client = Err(error.clone());
         }
-        if replies.send(CatalogReply::Page { cursor, result }).is_err() {
+        if replies
+            .send((request, CatalogReply::Page { cursor, result }))
+            .is_err()
+        {
             break;
         }
     }
@@ -310,6 +350,10 @@ impl RecentSessionsWorkspace {
         self.loading = false;
         match result {
             Ok(page) => {
+                let selected_id = self
+                    .rows
+                    .get(self.selected)
+                    .map(|row| row.thread_id.clone());
                 self.failed_cursor = None;
                 let append = cursor.is_some();
                 let mut incoming = page
@@ -350,6 +394,9 @@ impl RecentSessionsWorkspace {
                         .cmp(&left.recency_at)
                         .then_with(|| left.thread_id.cmp(&right.thread_id))
                 });
+                self.selected = selected_id
+                    .and_then(|id| self.rows.iter().position(|row| row.thread_id == id))
+                    .unwrap_or(self.selected);
                 self.next_cursor = page.next_cursor;
                 self.load_state = if self.rows.is_empty() {
                     RecentLoadState::Empty
@@ -607,6 +654,88 @@ fn bound(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ui_contract_b2_failed_pages_preserve_rows_cursor_and_selection() {
+        let mut workspace = RecentSessionsWorkspace::default();
+        let store = CutexSessionStore::default();
+        workspace.receive(
+            CatalogReply::Page {
+                cursor: None,
+                result: Ok(ThreadPage {
+                    data: vec![thread("selected", "native", 1)],
+                    next_cursor: Some("next".into()),
+                    backwards_cursor: None,
+                }),
+            },
+            &store,
+        );
+        for cursor in [Some("next".to_string()), None] {
+            workspace.mark_loading();
+            workspace.receive(
+                CatalogReply::Page {
+                    cursor: cursor.clone(),
+                    result: Err(CatalogError::Transport("fixture failed".into())),
+                },
+                &store,
+            );
+            assert!(!workspace.loading());
+            assert_eq!(workspace.rows.len(), 1);
+            assert_eq!(workspace.cursor_for(RecentCommand::Retry), cursor);
+            assert_eq!(workspace.next_cursor().as_deref(), Some("next"));
+        }
+        workspace.receive(
+            CatalogReply::Page {
+                cursor: Some("next".into()),
+                result: Ok(ThreadPage {
+                    data: vec![thread("newer", "native-2", 2)],
+                    next_cursor: None,
+                    backwards_cursor: None,
+                }),
+            },
+            &store,
+        );
+        assert_eq!(workspace.rows[workspace.selected].thread_id, "selected");
+    }
+    #[test]
+    fn ui_contract_b2_catalog_request_fence_and_disconnect() {
+        let (commands, _command_receiver) = mpsc::channel();
+        let (sender, replies) = mpsc::channel();
+        let catalog = RecentCatalog {
+            commands,
+            replies,
+            request: Cell::new(0),
+            disconnected: Cell::new(false),
+        };
+        assert!(catalog.request(RecentCommand::Retry, None));
+        sender
+            .send((
+                0,
+                CatalogReply::Page {
+                    cursor: None,
+                    result: Err(CatalogError::Transport("stale".into())),
+                },
+            ))
+            .unwrap();
+        sender
+            .send((
+                1,
+                CatalogReply::Page {
+                    cursor: Some("retry-cursor".into()),
+                    result: Err(CatalogError::Transport("current".into())),
+                },
+            ))
+            .unwrap();
+        assert!(
+            matches!(catalog.poll(), Some(CatalogReply::Page { cursor: Some(cursor), .. }) if cursor == "retry-cursor")
+        );
+        assert!(catalog.poll().is_none());
+        drop(sender);
+        assert!(matches!(
+            catalog.poll(),
+            Some(CatalogReply::Page { result: Err(_), .. })
+        ));
+        assert!(catalog.poll().is_none());
+    }
     use super::*;
     use cutex::agent_bus::model::AgentRegistrationClass;
     use cutex::session::model::CutexSessionRecord;
