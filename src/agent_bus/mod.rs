@@ -10,6 +10,7 @@ pub mod federation;
 pub mod groups;
 pub mod identity;
 pub mod launch;
+pub mod mcp;
 pub mod message;
 pub mod model;
 pub mod queue;

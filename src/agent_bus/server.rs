@@ -2961,8 +2961,31 @@ pub fn handle_agent_bus_request(
             if prune_stale_agents(state)? {
                 persist_agent_bus_registry(state)?;
             }
-            let payload: AgentBusSendRequest = serde_json::from_slice(&request.body)
+            let mut payload: AgentBusSendRequest = serde_json::from_slice(&request.body)
                 .context("Failed to parse agent message JSON")?;
+            if let Some(invocation) = validate_mcp_caller_fence(&request, state)? {
+                if payload.from_agent_id.as_ref() != request.headers.get("x-cutex-agent-id")
+                    || payload.from.is_some()
+                    || payload.from_session_id.is_some()
+                    || payload.to_session_id.is_some()
+                    || payload
+                        .sender_kind
+                        .as_ref()
+                        .is_some_and(|kind| !kind.is_agent())
+                    || payload.control_type.is_some()
+                    || payload.control_payload.is_some()
+                    || payload.submit_mode.is_some()
+                    || payload.display_source.is_some()
+                    || payload.external_action_id.is_some()
+                    || payload.kind != crate::agent_bus::model::AgentBusEnvelopeKind::Message
+                {
+                    anyhow::bail!("unauthorized MCP sender or operation");
+                }
+                // Reuse the existing identity-bound send validation. A runtime
+                // rebind cannot reinterpret this Core caller as another Agent.
+                payload.from_session_id =
+                    Some(invocation.caller_cutex_session.as_str().to_string());
+            }
             let response = match (handlers.send_payload_response)(state, payload, true) {
                 Ok(response) => response,
                 Err(error) => {
@@ -3132,6 +3155,40 @@ pub fn handle_agent_bus_request(
                     "Agent Management requires authenticated Agent Bus access",
                 );
                 return write_json_response(stream, 200, "OK", &serde_json::to_value(response)?);
+            }
+            match validate_mcp_caller_fence(&request, state) {
+                Ok(Some(invocation)) => {
+                    if !matches!(
+                        payload.operation,
+                        crate::agent_management::AgentOperation::QueryManaged
+                    ) {
+                        return write_json_response(
+                            stream,
+                            200,
+                            "OK",
+                            &serde_json::to_value(agent_management_no_write(
+                                payload.action_id.clone(),
+                                "unauthorized",
+                                "MCP operation is not enabled",
+                            ))?,
+                        );
+                    }
+                    let response = (handlers.agent_management)(state, invocation, payload)?;
+                    return write_json_response(stream, 200, "OK", &response);
+                }
+                Err(_) => {
+                    return write_json_response(
+                        stream,
+                        200,
+                        "OK",
+                        &serde_json::to_value(agent_management_no_write(
+                            payload.action_id.clone(),
+                            "unauthorized",
+                            "MCP current runtime binding rejected",
+                        ))?,
+                    )
+                }
+                _ => {}
             }
             let sender = match agent_management_sender(&request, state) {
                 Ok(sender) => sender,
@@ -3789,6 +3846,65 @@ fn require_agent_management_bridge_token(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("Agent Management requires a configured Agent Bus token"))?;
     require_service_bridge_token(request, Some(route_token), "Agent Bus")
+}
+
+/// Additional fail-closed occurrence fence for the opt-in MCP adapter. Native
+/// routes retain their existing contract; this grants no new principal/role.
+fn validate_mcp_caller_fence(
+    request: &crate::http::server::SimpleHttpRequest,
+    state: &Arc<Mutex<AgentBusState>>,
+) -> anyhow::Result<Option<AgentManagementInvocation>> {
+    use crate::agent_bus::mcp::{GENERATION_HEADER, THREAD_HEADER};
+    if !request.headers.contains_key(THREAD_HEADER)
+        && !request.headers.contains_key(GENERATION_HEADER)
+    {
+        return Ok(None);
+    }
+    let thread = request
+        .headers
+        .get(THREAD_HEADER)
+        .context("MCP thread missing")?;
+    let generation: u64 = request
+        .headers
+        .get(GENERATION_HEADER)
+        .context("MCP generation missing")?
+        .parse()?;
+    let sender = agent_management_sender(request, state)?;
+    let roster = state
+        .lock()
+        .map_err(|_| anyhow!("Bus unavailable"))?
+        .agents
+        .get(sender.runtime_agent_id.as_str())
+        .cloned()
+        .context("MCP occurrence missing")?;
+    let sessions = load_cutex_session_store()?;
+    let matches: Vec<_> = sessions
+        .sessions
+        .iter()
+        .filter(|(_, r)| r.codex_session_id.as_ref() == Some(thread))
+        .collect();
+    let [(key, record)] = matches.as_slice() else {
+        anyhow::bail!("MCP native mapping absent or ambiguous");
+    };
+    let caller_cutex_session =
+        crate::role_revision::CutexSessionId::new(record.cutex_session_id.clone())
+            .map_err(|_| anyhow!("invalid durable identity"))?;
+    if *key != &record.cutex_session_id
+        || sender.roster_session_id != *thread
+        || generation == 0
+        || record.runtime_generation != generation
+        || record.current_runtime_agent_id.as_deref() != Some(sender.runtime_agent_id.as_str())
+        || !record.agent_enabled
+        || record.is_retired()
+        || record.registration_class != crate::agent_bus::model::AgentRegistrationClass::Persistent
+        || roster.registration_class != crate::agent_bus::model::AgentRegistrationClass::Persistent
+    {
+        anyhow::bail!("MCP occurrence is not the current persistent runtime");
+    }
+    Ok(Some(AgentManagementInvocation {
+        caller_cutex_session,
+        caller_runtime_agent_id: sender.runtime_agent_id.as_str().to_string(),
+    }))
 }
 
 fn agent_management_sender(

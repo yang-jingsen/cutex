@@ -427,12 +427,75 @@ fn submit_authenticated_agent_control_request(
     label: &str,
     response_timeout: Duration,
 ) -> anyhow::Result<Vec<u8>> {
+    submit_authenticated_agent_control_with_fence(
+        port,
+        route_token,
+        sender,
+        path,
+        body,
+        label,
+        response_timeout,
+        None,
+    )
+}
+
+pub fn submit_mcp_control(
+    port: u16,
+    token: &str,
+    sender: &RuntimeAgentId,
+    fence: &crate::agent_bus::mcp::CallerFence,
+    path: &str,
+    body: &Value,
+) -> anyhow::Result<Value> {
+    if !matches!(
+        path,
+        "/api/agent-management/v1/actions" | "/api/messages/send"
+    ) {
+        anyhow::bail!("unsupported MCP route");
+    }
+    let body = serde_json::to_vec(body)?;
+    if body.len() > 262144 || token.trim().is_empty() || token.contains(['\r', '\n']) {
+        anyhow::bail!("invalid MCP request configuration");
+    }
+    let response = submit_authenticated_agent_control_with_fence(
+        port,
+        token,
+        sender,
+        path,
+        &body,
+        "MCP",
+        AGENT_MANAGEMENT_ACTION_TIMEOUT,
+        Some(fence),
+    )?;
+    Ok(serde_json::from_slice(&response)?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_authenticated_agent_control_with_fence(
+    port: u16,
+    route_token: &str,
+    sender: &RuntimeAgentId,
+    path: &str,
+    body: &[u8],
+    label: &str,
+    response_timeout: Duration,
+    fence: Option<&crate::agent_bus::mcp::CallerFence>,
+) -> anyhow::Result<Vec<u8>> {
+    let extra = if let Some(fence) = fence {
+        let thread = crate::session::identity::normalize_codex_session_id(&fence.thread_id)?;
+        format!(
+            "X-Cutex-Mcp-Thread-Id: {thread}\r\nX-Cutex-Mcp-Generation: {}\r\n",
+            fence.generation
+        )
+    } else {
+        String::new()
+    };
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .with_context(|| format!("Failed to connect local cutex agent bus {label} route"))?;
     stream.set_write_timeout(Some(AGENT_BUS_HTTP_TIMEOUT)).ok();
     stream.set_read_timeout(Some(response_timeout)).ok();
     let headers = format!(
-        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nAuthorization: Bearer {route_token}\r\nX-Cutex-Agent-Id: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nAuthorization: Bearer {route_token}\r\n{extra}X-Cutex-Agent-Id: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         sender.as_str(),
         body.len()
     );
@@ -449,6 +512,18 @@ fn submit_authenticated_agent_control_request(
     let header = String::from_utf8_lossy(&response[..split]);
     if !header.starts_with("HTTP/1.1 2") {
         let body = String::from_utf8_lossy(&response[split + 4..]);
+        if fence.is_some() {
+            let status = header
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<u16>().ok())
+                .unwrap_or(500);
+            let error = serde_json::from_str::<Value>(&body)
+                .unwrap_or_else(|_| serde_json::json!({"message":body.trim()}));
+            return Ok(serde_json::to_vec(
+                &serde_json::json!({"http_status":status,"error":error}),
+            )?);
+        }
         anyhow::bail!("Cutex {label} route returned non-success: {header}\n{body}");
     }
     Ok(response[split + 4..].to_vec())
