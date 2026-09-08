@@ -1,18 +1,9 @@
 //! Human-authenticated Cutex Project management workspace.
 
 use std::io::{self, IsTerminal, Stdout};
-use std::time::Duration;
 
 use anyhow::Context;
-use crossterm::cursor::Show;
-use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
-};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use cutex::agent_management::{
     AgentActionId, CutexProjectSummary, CutexProjectWorkspace, ProjectAccessRole,
     ProjectAgentChoice, ProjectMemberLifecycle, ProjectPaletteColor, ProjectPresentationInput,
@@ -29,17 +20,21 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{Frame, Terminal};
-use tui_input::{Input, InputRequest};
+use tui_input::Input;
 use uuid::Uuid;
 
 use super::management_control_plane::ManagementControlClient;
 use super::session_tui::footer_hints;
-use super::session_tui_workspace::{
-    primary_panel_shortcut, primary_panel_tabs, PrimaryPanel, PrimaryPanelOutcome,
-};
+use super::session_tui_input::{self as input_policy, Command, Gate, Help, LeaveReview};
+use super::session_tui_view::{self as views, AgentSessionView, ListKind, SubjectRef};
+use super::session_tui_workspace::{PrimaryPanel, PrimaryPanelOutcome};
 
-const POLL_INTERVAL: Duration = Duration::from_millis(80);
 type ProjectTerminal = Terminal<CrosstermBackend<Stdout>>;
+
+#[cfg(test)]
+pub(super) fn terminal_fixture() -> CutexProjectsModel {
+    CutexProjectsModel::empty_with_failure("isolated empty fixture; no provider access")
+}
 
 #[derive(Debug, Clone)]
 struct PresentationEditor {
@@ -81,8 +76,8 @@ enum ProjectSection {
 
 impl ProjectSection {
     const ALL: [Self; 4] = [
-        Self::Overview,
         Self::Members,
+        Self::Overview,
         Self::Operators,
         Self::Appearance,
     ];
@@ -123,9 +118,20 @@ struct ProjectMutationTarget {
 
 #[derive(Debug)]
 pub(super) struct CutexProjectsModel {
+    member_selected: Option<SubjectRef>,
+    member_index: usize,
+    member_inspecting: bool,
+    member_table: std::cell::RefCell<TableState>,
+    table_state: std::cell::RefCell<TableState>,
+    help: Option<Help>,
+    leave_review: Option<LeaveReview>,
+    text_cursors: [Option<usize>; 4],
+    pub(super) open_settings_requested: bool,
+    pub(super) member_action_requested: Option<(String, super::session_tui::SelectorEvent)>,
     durable_candidates: Vec<cutex::agent_management::DurableAgentCandidate>,
     import_request: Option<cutex::agent_management::DurableImportRequest>,
     import_name: Input,
+    import_name_focused: bool,
     projects: Vec<CutexProjectSummary>,
     archived_projects: Vec<CutexProjectSummary>,
     available_agents: Vec<ProjectAgentChoice>,
@@ -133,6 +139,7 @@ pub(super) struct CutexProjectsModel {
     query: Input,
     filter_focused: bool,
     show_archived: bool,
+    show_archived_members: bool,
     details: Option<CutexProjectWorkspace>,
     section: ProjectSection,
     operator_selected: usize,
@@ -144,16 +151,26 @@ pub(super) struct CutexProjectsModel {
     create_editor: Option<ProjectCreateEditor>,
     view: ProjectView,
     client: Option<ManagementControlClient>,
-    failure: Option<String>,
+    pub(super) failure: Option<String>,
     notice: Option<String>,
 }
 
 impl CutexProjectsModel {
     fn empty_with_failure(error: impl Into<String>) -> Self {
         Self {
+            member_selected: None,
+            member_index: 0,
+            member_inspecting: false,
+            member_table: Default::default(),
+            table_state: Default::default(),
+            help: None,
+            leave_review: None,
+            text_cursors: [None; 4],
+            open_settings_requested: false,
             durable_candidates: Vec::new(),
             import_request: None,
             import_name: Input::default(),
+            import_name_focused: false,
             projects: Vec::new(),
             archived_projects: Vec::new(),
             available_agents: Vec::new(),
@@ -161,8 +178,10 @@ impl CutexProjectsModel {
             query: Input::default(),
             filter_focused: false,
             show_archived: false,
+            show_archived_members: false,
+            member_action_requested: None,
             details: None,
-            section: ProjectSection::Overview,
+            section: ProjectSection::Members,
             operator_selected: 0,
             pending_operator: None,
             pending_project_mutation: None,
@@ -261,6 +280,7 @@ impl CutexProjectsModel {
     }
 
     fn begin_editor(&mut self) {
+        self.text_cursors = [None; 4];
         let Some(details) = self.details.as_ref() else {
             return;
         };
@@ -275,11 +295,11 @@ impl CutexProjectsModel {
     }
 
     fn begin_create(&mut self) {
+        self.text_cursors = [None; 4];
         if self.available_agents.is_empty() {
             self.notice = Some(
                 "No persistent durable Agent candidates are available. Adopt an Agent first; an Online runtime is not required.".to_string(),
             );
-            return;
         }
         self.create_editor = Some(ProjectCreateEditor {
             project_id: String::new(),
@@ -377,6 +397,8 @@ fn operation_rank(operation: HumanManagementOperatorKind) -> u8 {
 }
 
 pub(super) fn run(
+    terminal: &mut ProjectTerminal,
+    events: &mut super::session_tui::ShellEvents,
     previous_model: Option<CutexProjectsModel>,
 ) -> anyhow::Result<(PrimaryPanelOutcome, CutexProjectsModel)> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -389,7 +411,6 @@ pub(super) fn run(
         loading.notice = Some("Loading Cutex Projects…".to_string());
         loading
     });
-    let (mut terminal, restore) = open_terminal()?;
     if needs_initial_load {
         // Draw a complete first frame before any synchronous service discovery
         // or authenticated request. A slow or failed Management start must not
@@ -398,11 +419,54 @@ pub(super) fn run(
         model = load_model().unwrap_or_else(|error| {
             CutexProjectsModel::empty_with_failure(format!("Cutex Projects unavailable: {error:#}"))
         });
+    } else if model.view == ProjectView::Create {
+        // Return from saved-session selection without replacing the draft.
+        match model
+            .client
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Management unavailable"))
+            .and_then(|c| c.durable_candidates())
+        {
+            Ok(candidates) => {
+                let selected = model
+                    .create_editor
+                    .as_ref()
+                    .and_then(|e| model.available_agents.get(e.director))
+                    .map(|a| a.cutex_session_id.clone());
+                model.available_agents = candidate_choices(&candidates);
+                model.durable_candidates = candidates;
+                if let Some(editor) = model.create_editor.as_mut() {
+                    editor.director = selected
+                        .and_then(|id| {
+                            model
+                                .available_agents
+                                .iter()
+                                .position(|a| a.cutex_session_id == id)
+                        })
+                        .unwrap_or_else(|| {
+                            editor
+                                .director
+                                .min(model.available_agents.len().saturating_sub(1))
+                        });
+                }
+            }
+            Err(error) => {
+                model.failure = Some(format!(
+                    "Candidate refresh failed; draft retained: {error:#}"
+                ))
+            }
+        }
     }
-    let result = run_loop(&mut terminal, &mut model);
-    drop(terminal);
-    drop(restore);
+    let result = run_loop(terminal, events, &mut model);
     Ok((result?, model))
+}
+
+pub(super) fn refresh_after_member_action(model: &mut CutexProjectsModel) {
+    if let Err(error) = load_details(model) {
+        model.failure = Some(format!(
+            "Member snapshot is stale after action/return: {error:#}"
+        ));
+    }
 }
 
 fn load_model() -> anyhow::Result<CutexProjectsModel> {
@@ -415,6 +479,16 @@ fn load_model() -> anyhow::Result<CutexProjectsModel> {
     let durable_candidates = client.durable_candidates()?;
     let available_agents = candidate_choices(&durable_candidates);
     Ok(CutexProjectsModel {
+        member_selected: None,
+        member_index: 0,
+        member_inspecting: false,
+        member_table: Default::default(),
+        table_state: Default::default(),
+        help: None,
+        leave_review: None,
+        text_cursors: [None; 4],
+        open_settings_requested: false,
+        import_name_focused: false,
         durable_candidates,
         import_request: None,
         import_name: Input::default(),
@@ -425,8 +499,10 @@ fn load_model() -> anyhow::Result<CutexProjectsModel> {
         query: Input::default(),
         filter_focused: false,
         show_archived: false,
+        show_archived_members: false,
+        member_action_requested: None,
         details: None,
-        section: ProjectSection::Overview,
+        section: ProjectSection::Members,
         operator_selected: 0,
         pending_operator: None,
         pending_project_mutation: None,
@@ -472,6 +548,60 @@ fn reload(model: &mut CutexProjectsModel, open_details: bool) -> anyhow::Result<
     Ok(())
 }
 
+fn selected_member(model: &CutexProjectsModel) -> Option<AgentSessionView> {
+    let rows = visible_members(model);
+    model
+        .member_selected
+        .as_ref()
+        .and_then(|id| rows.iter().find(|r| r.subject == *id))
+        .or_else(|| rows.get(model.member_index))
+        .cloned()
+}
+fn request_member_action(
+    model: &mut CutexProjectsModel,
+    event: super::session_tui::SelectorEvent,
+) -> Option<PrimaryPanelOutcome> {
+    let Some(member) = selected_member(model) else {
+        model.notice =
+            Some("Select a current member; refresh unavailable observations first".into());
+        return None;
+    };
+    if member.retirement_note.is_some() {
+        model.notice = Some("Archived/permanently retired member: use Archive to review supported Restore; permanent retirement cannot restore".into());
+        return None;
+    }
+    let SubjectRef::Managed(id) = member.subject else {
+        return None;
+    };
+    model.member_action_requested = Some((id, event));
+    Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Agents))
+}
+fn visible_members(model: &CutexProjectsModel) -> Vec<AgentSessionView> {
+    let Some(project) = &model.details else {
+        return Vec::new();
+    };
+    let mut rows = views::project_members(project);
+    if model.show_archived_members {
+        for member in &project.archived_agents {
+            let mut view =
+                views::member_view(member, project.project_id.as_str(), "Member (archived)");
+            view.retirement_note =
+                Some("Reversibly archived; membership retained; no runtime activation".into());
+            rows.push(view);
+        }
+    }
+    rows
+}
+fn reconcile_member_selection(model: &mut CutexProjectsModel) {
+    let rows = visible_members(model);
+    model.member_index = model
+        .member_selected
+        .as_ref()
+        .and_then(|id| rows.iter().position(|r| r.subject == *id))
+        .unwrap_or(model.member_index)
+        .min(rows.len().saturating_sub(1));
+    model.member_selected = rows.get(model.member_index).map(|r| r.subject.clone());
+}
 fn load_details(model: &mut CutexProjectsModel) -> anyhow::Result<()> {
     let project_id = model
         .selected_project()
@@ -481,7 +611,19 @@ fn load_details(model: &mut CutexProjectsModel) -> anyhow::Result<()> {
         .client
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Management control plane is unavailable"))?;
-    model.details = Some(client.project(&project_id)?);
+    let details = client.project(&project_id)?;
+    if model
+        .details
+        .as_ref()
+        .is_none_or(|old| old.project_id != project_id)
+    {
+        model.member_selected = None;
+        model.member_index = 0;
+        model.member_inspecting = false;
+        *model.member_table.borrow_mut() = TableState::default();
+    }
+    model.details = Some(details);
+    reconcile_member_selection(model);
     model.operator_selected = model
         .operator_selected
         .min(model.operator_targets().len().saturating_sub(1));
@@ -637,6 +779,7 @@ fn begin_import_confirmation(
         None
     };
     model.import_name = Input::new(candidate.formal_name.clone().unwrap_or_default());
+    model.import_name_focused = candidate.formal_name.is_none();
     model.import_request = Some(cutex::agent_management::DurableImportRequest {
         action_id: AgentActionId::new(format!("management-import-{}", Uuid::new_v4()))?,
         confirmed_formal_name: candidate.formal_name.clone().unwrap_or_default(),
@@ -760,14 +903,15 @@ fn execute_project_mutation(model: &mut CutexProjectsModel) -> anyhow::Result<()
 
 fn run_loop(
     terminal: &mut ProjectTerminal,
+    events: &mut super::session_tui::ShellEvents,
     model: &mut CutexProjectsModel,
 ) -> anyhow::Result<PrimaryPanelOutcome> {
     loop {
         terminal.draw(|frame| render(frame, model))?;
-        if !event::poll(POLL_INTERVAL)? {
+        let Some(event) = events.next()? else {
             continue;
-        }
-        let key = match event::read()? {
+        };
+        let key = match event {
             Event::Key(key) => key,
             Event::Paste(text) => {
                 handle_paste(model, &text);
@@ -784,123 +928,403 @@ fn run_loop(
     }
 }
 
-fn handle_paste(model: &mut CutexProjectsModel, text: &str) {
-    match model.view {
-        ProjectView::ConfirmImport
-            if model
-                .import_request
-                .as_ref()
-                .is_some_and(|r| r.candidate.formal_name.is_none()) =>
-        {
-            for character in text.chars().filter(|c| !c.is_control()) {
-                model
-                    .import_name
-                    .handle(InputRequest::InsertChar(character));
-            }
-        }
+fn project_text_field(model: &mut CutexProjectsModel) -> Option<(&mut String, &mut Option<usize>)> {
+    let (value, field) = match model.view {
         ProjectView::Editor => {
-            let Some(editor) = model.editor.as_mut() else {
-                return;
-            };
-            match editor.field {
-                0 => editor.display_name.push_str(text),
-                1 => editor.badge_label.push_str(text),
-                2 => editor.color.push_str(text),
-                _ => unreachable!(),
-            }
+            let e = model.editor.as_mut()?;
+            (
+                match e.field {
+                    0 => &mut e.display_name,
+                    1 => &mut e.badge_label,
+                    2 => &mut e.color,
+                    _ => return None,
+                },
+                e.field,
+            )
         }
         ProjectView::Create => {
-            let Some(editor) = model.create_editor.as_mut() else {
-                return;
-            };
-            match editor.field {
-                0 => editor.project_id.push_str(text),
-                1 => editor.display_name.push_str(text),
-                2 => editor.badge_label.push_str(text),
-                3 => editor.color.push_str(text),
-                4 => {}
-                _ => unreachable!(),
-            }
+            let e = model.create_editor.as_mut()?;
+            (
+                match e.field {
+                    0 => &mut e.project_id,
+                    1 => &mut e.display_name,
+                    2 => &mut e.badge_label,
+                    3 => &mut e.color,
+                    _ => return None,
+                },
+                e.field,
+            )
         }
-        _ => {}
+        _ => return None,
+    };
+    Some((value, &mut model.text_cursors[field]))
+}
+fn handle_paste(model: &mut CutexProjectsModel, text: &str) {
+    if model.help.is_some() || model.leave_review.is_some() {
+        return;
+    }
+    if model.view == ProjectView::List && model.filter_focused {
+        input_policy::paste(&mut model.query, text);
+        model.retain_selection();
+    } else if model.view == ProjectView::ConfirmImport && model.import_name_focused {
+        input_policy::paste(&mut model.import_name, text);
+    } else if let Some((value, cursor)) = project_text_field(model) {
+        input_policy::paste_string(value, cursor, text);
     }
 }
-
-fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPanelOutcome> {
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
+fn project_modal(model: &CutexProjectsModel) -> bool {
+    matches!(
+        model.view,
+        ProjectView::ConfirmImport
+            | ProjectView::ConfirmOperator
+            | ProjectView::ConfirmProjectMutation
+    )
+}
+fn project_dirty(model: &CutexProjectsModel) -> bool {
+    model.editor.is_some() || model.create_editor.is_some()
+}
+fn project_commands(model: &CutexProjectsModel) -> Vec<(Command, Option<&'static str>)> {
+    input_policy::BINDINGS
+        .iter()
+        .map(|b| {
+            let reason = match b.command {
+                Command::Profiles
+                | Command::Workspaces
+                | Command::Archive
+                | Command::Appearance => {
+                    Some("Open Settings (Alt+S), then F1 management navigation")
+                }
+                Command::NewProject | Command::Archived if model.view != ProjectView::List => {
+                    Some("Return to the Project list")
+                }
+                Command::Actions | Command::Edit | Command::Inspect
+                    if !matches!(model.view, ProjectView::List | ProjectView::Details) =>
+                {
+                    Some("Finish the current editor/review")
+                }
+                Command::LoadMore | Command::Titles | Command::Scope => {
+                    Some("Available on Recent / Managed")
+                }
+                Command::Actions | Command::Edit | Command::Inspect
+                    if model.visible_indices().is_empty() =>
+                {
+                    Some("Select a Project")
+                }
+                _ => None,
+            };
+            (b.command, reason)
+        })
+        .collect()
+}
+fn project_command(
+    model: &mut CutexProjectsModel,
+    command: Command,
+) -> Option<PrimaryPanelOutcome> {
+    if model.view == ProjectView::Details
+        && model.section == ProjectSection::Members
+        && matches!(command, Command::Actions | Command::Edit)
     {
-        return Some(PrimaryPanelOutcome::Exit);
-    }
-    if key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Char('a' | 'A')) {
-        match model.view {
-            ProjectView::List => model.begin_create(),
-            ProjectView::Details => model.begin_project_actions(),
-            _ => {}
-        }
-        return None;
-    }
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('h' | 'H'))
-    {
-        model.show_archived = !model.show_archived;
-        model.retain_selection();
-        model.notice = Some(
-            if model.show_archived {
-                "Archived Projects are visible; use Alt+A for Restore/Remove."
+        return request_member_action(
+            model,
+            if command == Command::Actions {
+                super::session_tui::SelectorEvent::OpenActions
             } else {
-                "Archived Projects are hidden."
-            }
-            .to_string(),
+                super::session_tui::SelectorEvent::OpenSettings
+            },
         );
+    }
+    if let Some((_, Some(reason))) = project_commands(model)
+        .into_iter()
+        .find(|(c, _)| *c == command)
+    {
+        model.notice = Some(reason.into());
         return None;
     }
-    if key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Char('e' | 'E')) {
-        match model.view {
-            ProjectView::List => {
-                model.section = ProjectSection::Appearance;
-                match load_details(model) {
-                    Ok(()) => model.begin_editor(),
-                    Err(error) => model.failure = Some(format!("{error:#}")),
+    if matches!(
+        command,
+        Command::Page(_) | Command::Settings | Command::Exit | Command::Back
+    ) {
+        match input_policy::navigation_gate(false, project_modal(model), project_dirty(model)) {
+            Gate::Block => return None,
+            Gate::Review => {
+                model.leave_review = Some(LeaveReview::new(
+                    command,
+                    matches!(model.view, ProjectView::Editor | ProjectView::Create),
+                ));
+                return None;
+            }
+            Gate::Allow => {}
+        }
+    }
+    match command {
+        Command::Archived => {
+            if model.view == ProjectView::List {
+                model.show_archived = !model.show_archived;
+                model.retain_selection();
+            } else if model.view == ProjectView::Details && model.section == ProjectSection::Members
+            {
+                model.show_archived_members = !model.show_archived_members;
+                reconcile_member_selection(model);
+                model.notice = Some(
+                    if model.show_archived_members {
+                        "Members include archived; membership is retained"
+                    } else {
+                        "Archived members hidden (Ctrl+H to include)"
+                    }
+                    .into(),
+                );
+            }
+            None
+        }
+        Command::Help => {
+            model.help = Some(Help::default());
+            None
+        }
+        Command::Page(panel) => {
+            model.filter_focused = false;
+            (panel != PrimaryPanel::Projects).then_some(PrimaryPanelOutcome::Switch(panel))
+        }
+        Command::Settings => {
+            model.open_settings_requested = true;
+            Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Agents))
+        }
+        Command::Exit => Some(PrimaryPanelOutcome::Exit),
+        Command::Back => {
+            if model.member_inspecting {
+                model.member_inspecting = false;
+            } else {
+                model.view = ProjectView::List;
+            }
+            None
+        }
+        Command::NewProject => {
+            if model.view == ProjectView::List {
+                model.begin_create();
+            }
+            None
+        }
+        Command::Inspect
+            if model.view == ProjectView::Details && model.section == ProjectSection::Members =>
+        {
+            model.member_inspecting = selected_member(model).is_some();
+            None
+        }
+        Command::Actions | Command::Edit | Command::Inspect => {
+            if model.view == ProjectView::List {
+                if let Err(e) = load_details(model) {
+                    model.failure = Some(format!("{e:#}"));
+                    return None;
                 }
             }
-            ProjectView::Details => {
-                model.section = ProjectSection::Appearance;
-                model.begin_editor();
+            if model.view == ProjectView::Details {
+                match command {
+                    Command::Actions => model.begin_project_actions(),
+                    Command::Edit => model.begin_editor(),
+                    _ => {}
+                }
+            }
+            None
+        }
+        Command::Refresh => {
+            // Keep reviewed identity/version and draft context frozen. A fresh
+            // observation is requested after leaving this editor/review.
+            if project_modal(model) || project_dirty(model) {
+                model.notice = Some("Finish the draft/review before refreshing its target".into());
+                return None;
+            }
+            let result = if model.view == ProjectView::List {
+                reload(model, false)
+            } else {
+                load_details(model)
+            };
+            if let Err(e) = result {
+                model.failure = Some(format!("Refresh failed; previous snapshot is stale: {e:#}"));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPanelOutcome> {
+    let text = (model.view == ProjectView::List && model.filter_focused)
+        || (model.view == ProjectView::ConfirmImport && model.import_name_focused)
+        || matches!(model.view, ProjectView::Editor | ProjectView::Create);
+    if !super::session_tui_workspace_events::accepts_key(key, text) {
+        return None;
+    }
+    if let Some(mut review) = model.leave_review.take() {
+        match review.handle(key) {
+            Some(0) => {}
+            Some(1) => {
+                model.editor = None;
+                model.create_editor = None;
+                model.view = ProjectView::List;
+                return project_command(model, review.command);
+            }
+            Some(2) => {
+                let result = if model.view == ProjectView::Editor {
+                    save_editor(model)
+                } else {
+                    save_project_create(model)
+                };
+                if let Err(e) = result {
+                    model.failure = Some(format!("{e:#}"));
+                }
+            }
+            _ => model.leave_review = Some(review),
+        }
+        return None;
+    }
+    if let Some(mut help) = model.help.take() {
+        match help.handle(key, &project_commands(model)) {
+            Some(Some(command)) => return project_command(model, command),
+            Some(None) => {}
+            None => model.help = Some(help),
+        }
+        return None;
+    }
+    if input_policy::resolve(key) == Some(Command::Help) && !project_modal(model) {
+        model.help = Some(Help::default());
+        return None;
+    }
+    if model.view == ProjectView::List && model.filter_focused {
+        if input_policy::edit(&mut model.query, key) {
+            model.retain_selection();
+            return None;
+        }
+        if matches!(
+            key.code,
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab
+        ) {
+            model.filter_focused = false;
+            return None;
+        }
+    }
+    if model.view == ProjectView::ConfirmImport && model.import_name_focused {
+        if input_policy::edit(&mut model.import_name, key) {
+            return None;
+        }
+        if matches!(
+            key.code,
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab
+        ) {
+            model.import_name_focused = false;
+            model.confirm_selected = key.code == KeyCode::BackTab;
+            return None;
+        }
+    }
+    if model.view == ProjectView::ConfirmImport
+        && model
+            .import_request
+            .as_ref()
+            .is_some_and(|r| r.candidate.formal_name.is_none())
+    {
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            if (key.code == KeyCode::Tab && model.confirm_selected)
+                || (key.code == KeyCode::BackTab && !model.confirm_selected)
+            {
+                model.import_name_focused = true;
+            } else {
+                model.confirm_selected = !model.confirm_selected;
+            }
+            return None;
+        }
+    }
+    let palette = model.view == ProjectView::Editor
+        && model.editor.as_ref().is_some_and(|e| e.field == 2)
+        || model.view == ProjectView::Create
+            && model.create_editor.as_ref().is_some_and(|e| e.field == 3);
+    if !(palette
+        && matches!(
+            key.code,
+            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+        ))
+    {
+        if let Some((value, cursor)) = project_text_field(model) {
+            if input_policy::edit_string(value, cursor, key) {
+                return None;
+            }
+        }
+    }
+    if let Some(command) = input_policy::resolve(key) {
+        return project_command(model, command);
+    }
+    if key.code == KeyCode::Esc && matches!(model.view, ProjectView::Editor | ProjectView::Create) {
+        return project_command(model, Command::Back);
+    }
+    if model.view == ProjectView::List {
+        match key.code {
+            KeyCode::Esc => {
+                if model.query.value().is_empty() {
+                    model.notice = Some("Ctrl+C exits Cutex".into());
+                } else {
+                    model.query.reset();
+                    model.retain_selection();
+                }
+                return None;
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                model.filter_focused = true;
+                return None;
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
+                    && !c.is_control() =>
+            {
+                model.filter_focused = true;
+                if c != '/' {
+                    input_policy::edit(&mut model.query, key);
+                    model.retain_selection();
+                }
+                return None;
+            }
+            KeyCode::Home => {
+                model.selected = 0;
+                return None;
+            }
+            KeyCode::End => {
+                model.selected = model.visible_indices().len().saturating_sub(1);
+                return None;
+            }
+            KeyCode::PageUp => {
+                model.selected = model.selected.saturating_sub(10);
+                return None;
+            }
+            KeyCode::PageDown => {
+                model.selected =
+                    (model.selected + 10).min(model.visible_indices().len().saturating_sub(1));
+                return None;
             }
             _ => {}
         }
-        return None;
     }
-    if let Some(panel) = primary_panel_shortcut(key) {
-        return (panel != PrimaryPanel::Projects).then_some(PrimaryPanelOutcome::Switch(panel));
-    }
-    if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::F(5) {
-        let view = model.view;
-        let editor = model.editor.clone();
-        let create_editor = model.create_editor.clone();
-        let pending_operator = model.pending_operator.clone();
-        let pending_project_mutation = model.pending_project_mutation.clone();
-        let confirm_selected = model.confirm_selected;
-        let result = if view == ProjectView::List {
-            reload(model, false)
-        } else {
-            load_details(model)
-        };
-        if view != ProjectView::List {
-            // Refresh the backing projection without consuming a draft or
-            // review that belongs to this workspace.
-            model.view = view;
-            model.editor = editor;
-            model.create_editor = create_editor;
-            model.pending_operator = pending_operator;
-            model.pending_project_mutation = pending_project_mutation;
-            model.confirm_selected = confirm_selected;
-        }
-        match result {
-            Ok(()) => model.failure = None,
-            Err(error) => model.failure = Some(format!("{error:#}")),
+    // The palette is a widget, not a text cursor or a page-navigation command.
+    if palette && matches!(key.code, KeyCode::Left | KeyCode::Right) {
+        if let Some((value, cursor)) = project_text_field(model) {
+            let colors = ProjectPaletteColor::ALL;
+            let index = colors
+                .iter()
+                .position(|color| color.token() == *value)
+                .map_or(0, |index| {
+                    if key.code == KeyCode::Left {
+                        (index + colors.len() - 1) % colors.len()
+                    } else {
+                        (index + 1) % colors.len()
+                    }
+                });
+            *value = colors[index].token();
+            *cursor = None;
         }
         return None;
     }
+    handle_project_widget_key(model, key)
+}
+fn handle_project_widget_key(
+    model: &mut CutexProjectsModel,
+    key: KeyEvent,
+) -> Option<PrimaryPanelOutcome> {
     model.notice = None;
     match model.view {
         ProjectView::ConfirmImport => match key.code {
@@ -912,7 +1336,9 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                     ProjectView::Details
                 };
             }
-            KeyCode::Up | KeyCode::Down | KeyCode::Tab => {
+            KeyCode::Left => model.confirm_selected = false,
+            KeyCode::Right => model.confirm_selected = true,
+            KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab => {
                 model.confirm_selected = !model.confirm_selected
             }
             KeyCode::Enter if model.confirm_selected => match execute_import_confirmation(model) {
@@ -929,54 +1355,6 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                 } else {
                     ProjectView::Details
                 };
-            }
-            KeyCode::Char(character)
-                if model
-                    .import_request
-                    .as_ref()
-                    .is_some_and(|r| r.candidate.formal_name.is_none())
-                    && !key
-                        .modifiers
-                        .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
-            {
-                model
-                    .import_name
-                    .handle(InputRequest::InsertChar(character));
-            }
-            KeyCode::Backspace
-                if model
-                    .import_request
-                    .as_ref()
-                    .is_some_and(|r| r.candidate.formal_name.is_none()) =>
-            {
-                model.import_name.handle(InputRequest::DeletePrevChar);
-            }
-            _ => {}
-        },
-        ProjectView::List if model.filter_focused => match key.code {
-            KeyCode::Esc | KeyCode::Enter => model.filter_focused = false,
-            KeyCode::Tab | KeyCode::BackTab => model.filter_focused = false,
-            KeyCode::Left => {
-                model.query.handle(InputRequest::GoToPrevChar);
-            }
-            KeyCode::Right => {
-                model.query.handle(InputRequest::GoToNextChar);
-            }
-            KeyCode::Backspace => {
-                model.query.handle(InputRequest::DeletePrevChar);
-                model.retain_selection();
-            }
-            KeyCode::Delete => {
-                model.query.handle(InputRequest::DeleteNextChar);
-                model.retain_selection();
-            }
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                model.query.handle(InputRequest::InsertChar(character));
-                model.retain_selection();
             }
             _ => {}
         },
@@ -1001,7 +1379,7 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                     (model.selected + 1).min(model.visible_indices().len().saturating_sub(1));
             }
             KeyCode::Enter | KeyCode::Tab => {
-                model.section = ProjectSection::Overview;
+                model.section = ProjectSection::Members;
                 if let Err(error) = load_details(model) {
                     model.failure = Some(format!("{error:#}"));
                 }
@@ -1010,13 +1388,23 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
             _ => {}
         },
         ProjectView::Details => match key.code {
+            KeyCode::Esc if model.member_inspecting => model.member_inspecting = false,
             KeyCode::Esc => model.view = ProjectView::List,
-            KeyCode::Left => model.section = model.section.shifted(-1),
-            KeyCode::Right | KeyCode::Tab => model.section = model.section.shifted(1),
+            KeyCode::Left => {
+                model.member_inspecting = false;
+                model.section = model.section.shifted(-1);
+            }
+            KeyCode::Right | KeyCode::Tab => {
+                model.member_inspecting = false;
+                model.section = model.section.shifted(1);
+            }
             KeyCode::BackTab if model.section == ProjectSection::Overview => {
                 model.view = ProjectView::List
             }
-            KeyCode::BackTab => model.section = model.section.shifted(-1),
+            KeyCode::BackTab => {
+                model.member_inspecting = false;
+                model.section = model.section.shifted(-1);
+            }
             KeyCode::Up if model.section == ProjectSection::Operators => {
                 model.operator_selected = model.operator_selected.saturating_sub(1)
             }
@@ -1024,9 +1412,29 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                 model.operator_selected = (model.operator_selected + 1)
                     .min(model.operator_targets().len().saturating_sub(1))
             }
+            KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End
+                if model.section == ProjectSection::Members =>
+            {
+                let len = visible_members(model).len();
+                model.member_index = match key.code {
+                    KeyCode::Up => model.member_index.saturating_sub(1),
+                    KeyCode::Down => (model.member_index + 1).min(len.saturating_sub(1)),
+                    KeyCode::Home => 0,
+                    _ => len.saturating_sub(1),
+                };
+                model.member_selected = visible_members(model)
+                    .get(model.member_index)
+                    .map(|v| v.subject.clone());
+            }
             KeyCode::Enter => match model.section {
                 ProjectSection::Operators => model.begin_operator_confirmation(),
-                ProjectSection::Overview | ProjectSection::Members | ProjectSection::Appearance => {
+                ProjectSection::Members => {
+                    return request_member_action(
+                        model,
+                        super::session_tui::SelectorEvent::Activate,
+                    );
+                }
+                ProjectSection::Overview | ProjectSection::Appearance => {
                     model.notice = Some("This section has no mutating action.".to_string())
                 }
             },
@@ -1048,7 +1456,7 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                     editor.field = (editor.field + 2) % 3;
                 }
             }
-            KeyCode::Char(' ') => {
+            KeyCode::Char(' ') if model.editor.as_ref().is_some_and(|e| e.field == 2) => {
                 if let Some(editor) = model.editor.as_mut().filter(|editor| editor.field == 2) {
                     let index = ProjectPaletteColor::ALL
                         .iter()
@@ -1056,36 +1464,6 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                     editor.color = ProjectPaletteColor::ALL
                         [index.map_or(0, |index| index + 1) % ProjectPaletteColor::ALL.len()]
                     .token();
-                }
-            }
-            KeyCode::Backspace => {
-                if let Some(editor) = model.editor.as_mut() {
-                    match editor.field {
-                        0 => {
-                            editor.display_name.pop();
-                        }
-                        1 => {
-                            editor.badge_label.pop();
-                        }
-                        2 => {
-                            editor.color.pop();
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-            }
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                if let Some(editor) = model.editor.as_mut() {
-                    match editor.field {
-                        0 => editor.display_name.push(character),
-                        1 => editor.badge_label.push(character),
-                        2 => editor.color.push(character),
-                        _ => unreachable!(),
-                    }
                 }
             }
             KeyCode::Enter => match save_editor(model) {
@@ -1126,7 +1504,7 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                     }
                 }
             }
-            KeyCode::Char(' ') => {
+            KeyCode::Char(' ') if model.create_editor.as_ref().is_some_and(|e| e.field == 3) => {
                 if let Some(editor) = model
                     .create_editor
                     .as_mut()
@@ -1140,42 +1518,6 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                     .token();
                 }
             }
-            KeyCode::Backspace => {
-                if let Some(editor) = model.create_editor.as_mut() {
-                    match editor.field {
-                        0 => {
-                            editor.project_id.pop();
-                        }
-                        1 => {
-                            editor.display_name.pop();
-                        }
-                        2 => {
-                            editor.badge_label.pop();
-                        }
-                        3 => {
-                            editor.color.pop();
-                        }
-                        4 => {}
-                        _ => unreachable!(),
-                    }
-                }
-            }
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                if let Some(editor) = model.create_editor.as_mut() {
-                    match editor.field {
-                        0 => editor.project_id.push(character),
-                        1 => editor.display_name.push(character),
-                        2 => editor.badge_label.push(character),
-                        3 => editor.color.push(character),
-                        4 => {}
-                        _ => unreachable!(),
-                    }
-                }
-            }
             KeyCode::Enter => {
                 if model
                     .create_editor
@@ -1183,6 +1525,9 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                     .is_some_and(|editor| editor.field < 4)
                 {
                     model.create_editor.as_mut().unwrap().field += 1;
+                } else if model.available_agents.is_empty() {
+                    model.notice = Some("Draft kept. Select/Adopt an existing saved session in Recent, then Alt+P returns here. New Agent is unavailable until native persistence is verified.".into());
+                    return Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Recent));
                 } else {
                     match save_project_create(model) {
                         Ok(()) => model.failure = None,
@@ -1213,7 +1558,11 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                 model.pending_project_mutation = None;
                 model.view = ProjectView::Actions;
             }
-            KeyCode::Up | KeyCode::Down => model.confirm_selected = !model.confirm_selected,
+            KeyCode::Left => model.confirm_selected = false,
+            KeyCode::Right => model.confirm_selected = true,
+            KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab => {
+                model.confirm_selected = !model.confirm_selected
+            }
             KeyCode::Enter if model.confirm_selected => match execute_project_mutation(model) {
                 Ok(()) => model.failure = None,
                 Err(error) => {
@@ -1226,7 +1575,6 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                 model.pending_project_mutation = None;
                 model.view = ProjectView::Actions;
             }
-            KeyCode::Left | KeyCode::Right => {}
             _ => {}
         },
         ProjectView::ConfirmOperator => match key.code {
@@ -1234,7 +1582,11 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                 model.pending_operator = None;
                 model.view = ProjectView::Details;
             }
-            KeyCode::Up | KeyCode::Down => model.confirm_selected = !model.confirm_selected,
+            KeyCode::Left => model.confirm_selected = false,
+            KeyCode::Right => model.confirm_selected = true,
+            KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab => {
+                model.confirm_selected = !model.confirm_selected
+            }
             KeyCode::Enter if model.confirm_selected => match execute_operator_action(model) {
                 Ok(()) => model.failure = None,
                 Err(error) => {
@@ -1247,7 +1599,6 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                 model.pending_operator = None;
                 model.view = ProjectView::Details;
             }
-            KeyCode::Left | KeyCode::Right => {}
             _ => {}
         },
     }
@@ -1259,11 +1610,15 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(3),
+        Constraint::Length(1),
         Constraint::Length(2),
     ])
     .split(frame.area());
     frame.render_widget(
-        Paragraph::new(primary_panel_tabs(PrimaryPanel::Projects)),
+        Paragraph::new(super::session_tui_layout::tabs(
+            PrimaryPanel::Projects,
+            frame.area().width,
+        )),
         areas[0],
     );
     frame.render_widget(
@@ -1301,13 +1656,11 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
             render_operator_confirmation(frame, areas[2], model);
         }
     }
-    let footer = if let Some(message) = model.failure.as_deref().or(model.notice.as_deref()) {
-        vec![Span::raw(message.to_string())]
-    } else {
+    let footer = {
         match model.view {
             ProjectView::ConfirmImport => footer_hints(&[
                 ("Type", "formal name if required"),
-                ("↑/↓", "Cancel/Confirm"),
+                ("←/→/Tab", "Cancel/Confirm"),
                 ("Enter", "selected choice"),
                 ("Esc", "cancel"),
             ]),
@@ -1357,12 +1710,12 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
                 footer_hints(&[("↑/↓", "choose"), ("Enter", "review"), ("Esc", "details")])
             }
             ProjectView::ConfirmProjectMutation => footer_hints(&[
-                ("↑/↓", "Cancel/Confirm"),
+                ("←/→/Tab", "Cancel/Confirm"),
                 ("Enter", "choose"),
                 ("Esc", "cancel"),
             ]),
             ProjectView::ConfirmOperator => footer_hints(&[
-                ("↑/↓", "Cancel/Confirm"),
+                ("←/→/Tab", "Cancel/Confirm"),
                 ("Enter", "choose"),
                 ("Esc", "cancel"),
             ]),
@@ -1376,107 +1729,158 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
             } else {
                 Color::DarkGray
             })),
+        areas[4],
+    );
+    frame.render_widget(
+        Paragraph::new(
+            model
+                .failure
+                .as_deref()
+                .or(model.notice.as_deref())
+                .unwrap_or("Ready"),
+        )
+        .style(Style::new().fg(if model.failure.is_some() {
+            super::session_tui_layout::ERROR
+        } else {
+            super::session_tui_layout::MUTED
+        })),
         areas[3],
     );
+    let field = match model.view {
+        ProjectView::Editor => model.editor.as_ref().map(|e| {
+            (
+                e.field,
+                match e.field {
+                    0 => e.display_name.as_str(),
+                    1 => e.badge_label.as_str(),
+                    _ => e.color.as_str(),
+                },
+            )
+        }),
+        ProjectView::Create => model.create_editor.as_ref().and_then(|e| {
+            Some((
+                e.field,
+                match e.field {
+                    0 => e.project_id.as_str(),
+                    1 => e.display_name.as_str(),
+                    2 => e.badge_label.as_str(),
+                    3 => e.color.as_str(),
+                    _ => return None,
+                },
+            ))
+        }),
+        _ => None,
+    };
+    let input_area = Rect {
+        x: areas[2].x,
+        y: areas[2].bottom().saturating_sub(3),
+        width: areas[2].width,
+        height: 3.min(areas[2].height),
+    };
+    if let Some((index, value)) = field {
+        input_policy::render_input(
+            frame,
+            input_area,
+            &input_policy::string_input(value, model.text_cursors[index]),
+            " Focused field · Tab next · Enter save/next ",
+            true,
+        );
+    } else if model.view == ProjectView::ConfirmImport && model.import_name_focused {
+        input_policy::render_input(
+            frame,
+            input_area,
+            &model.import_name,
+            " Formal Agent name · Tab to choices ",
+            true,
+        );
+    }
+    if model.view == ProjectView::List && !model.filter_focused {
+        frame.render_widget(
+            Paragraph::new(input_policy::footer(&project_commands(model)))
+                .wrap(Wrap { trim: true }),
+            areas[4],
+        );
+    }
+    if let Some(help) = &model.help {
+        help.render(frame, &project_commands(model));
+    }
+    if let Some(review) = &model.leave_review {
+        review.render(frame);
+    }
 }
 
 fn render_list(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel) {
-    let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(area);
+    let chunks = Layout::vertical([
+        Constraint::Length(if area.height < 7 { 1 } else { 3 }),
+        Constraint::Min(1),
+    ])
+    .split(area);
     let filter_title = if model.filter_focused {
         " Filter (typing) "
     } else {
         " Filter name / project id / badge  [/] "
     };
-    let filter_block =
-        Block::bordered()
-            .title(filter_title)
-            .border_style(if model.filter_focused {
-                Style::new().fg(Color::Cyan)
-            } else {
-                Style::new()
-            });
-    frame.render_widget(
-        Paragraph::new(model.query.value()).block(filter_block),
+    input_policy::render_input(
+        frame,
         chunks[0],
+        &model.query,
+        filter_title,
+        model.filter_focused,
     );
-    if model.filter_focused {
-        let cursor = model.query.visual_cursor() as u16;
-        frame.set_cursor_position((chunks[0].x + 1 + cursor, chunks[0].y + 1));
-    }
     let visible = model.visible_indices();
+    let width = chunks[1].width.saturating_sub(4);
+    let mut columns = if width >= 36 {
+        vec![("Name", width - 29), ("Director", 20), ("Members", 7)]
+    } else {
+        vec![("Name", width.max(1))]
+    };
+    if width >= 100 {
+        columns[0].1 = width - 65;
+        columns.push(("Project ID", 35));
+    }
     let rows = visible.iter().map(|index| {
         let project = &model.projects[*index];
-        Row::new([
-            Cell::from(project.presentation.badge_label.clone())
-                .style(project_badge_style(project.presentation.color)),
-            Cell::from(project.presentation.display_name.clone()),
-            Cell::from(project.project_id.to_string()),
-            Cell::from(
-                project
-                    .director_name
-                    .clone()
-                    .unwrap_or_else(|| project.director_cutex_session_id.as_str().to_string()),
-            ),
-            Cell::from(project.active_member_count.to_string()),
-            Cell::from(if project.retired_member_count == 0 {
-                "-".to_string()
-            } else {
-                project.retired_member_count.to_string()
-            }),
-            Cell::from(match project.access_role {
-                ProjectAccessRole::PrimaryDirector => "primary",
-                ProjectAccessRole::AgentOperator => "operator",
-                ProjectAccessRole::HumanManagement => "management",
-            }),
-        ])
+        Row::new(
+            columns
+                .iter()
+                .map(|(column, width)| {
+                    let value = match *column {
+                        "Name" => project.presentation.display_name.clone(),
+                        "Director" => project.director_name.clone().unwrap_or_else(|| {
+                            project.director_cutex_session_id.as_str().to_owned()
+                        }),
+                        "Members" => project.active_member_count.to_string(),
+                        _ => project.project_id.to_string(),
+                    };
+                    Cell::from(views::clipped(&value, usize::from(*width)))
+                })
+                .collect::<Vec<_>>(),
+        )
     });
-    let widths = if chunks[1].width >= 96 {
-        vec![
-            Constraint::Length(4),
-            Constraint::Length(22),
-            Constraint::Min(16),
-            Constraint::Length(20),
-            Constraint::Length(7),
-            Constraint::Length(7),
-            Constraint::Length(10),
-        ]
+    let table = Table::new(
+        rows,
+        columns
+            .iter()
+            .map(|(_, width)| Constraint::Length(*width))
+            .collect::<Vec<_>>(),
+    )
+    .header(Row::new(
+        columns.iter().map(|(label, _)| *label).collect::<Vec<_>>(),
+    ))
+    .block(Block::bordered().title(if model.show_archived {
+        " Cutex Projects + archived "
     } else {
-        vec![
-            Constraint::Length(4),
-            Constraint::Length(16),
-            Constraint::Min(12),
-            Constraint::Length(16),
-            Constraint::Length(7),
-            Constraint::Length(0),
-            Constraint::Length(0),
-        ]
-    };
-    let table = Table::new(rows, widths)
-        .header(
-            Row::new([
-                "BADGE",
-                "PROJECT",
-                "PROJECT ID",
-                "DIRECTOR",
-                "AGENTS",
-                "RETIRED",
-                "ROLE",
-            ])
-            .style(Style::new().fg(Color::Gray).add_modifier(Modifier::BOLD)),
-        )
-        .block(Block::bordered().title(if model.show_archived {
-            " Canonical Projects + archived "
-        } else {
-            " Canonical Projects "
-        }))
-        .row_highlight_style(
-            Style::new()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("> ");
-    let mut state =
-        TableState::default().with_selected((!visible.is_empty()).then_some(model.selected));
+        " Cutex Projects "
+    }))
+    .row_highlight_style(
+        Style::new()
+            .bg(Color::Blue)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol("> ");
+    let mut state = model.table_state.borrow_mut();
+    state.select((!visible.is_empty()).then_some(model.selected));
     frame.render_stateful_widget(table, chunks[1], &mut state);
     if visible.is_empty() && chunks[1].height > 3 {
         frame.render_widget(
@@ -1539,7 +1943,18 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel)
     );
     match model.section {
         ProjectSection::Overview => render_overview(frame, chunks[1], project),
-        ProjectSection::Members => render_members(frame, chunks[1], project),
+        ProjectSection::Members => {
+            let members = visible_members(model);
+            if model.member_inspecting {
+                if let Some(member) = selected_member(model) {
+                    views::render_inspector(frame, chunks[1], &member);
+                }
+            } else {
+                let mut state = model.member_table.borrow_mut();
+                state.select((!members.is_empty()).then_some(model.member_index));
+                views::render_table(frame, chunks[1], &members, ListKind::Members, &mut state);
+            }
+        }
         ProjectSection::Operators => render_operators(frame, chunks[1], model, project),
         ProjectSection::Appearance => render_appearance(frame, chunks[1], project),
     }
@@ -1561,8 +1976,9 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, project: &CutexProjectWork
             )),
             Line::from(format!("Access boundary: {role}")),
             Line::from(format!(
-                "Members: {} active, {} retired, {} operators",
-                project.active_agents.len(),
+                "Members: {} ordinary, {} archived, {} permanently retired, {} operators (Ctrl+H includes archived)",
+                views::project_members(project).len(),
+                project.archived_agents.len(),
                 project.retired_agents.len(),
                 project.agent_operators.len()
             )),
@@ -1573,50 +1989,6 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, project: &CutexProjectWork
         ])
         .wrap(Wrap { trim: true })
         .block(Block::bordered().title(" Overview ")),
-        area,
-    );
-}
-
-fn render_members(frame: &mut Frame<'_>, area: Rect, project: &CutexProjectWorkspace) {
-    let mut lines = vec![Line::from(Span::styled(
-        "Primary Director",
-        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-    ))];
-    lines.push(Line::from(format!(
-        "  {}",
-        project.director.cutex_session_id.as_str()
-    )));
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Ordinary members",
-        Style::new().add_modifier(Modifier::BOLD),
-    )));
-    lines.extend(project.active_agents.iter().map(|member| {
-        Line::from(format!(
-            "  {}  [{}]  {}",
-            member.agent.spec.name,
-            lifecycle_label(member.lifecycle),
-            member.agent.cutex_session_id.as_str()
-        ))
-    }));
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Retired members",
-        Style::new()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    )));
-    lines.extend(project.retired_agents.iter().map(|member| {
-        Line::from(format!(
-            "  {}  {}",
-            member.agent.spec.name,
-            member.agent.cutex_session_id.as_str()
-        ))
-    }));
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .block(Block::bordered().title(" Members ")),
         area,
     );
 }
@@ -1778,7 +2150,9 @@ fn render_create_editor(frame: &mut Frame<'_>, area: Rect, model: &CutexProjects
         .available_agents
         .get(editor.director)
         .map(|agent| format!("{} ({})", agent.name, agent.cutex_session_id.as_str()))
-        .unwrap_or_else(|| "No durable Agent with a validated identity".to_string());
+        .unwrap_or_else(|| {
+            "None — Enter: saved Recent; New Agent unavailable (persistence unverified)".to_string()
+        });
     let field = |index, label: &str, value: String| {
         Line::from(vec![
             Span::styled(
@@ -1987,32 +2361,45 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     }
 }
 
-fn open_terminal() -> anyhow::Result<(ProjectTerminal, TerminalRestore)> {
-    enable_raw_mode().context("Failed to enable terminal raw mode")?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
-        .context("Failed to enter alternate screen")?;
-    let terminal = Terminal::new(CrosstermBackend::new(stdout))
-        .context("Failed to initialize Cutex Projects terminal")?;
-    Ok((terminal, TerminalRestore))
-}
-
-struct TerminalRestore;
-
-impl Drop for TerminalRestore {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let mut stdout = io::stdout();
-        let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen, Show);
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ui_contract_d11_no_candidate_saved_recent_roundtrip_keeps_draft() {
+        let mut model = model_with_projects();
+        model.available_agents.clear();
+        assert_eq!(
+            handle_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT)
+            ),
+            None
+        );
+        handle_paste(&mut model, "draft-id");
+        for _ in 0..4 {
+            handle_key(&mut model, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        }
+        assert_eq!(
+            handle_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Recent))
+        );
+        assert_eq!(model.create_editor.as_ref().unwrap().project_id, "draft-id");
+        assert_eq!(model.view, ProjectView::Create);
+        assert!(model.import_request.is_none());
+        assert!(model
+            .notice
+            .as_ref()
+            .unwrap()
+            .contains("New Agent is unavailable"));
+    }
     use super::*;
+    use std::time::Duration;
 
     #[test]
-    fn production_durable_import_http_tui_create_add_cancel_auth_and_rename() {
+    fn ui_contract_production_durable_import_http_tui_create_add_cancel_auth_and_rename_and_d1_archive_gap(
+    ) {
         use cutex::session::{
             model::{CutexSessionRecord, CutexSessionStore},
             store::{load_cutex_session_store, save_cutex_session_store},
@@ -2073,6 +2460,24 @@ mod tests {
                     Ok((mut stream, _)) => {
                         let request =
                             cutex::http::server::read_simple_http_request(&mut stream).unwrap();
+                        let mut context =
+                            crate::cli_app::management_context::management_request_context();
+                        // Only fresh native observation is simulated here. Root
+                        // authentication, provider persistence and replay are real.
+                        context.adopt_saved_native = |principal, request| {
+                            if load_cutex_session_store()
+                                .unwrap()
+                                .human_adoption_receipts
+                                .contains_key(request.action_id.as_str())
+                            {
+                                return (crate::cli_app::management_context::management_request_context().adopt_saved_native)(principal, request);
+                            }
+                            cutex::agent_management::AgentManagementProvider::open_default().unwrap().adopt_saved_native(
+                                principal, &cutex::session::store::cutex_sessions_path().unwrap(), request,
+                                &cutex::platform::host::current_host_name(),
+                                &|_: &cutex::agent_management::ProjectId, _: Option<&cutex::role_revision::CutexSessionId>| Ok(false),
+                            ).map_err(|e| cutex::agent_management::AgentManagementError::OwnerActionRequired(e.to_string()))
+                        };
                         cutex::management::v2::server::handle_v2_request(
                             &mut stream,
                             &request,
@@ -2080,7 +2485,7 @@ mod tests {
                             Some("seat"),
                             Some("human-root"),
                             &[],
-                            crate::cli_app::management_context::management_request_context(),
+                            context,
                         )
                         .unwrap();
                     }
@@ -2103,6 +2508,21 @@ mod tests {
         for wrong in ["ordinary", "seat", "bus", ""] {
             let denied = ManagementControlClient::test_endpoint(base.clone(), wrong.into());
             assert!(denied.durable_candidates().is_err());
+            assert!(denied
+                .adopt_saved_native(&cutex::agent_management::HumanAdoptRequest {
+                    action_id: cutex::agent_management::AgentActionId::new("denied-adopt").unwrap(),
+                    native_id: "saved-native".into(),
+                    cwd: "/private/fixture".into(),
+                    formal_name: "Human Name".into(),
+                })
+                .is_err());
+            assert!(denied
+                .review_agent_archive(&cutex::agent_management::AgentArchiveReviewRequest {
+                    cutex_session_id: cutex::role_revision::CutexSessionId::new("cutex.worker")
+                        .unwrap(),
+                    operation: cutex::agent_management::AgentArchiveOperation::Archive,
+                })
+                .is_err());
         }
         let mut model = CutexProjectsModel::empty_with_failure("test");
         model.failure = None;
@@ -2142,19 +2562,85 @@ mod tests {
         // the same authenticated client, without starting a daemon.
         save_project_create(&mut model).unwrap();
         let create = model.import_request.clone().unwrap();
-        handle_key(&mut model, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        );
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            handle_key(
+                &mut model,
+                KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, kind),
+            );
+        }
+        assert_eq!(model.view, ProjectView::ConfirmImport);
+        assert_eq!(
+            std::fs::read(cutex::session::store::cutex_sessions_path().unwrap()).unwrap(),
+            before
+        );
+        assert!(
+            cutex::agent_management::AgentManagementProvider::open_default()
+                .unwrap()
+                .store()
+                .snapshot()
+                .unwrap()
+                .agents
+                .is_empty()
+        );
         handle_key(
             &mut model,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         );
         assert!(model.failure.is_none(), "{:?}", model.failure);
         assert_eq!(model.view, ProjectView::List);
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            handle_key(
+                &mut model,
+                KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, kind),
+            );
+            assert_eq!(model.view, ProjectView::List);
+        }
         let receipt = client.import_durable_agent(&create).unwrap();
         assert!(receipt.complete, "{:?}", receipt.error);
         let project = client
             .project(&cutex::agent_management::ProjectId::new("alpha").unwrap())
             .unwrap();
         model.details = Some(project);
+        model.view = ProjectView::Details;
+        model.section = ProjectSection::Members;
+        reconcile_member_selection(&mut model);
+        let member_id = model.member_selected.clone();
+        assert!(member_id.is_some(), "Director alone must appear in Members");
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(
+            model.member_action_requested.take(),
+            Some((
+                "cutex.director".into(),
+                super::super::session_tui::SelectorEvent::Activate
+            ))
+        );
+        project_command(&mut model, Command::Inspect);
+        assert!(model.member_inspecting);
+        assert!(rendered(&model, 80, 30).contains("Inspector"));
+        handle_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!model.member_inspecting);
+        assert_eq!(model.view, ProjectView::Details);
+        assert_eq!(model.member_selected, member_id);
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT),
+        );
+        assert_eq!(model.view, ProjectView::Details);
+        assert_eq!(
+            model.member_action_requested.take(),
+            Some((
+                "cutex.director".into(),
+                super::super::session_tui::SelectorEvent::OpenActions
+            ))
+        );
+        model.view = ProjectView::List;
         model.durable_candidates = client.durable_candidates().unwrap();
         let worker = model
             .durable_candidates
@@ -2179,6 +2665,14 @@ mod tests {
         begin_import_confirmation(&mut model, add).unwrap();
         assert_eq!(model.import_name.value(), "");
         handle_paste(&mut model, "Explicit Worker");
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+        );
+        assert!(!model.import_name_focused && model.confirm_selected);
+        handle_key(&mut model, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(model.import_name_focused);
+        handle_key(&mut model, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         let mut add = model.import_request.clone().unwrap();
         add.confirmed_formal_name = model.import_name.value().into();
         let wrong = ManagementControlClient::test_endpoint(base, "ordinary".into());
@@ -2192,12 +2686,20 @@ mod tests {
                 .unwrap()
                 .in_roster
         );
-        handle_key(&mut model, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        );
         handle_key(
             &mut model,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         );
         assert!(model.failure.is_none(), "{:?}", model.failure);
+        assert!(client
+            .durable_candidates()
+            .unwrap()
+            .iter()
+            .any(|c| c.cutex_session_id == worker.cutex_session_id && c.in_roster));
         let receipt = client.import_durable_agent(&add).unwrap();
         assert!(receipt.complete && receipt.named && receipt.imported);
         let mut sessions = load_cutex_session_store().unwrap();
@@ -2258,6 +2760,278 @@ mod tests {
             .iter()
             .any(|c| c.formal_name.as_deref() == Some("Renamed Worker")
                 && c.current_project_id.is_some()));
+
+        // D1R2: approved reversible archive retains roster membership while
+        // the authoritative durable projection hides ordinary member rows.
+        _isolated_bus.set_nonblocking(true).unwrap();
+        let bus_stop = Arc::new(AtomicBool::new(false));
+        let stopping = bus_stop.clone();
+        let bus = thread::spawn(move || {
+            use std::io::Write;
+            while !stopping.load(Ordering::SeqCst) {
+                match _isolated_bus.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = cutex::http::server::read_simple_http_request(&mut stream).unwrap();
+                        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]").unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2))
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+        });
+        let _bus = ServerGuard(bus_stop, Some(bus));
+        let provider = cutex::agent_management::AgentManagementProvider::open_default().unwrap();
+        let roster_before = serde_json::to_value(provider.store().snapshot().unwrap()).unwrap();
+        let mut durable_only = load_cutex_session_store().unwrap();
+        let mut ordinary = durable_only.sessions["cutex.worker"].clone();
+        ordinary.cutex_session_id = "cutex.durable-only".into();
+        ordinary.codex_session_id = Some("native-durable-only".into());
+        ordinary.formal_agent_name = Some("Durable Only".into());
+        durable_only
+            .sessions
+            .insert(ordinary.cutex_session_id.clone(), ordinary);
+        save_cutex_session_store(&durable_only).unwrap();
+        // Real process boundary: unsupported online backend is rejected by the
+        // authenticated production adapter before either stop or persistence.
+        let mut owned = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let mut uncontained = load_cutex_session_store().unwrap();
+        let original = uncontained.sessions["cutex.durable-only"].clone();
+        let record = uncontained.sessions.get_mut("cutex.durable-only").unwrap();
+        record.runtime_backend = cutex::session::model::CutexSessionRuntimeBackend::HostForeground;
+        record.runtime_generation = 1;
+        record.runtime_pid = Some(owned.id());
+        save_cutex_session_store(&uncontained).unwrap();
+        let unsupported = cutex::agent_management::AgentArchiveRequest {
+            reason: None,
+            action_id: cutex::agent_management::AgentActionId::new("unsupported-real-process")
+                .unwrap(),
+            review: client
+                .review_agent_archive(&cutex::agent_management::AgentArchiveReviewRequest {
+                    cutex_session_id: cutex::role_revision::CutexSessionId::new(
+                        "cutex.durable-only",
+                    )
+                    .unwrap(),
+                    operation: cutex::agent_management::AgentArchiveOperation::Archive,
+                })
+                .unwrap(),
+        };
+        let before_rejection =
+            load_cutex_session_store().unwrap().sessions["cutex.durable-only"].clone();
+        assert!(client.execute_agent_archive(&unsupported).is_err());
+        assert!(owned.try_wait().unwrap().is_none());
+        assert_eq!(
+            load_cutex_session_store().unwrap().sessions["cutex.durable-only"],
+            before_rejection
+        );
+        owned.kill().unwrap();
+        owned.wait().unwrap();
+        let mut uncontained = load_cutex_session_store().unwrap();
+        uncontained
+            .sessions
+            .insert("cutex.durable-only".into(), original);
+        save_cutex_session_store(&uncontained).unwrap();
+        assert!(
+            client
+                .review_agent_archive(&cutex::agent_management::AgentArchiveReviewRequest {
+                    cutex_session_id: cutex::role_revision::CutexSessionId::new("cutex.director")
+                        .unwrap(),
+                    operation: cutex::agent_management::AgentArchiveOperation::Archive,
+                })
+                .is_err(),
+            "Director requires explicit rotation"
+        );
+        for id in ["cutex.durable-only", "cutex.worker"] {
+            let before = load_cutex_session_store().unwrap().sessions[id].clone();
+            let request = cutex::agent_management::AgentArchiveRequest {
+                reason: None,
+                action_id: cutex::agent_management::AgentActionId::new(format!("archive-{id}"))
+                    .unwrap(),
+                review: client
+                    .review_agent_archive(&cutex::agent_management::AgentArchiveReviewRequest {
+                        cutex_session_id: cutex::role_revision::CutexSessionId::new(id).unwrap(),
+                        operation: cutex::agent_management::AgentArchiveOperation::Archive,
+                    })
+                    .unwrap(),
+            };
+            let receipt = client.execute_agent_archive(&request).unwrap();
+            let cli_receipt =
+                crate::cli_app::session_archive::execute_confirmed_archive_with_client(
+                    &client, &request,
+                )
+                .unwrap();
+            assert_eq!(cli_receipt.cutex_session_id, id);
+            assert_eq!(cli_receipt.lifecycle, "archived");
+            assert_eq!(cli_receipt.retry_request.as_ref(), Some(&request));
+            assert!(
+                wrong.execute_agent_archive(&request).is_err(),
+                "ordinary token cannot replay root Archive"
+            );
+            assert_eq!(
+                receipt.stage,
+                cutex::agent_management::AgentArchiveStage::Committed
+            );
+            let archived = load_cutex_session_store().unwrap().sessions[id].clone();
+            assert!(archived.is_retired());
+            let mut recent = crate::cli_app::session_tui_recent::RecentSessionsWorkspace::default();
+            recent.receive(
+                crate::cli_app::session_tui_recent::CatalogReply::Page {
+                    cursor: None,
+                    result: Ok(cutex::catalog::ThreadPage {
+                        data: vec![cutex::catalog::CatalogThread {
+                            id: archived.codex_session_id.clone().unwrap(),
+                            session_id: "not-identity".into(),
+                            project_id: Some("native-workspace".into()),
+                            parent_thread_id: None,
+                            preview: "not-formal-name".into(),
+                            model_provider: "fixture".into(),
+                            created_at: Some(1),
+                            updated_at: Some(1),
+                            recency_at: Some(1),
+                            cwd: Some(_home.root().into()),
+                            name: None,
+                            status: serde_json::json!({}),
+                            source: serde_json::json!("cli"),
+                            additional_fields: Default::default(),
+                        }],
+                        next_cursor: None,
+                        backwards_cursor: None,
+                    }),
+                },
+                &load_cutex_session_store().unwrap(),
+            );
+            assert!(recent.visible_rows().is_empty());
+            assert!(!recent.rows()[0].state.can_adopt());
+            assert!(crate::cli_app::session_archive::retired_sessions()
+                .unwrap()
+                .iter()
+                .any(|r| r.cutex_session_id == id));
+            let current = serde_json::to_value(provider.store().snapshot().unwrap()).unwrap();
+            for key in [
+                "agents",
+                "projects",
+                "current_project_memberships",
+                "durable_import_actions",
+                "durable_import_audit",
+            ] {
+                assert_eq!(current[key], roster_before[key], "Archive preserves {key}");
+            }
+            let project = client
+                .project(&cutex::agent_management::ProjectId::new("alpha").unwrap())
+                .unwrap();
+            if id == "cutex.worker" {
+                assert!(
+                    !project
+                        .active_agents
+                        .iter()
+                        .any(|m| m.agent.cutex_session_id.as_str() == id),
+                    "archived worker is hidden in default Project members"
+                );
+                assert!(project
+                    .archived_agents
+                    .iter()
+                    .any(|m| m.agent.cutex_session_id.as_str() == id));
+                model.details = Some(project.clone());
+                model.show_archived_members = false;
+                assert!(!visible_members(&model)
+                    .iter()
+                    .any(|m| m.subject == SubjectRef::Managed(id.into())));
+                model.show_archived_members = true;
+                assert!(visible_members(&model)
+                    .iter()
+                    .any(|m| m.subject == SubjectRef::Managed(id.into())));
+            } else {
+                assert!(!project
+                    .active_agents
+                    .iter()
+                    .any(|m| m.agent.cutex_session_id.as_str() == id));
+            }
+            if id == "cutex.worker" {
+                let archived_project = client
+                    .project_mutation(&HumanManagementProjectMutationRequest {
+                        schema: HumanManagementProjectMutationSchema::V1,
+                        action_id: cutex::agent_management::AgentActionId::new(
+                            "archive-project-d1r2",
+                        )
+                        .unwrap(),
+                        project_id: project.project_id.clone(),
+                        expected_authority_epoch: project.authority_epoch,
+                        expected_project_revision: project.project_revision,
+                        operation: HumanManagementProjectMutationKind::Archive,
+                    })
+                    .unwrap();
+                assert!(
+                    client
+                        .review_agent_archive(&cutex::agent_management::AgentArchiveReviewRequest {
+                            cutex_session_id: cutex::role_revision::CutexSessionId::new(id)
+                                .unwrap(),
+                            operation: cutex::agent_management::AgentArchiveOperation::Restore,
+                        })
+                        .is_err(),
+                    "restore must not silently detach from archived Project"
+                );
+                client
+                    .project_mutation(&HumanManagementProjectMutationRequest {
+                        schema: HumanManagementProjectMutationSchema::V1,
+                        action_id: cutex::agent_management::AgentActionId::new(
+                            "restore-project-d1r2",
+                        )
+                        .unwrap(),
+                        project_id: project.project_id.clone(),
+                        expected_authority_epoch: project.authority_epoch,
+                        expected_project_revision: archived_project.project_revision,
+                        operation: HumanManagementProjectMutationKind::Restore,
+                    })
+                    .unwrap();
+            }
+            let restore = cutex::agent_management::AgentArchiveRequest {
+                reason: None,
+                action_id: cutex::agent_management::AgentActionId::new(format!("restore-{id}"))
+                    .unwrap(),
+                review: client
+                    .review_agent_archive(&cutex::agent_management::AgentArchiveReviewRequest {
+                        cutex_session_id: cutex::role_revision::CutexSessionId::new(id).unwrap(),
+                        operation: cutex::agent_management::AgentArchiveOperation::Restore,
+                    })
+                    .unwrap(),
+            };
+            assert_eq!(
+                client.execute_agent_archive(&restore).unwrap().stage,
+                cutex::agent_management::AgentArchiveStage::Committed
+            );
+            let restored = load_cutex_session_store().unwrap().sessions[id].clone();
+            assert!(restored.is_active());
+            assert_eq!(restored.cutex_session_id, before.cutex_session_id);
+            assert_eq!(restored.codex_session_id, before.codex_session_id);
+            assert_eq!(restored.formal_agent_name, before.formal_agent_name);
+            assert_eq!(restored.profile, before.profile);
+            assert!(!cutex::session::archive::record_has_runtime_claim(
+                &restored
+            ));
+            assert_eq!(
+                client.execute_agent_archive(&request).unwrap(),
+                receipt,
+                "historical replay unchanged after Restore"
+            );
+        }
+        // The real root HTTP route must replay an already committed adoption
+        // without launching a native process, and retain its exact snapshot.
+        let adoption = cutex::agent_management::HumanAdoptRequest {
+            action_id: cutex::agent_management::AgentActionId::new("http-adopt-replay").unwrap(),
+            native_id: "saved-http-native".into(),
+            cwd: _home.root().to_string_lossy().into_owned(),
+            formal_name: "Explicit HTTP Agent".into(),
+        };
+        let adopted = client.adopt_saved_native(&adoption).unwrap();
+        assert!(adopted.imported.as_ref().unwrap().complete);
+        assert_eq!(client.adopt_saved_native(&adoption).unwrap(), adopted);
+        let mut changed = adoption;
+        changed.formal_name = "Changed request".into();
+        assert!(client.adopt_saved_native(&changed).is_err());
     }
     use ratatui::backend::TestBackend;
 
@@ -2309,6 +3083,270 @@ mod tests {
     }
 
     #[test]
+    fn ui_contract_k09_project_spaces_and_paste_parity() {
+        for create in [false, true] {
+            for field in 0..if create { 3 } else { 2 } {
+                let mut typed = model_with_projects();
+                typed.view = if create {
+                    ProjectView::Create
+                } else {
+                    ProjectView::Editor
+                };
+                typed.editor = Some(PresentationEditor {
+                    display_name: String::new(),
+                    badge_label: String::new(),
+                    color: "green".into(),
+                    field,
+                });
+                typed.create_editor = Some(ProjectCreateEditor {
+                    project_id: String::new(),
+                    display_name: String::new(),
+                    badge_label: String::new(),
+                    color: "green".into(),
+                    director: 0,
+                    field,
+                });
+                let mut pasted = model_with_projects();
+                pasted.view = typed.view;
+                pasted.editor = typed.editor.clone();
+                pasted.create_editor = typed.create_editor.clone();
+                for c in "My Project 中文".chars() {
+                    assert_eq!(
+                        handle_key(
+                            &mut typed,
+                            KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+                        ),
+                        None
+                    );
+                }
+                handle_paste(&mut pasted, "My Project 中文\r\n\t\u{1b}");
+                if create {
+                    let a = typed.create_editor.unwrap();
+                    let b = pasted.create_editor.unwrap();
+                    assert_eq!(
+                        (&a.project_id, &a.display_name, &a.badge_label, &a.color),
+                        (&b.project_id, &b.display_name, &b.badge_label, &b.color)
+                    );
+                    assert_eq!(
+                        [a.project_id, a.display_name, a.badge_label][field],
+                        "My Project 中文"
+                    );
+                } else {
+                    let a = typed.editor.unwrap();
+                    let b = pasted.editor.unwrap();
+                    assert_eq!(
+                        (&a.display_name, &a.badge_label, &a.color),
+                        (&b.display_name, &b.badge_label, &b.color)
+                    );
+                    assert_eq!([a.display_name, a.badge_label][field], "My Project 中文");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ui_contract_project_filter_consumes_shortcuts_and_paste() {
+        let mut model = model_with_projects();
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        );
+        handle_paste(&mut model, "My Project\n");
+        handle_key(&mut model, KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+        );
+        assert_eq!(model.query.value(), "y Project");
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT),
+        );
+        assert_eq!(model.view, ProjectView::List);
+        assert!(model.create_editor.is_none());
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(model.query.value(), "");
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(!model.filter_focused);
+        assert_eq!(model.view, ProjectView::List);
+    }
+
+    #[test]
+    fn ui_contract_k07_k08_project_confirmations_focus_cancel_and_repeat() {
+        for view in [
+            ProjectView::ConfirmImport,
+            ProjectView::ConfirmOperator,
+            ProjectView::ConfirmProjectMutation,
+        ] {
+            let mut model = model_with_projects();
+            model.view = view;
+            assert!(!model.confirm_selected);
+            for (code, selected) in [
+                (KeyCode::Right, true),
+                (KeyCode::Left, false),
+                (KeyCode::Tab, true),
+                (KeyCode::Tab, false),
+                (KeyCode::BackTab, true),
+            ] {
+                handle_key(&mut model, KeyEvent::new(code, KeyModifiers::NONE));
+                assert_eq!(model.confirm_selected, selected);
+                assert_eq!(model.view, view);
+                assert!(model.failure.is_none());
+            }
+            for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+                handle_key(
+                    &mut model,
+                    KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, kind),
+                );
+                assert_eq!(model.view, view);
+                assert!(model.failure.is_none());
+            }
+            handle_key(&mut model, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+            handle_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            );
+            assert_ne!(model.view, view);
+            assert!(model.failure.is_none()); // Cancel did not attempt a service call.
+            model.view = view;
+            model.confirm_selected = true;
+            handle_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert_ne!(model.view, view);
+            assert!(model.failure.is_none());
+        }
+        let mut model = model_with_projects();
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            handle_key(
+                &mut model,
+                KeyEvent::new_with_kind(KeyCode::Char('a'), KeyModifiers::ALT, kind),
+            );
+            assert!(model.create_editor.is_none());
+        }
+    }
+
+    #[test]
+    fn ui_contract_b1_project_filter_and_editor_cursor_parity() {
+        let mut model = model_with_projects();
+        let text = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 /中文🙂";
+        for c in text.chars() {
+            handle_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            );
+        }
+        assert_eq!(model.query.value(), text);
+        for code in [KeyCode::Enter, KeyCode::Esc, KeyCode::Esc] {
+            assert_eq!(
+                handle_key(&mut model, KeyEvent::new(code, KeyModifiers::NONE)),
+                None
+            );
+        }
+        assert!(model.query.value().is_empty());
+        assert!(model.notice.as_deref().unwrap().contains("Ctrl+C"));
+        model.view = ProjectView::Editor;
+        model.editor = Some(PresentationEditor {
+            display_name: "ab".into(),
+            badge_label: "CX".into(),
+            color: "green".into(),
+            field: 0,
+        });
+        handle_key(&mut model, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        handle_paste(&mut model, "中文e\u{301}🙂\n\t\u{1b}");
+        assert_eq!(
+            model.editor.as_ref().unwrap().display_name,
+            "a中文e\u{301}🙂b"
+        );
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(model.editor.as_ref().unwrap().field, 0);
+        handle_key(&mut model, KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+        );
+        assert!(model
+            .editor
+            .as_ref()
+            .unwrap()
+            .display_name
+            .starts_with('中'));
+        let mut terminal = Terminal::new(TestBackend::new(38, 18)).unwrap();
+        terminal.draw(|frame| render(frame, &model)).unwrap();
+        assert!(terminal.get_cursor_position().unwrap().x < 37);
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert!(model.editor.as_ref().unwrap().display_name.is_empty());
+    }
+
+    #[test]
+    fn ui_contract_b1_project_f1_new_settings_and_dirty_navigation_gate() {
+        let mut model = model_with_projects();
+        model.available_agents.push(ProjectAgentChoice {
+            cutex_session_id: cutex::role_revision::CutexSessionId::new("cutex.director").unwrap(),
+            name: "Formal Director".into(),
+            current_project_id: None,
+        });
+        handle_key(&mut model, KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+        let index = project_commands(&model)
+            .iter()
+            .position(|(c, _)| *c == Command::NewProject)
+            .unwrap();
+        for _ in 0..index {
+            handle_key(&mut model, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(model.view, ProjectView::Create);
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT),
+        );
+        assert!(model.leave_review.is_some());
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(model.create_editor.is_some()); // Cancel is default
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT),
+        );
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        );
+        assert_eq!(
+            handle_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Agents))
+        );
+        assert!(model.open_settings_requested);
+        assert!(model.create_editor.is_none());
+        model.view = ProjectView::ConfirmProjectMutation;
+        for key in [
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE),
+        ] {
+            assert_eq!(handle_key(&mut model, key), None);
+            assert_eq!(model.view, ProjectView::ConfirmProjectMutation);
+        }
+    }
+
+    #[test]
     fn project_filter_matches_name_id_and_badge() {
         let mut model = model_with_projects();
         for query in ["render lab", "render-lab", "cx"] {
@@ -2320,7 +3358,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_action_letters_are_inert_and_filter_text_while_alt_a_opens_create() {
+    fn bare_action_letters_filter_while_alt_n_opens_create() {
         let mut model = model_with_projects();
         for character in ['a', 'e'] {
             handle_key(
@@ -2328,7 +3366,7 @@ mod tests {
                 KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
             );
             assert_eq!(model.view, ProjectView::List);
-            assert!(model.query.value().is_empty());
+            assert!(model.filter_focused);
         }
 
         handle_key(
@@ -2339,7 +3377,7 @@ mod tests {
             &mut model,
             KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
         );
-        assert_eq!(model.query.value(), "a");
+        assert_eq!(model.query.value(), "ae/a");
         model.filter_focused = false;
         model.available_agents.push(ProjectAgentChoice {
             cutex_session_id: cutex::role_revision::CutexSessionId::new("cutex.director-new")
@@ -2349,14 +3387,14 @@ mod tests {
         });
         handle_key(
             &mut model,
-            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT),
         );
         assert_eq!(model.view, ProjectView::Create);
         assert!(model.create_editor.is_some());
     }
 
     #[test]
-    fn list_arrows_switch_adjacent_tabs_and_editor_arrows_only_move_focus() {
+    fn list_arrows_switch_tabs_palette_arrows_stay_in_widget() {
         let mut model = model_with_projects();
         assert_eq!(
             handle_key(&mut model, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
@@ -2379,10 +3417,10 @@ mod tests {
             field: 2,
         });
         handle_key(&mut model, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-        assert_eq!(model.editor.as_ref().map(|editor| editor.field), Some(1));
+        assert_eq!(model.editor.as_ref().map(|editor| editor.field), Some(2));
         assert_eq!(
             model.editor.as_ref().map(|editor| editor.color.as_str()),
-            Some("green")
+            Some("blue")
         );
         handle_key(
             &mut model,
@@ -2412,8 +3450,9 @@ mod tests {
                 &mut model,
                 KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT)
             ),
-            Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Tasks))
+            None
         );
+        assert!(model.leave_review.is_some());
         assert_eq!(model.query.value(), "render");
         assert_eq!(model.view, ProjectView::Editor);
         assert_eq!(
@@ -2448,7 +3487,12 @@ mod tests {
                 .map(|editor| editor.display_name.as_str()),
             Some("Uncommitted Draft")
         );
-        assert!(model.failure.is_some());
+        assert!(model.failure.is_none());
+        assert!(model
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("before refreshing"));
     }
 
     #[test]
@@ -2470,8 +3514,9 @@ mod tests {
             );
             assert_eq!(model.view, ProjectView::ConfirmOperator);
             assert!(model.pending_operator.is_some());
-            assert!(!model.confirm_selected);
+            assert_eq!(model.confirm_selected, key == KeyCode::Right);
         }
+        handle_key(&mut model, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         handle_key(
             &mut model,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -2486,7 +3531,7 @@ mod tests {
         let style = project_badge_style(ProjectPaletteColor::Magenta);
         assert_eq!(style.fg, Some(Color::White));
         assert_eq!(style.bg, Some(Color::LightMagenta));
-        assert!(rendered(&model_with_projects(), 90, 18).contains("CX"));
+        assert!(rendered(&model_with_projects(), 90, 18).contains("Render Lab"));
     }
 
     #[test]
@@ -2605,8 +3650,9 @@ mod tests {
                 &mut model,
                 KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT),
             ),
-            Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Agents))
+            None
         );
+        assert!(model.leave_review.is_some());
         let after = model.editor.as_ref().unwrap();
         assert_eq!(after.display_name, before.display_name);
         assert_eq!(after.badge_label, before.badge_label);
@@ -2621,7 +3667,7 @@ mod tests {
         terminal.draw(|frame| render(frame, &model)).unwrap();
         terminal.backend_mut().resize(120, 24);
         terminal.draw(|frame| render(frame, &model)).unwrap();
-        assert!(format!("{:?}", terminal.backend().buffer()).contains("PROJECT ID"));
+        assert!(format!("{:?}", terminal.backend().buffer()).contains("Director"));
     }
 
     #[test]

@@ -303,8 +303,12 @@ fn execute_dispatch_plan(
         SessionTuiDispatchPlan::RepairInterruptedHistory { id } => {
             session::repair_interrupted_history(&id).map(|_| ())
         }
-        SessionTuiDispatchPlan::RetireSession { id } => session::retire_session(&id),
-        SessionTuiDispatchPlan::RestoreSession { id } => session::restore_session(&id),
+        SessionTuiDispatchPlan::RetireSession { .. }
+        | SessionTuiDispatchPlan::RestoreSession { .. } => {
+            anyhow::bail!(
+                "Archive/Restore requires the original typed Human confirmation; review again"
+            )
+        }
     }
 }
 

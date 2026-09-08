@@ -332,6 +332,8 @@ pub struct CutexProjectSummary {
     pub operator_count: usize,
     pub presentation: EffectiveProjectPresentation,
     pub active_member_count: usize,
+    #[serde(default)]
+    pub archived_member_count: usize,
     pub retired_member_count: usize,
     #[serde(default)]
     pub lifecycle: ProjectLifecycle,
@@ -354,6 +356,8 @@ pub struct CutexProjectWorkspace {
     pub agent_operators: Vec<ProjectAgentOperatorProjection>,
     pub presentation: EffectiveProjectPresentation,
     pub active_agents: Vec<ProjectMemberProjection>,
+    #[serde(default)]
+    pub archived_agents: Vec<ProjectMemberProjection>,
     pub retired_agents: Vec<ProjectMemberProjection>,
     /// Review-only candidates for retained Director rotations committed before
     /// Operator grants existed. Nothing in this projection performs a repair.
@@ -551,7 +555,14 @@ impl AgentManagementProvider {
         let mut available_agents = snapshot
             .agents
             .values()
-            .filter(|agent| agent.retired_at.is_none())
+            .filter(|agent| {
+                agent.retired_at.is_none()
+                    && !snapshot
+                        .reversible_archive_projection
+                        .get(&agent.cutex_session_id)
+                        .copied()
+                        .unwrap_or(false)
+            })
             .map(|agent| ProjectAgentChoice {
                 cutex_session_id: agent.cutex_session_id.clone(),
                 name: agent.spec.name.clone(),
@@ -885,6 +896,11 @@ impl AgentManagementProvider {
             .contains_key(&request.action_id)
         {
             reject_project_action_id_domain_collision(&before, &request.action_id)?;
+            if let HumanManagementProjectMutationKind::AddMember { cutex_session_id } =
+                &request.operation
+            {
+                self.require_not_reversibly_archived(cutex_session_id)?;
+            }
             let authority = before
                 .projects
                 .get(&request.project_id)
@@ -1250,6 +1266,7 @@ impl AgentManagementProvider {
             return Ok(record.receipt.clone());
         }
         reject_project_action_id_domain_collision(&before, &request.action_id)?;
+        self.require_not_reversibly_archived(director_cutex_session_id)?;
         if before.projects.contains_key(&request.project_id)
             || before.project_tombstones.contains_key(&request.project_id)
         {
@@ -1664,6 +1681,7 @@ fn project_workspace(
 ) -> Result<CutexProjectWorkspace, AgentManagementError> {
     let project_id = &authority.project_id;
     let mut active_agents = Vec::new();
+    let mut archived_agents = Vec::new();
     let mut retired_agents = Vec::new();
     let mut agent_operators = Vec::new();
     let mut director_member = None;
@@ -1672,6 +1690,16 @@ fn project_workspace(
             || current_project_id(snapshot, agent).as_ref() == Some(project_id)
     }) {
         let member = project_member(agent.clone(), observer);
+        if agent.retired_at.is_none()
+            && snapshot
+                .reversible_archive_projection
+                .get(&agent.cutex_session_id)
+                .copied()
+                .unwrap_or(false)
+        {
+            archived_agents.push(member);
+            continue;
+        }
         if agent.cutex_session_id == authority.authorized_director_session {
             director_member = Some(member);
         } else if let Some(grant) = snapshot
@@ -1721,6 +1749,7 @@ fn project_workspace(
             snapshot.project_presentations.get(project_id),
         ),
         active_agents,
+        archived_agents,
         retired_agents,
         legacy_operator_repair_candidates: legacy_operator_repair_candidates(snapshot, authority),
     })
@@ -1842,6 +1871,7 @@ fn summary(
     access_role: ProjectAccessRole,
 ) -> CutexProjectSummary {
     let mut active_member_count = 0;
+    let mut archived_member_count = 0;
     let mut retired_member_count = 0;
     for agent in snapshot.agents.values().filter(|agent| {
         agent.retired_at.is_some() && agent.project_id.as_ref() == Some(&authority.project_id)
@@ -1849,6 +1879,13 @@ fn summary(
     }) {
         if agent.retired_at.is_some() {
             retired_member_count += 1;
+        } else if snapshot
+            .reversible_archive_projection
+            .get(&agent.cutex_session_id)
+            .copied()
+            .unwrap_or(false)
+        {
+            archived_member_count += 1;
         } else {
             active_member_count += 1;
         }
@@ -1872,6 +1909,7 @@ fn summary(
             snapshot.project_presentations.get(&authority.project_id),
         ),
         active_member_count,
+        archived_member_count,
         retired_member_count,
         lifecycle: state.lifecycle,
         project_revision: state.revision,

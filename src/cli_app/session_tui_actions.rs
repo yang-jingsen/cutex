@@ -37,7 +37,7 @@ impl SessionTuiAction {
             Self::CloseAndRestart => "close and restart",
             Self::CloseRuntime => "close runtime",
             Self::RepairInterruptedHistory => "repair interrupted history",
-            Self::RetireSession => "retire session",
+            Self::RetireSession => "Archive Agent",
             Self::RestoreSession => "restore session",
         }
     }

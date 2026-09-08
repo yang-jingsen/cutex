@@ -5,12 +5,16 @@
 //! production lifecycle adapter so the durable state machine can be tested
 //! without creating real Agents.
 
+mod archive;
+mod durable_adoption;
 mod durable_import;
 mod model;
 mod projects;
 mod provider;
 mod store;
 
+pub use archive::*;
+pub use durable_adoption::*;
 pub use durable_import::*;
 pub use model::*;
 pub use projects::*;

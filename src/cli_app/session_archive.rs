@@ -38,6 +38,8 @@ pub(crate) struct ArchiveSessionView {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ArchiveTransitionReceipt {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_request: Option<cutex::agent_management::AgentArchiveRequest>,
     pub cutex_session_id: String,
     pub revision: u64,
     pub lifecycle: String,
@@ -143,12 +145,12 @@ pub(crate) fn cmd_session_retired(json_output: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     if sessions.is_empty() {
-        println!("No retired durable cutex sessions are known.");
+        println!("No reversibly archived durable Agents are known.");
         return Ok(());
     }
     for session in sessions {
         println!(
-            "{}  profile={}  path={}  retired={}  revision={}",
+            "{}  profile={}  path={}  archived={}  revision={}",
             session.agent,
             session.profile.as_deref().unwrap_or("-"),
             session.managed_path.as_deref().unwrap_or("-"),
@@ -171,7 +173,7 @@ pub(crate) fn cmd_session_retire(
             anyhow::Error::new(error)
         }
     })?;
-    present_receipt("Retired", &receipt, json_output)
+    present_receipt("Archived", &receipt, json_output)
 }
 
 pub(crate) fn cmd_session_restore(id: &str, json_output: bool) -> anyhow::Result<()> {
@@ -187,11 +189,17 @@ pub(crate) fn cmd_session_restore(id: &str, json_output: bool) -> anyhow::Result
 
 pub(crate) fn retired_sessions() -> anyhow::Result<Vec<ArchiveSessionView>> {
     let store = load_cutex_session_store()?;
+    let roster = cutex::agent_management::AgentManagementStore::open_default()?.snapshot()?;
     let mut sessions = store
         .sessions
         .values()
         .filter(|record| record.is_retired())
         .filter(|record| cutex_session_is_managed(record))
+        .filter(|record| {
+            !roster.agents.values().any(|a| {
+                a.cutex_session_id.as_str() == record.cutex_session_id && a.retired_at.is_some()
+            })
+        })
         .map(archive_session_view)
         .collect::<Vec<_>>();
     sessions.sort_by(|left, right| left.cutex_session_id.cmp(&right.cutex_session_id));
@@ -206,24 +214,11 @@ fn retire_for_command(
     id: &str,
     reason: Option<&str>,
 ) -> Result<ArchiveTransitionReceipt, ArchiveCommandError> {
-    let record = load_including_retired_for_command(id)?;
-    if !cutex_session_is_managed(&record) {
-        return Err(ArchiveCommandError::route_error(
-            "session_not_managed",
-            format!("Retire is only available for managed Cutex sessions: {id}"),
-            json!({ "cutexSessionId": id }),
-        ));
-    }
-    let mut params = json!({
-        "expectedRevision": record.durable_revision(),
-        "expectedRuntimeGeneration": record.runtime_generation,
-    });
-    if let Some(reason) = reason.filter(|reason| !reason.trim().is_empty()) {
-        params["reason"] = json!(reason);
-    }
-    #[cfg(feature = "archive-conflict-test-hook")]
-    await_archive_conflict_test_hook()?;
-    mutate(&record.cutex_session_id, "cutex/session/retire", params)
+    guarded_archive_command(
+        id,
+        cutex::agent_management::AgentArchiveOperation::Archive,
+        reason,
+    )
 }
 
 pub(crate) fn restore(id: &str) -> anyhow::Result<ArchiveTransitionReceipt> {
@@ -231,14 +226,103 @@ pub(crate) fn restore(id: &str) -> anyhow::Result<ArchiveTransitionReceipt> {
 }
 
 fn restore_for_command(id: &str) -> Result<ArchiveTransitionReceipt, ArchiveCommandError> {
-    let record = load_including_retired_for_command(id)?;
-    #[cfg(feature = "archive-conflict-test-hook")]
-    await_archive_conflict_test_hook()?;
-    mutate(
-        &record.cutex_session_id,
-        "cutex/session/restore",
-        json!({ "expectedRevision": record.durable_revision() }),
+    guarded_archive_command(
+        id,
+        cutex::agent_management::AgentArchiveOperation::Restore,
+        None,
     )
+}
+
+fn guarded_archive_command(
+    id: &str,
+    operation: cutex::agent_management::AgentArchiveOperation,
+    reason: Option<&str>,
+) -> Result<ArchiveTransitionReceipt, ArchiveCommandError> {
+    let result = (|| -> anyhow::Result<_> {
+        let client = super::management_control_plane::ManagementControlClient::connect()?;
+        let review =
+            client.review_agent_archive(&cutex::agent_management::AgentArchiveReviewRequest {
+                cutex_session_id: cutex::role_revision::CutexSessionId::new(id.to_string())
+                    .map_err(|_| anyhow::anyhow!("exact durable Agent ID required"))?,
+                operation,
+            })?;
+        let request = cutex::agent_management::AgentArchiveRequest {
+            reason: reason.map(str::to_string),
+            action_id: cutex::agent_management::AgentActionId::new(format!(
+                "cli-archive-{}",
+                uuid::Uuid::new_v4()
+            ))?,
+            review,
+        };
+        execute_confirmed_archive_with_client(&client, &request)
+    })();
+    result.map_err(|error| match error.downcast::<ArchiveCommandError>() {
+        Ok(error) => error,
+        Err(error) => ArchiveCommandError::route_error(
+            "guarded_archive_failed",
+            format!("{error:#}"),
+            json!({"cutexSessionId": id}),
+        ),
+    })
+}
+
+pub(super) fn execute_confirmed_archive(
+    request: &cutex::agent_management::AgentArchiveRequest,
+) -> anyhow::Result<ArchiveTransitionReceipt> {
+    let client = super::management_control_plane::ManagementControlClient::connect()?;
+    execute_confirmed_archive_with_client(&client, request)
+}
+
+pub(super) fn execute_confirmed_archive_with_client(
+    client: &super::management_control_plane::ManagementControlClient,
+    request: &cutex::agent_management::AgentArchiveRequest,
+) -> anyhow::Result<ArchiveTransitionReceipt> {
+    let receipt = client
+        .execute_agent_archive(request)
+        .map_err(|error| ArchiveCommandError {
+            stage: "archive_response".into(),
+            code: "archive_response_unconfirmed".into(),
+            message: format!(
+                "{error:#}; replay exact action {} to reconcile",
+                request.action_id
+            ),
+            retryable: true,
+            outcome_unknown: true,
+            details: json!({ "retryRequest": request }),
+        })?;
+    if receipt.stage != cutex::agent_management::AgentArchiveStage::Committed {
+        return Err(ArchiveCommandError {
+            stage: format!("{:?}", receipt.stage),
+            code: "archive_not_committed".into(),
+            message: receipt
+                .error
+                .clone()
+                .unwrap_or_else(|| "Archive did not complete; no rollback is claimed".into()),
+            retryable: receipt.stage
+                != cutex::agent_management::AgentArchiveStage::StoppedNotArchived,
+            outcome_unknown: receipt.stage == cutex::agent_management::AgentArchiveStage::Uncertain,
+            details: json!({ "receipt": receipt, "retryRequest": request }),
+        }
+        .into());
+    }
+    let record = receipt
+        .result
+        .ok_or_else(|| anyhow::anyhow!("archive receipt omitted result"))?;
+    let lifecycle = if record.is_retired() {
+        "archived"
+    } else {
+        "active"
+    }
+    .into();
+    Ok(ArchiveTransitionReceipt {
+        retry_request: Some(request.clone()),
+        cutex_session_id: record.cutex_session_id,
+        revision: record.revision,
+        lifecycle,
+        runtime_generation: record.runtime_generation,
+        status: "offline".into(),
+        timestamp: record.retired_at,
+    })
 }
 
 #[cfg(feature = "archive-conflict-test-hook")]
@@ -395,6 +479,7 @@ fn mutate(
         super::management_context::mutate_archive_session(cutex_session_id, method, params)
             .map_err(ArchiveCommandError::from_provider)?;
     Ok(ArchiveTransitionReceipt {
+        retry_request: None,
         cutex_session_id: required_string(&result, "cutexSessionId")?,
         revision: required_u64(&result, "revision")?,
         lifecycle: required_string(&result, "lifecycle")?,
@@ -411,7 +496,7 @@ fn archive_session_view(record: &CutexSessionRecord) -> ArchiveSessionView {
     ArchiveSessionView {
         cutex_session_id: record.cutex_session_id.clone(),
         revision: record.durable_revision(),
-        lifecycle: record.archive_state.label().to_string(),
+        lifecycle: "archived".to_string(),
         runtime_generation: record.runtime_generation,
         status: "offline",
         timestamp: record.retired_at.clone(),

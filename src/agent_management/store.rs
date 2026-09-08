@@ -30,6 +30,13 @@ const MUTATION_LOCK_FILE: &str = "agent-management-mutation-v1.lock";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentManagementSnapshot {
+    /// Read-only durable projection, never persisted into roster history.
+    #[serde(skip)]
+    pub reversible_archive_projection: BTreeMap<crate::role_revision::CutexSessionId, bool>,
+    #[serde(default)]
+    pub agent_archive_actions: BTreeMap<AgentActionId, super::AgentArchiveReceipt>,
+    #[serde(default)]
+    pub agent_archive_audit: BTreeMap<String, super::AgentArchiveReceipt>,
     pub schema: AgentManagementStoreSchema,
     pub store_revision: u64,
     #[serde(default)]
@@ -98,6 +105,9 @@ pub struct AgentManagementSnapshot {
 impl AgentManagementSnapshot {
     fn empty() -> Self {
         Self {
+            reversible_archive_projection: BTreeMap::new(),
+            agent_archive_actions: BTreeMap::new(),
+            agent_archive_audit: BTreeMap::new(),
             schema: AgentManagementStoreSchema::V1,
             store_revision: 0,
             durable_import_actions: BTreeMap::new(),

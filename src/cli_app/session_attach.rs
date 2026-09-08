@@ -23,7 +23,16 @@ pub(crate) fn cmd_session_attach(name: &str, takeover: bool) -> anyhow::Result<(
         )
     })?);
 
-    std::process::exit(exit_code);
+    foreground_status(exit_code)
+}
+
+/// Return to the caller so TerminalShell can restore its terminal guard.
+pub(super) fn foreground_status(exit_code: i32) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        exit_code == 0,
+        "foreground child exited with status {exit_code}"
+    );
+    Ok(())
 }
 
 fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {

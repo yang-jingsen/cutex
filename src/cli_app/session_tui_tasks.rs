@@ -982,6 +982,40 @@ fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ui_contract_b2_legacy_navigation_keeps_task_local_state() {
+        let mut model = TaskModel::default();
+        let mut cadence = RefreshCadence::new(Instant::now());
+        handle_key(
+            &mut model,
+            &mut cadence,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        );
+        handle_key(
+            &mut model,
+            &mut cadence,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        assert_eq!(model.query.value(), "x");
+        let query = model.query.clone();
+        assert_eq!(
+            handle_key(
+                &mut model,
+                &mut cadence,
+                KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT)
+            ),
+            Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Agents))
+        );
+        assert_eq!(model.query.value(), query.value());
+        assert!(model.filter_focused); // frozen legacy behavior, not B1 focus policy
+        handle_key(
+            &mut model,
+            &mut cadence,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(!model.filter_focused);
+        assert_eq!(model.query.value(), "x");
+    }
     use super::*;
     use ratatui::backend::TestBackend;
     use std::time::Duration;

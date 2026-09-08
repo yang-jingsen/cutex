@@ -16,6 +16,9 @@ pub(crate) fn load_management_v2_registry() -> anyhow::Result<ImRegistry> {
 
 pub(crate) fn management_request_context() -> ManagementRequestContext {
     ManagementRequestContext {
+        adopt_saved_native,
+        review_agent_archive,
+        execute_agent_archive,
         durable_agent_candidates,
         import_durable_agent,
         load_registry: load_management_v2_registry,
@@ -38,6 +41,93 @@ pub(crate) fn management_request_context() -> ManagementRequestContext {
         execute_management_project_mutation,
         query_management_tasks,
     }
+}
+
+fn adopt_saved_native(
+    principal: &cutex::management::control_plane::HumanManagementPrincipal,
+    request: &cutex::agent_management::HumanAdoptRequest,
+) -> Result<cutex::agent_management::HumanAdoptResult, cutex::agent_management::AgentManagementError>
+{
+    let operation = || -> anyhow::Result<_> {
+        let path = cutex::session::store::cutex_sessions_path()?;
+        let store = cutex::session::store::load_cutex_session_store()?;
+        if !store
+            .human_adoption_receipts
+            .contains_key(request.action_id.as_str())
+        {
+            use cutex::catalog::CatalogEndpoint;
+            let launch = super::session_native_workflow::NativeLaunch {
+                cwd: request.cwd.clone().into(),
+                native_home: cutex::config::paths::host_codex_home_dir()?,
+                profile: None,
+                model: None,
+            };
+            let mut endpoint = launch.endpoint()?;
+            let native = endpoint.request(
+                "thread/read",
+                serde_json::json!({"threadId":request.native_id,"includeTurns":false}),
+            )?;
+            anyhow::ensure!(
+                native
+                    .pointer("/thread/id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(request.native_id.as_str())
+                    && native
+                        .pointer("/thread/cwd")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(request.cwd.as_str()),
+                "native source/cwd changed; review again"
+            );
+        }
+        management_agent_provider()?.adopt_saved_native(
+            principal,
+            &path,
+            request,
+            &cutex::platform::host::current_host_name(),
+            &ManagementProjectTaskInspector,
+        )
+    };
+    operation().map_err(|e| {
+        cutex::agent_management::AgentManagementError::OwnerActionRequired(format!("{e:#}"))
+    })
+}
+
+fn review_agent_archive(
+    principal: &cutex::management::control_plane::HumanManagementPrincipal,
+    request: &cutex::agent_management::AgentArchiveReviewRequest,
+) -> Result<
+    cutex::agent_management::AgentArchiveReview,
+    cutex::agent_management::AgentManagementError,
+> {
+    let path = cutex::session::store::cutex_sessions_path()
+        .map_err(|_| cutex::agent_management::AgentManagementError::PersistenceUnavailable)?;
+    management_agent_provider()?.review_agent_archive(
+        principal,
+        &path,
+        &request.cutex_session_id,
+        request.operation,
+    )
+}
+
+fn execute_agent_archive(
+    principal: &cutex::management::control_plane::HumanManagementPrincipal,
+    request: &cutex::agent_management::AgentArchiveRequest,
+) -> Result<
+    cutex::agent_management::AgentArchiveReceipt,
+    cutex::agent_management::AgentManagementError,
+> {
+    let path = cutex::session::store::cutex_sessions_path()
+        .map_err(|_| cutex::agent_management::AgentManagementError::PersistenceUnavailable)?;
+    let tasks = cutex::task_delivery::provider_adapter::default_task_service_provider_root()
+        .and_then(cutex::task_service::TaskServiceProvider::open)
+        .map_err(|_| cutex::agent_management::AgentManagementError::PersistenceUnavailable)?;
+    management_agent_provider()?.execute_agent_archive(
+        principal,
+        &path,
+        request,
+        &tasks,
+        &mut super::management_archive_runtime::GuardedArchiveRuntime::default(),
+    )
 }
 
 fn durable_agent_candidates(
@@ -284,11 +374,9 @@ fn mutate_management_v2_session(
         return mutate_management_v2_runtime(cutex_session_id, method, &params);
     }
     if matches!(method, "cutex/session/retire" | "cutex/session/restore") {
-        return super::management_archive::mutate_management_v2_archive(
-            cutex_session_id,
-            method,
-            &params,
-        );
+        return Err(UserInputExecutionError { stage: "authorization".into(), code: "human_archive_review_required".into(),
+            message: "Use the root-Human Archive review/action service; legacy session lifecycle cannot bypass project/task guards".into(),
+            retryable: false, outcome_unknown: false, details: serde_json::json!({}) });
     }
     let mut store = load_cutex_session_store().map_err(session_mutation_persistence_error)?;
     let key = cutex_session_key_for_user_id(&store, cutex_session_id).ok_or_else(|| {
