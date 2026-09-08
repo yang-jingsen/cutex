@@ -19,6 +19,7 @@ pub(crate) fn run_command(command: SessionCommand) -> anyhow::Result<()> {
         SessionCommand::Restore { id, json } => {
             super::session_archive::cmd_session_restore(&id, json)
         }
+        SessionCommand::RepairHistory { id, json } => cmd_session_repair_history(&id, json),
         SessionCommand::Adopt {
             id,
             name,
@@ -98,6 +99,99 @@ pub(crate) fn retire_session(id: &str) -> anyhow::Result<()> {
 
 pub(crate) fn restore_session(id: &str) -> anyhow::Result<()> {
     super::session_archive::restore(id).map(|_| ())
+}
+
+pub(crate) fn repair_interrupted_history(
+    id: &str,
+) -> anyhow::Result<cutex::runtime::codex_home::InterruptedHistoryRepair> {
+    let store = cutex::session::store::load_cutex_session_store()?;
+    let key = cutex::session::service::cutex_session_key_for_user_id(&store, id)
+        .ok_or_else(|| anyhow::anyhow!("cutex session is not known: {id}"))?;
+    let record = store
+        .sessions
+        .get(&key)
+        .ok_or_else(|| anyhow::anyhow!("cutex session disappeared: {key}"))?;
+    let session_id = record
+        .codex_session_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("cutex session has no native thread id: {key}"))?;
+    if !cutex::runtime::lifecycle::cutex_session_host_is_local(
+        &record.host_id,
+        &cutex::platform::host::current_host_name(),
+    ) {
+        anyhow::bail!(
+            "history repair requires the runtime's local host: {}",
+            record.host_id
+        );
+    }
+    let live_pid = [
+        record.runtime_pid,
+        record.alden_pid,
+        record
+            .app_server_runtime
+            .as_ref()
+            .map(|binding| binding.pid),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|pid| cutex::platform::process::process_is_running(*pid));
+    if let Some(pid) = live_pid {
+        anyhow::bail!(
+            "history repair requires the Agent to be offline; runtime pid {pid} is still running"
+        );
+    }
+    let config = cutex::config::store::load_codez_config();
+    if cutex::agent_bus::client::agent_bus_fetch_agents_if_healthy(&config)
+        .iter()
+        .any(|agent| agent.session_id.as_deref() == Some(session_id))
+    {
+        anyhow::bail!("history repair requires the Agent to be offline; Agent Bus is still live");
+    }
+
+    cutex::runtime::codex_home::repair_interrupted_rollout_history(session_id)
+}
+
+fn cmd_session_repair_history(id: &str, json: bool) -> anyhow::Result<()> {
+    let repair = repair_interrupted_history(id)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "rolloutPath": repair.rollout_path,
+                "backupPath": repair.backup_path,
+                "repairedTurnIds": repair.repaired_turn_ids,
+                "normalizedOrdinals": repair.normalized_ordinals,
+            }))?
+        );
+    } else if repair.repaired_turn_ids.is_empty() && !repair.normalized_ordinals {
+        println!(
+            "No interrupted history defects found in {}",
+            repair.rollout_path.display()
+        );
+    } else if repair.repaired_turn_ids.is_empty() {
+        println!(
+            "Normalized the interrupted history ordinal suffix in {}",
+            repair.rollout_path.display()
+        );
+        if let Some(backup_path) = repair.backup_path {
+            println!("Backup: {}", backup_path.display());
+        }
+    } else {
+        println!(
+            "Repaired {} orphaned turn(s){} in {}",
+            repair.repaired_turn_ids.len(),
+            if repair.normalized_ordinals {
+                " and normalized the broken ordinal suffix"
+            } else {
+                ""
+            },
+            repair.rollout_path.display()
+        );
+        if let Some(backup_path) = repair.backup_path {
+            println!("Backup: {}", backup_path.display());
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn cmd_session_lifecycle_action(

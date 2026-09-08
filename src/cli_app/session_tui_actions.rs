@@ -19,6 +19,7 @@ pub(super) enum SessionTuiAction {
     ResumeManaged,
     CloseAndRestart,
     CloseRuntime,
+    RepairInterruptedHistory,
     RetireSession,
     RestoreSession,
 }
@@ -35,6 +36,7 @@ impl SessionTuiAction {
             Self::ResumeManaged => "resume managed",
             Self::CloseAndRestart => "close and restart",
             Self::CloseRuntime => "close runtime",
+            Self::RepairInterruptedHistory => "repair interrupted history",
             Self::RetireSession => "retire session",
             Self::RestoreSession => "restore session",
         }
@@ -46,6 +48,7 @@ impl SessionTuiAction {
             Self::Online
                 | Self::CloseAndRestart
                 | Self::CloseRuntime
+                | Self::RepairInterruptedHistory
                 | Self::RetireSession
                 | Self::RestoreSession
         )
@@ -66,6 +69,7 @@ impl SessionTuiAction {
             | Self::ResumeHere
             | Self::ResumeManaged
             | Self::CloseRuntime
+            | Self::RepairInterruptedHistory
             | Self::RetireSession
             | Self::RestoreSession => false,
         }
@@ -175,6 +179,14 @@ pub(super) fn session_tui_actions_for_record(
             false,
         );
     }
+    if lifecycle == CutexSessionLifecycleState::Offline && record.codex_session_id.is_some() {
+        push_action(
+            &mut actions,
+            SessionTuiAction::RepairInterruptedHistory,
+            "Back up history and close orphaned turns left by a hard stop",
+            false,
+        );
+    }
 
     actions
 }
@@ -205,6 +217,9 @@ fn primary_action_detail(action: SessionTuiAction) -> &'static str {
             "Close runtime, then bring it online with the selected profile"
         }
         SessionTuiAction::CloseRuntime => "Close runtime gracefully; keep session and history",
+        SessionTuiAction::RepairInterruptedHistory => {
+            "Back up history and close orphaned turns left by a hard stop"
+        }
         SessionTuiAction::RetireSession => {
             "Archive this managed session; this is distinct from Close runtime"
         }
@@ -295,8 +310,13 @@ mod tests {
 
         assert_eq!(
             action_kinds(&actions),
-            vec![SessionTuiAction::ResumeAttach, SessionTuiAction::Online]
+            vec![
+                SessionTuiAction::ResumeAttach,
+                SessionTuiAction::Online,
+                SessionTuiAction::RepairInterruptedHistory,
+            ]
         );
+        assert!(actions.last().unwrap().action.requires_confirmation());
     }
 
     #[test]
@@ -388,6 +408,7 @@ mod tests {
                 SessionTuiAction::Online,
                 SessionTuiAction::ResumeHere,
                 SessionTuiAction::ResumeManaged,
+                SessionTuiAction::RepairInterruptedHistory,
             ]
         );
         assert!(actions[0].primary);

@@ -52,6 +52,9 @@ enum SessionTuiDispatchPlan {
     CloseRuntime {
         id: String,
     },
+    RepairInterruptedHistory {
+        id: String,
+    },
     RetireSession {
         id: String,
     },
@@ -72,6 +75,7 @@ impl SessionTuiDispatchPlan {
             | Self::ResumeManaged { .. }
             | Self::CloseAndRestart { .. }
             | Self::CloseRuntime { .. }
+            | Self::RepairInterruptedHistory { .. }
             | Self::RetireSession { .. }
             | Self::RestoreSession { .. } => None,
         }
@@ -113,6 +117,7 @@ fn runtime_close_output_for_surface(
             if matches!(
                 intent.action,
                 SessionTuiAction::CloseRuntime
+                    | SessionTuiAction::RepairInterruptedHistory
                     | SessionTuiAction::RetireSession
                     | SessionTuiAction::RestoreSession
             ) =>
@@ -120,7 +125,7 @@ fn runtime_close_output_for_surface(
             Ok(RuntimeCloseOutput::Suppress)
         }
         SessionTuiDispatchSurface::Selector => {
-            anyhow::bail!("only Close runtime, Retire session, or Restore session may be dispatched inside the session selector")
+            anyhow::bail!("only Close runtime, Repair interrupted history, Retire session, or Restore session may be dispatched inside the session selector")
         }
     }
 }
@@ -243,6 +248,9 @@ fn dispatch_plan_for_intent(
             launch_profile: intent.launch_profile.clone(),
         },
         SessionTuiAction::CloseRuntime => SessionTuiDispatchPlan::CloseRuntime { id },
+        SessionTuiAction::RepairInterruptedHistory => {
+            SessionTuiDispatchPlan::RepairInterruptedHistory { id }
+        }
         SessionTuiAction::RetireSession => SessionTuiDispatchPlan::RetireSession {
             id: record.cutex_session_id,
         },
@@ -292,6 +300,9 @@ fn execute_dispatch_plan(
                 session::cmd_session_close_and_wait_quiet(&id).map(|_| ())
             }
         },
+        SessionTuiDispatchPlan::RepairInterruptedHistory { id } => {
+            session::repair_interrupted_history(&id).map(|_| ())
+        }
         SessionTuiDispatchPlan::RetireSession { id } => session::retire_session(&id),
         SessionTuiDispatchPlan::RestoreSession { id } => session::restore_session(&id),
     }
@@ -636,7 +647,27 @@ mod tests {
     }
 
     #[test]
-    fn selector_dispatch_suppresses_output_only_for_close_runtime() {
+    fn offline_history_repair_uses_the_explicit_non_launching_plan() {
+        let store = store_with(record(CutexSessionRuntimeBackend::Host));
+        let repair = dispatch_plan_for_intent(
+            &intent(SessionTuiAction::RepairInterruptedHistory),
+            &store,
+            &[],
+            &[],
+        )
+        .expect("history repair plan");
+
+        assert_eq!(
+            repair,
+            SessionTuiDispatchPlan::RepairInterruptedHistory {
+                id: "019e-dispatch".to_string(),
+            }
+        );
+        assert_eq!(repair.recorded_user_action(), None);
+    }
+
+    #[test]
+    fn selector_dispatch_suppresses_output_for_selector_owned_operations() {
         let close = intent(SessionTuiAction::CloseRuntime);
         assert_eq!(
             runtime_close_output_for_surface(&close, SessionTuiDispatchSurface::PostTerminal)
@@ -646,6 +677,13 @@ mod tests {
         assert_eq!(
             runtime_close_output_for_surface(&close, SessionTuiDispatchSurface::Selector)
                 .expect("selector close output"),
+            RuntimeCloseOutput::Suppress
+        );
+
+        let repair = intent(SessionTuiAction::RepairInterruptedHistory);
+        assert_eq!(
+            runtime_close_output_for_surface(&repair, SessionTuiDispatchSurface::Selector)
+                .expect("selector repair output"),
             RuntimeCloseOutput::Suppress
         );
 
