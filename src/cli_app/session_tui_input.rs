@@ -118,6 +118,7 @@ pub(super) fn render_input(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Command {
+    Details,
     Page(PrimaryPanel),
     Settings,
     Actions,
@@ -155,6 +156,13 @@ const fn alt(command: Command, key: char, label: &'static str, hint: &'static st
     }
 }
 pub(super) const BINDINGS: &[Binding] = &[
+    Binding {
+        command: Command::Details,
+        key: KeyCode::F(2),
+        modifiers: KeyModifiers::NONE,
+        label: "Status / confirmation details",
+        hint: "F2",
+    },
     Binding {
         command: Command::Archived,
         key: KeyCode::Char('h'),

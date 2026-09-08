@@ -769,6 +769,10 @@ impl AppContext {
 
 #[derive(Debug, Clone)]
 struct SelectorModel {
+    details: Option<String>,
+    status_scroll: views::DetailScroll,
+    detail_scroll: views::DetailScroll,
+    recent_detail_scroll: views::DetailScroll,
     managed_scope: usize,
     managed_table: std::cell::RefCell<TableState>,
     recent_table: std::cell::RefCell<TableState>,
@@ -816,6 +820,10 @@ impl SelectorModel {
         sort_rows(&mut rows);
         let context = AppContext::extract(&mut rows);
         let mut model = Self {
+            details: None,
+            status_scroll: Default::default(),
+            detail_scroll: views::DetailScroll::default(),
+            recent_detail_scroll: views::DetailScroll::default(),
             managed_scope: 0,
             managed_table: Default::default(),
             recent_table: Default::default(),
@@ -5739,6 +5747,20 @@ fn selector_commands(model: &SelectorModel) -> Vec<(Command, Option<&'static str
         .collect()
 }
 fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyRoute {
+    if command == Command::Details {
+        model.status_scroll.reset();
+        model.details = Some(format!(
+            "Current review: {:?}\nArchive confirmation: {:?}\nRecent adoption: {:?}\nFormal name input: {}\nRecent: {:?}\nNotice: {}\nStatus: {}",
+            model.mode,
+            model.archive_confirmation,
+            model.recent.review(),
+            model.recent.adoption_name().map(|i| i.value()).unwrap_or("not editing"),
+            model.recent.load_state(),
+            model.notice.as_deref().unwrap_or("None"),
+            model.warning.as_deref().unwrap_or("No error"),
+        ));
+        return SelectorKeyRoute::Control(None);
+    }
     if let Some((_, Some(reason))) = selector_commands(model)
         .into_iter()
         .find(|(c, _)| *c == command)
@@ -5860,7 +5882,7 @@ fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyR
                 SelectorKeyRoute::Control(None)
             }
         }
-        Command::NewProject => SelectorKeyRoute::Control(None),
+        Command::Details | Command::NewProject => SelectorKeyRoute::Control(None),
         Command::Titles => {
             if matches!(model.mode, SelectorMode::Agents) {
                 model.show_thread_titles = !model.show_thread_titles;
@@ -5868,6 +5890,8 @@ fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyR
             SelectorKeyRoute::Control(None)
         }
         Command::Inspect => {
+            model.detail_scroll.reset();
+            model.recent_detail_scroll.reset();
             model.filter_focused = false;
             model.recent.blur_filter();
             if matches!(model.mode, SelectorMode::Agents) {
@@ -5916,6 +5940,17 @@ fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyR
     }
 }
 fn route_selector_key(model: &mut SelectorModel, key: KeyEvent) -> SelectorKeyRoute {
+    if model.details.is_some() {
+        if key.kind != KeyEventKind::Release && key.code == KeyCode::Esc {
+            model.details = None;
+        } else {
+            model.status_scroll.handle(key);
+        }
+        return SelectorKeyRoute::Control(None);
+    }
+    if key.kind == KeyEventKind::Press && input_policy::resolve(key) == Some(Command::Details) {
+        return selector_command(model, Command::Details);
+    }
     let text_input = selector_input(model).is_some();
     if !super::session_tui_workspace_events::accepts_key(key, text_input) {
         return SelectorKeyRoute::Control(None);
@@ -6011,6 +6046,9 @@ fn route_selector_key(model: &mut SelectorModel, key: KeyEvent) -> SelectorKeyRo
         return SelectorKeyRoute::Control(None);
     }
     if recent && model.recent_inspecting {
+        if model.recent_detail_scroll.handle(key) {
+            return SelectorKeyRoute::Control(None);
+        }
         if let Some(command) = input_policy::resolve(key) {
             return selector_command(model, command);
         }
@@ -6094,6 +6132,13 @@ fn route_selector_key(model: &mut SelectorModel, key: KeyEvent) -> SelectorKeyRo
         }
     }
     if !filter
+        && matches!(model.mode, SelectorMode::Agents)
+        && model.inspector_overview_focused
+        && model.detail_scroll.handle(key)
+    {
+        return SelectorKeyRoute::Control(None);
+    }
+    if !filter
         && !selector_modal(model)
         && matches!(
             model.mode,
@@ -6139,6 +6184,9 @@ fn route_selector_key(model: &mut SelectorModel, key: KeyEvent) -> SelectorKeyRo
 }
 
 fn handle_selector_paste(model: &mut SelectorModel, text: &str) {
+    if model.details.is_some() {
+        return;
+    }
     if model.help.is_some() || model.leave_review.is_some() {
         return;
     }
@@ -6916,6 +6964,16 @@ fn selector_event_from_key(key: KeyEvent, enhanced_keyboard: bool) -> Option<Sel
 }
 
 fn render_selector(frame: &mut Frame<'_>, model: &SelectorModel) {
+    if let Some(text) = &model.details {
+        views::render_details(
+            frame,
+            frame.area(),
+            " CUTEX · Status / review details · read only ",
+            text,
+            &model.status_scroll,
+        );
+        return;
+    }
     render_workspace(frame, model, &SelectorWorkspaceRenderer);
     if let Some(navigation) = &model.settings_navigation {
         navigation.render_titled(
@@ -7026,7 +7084,7 @@ fn render_selector_contents(frame: &mut Frame<'_>, model: &SelectorModel) {
             "Ready"
         });
     frame.render_widget(
-        Paragraph::new(status).style(Style::new().fg(
+        Paragraph::new(format!("F2 details · {status}")).style(Style::new().fg(
             if model.warning.is_some()
                 || (matches!(model.mode, SelectorMode::RecentSessions)
                     && matches!(
@@ -7042,6 +7100,30 @@ fn render_selector_contents(frame: &mut Frame<'_>, model: &SelectorModel) {
         chunks[4],
     );
     render_footer(frame, chunks[5], model);
+    let confirmed = match &model.mode {
+        SelectorMode::ConfirmRuntimeAction { confirmed, .. } => Some(*confirmed),
+        SelectorMode::RecentSessions
+            if model.recent.review().is_some() && !model.recent.adoption_name_focused() =>
+        {
+            Some(model.recent.review_confirmed())
+        }
+        _ => None,
+    };
+    if let Some(confirmed) = confirmed {
+        frame.render_widget(
+            Paragraph::new(if confirmed {
+                "Cancel  [Confirm] · Enter selected · F2 details"
+            } else {
+                "[Cancel]  Confirm · Enter selected · F2 details"
+            })
+            .style(Style::new().add_modifier(Modifier::BOLD)),
+            Rect {
+                y: main_area.bottom().saturating_sub(1),
+                height: 1,
+                ..main_area
+            },
+        );
+    }
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
@@ -7270,7 +7352,7 @@ fn render_recent_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorMo
             .visible_rows()
             .get(model.recent.selected_visible())
         {
-            views::render_inspector(frame, area, &row.view);
+            views::render_inspector(frame, area, &row.view, &model.recent_detail_scroll);
         }
         return;
     }
@@ -8045,7 +8127,7 @@ fn render_inspector_overview(
     view.name = row.agent.clone();
     view.configured_profile = row.configured_profile.clone();
     view.native_title = row.thread_title.clone();
-    views::render_inspector(frame, area, &view);
+    views::render_inspector(frame, area, &view, &model.detail_scroll);
 }
 
 fn render_inspector_settings(
@@ -9399,6 +9481,123 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ui_contract_e1_focus_scroll_status_modal_and_editor_return() {
+        let mut model = SelectorModel::new(
+            vec![row(
+                "exact-id",
+                "editable",
+                CutexSessionLifecycleState::Offline,
+                false,
+                true,
+            )],
+            false,
+            false,
+        );
+        let query = model.rows[0].agent.clone();
+        model.query = Input::new(query.clone());
+        let selected = model.selected_target();
+        let offset = model.managed_table.borrow().offset();
+        selector_command(&mut model, Command::Inspect);
+        assert!(model.inspector_overview_focused);
+        rendered_text_at(60, 18, &model);
+        for key in [KeyCode::PageDown, KeyCode::End, KeyCode::Up, KeyCode::Home] {
+            route_selector_key(&mut model, KeyEvent::new(key, KeyModifiers::NONE));
+            assert_eq!(model.selected_target(), selected);
+        }
+        route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(model.managed_table.borrow().offset(), offset);
+        assert_eq!(model.query.value(), query);
+        model.filter_focused = true;
+        route_selector_key(&mut model, KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(model.query.cursor(), 0);
+        model.warning = Some(format!("{}FINAL-ERROR", "long error ".repeat(200)));
+        route_selector_key(&mut model, KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        handle_selector_paste(&mut model, "MUST NOT EDIT");
+        assert_eq!(model.query.value(), query);
+        rendered_text_at(60, 18, &model);
+        route_selector_key(&mut model, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert!(rendered_text_at(60, 18, &model).contains("FINAL-ERROR"));
+        route_selector_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(model.details.is_some());
+        route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(model.filter_focused);
+        assert_eq!(model.query.cursor(), 0);
+        let mut recent = contract_recent_model();
+        let selected = recent.recent.selected_visible();
+        selector_command(&mut recent, Command::Inspect);
+        rendered_text_at(60, 18, &recent);
+        for key in [KeyCode::End, KeyCode::PageUp, KeyCode::Home] {
+            route_selector_key(&mut recent, KeyEvent::new(key, KeyModifiers::NONE));
+            assert!(recent.recent_inspecting);
+            assert_eq!(recent.recent.selected_visible(), selected);
+        }
+        route_selector_key(&mut recent, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!recent.recent_inspecting);
+        route_selector_key(
+            &mut recent,
+            KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
+        );
+        route_selector_key(
+            &mut recent,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(
+            recent.details.is_some(),
+            "F1 actionable fallback uses the same Details binding"
+        );
+    }
+    #[test]
+    #[ignore = "scripts/tui-e1-pty.py owns the real private PTY; no services"]
+    fn ui_contract_e1_terminal_resize_detail_child() {
+        use std::io::Write;
+        let mut model = editable_model(&editable_record());
+        model.warning = Some(format!("{}FINAL-ERROR", "long error ".repeat(200)));
+        let selected = model.selected_target();
+        let mut shell = TerminalShell::open().unwrap();
+        let mut events = ShellEvents;
+        let mut resized = false;
+        let mut opened = false;
+        println!("E1_READY");
+        io::stdout().flush().unwrap();
+        loop {
+            shell
+                .terminal()
+                .draw(|f| render_selector(f, &model))
+                .unwrap();
+            match events.next().unwrap() {
+                Some(Event::Resize(_, _)) => {
+                    resized = true;
+                    println!("E1_RESIZED");
+                    io::stdout().flush().unwrap();
+                }
+                Some(Event::Key(key)) => {
+                    route_selector_key(&mut model, key);
+                    if key.code == KeyCode::F(2) {
+                        opened = model.details.is_some();
+                        println!("E1_DETAILS");
+                        io::stdout().flush().unwrap();
+                    }
+                    if key.code == KeyCode::End {
+                        println!("E1_SCROLLED");
+                        io::stdout().flush().unwrap();
+                    }
+                    if key.code == KeyCode::Esc {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(opened && resized);
+        assert!(model.details.is_none());
+        assert_eq!(model.selected_target(), selected);
+        drop(shell);
+        println!("E1_COOKED");
+    }
     #[test]
     fn ui_contract_b2_return_context_and_independent_settings() {
         let rows = (0..70)

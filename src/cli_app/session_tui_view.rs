@@ -4,7 +4,7 @@ use ratatui::{
     layout::{Constraint, Rect},
     style::{Modifier, Style},
     text::Line,
-    widgets::{Block, Cell, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Block, Cell, Paragraph, Row, Table, TableState},
     Frame,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -12,6 +12,58 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ui_contract_e1_details_geometry_unicode_and_reachable_tail() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let text = format!(
+            "Name: {}\nFull path: C:\\work\\{}\\UNIQUE-END\nError: final-error-tail",
+            "中文e\u{301}👩‍💻 ".repeat(90),
+            "long-segment".repeat(90)
+        );
+        for (width, height) in [
+            (60, 18),
+            (80, 24),
+            (100, 30),
+            (120, 36),
+            (160, 48),
+            (240, 50),
+        ]
+        .into_iter()
+        .chain((70..=120).map(|w| (w, 18)))
+        {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            let scroll = DetailScroll::default();
+            terminal
+                .draw(|f| render_details(f, f.area(), "Inspector", &text, &scroll))
+                .unwrap();
+            assert!(scroll.total.get() > 1);
+            assert!(scroll.handle(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)));
+            terminal
+                .draw(|f| render_details(f, f.area(), "Inspector", &text, &scroll))
+                .unwrap();
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(rendered.contains("final-error-tail"), "{width}x{height}");
+            assert!(
+                rendered.replace(['│', ' '], "").contains("UNIQUE-END"),
+                "{width}x{height}"
+            );
+            assert!(scroll.handle(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)));
+            assert_eq!(scroll.offset.get(), 0);
+            for line in detail_lines(&text, (width - 2) as usize) {
+                assert!(line.width() <= (width - 2) as usize);
+            }
+        }
+        let raw = "中文 e\u{301} 👩‍💻 C:\\x\\identity";
+        assert_eq!(detail_lines(raw, 5).concat(), raw);
+        assert!(detail_lines("\u{1b}bad", 10).concat().contains("\\u{1b}"));
+    }
     #[test]
     fn ui_contract_c_v04_columns_fit_inner_width_without_zero_placeholders() {
         for width in 1..=240 {
@@ -346,7 +398,118 @@ pub(super) fn render_table(
         );
     }
 }
-pub(super) fn render_inspector(frame: &mut Frame<'_>, area: Rect, row: &AgentSessionView) {
+#[derive(Debug, Default, Clone)]
+pub(super) struct DetailScroll {
+    offset: std::cell::Cell<usize>,
+    page: std::cell::Cell<usize>,
+    total: std::cell::Cell<usize>,
+}
+impl DetailScroll {
+    pub(super) fn reset(&self) {
+        self.offset.set(0);
+    }
+    pub(super) fn handle(&self, key: crossterm::event::KeyEvent) -> bool {
+        use crossterm::event::{KeyCode, KeyEventKind};
+        if key.kind == KeyEventKind::Release || !key.modifiers.is_empty() {
+            return false;
+        }
+        let max = self.total.get().saturating_sub(self.page.get());
+        let next = match key.code {
+            KeyCode::Up => self.offset.get().saturating_sub(1),
+            KeyCode::Down => self.offset.get().saturating_add(1),
+            KeyCode::PageUp => self.offset.get().saturating_sub(self.page.get().max(1)),
+            KeyCode::PageDown => self.offset.get().saturating_add(self.page.get().max(1)),
+            KeyCode::Home => 0,
+            KeyCode::End => max,
+            _ => return false,
+        };
+        self.offset.set(next.min(max));
+        true
+    }
+}
+
+// Pre-wrap by terminal cells, retaining every printable scalar and whitespace.
+// Unlike word wrapping, long unbroken IDs/paths always have reachable tails.
+fn detail_lines(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for source in text.split('\n') {
+        let mut line = String::new();
+        let mut cells = 0;
+        for ch in source.chars() {
+            let printable = if ch.is_control() {
+                format!("\\u{{{:x}}}", ch as u32)
+            } else {
+                ch.to_string()
+            };
+            for ch in printable.chars() {
+                let size = ch.width().unwrap_or(0);
+                if cells + size > width.max(2) && !line.is_empty() {
+                    lines.push(std::mem::take(&mut line));
+                    cells = 0;
+                }
+                line.push(ch);
+                cells += size;
+            }
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+pub(super) fn render_details(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    text: &str,
+    scroll: &DetailScroll,
+) {
+    let block = Block::bordered().title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let page = usize::from(inner.height.saturating_sub(1));
+    let lines = detail_lines(text, usize::from(inner.width));
+    scroll.total.set(lines.len());
+    scroll.page.set(page);
+    let offset = scroll.offset.get().min(lines.len().saturating_sub(page));
+    scroll.offset.set(offset);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(offset)
+                .take(page)
+                .map(Line::from)
+                .collect::<Vec<_>>(),
+        ),
+        Rect {
+            height: page as u16,
+            ..inner
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(format!(
+            "↑↓ PgUp/Dn Home/End · Esc back · {}/{}",
+            offset + 1,
+            scroll.total.get()
+        ))
+        .style(Style::new().add_modifier(Modifier::BOLD)),
+        Rect {
+            y: inner.y + inner.height - 1,
+            height: 1,
+            ..inner
+        },
+    );
+}
+
+pub(super) fn render_inspector(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    row: &AgentSessionView,
+    scroll: &DetailScroll,
+) {
     let mut lines = vec![
         format!("Name: {}", row.name),
         format!("Identity: {:?}", row.subject),
@@ -383,11 +546,11 @@ pub(super) fn render_inspector(frame: &mut Frame<'_>, area: Rect, row: &AgentSes
     if let Some(note) = &row.retirement_note {
         lines.push(note.clone());
     }
-    lines.push("Read-only inspection · Esc returns · lifecycle actions deferred".into());
-    frame.render_widget(
-        Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
-            .wrap(Wrap { trim: false })
-            .block(Block::bordered().title(" Inspector ")),
+    render_details(
+        frame,
         area,
+        " Inspector · read only ",
+        &lines.join("\n"),
+        scroll,
     );
 }
