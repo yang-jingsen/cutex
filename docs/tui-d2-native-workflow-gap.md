@@ -1,5 +1,51 @@
 # D2 native workflow adapter decision — reference only
 
+## Follow-up after R13 adapter authorization
+
+R13 authorized the bounded native-only adapter; the initial authority question
+below is resolved. The current stop is a concrete native persistence boundary,
+not a renewed request to authorize ordinary adapter work.
+
+Three private, model-free observations:
+
+1. Direct native `thread/start` with `ephemeral=false` returned a thread ID and
+   rollout path. Immediate creator exit followed by fresh-process resume failed
+   `-32600: no rollout found`; no native files were present.
+2. Adding a `thread/read includeTurns=true` roundtrip returned `list_turns is not
+   supported yet`, but the subsequent fresh-process resume succeeded and native
+   files existed. Thus persistence is possible without a model turn; this does
+   not establish a reliable persistence acknowledgement.
+3. The actual new Rust application adapter used `thread/read includeTurns=false`
+   followed by creator drop and fresh-process resume. Read succeeded but resume
+   again failed `no rollout found`. It correctly returned uncertainty and never
+   wrote/adopted a Cutex identity. This is the second real failure of the
+   create/read/exit/resume experiment, so SOP section 11/real-platform stopping
+   guidance applies; no blind delay/retry loop or fabricated success was added.
+
+The unexposed adapter in `cli_app/session_native_workflow.rs` clears inherited
+environment, allowlists explicit profile/auth and normal terminal context,
+returns child status instead of process exit, and has a failing opt-in native
+oracle. It is reference-only, not ready to wire into forms. Catalog transport
+has only a constructor accepting an explicitly configured child Command.
+
+Exact executed native test:
+`cargo test --offline --locked --bin cutex ui_contract_d2_real_native_bootstrap -- --ignored --nocapture`
+with scrubbed environment, private HOME and
+`CUTEX_CODEX_BIN=/home/senxiu/Resources/Shortcuts/cute-codex`.
+Result: 1 selected, 0 passed, 1 failed at persistence proof. Log:
+`/tmp/cutex-d2-real-native.log`. The direct probe is
+`scripts/tui-d2-native-probe.py`; roots
+`/tmp/cutex-d2-native-uef2wq61` (failure) and
+`/tmp/cutex-d2-native-2mhhclq2` (success) are private evidence.
+No model prompt/turn, production HOME, service, identity or notification used.
+
+Next decision: obtain/verify a native persisted-thread acknowledgement (possibly
+the existing saved catalog `thread/list` boundary while keeping the creator
+alive), or defer New Agent bootstrap until a Human interactive first session is
+known resumable. A fixed sleep is not acknowledgement. No paid Hi recipe,
+native-history file writing, kernel changes or second-identity retry is proposed.
+Remaining D2 forms/member workflows are not implemented or accepted.
+
 Inspected accepted base `929c67d821f7c8efe9394ac066c9ec64dfc515d8`,
 tree `58d5df7c170883411101e7a1095031f97848f2e9`. No workflow is enabled by
 this document. D1R2 source remains unchanged.

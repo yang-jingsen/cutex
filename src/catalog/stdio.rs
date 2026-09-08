@@ -108,8 +108,19 @@ impl OwnedStdioEndpoint {
     pub fn spawn(options: StdioAppServerOptions) -> Result<Self, CatalogError> {
         validate_options(&options)?;
         let mut command = Command::new(&options.program);
+        command.args(&options.args);
+        Self::spawn_command(options, command)
+    }
+
+    /// Own an explicitly configured application child (for example a
+    /// native-only launch with a cleared inherited authority environment).
+    /// The transport still owns stdio, timeouts and child cleanup.
+    pub fn spawn_command(
+        options: StdioAppServerOptions,
+        mut command: Command,
+    ) -> Result<Self, CatalogError> {
+        validate_options(&options)?;
         command
-            .args(&options.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

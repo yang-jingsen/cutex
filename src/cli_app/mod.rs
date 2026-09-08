@@ -40,6 +40,7 @@ mod session_archive;
 mod session_attach;
 mod session_listing;
 mod session_management;
+mod session_native_workflow;
 mod session_presenter;
 mod session_reconcile;
 mod session_runtime;

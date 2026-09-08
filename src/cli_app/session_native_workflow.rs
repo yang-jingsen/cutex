@@ -1,0 +1,236 @@
+//! Native-only application boundary. No durable identity, roster or activation.
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus};
+
+use cutex::catalog::{CatalogEndpoint, OwnedStdioEndpoint, StdioAppServerOptions};
+use cutex::launch::command::LaunchCommand;
+use serde_json::{json, Value};
+
+#[derive(Clone, Debug)]
+pub(super) struct NativeLaunch {
+    pub cwd: PathBuf,
+    pub native_home: PathBuf,
+    pub profile: Option<String>,
+    pub model: Option<String>,
+}
+
+impl NativeLaunch {
+    fn command(&self, operation: &[String]) -> anyhow::Result<Command> {
+        anyhow::ensure!(
+            self.cwd.is_absolute() && self.cwd.is_dir(),
+            "native cwd must be an existing absolute directory"
+        );
+        anyhow::ensure!(
+            self.native_home.is_absolute(),
+            "native source home must be absolute"
+        );
+        let mut args = vec![
+            "--cd".into(),
+            self.cwd.to_string_lossy().into_owned(),
+            "-c".into(),
+            "notify=[]".into(),
+        ];
+        if let Some(model) = &self.model {
+            anyhow::ensure!(
+                !model.trim().is_empty() && !model.chars().any(char::is_control),
+                "invalid model"
+            );
+            args.extend(["--model".into(), model.clone()]);
+        }
+        args.extend_from_slice(operation);
+        let launch = if let Some(profile) = &self.profile {
+            let resolved = super::launch::resolve_launch_profile_override(profile)?;
+            anyhow::ensure!(
+                matches!(
+                    resolved.account.runtime,
+                    cutex::profiles::model::RuntimeConfig::Host
+                ) && resolved.account.cli_kind == cutex::profiles::model::CliKind::Codex,
+                "native-only workflow currently supports host Codex profiles only"
+            );
+            super::launch_command::codex_launch_command_with_prevalidated_profile(
+                &resolved.account,
+                &args,
+                false,
+                &[],
+                &resolved.files,
+            )?
+        } else {
+            LaunchCommand::new(cutex::launch::program::codex_program()).args(args)
+        };
+        Ok(isolated_command(&launch, &self.cwd, &self.native_home))
+    }
+
+    /// Called only inside TerminalShell handoff. Never exits the outer process
+    /// or retries a launch whose external result is unknown.
+    pub(super) fn interactive(&self, native_id: Option<&str>) -> anyhow::Result<ExitStatus> {
+        let operation = match native_id {
+            Some(id) => {
+                anyhow::ensure!(
+                    cutex::session::identity::normalize_codex_session_id(id)
+                        .ok()
+                        .as_deref()
+                        == Some(id),
+                    "exact native ID required"
+                );
+                vec!["resume".into(), id.into()]
+            }
+            None => Vec::new(),
+        };
+        self.command(&operation)?.status().map_err(|error| {
+            anyhow::anyhow!(
+                "native launch result unknown; inspect Recent before creating again: {error}"
+            )
+        })
+    }
+
+    pub(super) fn endpoint(&self) -> anyhow::Result<OwnedStdioEndpoint> {
+        let command = self.command(&["app-server".into(), "--stdio".into()])?;
+        let options = StdioAppServerOptions::new(command.get_program(), self.native_home.clone());
+        let mut endpoint = OwnedStdioEndpoint::spawn_command(options, command)?;
+        let initialized = endpoint.request("initialize", json!({"clientInfo": {"name":"cutex_native_workflow", "version":env!("CARGO_PKG_VERSION")}, "capabilities":{"experimentalApi":true}}))?;
+        anyhow::ensure!(
+            initialized.get("codexHome").and_then(Value::as_str) == self.native_home.to_str(),
+            "native source home mismatch"
+        );
+        endpoint.notify("initialized", None)?;
+        Ok(endpoint)
+    }
+
+    /// Call only after the owning workflow has durably recorded its intent.
+    /// A returned native ID is not success until the native provider can read
+    /// its persisted metadata. Never create a second thread on this path.
+    pub(super) fn bootstrap(&self) -> anyhow::Result<String> {
+        let mut endpoint = self.endpoint()?;
+        let created = endpoint.request("thread/start", json!({"cwd":self.cwd, "model":self.model,
+            "ephemeral":false, "approvalPolicy":"never", "sandbox":"read-only", "sessionStartSource":"startup"}))?;
+        let id = created
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                anyhow::anyhow!("native creation unknown: missing ID; do not retry creation")
+            })?
+            .to_string();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if endpoint
+                .request("thread/read", json!({"threadId":id, "includeTurns":false}))
+                .is_ok()
+            {
+                // A separate provider process must be able to resume this ID;
+                // memory in the creator alone is not durable evidence.
+                drop(endpoint);
+                let mut fresh = self.endpoint()?;
+                let resumed = fresh.request("thread/resume", json!({"threadId":id}))
+                    .map_err(|error| anyhow::anyhow!("native identity {id} created but persistence unconfirmed: {error}; do not create again"))?;
+                anyhow::ensure!(
+                    resumed.pointer("/thread/id").and_then(Value::as_str) == Some(id.as_str()),
+                    "native resume identity mismatch"
+                );
+                return Ok(id);
+            }
+            anyhow::ensure!(std::time::Instant::now() < deadline, "native identity {id} persistence unknown; inspect native history, do not create again");
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+}
+
+fn isolated_command(launch: &LaunchCommand, cwd: &Path, native_home: &Path) -> Command {
+    let mut command = Command::new(&launch.program);
+    command.env_clear().args(&launch.args).current_dir(cwd);
+    // Allowlist normal OS/terminal context; no ambient credentials, Cutex
+    // identity/task/management/runtime/notification state or config overrides.
+    for key in [
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "SYSTEMROOT",
+        "WINDIR",
+        "TERM",
+        "COLORTERM",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    for (key, value) in &launch.envs {
+        if matches!(
+            key.as_str(),
+            "CODEX_AUTH_FILE"
+                | "CODEX_CONFIG_FILE"
+                | "CODEX_INSTALL_DIR"
+                | "OPENAI_API_KEY"
+                | "HTTPS_PROXY"
+                | "HTTP_PROXY"
+                | "ALL_PROXY"
+                | "NO_PROXY"
+                | "https_proxy"
+                | "http_proxy"
+                | "all_proxy"
+                | "no_proxy"
+        ) {
+            command.env(key, value);
+        }
+    }
+    command.env("CODEX_HOME", native_home);
+    command
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn ui_contract_d2_native_environment_drops_authority_and_notifications() {
+        let launch = LaunchCommand::new("native")
+            .env("CUTEX_AGENT_ID", "parent")
+            .env("CUTEX_MANAGEMENT_TOKEN", "secret")
+            .env("CUTEX_TASK_ID", "task")
+            .env("CODEX_NOTIFY_URL", "notify")
+            .env("CODEX_AUTH_FILE", "/explicit/auth");
+        let command = isolated_command(&launch, Path::new("/tmp"), Path::new("/tmp/native"));
+        let env = command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert!(!env
+            .keys()
+            .any(|key| key.starts_with("CUTEX_") || key.contains("NOTIFY")));
+        assert_eq!(env["CODEX_AUTH_FILE"].as_deref(), Some("/explicit/auth"));
+        assert_eq!(env["CODEX_HOME"].as_deref(), Some("/tmp/native"));
+    }
+
+    #[test]
+    #[ignore = "explicit installed-native private protocol oracle; never sends a model turn"]
+    fn ui_contract_d2_real_native_bootstrap_persists_without_cutex_identity() {
+        let home =
+            crate::cli_app::test_home::IsolatedTestHome::new("cutex-d2-native-rust").unwrap();
+        let native_home = home.root().join("native");
+        std::fs::create_dir(&native_home).unwrap();
+        let durable = cutex::session::model::CutexSessionStore::default();
+        cutex::session::store::save_cutex_session_store(&durable).unwrap();
+        let path = cutex::session::store::cutex_sessions_path().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let provider = cutex::agent_management::AgentManagementStore::open_default().unwrap();
+        let roster = provider.snapshot().unwrap();
+        let launch = NativeLaunch {
+            cwd: home.root().into(),
+            native_home,
+            profile: None,
+            model: None,
+        };
+        let id = launch.bootstrap().unwrap();
+        assert!(!id.is_empty());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert_eq!(provider.snapshot().unwrap(), roster);
+    }
+}
