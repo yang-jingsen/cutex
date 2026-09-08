@@ -370,6 +370,20 @@ pub(super) fn member_view(
     }
 }
 
+pub(super) fn project_member_view(
+    member: &ProjectMemberProjection,
+    project: &CutexProjectWorkspace,
+    role: &str,
+) -> AgentSessionView {
+    let mut view = member_view(member, &project.presentation.display_name, role);
+    view.project_id = Some(project.project_id.to_string());
+    view.badge = (!project.presentation.badge_label.is_empty()).then(|| ProjectBadge {
+        label: project.presentation.badge_label.clone(),
+        color: project.presentation.color,
+    });
+    view
+}
+
 pub(super) fn project_members(project: &CutexProjectWorkspace) -> Vec<AgentSessionView> {
     let mut members = std::collections::BTreeMap::<SubjectRef, AgentSessionView>::new();
     for (member, role) in project
@@ -385,12 +399,7 @@ pub(super) fn project_members(project: &CutexProjectWorkspace) -> Vec<AgentSessi
         )
         .chain(project.active_agents.iter().map(|m| (m, "Member")))
     {
-        let mut view = member_view(member, &project.presentation.display_name, role);
-        view.project_id = Some(project.project_id.to_string());
-        view.badge = Some(ProjectBadge {
-            label: project.presentation.badge_label.clone(),
-            color: project.presentation.color,
-        });
+        let view = project_member_view(member, project, role);
         members
             .entry(view.subject.clone())
             .and_modify(|existing| {
@@ -414,7 +423,7 @@ pub(super) fn project_members(project: &CutexProjectWorkspace) -> Vec<AgentSessi
                 view.role = format!("Director/{}", view.role);
             })
             .or_insert(AgentSessionView {
-                badge: Some(ProjectBadge {
+                badge: (!project.presentation.badge_label.is_empty()).then(|| ProjectBadge {
                     label: project.presentation.badge_label.clone(),
                     color: project.presentation.color,
                 }),

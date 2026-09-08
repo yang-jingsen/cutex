@@ -592,8 +592,7 @@ fn visible_members(model: &CutexProjectsModel) -> Vec<AgentSessionView> {
     let mut rows = views::project_members(project);
     if model.show_archived_members {
         for member in &project.archived_agents {
-            let mut view =
-                views::member_view(member, project.project_id.as_str(), "Member (archived)");
+            let mut view = views::project_member_view(member, project, "Member (archived)");
             view.retirement_note =
                 Some("Reversibly archived; membership retained; no runtime activation".into());
             rows.push(view);
@@ -1897,14 +1896,16 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel) {
         columns[0].1 = width - 65;
         columns.push(("Project ID", 35));
     }
-    let rows = visible.iter().map(|index| {
+    let rows = visible.iter().enumerate().map(|(row_index, index)| {
         let project = &model.projects[*index];
         Row::new(
             columns
                 .iter()
                 .map(|(column, width)| {
+                    if *column == "Name" {
+                        return Cell::from(project_name_line(project, usize::from(*width)));
+                    }
                     let value = match *column {
-                        "Name" => project.presentation.display_name.clone(),
                         "Director" => project.director_name.clone().unwrap_or_else(|| {
                             project.director_cutex_session_id.as_str().to_owned()
                         }),
@@ -1915,6 +1916,14 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel) {
                 })
                 .collect::<Vec<_>>(),
         )
+        .style(if row_index == model.selected {
+            Style::new()
+                .bg(Color::Blue)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new()
+        })
     });
     let table = Table::new(
         rows,
@@ -1931,12 +1940,9 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel) {
     } else {
         " Cutex Projects "
     }))
-    .row_highlight_style(
-        Style::new()
-            .bg(Color::Blue)
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-    )
+    // Each row owns its selection base so the configured badge span remains
+    // visible on the selected row instead of being erased by a late highlight.
+    .row_highlight_style(Style::new())
     .highlight_symbol("> ");
     let mut state = model.table_state.borrow_mut();
     state.select((!visible.is_empty()).then_some(model.selected));
@@ -1957,6 +1963,51 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel) {
             },
         );
     }
+}
+
+fn project_name_line(project: &CutexProjectSummary, width: usize) -> Line<'static> {
+    if width == 0 {
+        return Line::default();
+    }
+    let label = views::clipped(&project.presentation.badge_label, 2);
+    let badge_width = width.min(4);
+    let badge = if label.is_empty() {
+        Span::raw(" ".repeat(badge_width))
+    } else if badge_width < 4 {
+        Span::styled(
+            format!(
+                "{}{}",
+                label,
+                " ".repeat(
+                    badge_width
+                        .saturating_sub(unicode_width::UnicodeWidthStr::width(label.as_str()))
+                )
+            ),
+            project_badge_style(project.presentation.color),
+        )
+    } else {
+        Span::styled(
+            format!(
+                " {}{} ",
+                label,
+                " ".repeat(
+                    2usize.saturating_sub(unicode_width::UnicodeWidthStr::width(label.as_str()))
+                )
+            ),
+            project_badge_style(project.presentation.color),
+        )
+    };
+    let mut spans = vec![badge];
+    if width > 4 {
+        spans.push(Span::raw(" "));
+    }
+    if width > 5 {
+        spans.push(Span::raw(views::clipped(
+            &project.presentation.display_name,
+            width - 5,
+        )));
+    }
+    Line::from(spans)
 }
 
 fn render_details(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel) {
@@ -3208,6 +3259,32 @@ mod tests {
         format!("{:?}", terminal.backend().buffer())
     }
 
+    fn rendered_buffer(
+        model: &CutexProjectsModel,
+        width: u16,
+        height: u16,
+    ) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| render(frame, model)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn badge_cell(buffer: &ratatui::buffer::Buffer, label: &str) -> (u16, u16) {
+        let symbols = label.chars().map(|c| c.to_string()).collect::<Vec<_>>();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width.saturating_sub(symbols.len() as u16 - 1) {
+                if symbols
+                    .iter()
+                    .enumerate()
+                    .all(|(offset, symbol)| buffer[(x + offset as u16, y)].symbol() == symbol)
+                {
+                    return (x, y);
+                }
+            }
+        }
+        panic!("badge {label:?} not rendered");
+    }
+
     #[test]
     fn ui_contract_k09_project_spaces_and_paste_parity() {
         for create in [false, true] {
@@ -3658,6 +3735,142 @@ mod tests {
         assert_eq!(style.fg, Some(Color::Black));
         assert_eq!(style.bg, Some(Color::LightMagenta));
         assert!(rendered(&model_with_projects(), 90, 18).contains("Render Lab"));
+    }
+
+    #[test]
+    fn projects_rows_show_configured_badges_selected_narrow_wide_and_blank_slot() {
+        let mut model = model_with_projects();
+        model.projects[0].presentation.badge_label = "QZ".into();
+        model.projects[0].presentation.color = ProjectPaletteColor::Green;
+        model.selected = 1;
+        model.projects.push(project(
+            "no-badge",
+            "No Badge",
+            "",
+            ProjectPaletteColor::Red,
+        ));
+
+        let wide = rendered_buffer(&model, 90, 18);
+        let (qx, qy) = badge_cell(&wide, "QZ");
+        assert_eq!(wide[(qx, qy)].bg, Color::LightGreen);
+        assert_eq!(wide[(qx, qy)].fg, Color::Black);
+        let (cx, cy) = badge_cell(&wide, "CX");
+        assert_eq!(wide[(cx, cy)].bg, Color::LightMagenta);
+        assert_eq!(wide[(cx, cy)].fg, Color::Black);
+        assert_eq!(wide[(cx + 4, cy)].bg, Color::Blue, "selected row base");
+
+        let text = (0..wide.area.height)
+            .map(|y| {
+                (0..wide.area.width).fold(String::new(), |mut line, x| {
+                    line.push_str(wide[(x, y)].symbol());
+                    line
+                })
+            })
+            .collect::<Vec<_>>();
+        let starts = ["Cutex Stack Main", "Render Lab", "No Badge"].map(|name| {
+            text.iter()
+                .find_map(|line| line.find(name))
+                .unwrap_or_else(|| panic!("missing project name {name}"))
+        });
+        assert_eq!(starts[0], starts[1]);
+        assert_eq!(
+            starts[1], starts[2],
+            "unset badge keeps the fixed blank slot"
+        );
+        assert!(
+            wide.content.iter().all(|cell| cell.bg != Color::LightRed),
+            "unset badge must not paint its configured color"
+        );
+
+        model.selected = 0;
+        let narrow = rendered_buffer(&model, 10, 12);
+        let (x, y) = badge_cell(&narrow, "QZ");
+        assert_eq!(narrow[(x, y)].bg, Color::LightGreen);
+        assert_eq!(narrow[(x, y)].fg, Color::Black);
+    }
+
+    #[test]
+    fn archived_project_member_reuses_configured_badge_projection() {
+        use cutex::agent_management::{
+            EffectiveProjectPresentation, ManagedAgentRecord, ManagedAgentSpec,
+            ProjectDirectorProjection, ProjectId, ProjectLifecycle, ProjectMemberProjection,
+        };
+        use cutex::role_revision::{CutexSessionId, Rfc3339};
+        let member = ProjectMemberProjection {
+            agent: ManagedAgentRecord {
+                project_id: Some(ProjectId::new("render-lab").unwrap()),
+                created_by_director_session: Some(CutexSessionId::new("cutex.director").unwrap()),
+                created_by_operator_session: None,
+                cutex_session_id: CutexSessionId::new("cutex.archived").unwrap(),
+                native_session_id: "native-archived".into(),
+                spec: ManagedAgentSpec {
+                    name: "Formal Archived Agent".into(),
+                    cwd: "/private/archived".into(),
+                    profile: Some("aemeath".into()),
+                    runtime_backend: "app_server".into(),
+                    model: "gpt-test".into(),
+                    reasoning: "medium".into(),
+                    permissions: "default".into(),
+                    approval_policy: "never".into(),
+                    sandbox_mode: "workspace-write".into(),
+                    groups: vec!["workers".into()],
+                    expose_to_im: false,
+                    pin: false,
+                },
+                created_at: Rfc3339::new("2026-09-09T00:00:00Z").unwrap(),
+                retired_at: None,
+            },
+            lifecycle: ProjectMemberLifecycle::Offline,
+            runtime: None,
+            observation_error: None,
+        };
+        let project = CutexProjectWorkspace {
+            project_id: ProjectId::new("render-lab").unwrap(),
+            authority_epoch: 1,
+            lifecycle: ProjectLifecycle::Active,
+            project_revision: 1,
+            director: ProjectDirectorProjection {
+                cutex_session_id: CutexSessionId::new("cutex.director").unwrap(),
+                member: None,
+            },
+            access_role: ProjectAccessRole::HumanManagement,
+            operator_grant_revision: 0,
+            agent_operators: Vec::new(),
+            presentation: EffectiveProjectPresentation {
+                display_name: "Render Lab".into(),
+                badge_label: "CX".into(),
+                color: ProjectPaletteColor::Magenta,
+                revision: 2,
+                stored: true,
+            },
+            active_agents: Vec::new(),
+            archived_agents: vec![member],
+            retired_agents: Vec::new(),
+            legacy_operator_repair_candidates: Vec::new(),
+        };
+        let mut model = model_with_projects();
+        model.details = Some(project);
+        model.show_archived_members = true;
+        let rows = visible_members(&model);
+        let archived = rows
+            .iter()
+            .find(|row| row.name == "Formal Archived Agent")
+            .expect("archived member row");
+        assert_eq!(archived.project_id.as_deref(), Some("render-lab"));
+        assert_eq!(
+            archived.badge.as_ref().map(|badge| badge.label.as_str()),
+            Some("CX")
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(70, 10)).unwrap();
+        let mut state = TableState::default().with_selected(Some(0));
+        terminal
+            .draw(|frame| {
+                views::render_table(frame, frame.area(), &rows, ListKind::Members, &mut state)
+            })
+            .unwrap();
+        let (x, y) = badge_cell(terminal.backend().buffer(), "CX");
+        assert_eq!(terminal.backend().buffer()[(x, y)].bg, Color::LightMagenta);
     }
 
     #[test]
