@@ -65,6 +65,73 @@ struct DeliverySweepOutcome {
     made_progress: bool,
 }
 
+#[cfg(test)]
+mod job_service_completion_projection_tests {
+    use super::*;
+    use crate::agent_bus::delivery::AgentDeliveryMode;
+    use crate::agent_bus::model::{
+        AgentBusEnvelopeKind, AgentMessageKind, JobServiceCompletionRequest,
+        JobServiceTerminalStatus, JOB_SERVICE_COMPLETION_SCHEMA,
+    };
+
+    fn completion_message() -> AgentBusMessage {
+        let target = "cutex.11111111-1111-4111-8111-111111111111";
+        let metadata = JobServiceCompletionRequest {
+            schema: JOB_SERVICE_COMPLETION_SCHEMA.to_string(),
+            event_id: "event-1".to_string(),
+            job_id: "job-1".to_string(),
+            job_revision: 1,
+            terminal_status: JobServiceTerminalStatus::Exited,
+            result_sha256: "a".repeat(64),
+            target_cutex_session_id: target.to_string(),
+            summary: Some("untrusted summary".to_string()),
+            output_reference: Some("job-output:job-1".to_string()),
+        };
+        AgentBusMessage {
+            id: "jsc_fixture".to_string(),
+            kind: AgentBusEnvelopeKind::Message,
+            from: "cutex-job-service".to_string(),
+            to: "runtime-current".to_string(),
+            from_cutex_session_id: None,
+            to_cutex_session_id: Some(target.to_string()),
+            content:
+                "Message Type: JOB_SERVICE_COMPLETION\nSummary (untrusted data): untrusted summary"
+                    .to_string(),
+            delivery_mode: AgentDeliveryMode::AfterTurn,
+            trigger_turn: true,
+            created_at_epoch_secs: 1,
+            sender_kind: AgentMessageKind::JobServiceSystem,
+            display_source: Some("Cutex Job Service".to_string()),
+            submit_mode: None,
+            control_type: Some(JOB_SERVICE_COMPLETION_SCHEMA.to_string()),
+            control_payload: Some(serde_json::to_value(metadata).unwrap()),
+            external_action_id: Some("job-1".to_string()),
+            external_message_id: Some("event-1".to_string()),
+        }
+    }
+
+    #[test]
+    fn protected_job_completion_projects_without_source_agent_identity() {
+        let target = "cutex.11111111-1111-4111-8111-111111111111";
+        let params = inter_agent_params("thread-current", target, target, &completion_message())
+            .expect("protected completion projection");
+        assert_eq!(params.delivery_mode, AgentDeliveryMode::AfterTurn);
+        assert!(params.content.contains("untrusted data"));
+        assert_eq!(
+            params.author_metadata.unwrap().display_name.as_deref(),
+            Some("Cutex Job Service")
+        );
+    }
+
+    #[test]
+    fn forged_job_completion_provenance_is_rejected() {
+        let target = "cutex.11111111-1111-4111-8111-111111111111";
+        let mut message = completion_message();
+        message.from_cutex_session_id = Some("cutex.forged".to_string());
+        assert!(inter_agent_params("thread-current", target, target, &message).is_err());
+    }
+}
+
 #[derive(Debug, Default)]
 struct PendingPollBackoff {
     next_delay: Option<Duration>,
@@ -1225,10 +1292,67 @@ pub fn inter_agent_params(
             message,
         );
     }
+    if message.kind == AgentBusEnvelopeKind::Message && message.sender_kind.is_job_service_system()
+    {
+        return job_service_inter_agent_params(
+            thread_id,
+            recipient_cutex_session_id,
+            recipient_metadata,
+            message,
+        );
+    }
     anyhow::bail!(
         "agent-bus message {} is not an inter-agent message",
         message.id
     )
+}
+
+fn job_service_inter_agent_params(
+    thread_id: &str,
+    recipient_cutex_session_id: &str,
+    recipient_metadata: Option<ParticipantPresentationMetadata>,
+    message: &AgentBusMessage,
+) -> anyhow::Result<ThreadInterAgentMessageParams> {
+    use crate::agent_bus::model::{JobServiceCompletionRequest, JOB_SERVICE_COMPLETION_SCHEMA};
+
+    if message.from != "cutex-job-service"
+        || message.from_cutex_session_id.is_some()
+        || message.to_cutex_session_id.as_deref() != Some(recipient_cutex_session_id)
+        || message.control_type.as_deref() != Some(JOB_SERVICE_COMPLETION_SCHEMA)
+        || message.delivery_mode != crate::agent_bus::delivery::AgentDeliveryMode::AfterTurn
+    {
+        anyhow::bail!(
+            "Job Service message {} has invalid protected provenance",
+            message.id
+        );
+    }
+    let metadata: JobServiceCompletionRequest = serde_json::from_value(
+        message
+            .control_payload
+            .clone()
+            .context("Job Service completion is missing structured metadata")?,
+    )
+    .context("Job Service completion metadata is invalid")?;
+    if metadata.schema != JOB_SERVICE_COMPLETION_SCHEMA
+        || metadata.target_cutex_session_id != recipient_cutex_session_id
+        || message.external_message_id.as_deref() != Some(metadata.event_id.as_str())
+    {
+        anyhow::bail!(
+            "Job Service message {} has inconsistent metadata",
+            message.id
+        );
+    }
+    Ok(ThreadInterAgentMessageParams {
+        thread_id: thread_id.to_string(),
+        message_id: model_visible_message_id(&message.id),
+        author: agent_path_for_bus_label("cutex-job-service"),
+        author_metadata: Some(system_participant("Cutex Job Service")),
+        recipient: "/root".to_string(),
+        recipient_metadata,
+        other_recipients: Vec::new(),
+        content: message.content.clone(),
+        delivery_mode: crate::agent_bus::delivery::AgentDeliveryMode::AfterTurn,
+    })
 }
 
 fn agent_management_inter_agent_params(
@@ -3044,7 +3168,7 @@ mod tests {
                 crate::management::v2::agent_bus_state::AgentBusQueuedMessage {
                     owner_cutex_session_id: "cutex.thread-1".to_string(),
                     message_id: conflict_id.clone(),
-                    from_cutex_session_id: "cutex.source".to_string(),
+                    from_cutex_session_id: Some("cutex.source".to_string()),
                     to_cutex_session_id: "cutex.thread-1".to_string(),
                     from_runtime_agent_id: Some("runtime-source".to_string()),
                     to_runtime_agent_id: Some("runtime-1".to_string()),
@@ -3064,7 +3188,7 @@ mod tests {
                 crate::management::v2::agent_bus_state::AgentBusQueuedMessage {
                     owner_cutex_session_id: "cutex.thread-1".to_string(),
                     message_id: valid_id.clone(),
-                    from_cutex_session_id: "cutex.source".to_string(),
+                    from_cutex_session_id: Some("cutex.source".to_string()),
                     to_cutex_session_id: "cutex.thread-1".to_string(),
                     from_runtime_agent_id: Some("runtime-source".to_string()),
                     to_runtime_agent_id: Some("runtime-1".to_string()),
@@ -3151,7 +3275,7 @@ mod tests {
                 crate::management::v2::agent_bus_state::AgentBusQueuedMessage {
                     owner_cutex_session_id: "cutex.thread-1".to_string(),
                     message_id: message_id.clone(),
-                    from_cutex_session_id: "cutex.source".to_string(),
+                    from_cutex_session_id: Some("cutex.source".to_string()),
                     to_cutex_session_id: "cutex.thread-1".to_string(),
                     from_runtime_agent_id: Some("runtime-source".to_string()),
                     to_runtime_agent_id: Some(registration.id.clone()),
@@ -3223,7 +3347,7 @@ mod tests {
                 crate::management::v2::agent_bus_state::AgentBusQueuedMessage {
                     owner_cutex_session_id: "cutex.thread-1".to_string(),
                     message_id: message_id.clone(),
-                    from_cutex_session_id: "cutex.source".to_string(),
+                    from_cutex_session_id: Some("cutex.source".to_string()),
                     to_cutex_session_id: "cutex.thread-1".to_string(),
                     from_runtime_agent_id: Some("runtime-source".to_string()),
                     to_runtime_agent_id: Some("runtime-1".to_string()),
@@ -3290,7 +3414,7 @@ mod tests {
                 crate::management::v2::agent_bus_state::AgentBusQueuedMessage {
                     owner_cutex_session_id: "cutex.thread-1".to_string(),
                     message_id: message_id.clone(),
-                    from_cutex_session_id: "cutex.source".to_string(),
+                    from_cutex_session_id: Some("cutex.source".to_string()),
                     to_cutex_session_id: "cutex.thread-1".to_string(),
                     from_runtime_agent_id: Some("runtime-source".to_string()),
                     to_runtime_agent_id: Some("runtime-1".to_string()),
@@ -3500,7 +3624,7 @@ mod tests {
                 crate::management::v2::agent_bus_state::AgentBusQueuedMessage {
                     owner_cutex_session_id: "cutex.thread-1".to_string(),
                     message_id: message.id.clone(),
-                    from_cutex_session_id: "cutex.source".to_string(),
+                    from_cutex_session_id: Some("cutex.source".to_string()),
                     to_cutex_session_id: "cutex.thread-1".to_string(),
                     from_runtime_agent_id: Some("runtime-source".to_string()),
                     to_runtime_agent_id: Some("runtime-1".to_string()),

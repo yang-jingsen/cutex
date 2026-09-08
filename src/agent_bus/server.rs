@@ -35,6 +35,10 @@ use crate::agent_bus::model::AgentBusPollResponse;
 use crate::agent_bus::model::AgentBusSendRequest;
 use crate::agent_bus::model::AgentBusUnregisterRequest;
 use crate::agent_bus::model::{
+    JobServiceCompletionQuery, JobServiceCompletionReceipt, JobServiceCompletionRequest,
+    JOB_SERVICE_COMPLETION_MAX_BODY_BYTES,
+};
+use crate::agent_bus::model::{
     TaskServiceActionOutcome, TaskServiceActionResponse, TaskServiceActionResponseSchema,
     TaskServiceQueryOutcome, TaskServiceQueryResponse, TaskServiceQueryResponseSchema,
     TaskServiceWorkerContextOutcome, TaskServiceWorkerContextResponse,
@@ -2771,12 +2775,22 @@ pub struct AgentBusRequestHandlers {
         AgentManagementInvocation,
         AgentManagementRequest,
     ) -> anyhow::Result<Value>,
+    pub job_service_completion: fn(
+        &Arc<Mutex<AgentBusState>>,
+        &crate::agent_bus::identity::JobServiceSystemPrincipal,
+        JobServiceCompletionRequest,
+    ) -> anyhow::Result<JobServiceCompletionReceipt>,
+    pub job_service_completion_query: fn(
+        &crate::agent_bus::identity::JobServiceSystemPrincipal,
+        JobServiceCompletionQuery,
+    ) -> anyhow::Result<JobServiceCompletionReceipt>,
 }
 
 pub fn handle_agent_bus_request(
     stream: &mut TcpStream,
     state: &Arc<Mutex<AgentBusState>>,
     token: Option<&str>,
+    job_service_token: Option<&str>,
     handlers: AgentBusRequestHandlers,
     task_actions: &Arc<TaskWorkerActionHost>,
 ) -> anyhow::Result<()> {
@@ -2959,6 +2973,78 @@ pub fn handle_agent_bus_request(
                 }
             };
             write_json_response(stream, 200, "OK", &response)
+        }
+        ("POST", "/api/job-service/v1/completions") => {
+            let Some(route_token) = job_service_token.filter(|value| !value.is_empty()) else {
+                return write_http_response(
+                    stream,
+                    503,
+                    "Service Unavailable",
+                    "text/plain",
+                    b"Job Service completion credential unavailable",
+                );
+            };
+            if require_service_bridge_token(&request, Some(route_token), "Job Service completion")
+                .is_err()
+            {
+                return write_http_response(
+                    stream,
+                    401,
+                    "Unauthorized",
+                    "text/plain",
+                    b"Unauthorized Job Service completion request",
+                );
+            }
+            if request.body.len() > JOB_SERVICE_COMPLETION_MAX_BODY_BYTES {
+                return write_http_response(
+                    stream,
+                    413,
+                    "Payload Too Large",
+                    "text/plain",
+                    b"Job Service completion request exceeds route limit",
+                );
+            }
+            let payload: JobServiceCompletionRequest = serde_json::from_slice(&request.body)
+                .context("strict Job Service completion parsing failed")?;
+            let principal = crate::agent_bus::identity::job_service_system_principal();
+            let response = (handlers.job_service_completion)(state, &principal, payload)?;
+            write_json_response(stream, 200, "OK", &serde_json::to_value(response)?)
+        }
+        ("POST", "/api/job-service/v1/completions/query") => {
+            let Some(route_token) = job_service_token.filter(|value| !value.is_empty()) else {
+                return write_http_response(
+                    stream,
+                    503,
+                    "Service Unavailable",
+                    "text/plain",
+                    b"Job Service completion credential unavailable",
+                );
+            };
+            if require_service_bridge_token(&request, Some(route_token), "Job Service completion")
+                .is_err()
+            {
+                return write_http_response(
+                    stream,
+                    401,
+                    "Unauthorized",
+                    "text/plain",
+                    b"Unauthorized Job Service completion request",
+                );
+            }
+            if request.body.len() > JOB_SERVICE_COMPLETION_MAX_BODY_BYTES {
+                return write_http_response(
+                    stream,
+                    413,
+                    "Payload Too Large",
+                    "text/plain",
+                    b"Job Service completion query exceeds route limit",
+                );
+            }
+            let payload: JobServiceCompletionQuery = serde_json::from_slice(&request.body)
+                .context("strict Job Service completion query parsing failed")?;
+            let principal = crate::agent_bus::identity::job_service_system_principal();
+            let response = (handlers.job_service_completion_query)(&principal, payload)?;
+            write_json_response(stream, 200, "OK", &serde_json::to_value(response)?)
         }
         ("POST", "/api/rotation/v1/release") => {
             if request.body.len() > crate::rotation::RELEASE_ROTATION_MAX_MESSAGE_BYTES + 16 * 1024
@@ -7747,6 +7833,8 @@ mod tests {
             send_payload_response: counted_unreachable_send,
             release_rotation: counted_unreachable_rotation,
             agent_management: counted_unreachable_agent_management,
+            job_service_completion: |_, _, _| anyhow::bail!("unreachable Job Service submit"),
+            job_service_completion_query: |_, _| anyhow::bail!("unreachable Job Service query"),
         }
     }
 
@@ -9226,6 +9314,15 @@ mod tests {
         state: Arc<Mutex<AgentBusState>>,
         host: Arc<TaskWorkerActionHost>,
     ) -> Vec<u8> {
+        invoke_route_with_handlers(request, state, host, task_route_handlers())
+    }
+
+    fn invoke_route_with_handlers(
+        request: Vec<u8>,
+        state: Arc<Mutex<AgentBusState>>,
+        host: Arc<TaskWorkerActionHost>,
+        handlers: AgentBusRequestHandlers,
+    ) -> Vec<u8> {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let mut client = TcpStream::connect(address).unwrap();
@@ -9236,7 +9333,8 @@ mod tests {
             &mut server,
             &state,
             Some("route-token"),
-            task_route_handlers(),
+            Some("job-service-route-token"),
+            handlers,
             &host,
         ) {
             write_http_response(
@@ -9259,6 +9357,74 @@ mod tests {
             .position(|window| window == b"\r\n\r\n")
             .unwrap();
         serde_json::from_slice(&response[split + 4..]).unwrap()
+    }
+
+    #[test]
+    fn job_service_completion_route_rejects_the_agent_bus_credential() {
+        let fixture = worker_host_fixture("job-service-auth-separation");
+        let before = route_no_write_observer(&fixture);
+        let request = raw_task_route_request(
+            "/api/job-service/v1/completions",
+            "route-token",
+            "runtime-worker",
+            b"{}",
+        );
+        let response = invoke_task_route(
+            request,
+            Arc::clone(&fixture.state),
+            Arc::clone(&fixture.host),
+        );
+        assert!(response.starts_with(b"HTTP/1.1 401 Unauthorized"));
+        assert_route_no_write_observer(&fixture, &before, "job service wrong credential");
+    }
+
+    #[test]
+    fn job_service_completion_route_mints_principal_only_after_dedicated_auth() {
+        fn accepted(
+            _state: &Arc<Mutex<AgentBusState>>,
+            principal: &crate::agent_bus::identity::JobServiceSystemPrincipal,
+            request: JobServiceCompletionRequest,
+        ) -> anyhow::Result<JobServiceCompletionReceipt> {
+            assert!(principal.authenticate());
+            Ok(JobServiceCompletionReceipt {
+                schema: crate::agent_bus::model::JOB_SERVICE_COMPLETION_SCHEMA.to_string(),
+                status: "committed".to_string(),
+                event_id: request.event_id,
+                message_id: Some("jsc_fixture".to_string()),
+                disposition: crate::agent_bus::model::JobServiceCompletionDisposition::Pending,
+                deduplicated: false,
+                a4_receipt: None,
+                error_code: None,
+            })
+        }
+
+        let fixture = worker_host_fixture("job-service-authenticated-route");
+        let mut handlers = task_route_handlers();
+        handlers.job_service_completion = accepted;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "schema": "cutex.job_service.completion.v1",
+            "eventId": "event-1",
+            "jobId": "job-1",
+            "jobRevision": 1,
+            "terminalStatus": "exited",
+            "resultSha256": "a".repeat(64),
+            "targetCutexSessionId": "cutex.11111111-1111-4111-8111-111111111111"
+        }))
+        .unwrap();
+        let request = raw_task_route_request(
+            "/api/job-service/v1/completions",
+            "job-service-route-token",
+            "ignored-model-sender",
+            &body,
+        );
+        let response = invoke_route_with_handlers(
+            request,
+            Arc::clone(&fixture.state),
+            Arc::clone(&fixture.host),
+            handlers,
+        );
+        assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+        assert_eq!(http_json(&response)["eventId"], "event-1");
     }
 
     #[test]

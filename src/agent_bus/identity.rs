@@ -24,6 +24,25 @@ impl TaskServiceSystemPrincipal {
     }
 }
 
+/// Opaque proof that a completion entered through the dedicated local Job
+/// Service credential. It has no wire representation and cannot be supplied
+/// in an ordinary Agent Bus message body.
+pub struct JobServiceSystemPrincipal {
+    protocol: &'static str,
+}
+
+pub(crate) fn job_service_system_principal() -> JobServiceSystemPrincipal {
+    JobServiceSystemPrincipal {
+        protocol: crate::agent_bus::model::JOB_SERVICE_COMPLETION_SCHEMA,
+    }
+}
+
+impl JobServiceSystemPrincipal {
+    pub fn authenticate(&self) -> bool {
+        self.protocol == crate::agent_bus::model::JOB_SERVICE_COMPLETION_SCHEMA
+    }
+}
+
 /// Opaque proof that a message originates after Agent Management has
 /// authorized and begun a service action. It has no wire representation and
 /// cannot be constructed from an Agent-authored request.

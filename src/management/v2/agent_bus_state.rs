@@ -36,7 +36,7 @@ static AGENT_BUS_MESSAGE_REPOSITORY: OnceLock<AgentBusMessageRepository> = OnceL
 #[serde(rename_all = "camelCase")]
 pub struct AgentBusMessageSnapshot {
     pub message_id: String,
-    pub from_cutex_session_id: String,
+    pub from_cutex_session_id: Option<String>,
     pub to_cutex_session_id: String,
     pub delivery_mode: String,
     pub content: String,
@@ -80,7 +80,7 @@ pub struct AgentBusMessageRepository {
 pub struct AgentBusQueuedMessage {
     pub owner_cutex_session_id: String,
     pub message_id: String,
-    pub from_cutex_session_id: String,
+    pub from_cutex_session_id: Option<String>,
     pub to_cutex_session_id: String,
     pub from_runtime_agent_id: Option<String>,
     pub to_runtime_agent_id: Option<String>,
@@ -148,9 +148,26 @@ impl AgentBusMessageRepository {
         })
     }
 
-    pub fn record_queued(&self, message: AgentBusQueuedMessage) -> anyhow::Result<()> {
+    /// Returns `true` only for the first durable commit and `false` for an
+    /// exact replay of the same message identity and semantic content.
+    pub fn record_queued(&self, message: AgentBusQueuedMessage) -> anyhow::Result<bool> {
+        self.record_queued_internal(message, true)
+    }
+
+    #[cfg(test)]
+    fn record_queued_isolated(&self, message: AgentBusQueuedMessage) -> anyhow::Result<bool> {
+        self.record_queued_internal(message, false)
+    }
+
+    fn record_queued_internal(
+        &self,
+        message: AgentBusQueuedMessage,
+        record_management_event: bool,
+    ) -> anyhow::Result<bool> {
         validate_session_identity(&message.owner_cutex_session_id)?;
-        validate_session_identity(&message.from_cutex_session_id)?;
+        if let Some(from) = message.from_cutex_session_id.as_deref() {
+            validate_session_identity(from)?;
+        }
         validate_session_identity(&message.to_cutex_session_id)?;
         if message.message_id.is_empty() {
             anyhow::bail!("agent-bus messageId must not be empty");
@@ -168,35 +185,38 @@ impl AgentBusMessageRepository {
         ) {
             anyhow::bail!("agent-bus delivery mode is outside the v2 contract");
         }
-        if let Some(existing) = self.get(&message.message_id)? {
-            if existing.owner_cutex_session_id == message.owner_cutex_session_id
-                && existing.snapshot.from_cutex_session_id == message.from_cutex_session_id
-                && existing.snapshot.to_cutex_session_id == message.to_cutex_session_id
-                && existing.snapshot.delivery_mode == message.delivery_mode
-                && existing.snapshot.content == message.content
-                && existing.snapshot.semantic_sha256.as_deref()
-                    == Some(message.semantic_sha256.as_str())
-            {
-                return Ok(());
+        self.with_lock(|path| {
+            let mut store = load_store(path)?;
+            if let Some(existing) = store.messages.get(&message.message_id) {
+                if existing.owner_cutex_session_id == message.owner_cutex_session_id
+                    && existing.snapshot.from_cutex_session_id == message.from_cutex_session_id
+                    && existing.snapshot.to_cutex_session_id == message.to_cutex_session_id
+                    && existing.snapshot.delivery_mode == message.delivery_mode
+                    && existing.snapshot.content == message.content
+                    && existing.snapshot.semantic_sha256.as_deref()
+                        == Some(message.semantic_sha256.as_str())
+                {
+                    return Ok(false);
+                }
+                anyhow::bail!("agent-bus messageId was reused with different canonical content");
             }
-            anyhow::bail!("agent-bus messageId was reused with different canonical content");
-        }
-        append_event(
-            &message.owner_cutex_session_id,
-            &message.message_id,
-            "cutex/agentBus/messageQueued",
-            json!({
-                "messageId": message.message_id,
-                "fromCutexSessionId": message.from_cutex_session_id,
-                "toCutexSessionId": message.to_cutex_session_id,
-                "fromRuntimeAgentId": message.from_runtime_agent_id,
-                "toRuntimeAgentId": message.to_runtime_agent_id,
-                "deliveryMode": message.delivery_mode,
-                "content": message.content,
-                "queuedAt": message.queued_at.to_rfc3339(),
-            }),
-        )?;
-        self.mutate(|store| {
+            if record_management_event {
+                append_event(
+                    &message.owner_cutex_session_id,
+                    &message.message_id,
+                    "cutex/agentBus/messageQueued",
+                    json!({
+                        "messageId": message.message_id,
+                        "fromCutexSessionId": message.from_cutex_session_id,
+                        "toCutexSessionId": message.to_cutex_session_id,
+                        "fromRuntimeAgentId": message.from_runtime_agent_id,
+                        "toRuntimeAgentId": message.to_runtime_agent_id,
+                        "deliveryMode": message.delivery_mode,
+                        "content": message.content,
+                        "queuedAt": message.queued_at.to_rfc3339(),
+                    }),
+                )?;
+            }
             store.messages.insert(
                 message.message_id.clone(),
                 StoredAgentBusMessage {
@@ -219,7 +239,8 @@ impl AgentBusMessageRepository {
                     updated_at: message.queued_at.to_rfc3339(),
                 },
             );
-            Ok(())
+            write_private_pretty_json_atomic(path, &store, "management v2 agent-bus state")?;
+            Ok(true)
         })
     }
 
@@ -352,6 +373,13 @@ impl AgentBusMessageRepository {
         Ok(self
             .get(message_id)?
             .and_then(|stored| stored.snapshot.semantic_sha256))
+    }
+
+    pub fn snapshot_by_message_id(
+        &self,
+        message_id: &str,
+    ) -> anyhow::Result<Option<AgentBusMessageSnapshot>> {
+        Ok(self.get(message_id)?.map(|stored| stored.snapshot))
     }
 
     pub fn record_failed(
@@ -576,6 +604,63 @@ fn secure_file(_path: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    fn system_queued_message(content: &str) -> AgentBusQueuedMessage {
+        let target = "cutex.11111111-1111-4111-8111-111111111111".to_string();
+        let envelope = AgentBusMessage {
+            id: "jsc_stable".to_string(),
+            kind: crate::agent_bus::model::AgentBusEnvelopeKind::Message,
+            from: "cutex-job-service".to_string(),
+            to: target.clone(),
+            from_cutex_session_id: None,
+            to_cutex_session_id: Some(target.clone()),
+            content: content.to_string(),
+            delivery_mode: crate::agent_bus::delivery::AgentDeliveryMode::AfterTurn,
+            trigger_turn: true,
+            created_at_epoch_secs: 1,
+            sender_kind: crate::agent_bus::model::AgentMessageKind::JobServiceSystem,
+            display_source: Some("Cutex Job Service".to_string()),
+            submit_mode: None,
+            control_type: Some(crate::agent_bus::model::JOB_SERVICE_COMPLETION_SCHEMA.to_string()),
+            control_payload: None,
+            external_action_id: Some("job-1".to_string()),
+            external_message_id: Some("event-1".to_string()),
+        };
+        AgentBusQueuedMessage {
+            owner_cutex_session_id: target.clone(),
+            message_id: envelope.id.clone(),
+            from_cutex_session_id: None,
+            to_cutex_session_id: target,
+            from_runtime_agent_id: None,
+            to_runtime_agent_id: None,
+            delivery_mode: "after_turn".to_string(),
+            content: content.to_string(),
+            queued_at: Utc::now(),
+            canonical_envelope: envelope,
+            semantic_sha256: crate::task_service::sha256_bytes(content.as_bytes())
+                .as_str()
+                .to_string(),
+        }
+    }
+
+    #[test]
+    fn system_source_persists_before_redrive_and_changed_replay_conflicts() {
+        let root = std::env::temp_dir().join(format!("cutex-js3a-state-{}", uuid::Uuid::new_v4()));
+        let repository = AgentBusMessageRepository::open(&root).unwrap();
+        let queued = system_queued_message("terminal result");
+        repository.record_queued_isolated(queued.clone()).unwrap();
+        repository.record_queued_isolated(queued).unwrap();
+        let reopened = AgentBusMessageRepository::open(&root).unwrap();
+        let pending = reopened.pending_v2().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0]
+            .canonical_envelope
+            .from_cutex_session_id
+            .is_none());
+        let changed = system_queued_message("changed terminal result");
+        assert!(reopened.record_queued_isolated(changed).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn queued_and_delivered_updates_one_bootstrap_message() {
         let root =
@@ -593,7 +678,7 @@ mod tests {
                         canonical_envelope: None,
                         snapshot: AgentBusMessageSnapshot {
                             message_id: "message-1".to_string(),
-                            from_cutex_session_id: "cutex.source".to_string(),
+                            from_cutex_session_id: Some("cutex.source".to_string()),
                             to_cutex_session_id: "cutex.target".to_string(),
                             delivery_mode: "after_turn".to_string(),
                             content: "hello".to_string(),

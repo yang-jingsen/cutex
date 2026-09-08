@@ -69,6 +69,7 @@ pub enum AgentMessageKind {
     User,
     Owner,
     TaskServiceSystem,
+    JobServiceSystem,
 }
 
 impl AgentMessageKind {
@@ -80,14 +81,83 @@ impl AgentMessageKind {
         matches!(self, AgentMessageKind::TaskServiceSystem)
     }
 
+    pub fn is_job_service_system(&self) -> bool {
+        matches!(self, AgentMessageKind::JobServiceSystem)
+    }
+
     pub fn sender_label(&self) -> &'static str {
         match self {
             AgentMessageKind::Agent => "cutex",
             AgentMessageKind::User => "user",
             AgentMessageKind::Owner => "owner",
             AgentMessageKind::TaskServiceSystem => "task_service",
+            AgentMessageKind::JobServiceSystem => "job_service",
         }
     }
+}
+
+pub const JOB_SERVICE_COMPLETION_SCHEMA: &str = "cutex.job_service.completion.v1";
+pub const JOB_SERVICE_COMPLETION_MAX_BODY_BYTES: usize = 32 * 1024;
+pub const JOB_SERVICE_COMPLETION_MAX_SUMMARY_BYTES: usize = 2 * 1024;
+pub const JOB_SERVICE_COMPLETION_MAX_OUTPUT_REF_BYTES: usize = 2 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobServiceTerminalStatus {
+    Exited,
+    Failed,
+    Cancelled,
+    Interrupted,
+    LaunchUnknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobServiceCompletionRequest {
+    pub schema: String,
+    pub event_id: String,
+    pub job_id: String,
+    pub job_revision: u64,
+    pub terminal_status: JobServiceTerminalStatus,
+    pub result_sha256: String,
+    pub target_cutex_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_reference: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobServiceCompletionQuery {
+    pub schema: String,
+    pub event_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobServiceCompletionDisposition {
+    Pending,
+    Delivered,
+    Archived,
+    Orphaned,
+    NotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobServiceCompletionReceipt {
+    pub schema: String,
+    pub status: String,
+    pub event_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    pub disposition: JobServiceCompletionDisposition,
+    pub deduplicated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a4_receipt: Option<crate::app_server::commands::InterAgentContextPersistedReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -974,5 +1044,30 @@ mod tests {
             request.resolved_delivery_mode(),
             AgentDeliveryMode::AfterTurn
         );
+    }
+}
+
+#[cfg(test)]
+mod job_service_completion_tests {
+    use super::*;
+
+    #[test]
+    fn job_service_completion_request_is_strict_and_system_kind_is_distinct() {
+        let json = serde_json::json!({
+            "schema": JOB_SERVICE_COMPLETION_SCHEMA,
+            "eventId": "event-1",
+            "jobId": "job-1",
+            "jobRevision": 2,
+            "terminalStatus": "exited",
+            "resultSha256": "a".repeat(64),
+            "targetCutexSessionId": "cutex.11111111-1111-4111-8111-111111111111"
+        });
+        let parsed: JobServiceCompletionRequest = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(parsed.job_revision, 2);
+        let mut changed = json;
+        changed["modelSuppliedPrincipal"] = serde_json::json!("forged");
+        assert!(serde_json::from_value::<JobServiceCompletionRequest>(changed).is_err());
+        assert!(AgentMessageKind::JobServiceSystem.is_job_service_system());
+        assert!(!AgentMessageKind::TaskServiceSystem.is_job_service_system());
     }
 }
