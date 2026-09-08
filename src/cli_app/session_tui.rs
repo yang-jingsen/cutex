@@ -795,6 +795,7 @@ impl SelectorModel {
                 self.mode = SelectorMode::RecentSessions;
             }
             PrimaryPanel::Agents if matches!(self.mode, SelectorMode::RecentSessions) => {
+                self.recent.blur_filter();
                 self.mode = self
                     .suspended_managed_mode
                     .take()
@@ -850,11 +851,15 @@ impl SelectorModel {
                 self.handle(SelectorEvent::OpenSettings)
             }
             SelectorMode::RecentSessions if self.recent.review().is_some() => {
-                self.handle(if forward {
-                    SelectorEvent::Down
-                } else {
+                self.handle(if self.recent.review_confirmed() {
                     SelectorEvent::Up
+                } else {
+                    SelectorEvent::Down
                 })
+            }
+            SelectorMode::RecentSessions if self.recent.filter_focused() => {
+                self.recent.blur_filter();
+                SelectorControl::Continue
             }
             SelectorMode::RecentSessions if forward => self.handle(SelectorEvent::Activate),
             SelectorMode::RecentSessions => SelectorControl::Continue,
@@ -862,10 +867,10 @@ impl SelectorModel {
                 self.handle(SelectorEvent::OpenActions)
             }
             SelectorMode::RetiredSessions { .. } => self.handle(SelectorEvent::Back),
-            SelectorMode::ConfirmRuntimeAction { .. } => self.handle(if forward {
-                SelectorEvent::Down
-            } else {
+            SelectorMode::ConfirmRuntimeAction { confirmed, .. } => self.handle(if confirmed {
                 SelectorEvent::Up
+            } else {
+                SelectorEvent::Down
             }),
             SelectorMode::ClosingRuntime { .. } => SelectorControl::Continue,
         }
@@ -916,7 +921,7 @@ impl SelectorModel {
                 self.handle(if expand {
                     SelectorEvent::Down
                 } else {
-                    SelectorEvent::Escape
+                    SelectorEvent::Up
                 })
             }
             SelectorMode::RecentSessions if expand => self.handle(SelectorEvent::Activate),
@@ -1344,21 +1349,6 @@ impl SelectorModel {
             }
             return SelectorControl::Continue;
         }
-        if self.recent.filter_focused() {
-            match event {
-                SelectorEvent::Insert(character) => self.recent.push_filter(character),
-                SelectorEvent::Backspace | SelectorEvent::Delete => self.recent.pop_filter(),
-                SelectorEvent::ClearInput => self.recent.clear_filter(),
-                SelectorEvent::Activate | SelectorEvent::Escape => self.recent.blur_filter(),
-                SelectorEvent::Up => self.recent.move_selection(-1),
-                SelectorEvent::Down => self.recent.move_selection(1),
-                SelectorEvent::First => self.recent.select_edge(false),
-                SelectorEvent::Last => self.recent.select_edge(true),
-                SelectorEvent::Back | SelectorEvent::OpenActions | SelectorEvent::OpenSettings => {}
-                SelectorEvent::Exit => return SelectorControl::Exit,
-            }
-            return SelectorControl::Continue;
-        }
         match event {
             SelectorEvent::Up => self.move_selection(-1),
             SelectorEvent::Down => self.move_selection(1),
@@ -1469,6 +1459,20 @@ impl SelectorModel {
     }
 
     fn handle_recent_sessions_event(&mut self, event: SelectorEvent) -> SelectorControl {
+        if self.recent.filter_focused() {
+            match event {
+                SelectorEvent::Insert(character) => self.recent.push_filter(character),
+                SelectorEvent::Backspace => self.recent.pop_filter(),
+                SelectorEvent::Delete => self.recent.edit_filter(InputRequest::DeleteNextChar),
+                SelectorEvent::ClearInput => self.recent.clear_filter(),
+                SelectorEvent::First => self.recent.edit_filter(InputRequest::GoToStart),
+                SelectorEvent::Last => self.recent.edit_filter(InputRequest::GoToEnd),
+                SelectorEvent::Activate | SelectorEvent::Escape => self.recent.blur_filter(),
+                SelectorEvent::Exit => return SelectorControl::Exit,
+                _ => {}
+            }
+            return SelectorControl::Continue;
+        }
         if self.recent.review().is_some() {
             match event {
                 SelectorEvent::Up | SelectorEvent::First | SelectorEvent::Back => {
@@ -1479,6 +1483,7 @@ impl SelectorModel {
                 }
                 SelectorEvent::Activate if self.recent.review_confirmed() => {
                     if let Some(request) = self.recent.adoption_request() {
+                        self.recent.cancel_review();
                         return SelectorControl::AdoptRecent(request);
                     }
                 }
@@ -5077,6 +5082,86 @@ impl Drop for TerminalRestore {
     }
 }
 
+enum SelectorKeyRoute {
+    Switch(PrimaryPanel),
+    Refresh,
+    Control(Option<SelectorControl>),
+}
+
+/// Shared by the terminal loop and key-sequence tests; effects run only after routing.
+fn route_selector_key(model: &mut SelectorModel, key: KeyEvent) -> SelectorKeyRoute {
+    let recent_input =
+        matches!(model.mode, SelectorMode::RecentSessions) && model.recent.filter_focused();
+    let managed_input =
+        matches!(model.mode, SelectorMode::Agents) && !model.inspector_overview_focused;
+    if !super::session_tui_workspace_events::accepts_key(key, recent_input || managed_input) {
+        return SelectorKeyRoute::Control(None);
+    }
+    // Focused input consumes keys before page/action shortcuts. Alt shortcuts
+    // are deliberately inert until editing ends; they cannot leak into review.
+    if recent_input {
+        match key.code {
+            KeyCode::Tab | KeyCode::BackTab => model.recent.blur_filter(),
+            KeyCode::Left => model.recent.edit_filter(InputRequest::GoToPrevChar),
+            KeyCode::Right => model.recent.edit_filter(InputRequest::GoToNextChar),
+            _ => {
+                if let Some(event) = selector_event_from_key(key, model.enhanced_keyboard) {
+                    return SelectorKeyRoute::Control(Some(model.handle(event)));
+                }
+            }
+        }
+        return SelectorKeyRoute::Control(None);
+    }
+    if let Some(panel) = primary_panel_shortcut(key) {
+        if matches!(
+            model.mode,
+            SelectorMode::ClosingRuntime { .. } | SelectorMode::ConfirmRuntimeAction { .. }
+        ) || (matches!(model.mode, SelectorMode::RecentSessions)
+            && model.recent.review().is_some())
+        {
+            return SelectorKeyRoute::Control(None);
+        }
+        let active = if matches!(model.mode, SelectorMode::RecentSessions) {
+            PrimaryPanel::Recent
+        } else {
+            PrimaryPanel::Agents
+        };
+        return if panel != active {
+            model.recent.blur_filter();
+            SelectorKeyRoute::Switch(panel)
+        } else {
+            SelectorKeyRoute::Control(None)
+        };
+    }
+    if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::F(5) {
+        return SelectorKeyRoute::Refresh;
+    }
+    if let Some(panel) = selector_list_panel_from_horizontal_key(model, key) {
+        return panel.map_or(SelectorKeyRoute::Control(None), SelectorKeyRoute::Switch);
+    }
+    if handle_managed_inspector_shortcut(model, key) || handle_recent_actions_shortcut(model, key) {
+        return SelectorKeyRoute::Control(None);
+    }
+    let control = if let Some(control) = selector_navigation_control_from_key(model, key) {
+        Some(control)
+    } else if toggle_managed_thread_titles_from_key(model, key) {
+        None
+    } else if close_runtime_shortcut_from_key(key) {
+        Some(model.activate_close_shortcut())
+    } else {
+        selector_event_from_key(key, model.enhanced_keyboard).map(|event| model.handle(event))
+    };
+    SelectorKeyRoute::Control(control)
+}
+
+fn handle_selector_paste(model: &mut SelectorModel, text: &str) {
+    if matches!(model.mode, SelectorMode::RecentSessions) && model.recent.filter_focused() {
+        for character in text.chars().filter(|c| !c.is_control()) {
+            model.handle(SelectorEvent::Insert(character));
+        }
+    }
+}
+
 fn run_event_loop(
     terminal: &mut CutexTerminal,
     model: &mut SelectorModel,
@@ -5107,70 +5192,36 @@ fn run_event_loop(
         }
         match event::read()? {
             Event::Key(key) => {
-                if let Some(panel) = primary_panel_shortcut(key) {
-                    if matches!(model.mode, SelectorMode::ClosingRuntime { .. }) {
-                        continue;
+                let control = match route_selector_key(model, key) {
+                    SelectorKeyRoute::Switch(panel) => {
+                        return Ok(SessionTuiCycleOutcome::Switch(panel))
                     }
-                    let active = if matches!(model.mode, SelectorMode::RecentSessions) {
-                        PrimaryPanel::Recent
-                    } else {
-                        PrimaryPanel::Agents
-                    };
-                    if panel != active {
-                        return Ok(SessionTuiCycleOutcome::Switch(panel));
-                    }
-                    continue;
-                }
-                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-                    && key.modifiers == KeyModifiers::NONE
-                    && key.code == KeyCode::F(5)
-                {
-                    if matches!(model.mode, SelectorMode::ClosingRuntime { .. }) {
-                        continue;
-                    }
-                    if matches!(model.mode, SelectorMode::RecentSessions) {
-                        if recent_catalog.request(RecentCommand::Retry, None) {
-                            model.recent_loading_started();
-                        } else {
-                            model.warning = Some(
-                                "recent catalog worker stopped; retry by reopening the TUI"
-                                    .to_string(),
-                            );
+                    SelectorKeyRoute::Refresh => {
+                        if matches!(model.mode, SelectorMode::ClosingRuntime { .. }) {
+                            continue;
                         }
-                    } else if !model.refreshing {
-                        match spawn_snapshot_refresh() {
-                            Ok(next) => {
-                                *refresh = next;
-                                model.refreshing = true;
+                        if matches!(model.mode, SelectorMode::RecentSessions) {
+                            if recent_catalog.request(RecentCommand::Retry, None) {
+                                model.recent_loading_started();
+                            } else {
+                                model.warning = Some(
+                                    "recent catalog worker stopped; retry by reopening the TUI"
+                                        .to_string(),
+                                );
                             }
-                            Err(error) => model.mark_refresh_failed(format!("{error:#}")),
+                        } else if !model.refreshing {
+                            match spawn_snapshot_refresh() {
+                                Ok(next) => {
+                                    *refresh = next;
+                                    model.refreshing = true;
+                                }
+                                Err(error) => model.mark_refresh_failed(format!("{error:#}")),
+                            }
                         }
+                        continue;
                     }
-                    continue;
-                }
-                if let Some(next_panel) = selector_list_panel_from_horizontal_key(model, key) {
-                    if let Some(next_panel) = next_panel {
-                        return Ok(SessionTuiCycleOutcome::Switch(next_panel));
-                    }
-                    continue;
-                }
-                if handle_managed_inspector_shortcut(model, key) {
-                    continue;
-                }
-                if handle_recent_actions_shortcut(model, key) {
-                    continue;
-                }
-                let control =
-                    if let Some(control) = selector_navigation_control_from_key(model, key) {
-                        Some(control)
-                    } else if toggle_managed_thread_titles_from_key(model, key) {
-                        None
-                    } else if close_runtime_shortcut_from_key(key) {
-                        Some(model.activate_close_shortcut())
-                    } else {
-                        selector_event_from_key(key, model.enhanced_keyboard)
-                            .map(|selector_event| model.handle(selector_event))
-                    };
+                    SelectorKeyRoute::Control(control) => control,
+                };
                 if let Some(control) = control {
                     match control {
                         SelectorControl::Continue => {}
@@ -5301,6 +5352,7 @@ fn run_event_loop(
                     }
                 }
             }
+            Event::Paste(text) => handle_selector_paste(model, &text),
             Event::Resize(_, _) => {}
             _ => {}
         }
@@ -5696,7 +5748,11 @@ fn selector_list_panel_from_horizontal_key(
     }
     let active = match &model.mode {
         SelectorMode::Agents if !model.inspector_overview_focused => PrimaryPanel::Agents,
-        SelectorMode::RecentSessions if model.recent.review().is_none() => PrimaryPanel::Recent,
+        SelectorMode::RecentSessions
+            if model.recent.review().is_none() && !model.recent.filter_focused() =>
+        {
+            PrimaryPanel::Recent
+        }
         _ => return None,
     };
     match key.code {
@@ -5764,6 +5820,7 @@ fn handle_recent_actions_shortcut(model: &mut SelectorModel, key: KeyEvent) -> b
         && matches!(key.code, KeyCode::Char('a' | 'A'))
         && matches!(model.mode, SelectorMode::RecentSessions)
         && model.recent.review().is_none()
+        && !model.recent.filter_focused()
     {
         let _ = model.handle(SelectorEvent::OpenActions);
         true
@@ -6134,8 +6191,11 @@ fn render_recent_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorMo
     }
     let [filter_area, table_area] =
         Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).areas(area);
+    let input_width = filter_area.width.saturating_sub(2) as usize;
+    let input = model.recent.filter_input();
+    let scroll = input.visual_scroll(input_width.saturating_sub(1).max(1));
     frame.render_widget(
-        Paragraph::new(model.recent.query()).block(
+        Paragraph::new(model.recent.query()).scroll((0, scroll as u16)).block(
             Block::bordered()
                 .title(" Filter loaded rows: title / name / cwd / provider / project / state  [/] ")
                 .border_style(Style::new().fg(if model.recent.filter_focused() {
@@ -6146,9 +6206,14 @@ fn render_recent_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorMo
         ),
         filter_area,
     );
-    if model.recent.filter_focused() {
+    if model.recent.filter_focused() && input_width > 0 && filter_area.height >= 3 {
         frame.set_cursor_position((
-            filter_area.x + 1 + model.recent.query().chars().count() as u16,
+            filter_area.x
+                + 1
+                + input
+                    .visual_cursor()
+                    .saturating_sub(scroll)
+                    .min(input_width.saturating_sub(1)) as u16,
             filter_area.y + 1,
         ));
     }
@@ -13775,6 +13840,255 @@ mod tests {
             assert_ne!(description_cell.fg, Color::Cyan);
             assert!(!description_cell.modifier.contains(Modifier::BOLD));
         }
+    }
+
+    fn contract_recent_model() -> SelectorModel {
+        use super::super::session_tui_recent::CatalogReply;
+        let mut model = SelectorModel::new(Vec::new(), false, false);
+        model.activate_primary_panel(PrimaryPanel::Recent);
+        model.recent.receive(
+            CatalogReply::Page {
+                cursor: None,
+                result: Ok(cutex::catalog::ThreadPage {
+                    data: vec![cutex::catalog::CatalogThread {
+                        id: "native-one".into(),
+                        session_id: "tree-one".into(),
+                        project_id: None,
+                        parent_thread_id: None,
+                        preview: "Native title".into(),
+                        model_provider: "openai".into(),
+                        created_at: Some(1),
+                        updated_at: Some(1),
+                        recency_at: Some(1),
+                        cwd: Some("/work".into()),
+                        name: None,
+                        status: serde_json::json!({}),
+                        source: serde_json::json!("cli"),
+                        additional_fields: Default::default(),
+                    }],
+                    next_cursor: Some("next".into()),
+                    backwards_cursor: None,
+                }),
+            },
+            &CutexSessionStore::default(),
+        );
+        model
+    }
+
+    fn contract_key(model: &mut SelectorModel, code: KeyCode) {
+        assert!(matches!(
+            route_selector_key(model, KeyEvent::new(code, KeyModifiers::NONE)),
+            SelectorKeyRoute::Control(None | Some(SelectorControl::Continue))
+        ));
+    }
+
+    #[test]
+    fn ui_contract_k01_k03_recent_input_owns_editing_and_prerouter() {
+        let mut model = contract_recent_model();
+        contract_key(&mut model, KeyCode::Char('/'));
+        for c in "abc".chars() {
+            contract_key(&mut model, KeyCode::Char(c));
+        }
+        contract_key(&mut model, KeyCode::Backspace);
+        assert_eq!(model.recent.query(), "ab");
+        contract_key(&mut model, KeyCode::Home);
+        contract_key(&mut model, KeyCode::Delete);
+        assert_eq!(model.recent.query(), "b");
+        contract_key(&mut model, KeyCode::End);
+        contract_key(&mut model, KeyCode::Char('c'));
+        contract_key(&mut model, KeyCode::Left);
+        assert_eq!(model.recent.filter_input().cursor(), 1);
+        contract_key(&mut model, KeyCode::Char('X'));
+        contract_key(&mut model, KeyCode::Right);
+        assert_eq!(model.recent.query(), "bXc");
+        assert_eq!(model.recent.filter_input().cursor(), 3);
+        assert!(matches!(
+            route_selector_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)
+            ),
+            SelectorKeyRoute::Control(Some(SelectorControl::Continue))
+        ));
+        assert_eq!(model.recent.query(), "");
+        assert_eq!(model.query.value(), "");
+        assert!(model.recent.review().is_none());
+    }
+
+    #[test]
+    fn ui_contract_k02_k04_k05_k06_recent_focus_does_not_activate_or_leak() {
+        let mut model = contract_recent_model();
+        contract_key(&mut model, KeyCode::Char('/'));
+        for c in "nNqaev /".chars() {
+            contract_key(&mut model, KeyCode::Char(c));
+        }
+        for c in ['a', 'm', 'r', 'p', 't'] {
+            assert!(matches!(
+                route_selector_key(
+                    &mut model,
+                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
+                ),
+                SelectorKeyRoute::Control(None)
+            ));
+        }
+        assert_eq!(model.recent.query(), "nNqaev /");
+        contract_key(&mut model, KeyCode::Enter);
+        assert!(!model.recent.filter_focused());
+        assert!(model.recent.review().is_none());
+        for exit in [KeyCode::Tab, KeyCode::BackTab, KeyCode::Esc] {
+            contract_key(&mut model, KeyCode::Char('/'));
+            contract_key(&mut model, exit);
+            assert!(!model.recent.filter_focused());
+            assert!(model.recent.review().is_none());
+            assert!(matches!(model.mode, SelectorMode::RecentSessions));
+        }
+        contract_key(&mut model, KeyCode::Esc);
+        assert!(matches!(model.mode, SelectorMode::Agents));
+        contract_key(&mut model, KeyCode::Char('z'));
+        assert_eq!(model.query.value(), "z");
+        assert_eq!(model.recent.query(), "nNqaev /");
+        // Even stale historical focus cannot redirect Managed's handler.
+        model.recent.focus_filter();
+        contract_key(&mut model, KeyCode::Char('x'));
+        assert_eq!(model.query.value(), "zx");
+        assert_eq!(model.recent.query(), "nNqaev /");
+    }
+
+    #[test]
+    fn ui_contract_k07_k08_recent_review_horizontal_and_single_submission() {
+        let mut model = contract_recent_model();
+        contract_key(&mut model, KeyCode::Enter);
+        assert!(model.recent.review().is_some());
+        assert!(!model.recent.review_confirmed());
+        contract_key(&mut model, KeyCode::Right);
+        assert!(model.recent.review_confirmed());
+        contract_key(&mut model, KeyCode::Left);
+        assert!(model.recent.review().is_some());
+        assert!(!model.recent.review_confirmed());
+        contract_key(&mut model, KeyCode::Tab);
+        assert!(model.recent.review_confirmed());
+        contract_key(&mut model, KeyCode::BackTab);
+        assert!(!model.recent.review_confirmed());
+        contract_key(&mut model, KeyCode::Enter);
+        assert!(model.recent.review().is_none());
+        contract_key(&mut model, KeyCode::Enter);
+        contract_key(&mut model, KeyCode::Right);
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            assert!(matches!(
+                route_selector_key(
+                    &mut model,
+                    KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, kind)
+                ),
+                SelectorKeyRoute::Control(None)
+            ));
+        }
+        assert!(matches!(
+            route_selector_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            SelectorKeyRoute::Control(Some(SelectorControl::AdoptRecent(_)))
+        ));
+        assert!(model.recent.review().is_none());
+        contract_key(&mut model, KeyCode::Enter); // a fresh review, never a second effect
+        contract_key(&mut model, KeyCode::Esc);
+        assert!(model.recent.review().is_none());
+    }
+
+    #[test]
+    fn ui_contract_k07_k08_retire_confirmation_and_busy_guard() {
+        let mut model = SelectorModel::new(Vec::new(), false, false);
+        model.mode = SelectorMode::ConfirmRuntimeAction {
+            agent_key: "cutex.exact".into(),
+            action: SessionTuiAction::RetireSession,
+            launch_profile: None,
+            confirmed: false,
+        };
+        contract_key(&mut model, KeyCode::Right);
+        contract_key(&mut model, KeyCode::Left);
+        assert!(matches!(
+            model.mode,
+            SelectorMode::ConfirmRuntimeAction {
+                confirmed: false,
+                ..
+            }
+        ));
+        contract_key(&mut model, KeyCode::Tab);
+        contract_key(&mut model, KeyCode::BackTab);
+        assert!(matches!(
+            model.mode,
+            SelectorMode::ConfirmRuntimeAction {
+                confirmed: false,
+                ..
+            }
+        ));
+        contract_key(&mut model, KeyCode::Right);
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            assert!(matches!(
+                route_selector_key(
+                    &mut model,
+                    KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, kind)
+                ),
+                SelectorKeyRoute::Control(None)
+            ));
+        }
+        let SelectorKeyRoute::Control(Some(SelectorControl::Selected(intent))) = route_selector_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ) else {
+            panic!("expected retire intent")
+        };
+        assert_eq!(intent.key, "cutex.exact");
+        assert_eq!(intent.action, SessionTuiAction::RetireSession);
+        // Same guard used immediately by the production effect consumer.
+        model.runtime_close_started(&intent);
+        contract_key(&mut model, KeyCode::Enter);
+        assert!(matches!(model.mode, SelectorMode::ClosingRuntime { .. }));
+    }
+
+    #[test]
+    fn ui_contract_k08_recent_repeat_edits_but_release_is_ignored() {
+        let mut model = contract_recent_model();
+        contract_key(&mut model, KeyCode::Char('/'));
+        for kind in [
+            KeyEventKind::Press,
+            KeyEventKind::Repeat,
+            KeyEventKind::Release,
+        ] {
+            route_selector_key(
+                &mut model,
+                KeyEvent::new_with_kind(KeyCode::Char('n'), KeyModifiers::NONE, kind),
+            );
+        }
+        assert_eq!(model.recent.query(), "nn");
+        route_selector_key(
+            &mut model,
+            KeyEvent::new_with_kind(KeyCode::Left, KeyModifiers::NONE, KeyEventKind::Repeat),
+        );
+        assert_eq!(model.recent.filter_input().cursor(), 1);
+    }
+
+    #[test]
+    fn ui_contract_recent_paste_and_unicode_cursor_stay_in_filter() {
+        let mut model = contract_recent_model();
+        contract_key(&mut model, KeyCode::Char('/'));
+        let text = "中文 e\u{301} 🙂 ".repeat(12);
+        handle_selector_paste(&mut model, &format!("{text}\r\n\t\u{1b}"));
+        assert_eq!(model.recent.query(), text);
+        let mut terminal = Terminal::new(TestBackend::new(38, 12)).unwrap();
+        terminal
+            .draw(|frame| render_recent_workspace(frame, frame.area(), &model))
+            .unwrap();
+        let cursor = terminal.get_cursor_position().unwrap();
+        assert!(cursor.x > 0 && cursor.x < 37);
+        assert_eq!(cursor.y, 1);
+        contract_key(&mut model, KeyCode::Home);
+        terminal
+            .draw(|frame| render_recent_workspace(frame, frame.area(), &model))
+            .unwrap();
+        assert_eq!(terminal.get_cursor_position().unwrap().x, 1);
+        model.activate_primary_panel(PrimaryPanel::Agents);
+        handle_selector_paste(&mut model, "hidden");
+        assert_eq!(model.recent.query(), text);
     }
 
     #[test]

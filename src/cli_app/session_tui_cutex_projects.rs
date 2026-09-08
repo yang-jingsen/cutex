@@ -785,7 +785,15 @@ fn run_loop(
 }
 
 fn handle_paste(model: &mut CutexProjectsModel, text: &str) {
+    let text: String = text.chars().filter(|c| !c.is_control()).collect();
+    let text = text.as_str();
     match model.view {
+        ProjectView::List if model.filter_focused => {
+            for character in text.chars() {
+                model.query.handle(InputRequest::InsertChar(character));
+            }
+            model.retain_selection();
+        }
         ProjectView::ConfirmImport
             if model
                 .import_request
@@ -827,9 +835,55 @@ fn handle_paste(model: &mut CutexProjectsModel, text: &str) {
 }
 
 fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPanelOutcome> {
+    let text_input = (model.view == ProjectView::List && model.filter_focused)
+        || matches!(
+            model.view,
+            ProjectView::Editor | ProjectView::Create | ProjectView::ConfirmImport
+        );
+    if !super::session_tui_workspace_events::accepts_key(key, text_input) {
+        return None;
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
     {
         return Some(PrimaryPanelOutcome::Exit);
+    }
+    if model.view == ProjectView::List && model.filter_focused {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab => {
+                model.filter_focused = false
+            }
+            KeyCode::Left => {
+                model.query.handle(InputRequest::GoToPrevChar);
+            }
+            KeyCode::Right => {
+                model.query.handle(InputRequest::GoToNextChar);
+            }
+            KeyCode::Home => {
+                model.query.handle(InputRequest::GoToStart);
+            }
+            KeyCode::End => {
+                model.query.handle(InputRequest::GoToEnd);
+            }
+            KeyCode::Backspace => {
+                model.query.handle(InputRequest::DeletePrevChar);
+            }
+            KeyCode::Delete => {
+                model.query.handle(InputRequest::DeleteNextChar);
+            }
+            KeyCode::Char('u' | 'U') if key.modifiers == KeyModifiers::CONTROL => {
+                model.query.handle(InputRequest::DeleteLine);
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                model.query.handle(InputRequest::InsertChar(character));
+            }
+            _ => {}
+        }
+        model.retain_selection();
+        return None;
     }
     if key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Char('a' | 'A')) {
         match model.view {
@@ -871,6 +925,14 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
         return None;
     }
     if let Some(panel) = primary_panel_shortcut(key) {
+        if matches!(
+            model.view,
+            ProjectView::ConfirmImport
+                | ProjectView::ConfirmOperator
+                | ProjectView::ConfirmProjectMutation
+        ) {
+            return None;
+        }
         return (panel != PrimaryPanel::Projects).then_some(PrimaryPanelOutcome::Switch(panel));
     }
     if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::F(5) {
@@ -912,7 +974,9 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                     ProjectView::Details
                 };
             }
-            KeyCode::Up | KeyCode::Down | KeyCode::Tab => {
+            KeyCode::Left => model.confirm_selected = false,
+            KeyCode::Right => model.confirm_selected = true,
+            KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab => {
                 model.confirm_selected = !model.confirm_selected
             }
             KeyCode::Enter if model.confirm_selected => match execute_import_confirmation(model) {
@@ -950,33 +1014,6 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                     .is_some_and(|r| r.candidate.formal_name.is_none()) =>
             {
                 model.import_name.handle(InputRequest::DeletePrevChar);
-            }
-            _ => {}
-        },
-        ProjectView::List if model.filter_focused => match key.code {
-            KeyCode::Esc | KeyCode::Enter => model.filter_focused = false,
-            KeyCode::Tab | KeyCode::BackTab => model.filter_focused = false,
-            KeyCode::Left => {
-                model.query.handle(InputRequest::GoToPrevChar);
-            }
-            KeyCode::Right => {
-                model.query.handle(InputRequest::GoToNextChar);
-            }
-            KeyCode::Backspace => {
-                model.query.handle(InputRequest::DeletePrevChar);
-                model.retain_selection();
-            }
-            KeyCode::Delete => {
-                model.query.handle(InputRequest::DeleteNextChar);
-                model.retain_selection();
-            }
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                model.query.handle(InputRequest::InsertChar(character));
-                model.retain_selection();
             }
             _ => {}
         },
@@ -1048,7 +1085,7 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                     editor.field = (editor.field + 2) % 3;
                 }
             }
-            KeyCode::Char(' ') => {
+            KeyCode::Char(' ') if model.editor.as_ref().is_some_and(|e| e.field == 2) => {
                 if let Some(editor) = model.editor.as_mut().filter(|editor| editor.field == 2) {
                     let index = ProjectPaletteColor::ALL
                         .iter()
@@ -1126,7 +1163,7 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                     }
                 }
             }
-            KeyCode::Char(' ') => {
+            KeyCode::Char(' ') if model.create_editor.as_ref().is_some_and(|e| e.field == 3) => {
                 if let Some(editor) = model
                     .create_editor
                     .as_mut()
@@ -1213,7 +1250,11 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                 model.pending_project_mutation = None;
                 model.view = ProjectView::Actions;
             }
-            KeyCode::Up | KeyCode::Down => model.confirm_selected = !model.confirm_selected,
+            KeyCode::Left => model.confirm_selected = false,
+            KeyCode::Right => model.confirm_selected = true,
+            KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab => {
+                model.confirm_selected = !model.confirm_selected
+            }
             KeyCode::Enter if model.confirm_selected => match execute_project_mutation(model) {
                 Ok(()) => model.failure = None,
                 Err(error) => {
@@ -1226,7 +1267,6 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                 model.pending_project_mutation = None;
                 model.view = ProjectView::Actions;
             }
-            KeyCode::Left | KeyCode::Right => {}
             _ => {}
         },
         ProjectView::ConfirmOperator => match key.code {
@@ -1234,7 +1274,11 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                 model.pending_operator = None;
                 model.view = ProjectView::Details;
             }
-            KeyCode::Up | KeyCode::Down => model.confirm_selected = !model.confirm_selected,
+            KeyCode::Left => model.confirm_selected = false,
+            KeyCode::Right => model.confirm_selected = true,
+            KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab => {
+                model.confirm_selected = !model.confirm_selected
+            }
             KeyCode::Enter if model.confirm_selected => match execute_operator_action(model) {
                 Ok(()) => model.failure = None,
                 Err(error) => {
@@ -1247,7 +1291,6 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                 model.pending_operator = None;
                 model.view = ProjectView::Details;
             }
-            KeyCode::Left | KeyCode::Right => {}
             _ => {}
         },
     }
@@ -1307,7 +1350,7 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
         match model.view {
             ProjectView::ConfirmImport => footer_hints(&[
                 ("Type", "formal name if required"),
-                ("↑/↓", "Cancel/Confirm"),
+                ("←/→/Tab", "Cancel/Confirm"),
                 ("Enter", "selected choice"),
                 ("Esc", "cancel"),
             ]),
@@ -1357,12 +1400,12 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
                 footer_hints(&[("↑/↓", "choose"), ("Enter", "review"), ("Esc", "details")])
             }
             ProjectView::ConfirmProjectMutation => footer_hints(&[
-                ("↑/↓", "Cancel/Confirm"),
+                ("←/→/Tab", "Cancel/Confirm"),
                 ("Enter", "choose"),
                 ("Esc", "cancel"),
             ]),
             ProjectView::ConfirmOperator => footer_hints(&[
-                ("↑/↓", "Cancel/Confirm"),
+                ("←/→/Tab", "Cancel/Confirm"),
                 ("Enter", "choose"),
                 ("Esc", "cancel"),
             ]),
@@ -2012,7 +2055,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn production_durable_import_http_tui_create_add_cancel_auth_and_rename() {
+    fn ui_contract_production_durable_import_http_tui_create_add_cancel_auth_and_rename() {
         use cutex::session::{
             model::{CutexSessionRecord, CutexSessionStore},
             store::{load_cutex_session_store, save_cutex_session_store},
@@ -2142,13 +2185,43 @@ mod tests {
         // the same authenticated client, without starting a daemon.
         save_project_create(&mut model).unwrap();
         let create = model.import_request.clone().unwrap();
-        handle_key(&mut model, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        );
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            handle_key(
+                &mut model,
+                KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, kind),
+            );
+        }
+        assert_eq!(model.view, ProjectView::ConfirmImport);
+        assert_eq!(
+            std::fs::read(cutex::session::store::cutex_sessions_path().unwrap()).unwrap(),
+            before
+        );
+        assert!(
+            cutex::agent_management::AgentManagementProvider::open_default()
+                .unwrap()
+                .store()
+                .snapshot()
+                .unwrap()
+                .agents
+                .is_empty()
+        );
         handle_key(
             &mut model,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         );
         assert!(model.failure.is_none(), "{:?}", model.failure);
         assert_eq!(model.view, ProjectView::List);
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            handle_key(
+                &mut model,
+                KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, kind),
+            );
+            assert_eq!(model.view, ProjectView::List);
+        }
         let receipt = client.import_durable_agent(&create).unwrap();
         assert!(receipt.complete, "{:?}", receipt.error);
         let project = client
@@ -2192,7 +2265,10 @@ mod tests {
                 .unwrap()
                 .in_roster
         );
-        handle_key(&mut model, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        );
         handle_key(
             &mut model,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -2306,6 +2382,154 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| render(frame, model)).unwrap();
         format!("{:?}", terminal.backend().buffer())
+    }
+
+    #[test]
+    fn ui_contract_k09_project_spaces_and_paste_parity() {
+        for create in [false, true] {
+            for field in 0..if create { 3 } else { 2 } {
+                let mut typed = model_with_projects();
+                typed.view = if create {
+                    ProjectView::Create
+                } else {
+                    ProjectView::Editor
+                };
+                typed.editor = Some(PresentationEditor {
+                    display_name: String::new(),
+                    badge_label: String::new(),
+                    color: "green".into(),
+                    field,
+                });
+                typed.create_editor = Some(ProjectCreateEditor {
+                    project_id: String::new(),
+                    display_name: String::new(),
+                    badge_label: String::new(),
+                    color: "green".into(),
+                    director: 0,
+                    field,
+                });
+                let mut pasted = model_with_projects();
+                pasted.view = typed.view;
+                pasted.editor = typed.editor.clone();
+                pasted.create_editor = typed.create_editor.clone();
+                for c in "My Project 中文".chars() {
+                    assert_eq!(
+                        handle_key(
+                            &mut typed,
+                            KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+                        ),
+                        None
+                    );
+                }
+                handle_paste(&mut pasted, "My Project 中文\r\n\t\u{1b}");
+                if create {
+                    let a = typed.create_editor.unwrap();
+                    let b = pasted.create_editor.unwrap();
+                    assert_eq!(
+                        (&a.project_id, &a.display_name, &a.badge_label, &a.color),
+                        (&b.project_id, &b.display_name, &b.badge_label, &b.color)
+                    );
+                    assert_eq!(
+                        [a.project_id, a.display_name, a.badge_label][field],
+                        "My Project 中文"
+                    );
+                } else {
+                    let a = typed.editor.unwrap();
+                    let b = pasted.editor.unwrap();
+                    assert_eq!(
+                        (&a.display_name, &a.badge_label, &a.color),
+                        (&b.display_name, &b.badge_label, &b.color)
+                    );
+                    assert_eq!([a.display_name, a.badge_label][field], "My Project 中文");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ui_contract_project_filter_consumes_shortcuts_and_paste() {
+        let mut model = model_with_projects();
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        );
+        handle_paste(&mut model, "My Project\n");
+        handle_key(&mut model, KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+        );
+        assert_eq!(model.query.value(), "y Project");
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT),
+        );
+        assert_eq!(model.view, ProjectView::List);
+        assert!(model.create_editor.is_none());
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(model.query.value(), "");
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(!model.filter_focused);
+        assert_eq!(model.view, ProjectView::List);
+    }
+
+    #[test]
+    fn ui_contract_k07_k08_project_confirmations_focus_cancel_and_repeat() {
+        for view in [
+            ProjectView::ConfirmImport,
+            ProjectView::ConfirmOperator,
+            ProjectView::ConfirmProjectMutation,
+        ] {
+            let mut model = model_with_projects();
+            model.view = view;
+            assert!(!model.confirm_selected);
+            for (code, selected) in [
+                (KeyCode::Right, true),
+                (KeyCode::Left, false),
+                (KeyCode::Tab, true),
+                (KeyCode::Tab, false),
+                (KeyCode::BackTab, true),
+            ] {
+                handle_key(&mut model, KeyEvent::new(code, KeyModifiers::NONE));
+                assert_eq!(model.confirm_selected, selected);
+                assert_eq!(model.view, view);
+                assert!(model.failure.is_none());
+            }
+            for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+                handle_key(
+                    &mut model,
+                    KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, kind),
+                );
+                assert_eq!(model.view, view);
+                assert!(model.failure.is_none());
+            }
+            handle_key(&mut model, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+            handle_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            );
+            assert_ne!(model.view, view);
+            assert!(model.failure.is_none()); // Cancel did not attempt a service call.
+            model.view = view;
+            model.confirm_selected = true;
+            handle_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert_ne!(model.view, view);
+            assert!(model.failure.is_none());
+        }
+        let mut model = model_with_projects();
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            handle_key(
+                &mut model,
+                KeyEvent::new_with_kind(KeyCode::Char('a'), KeyModifiers::ALT, kind),
+            );
+            assert!(model.create_editor.is_none());
+        }
     }
 
     #[test]
@@ -2470,8 +2694,9 @@ mod tests {
             );
             assert_eq!(model.view, ProjectView::ConfirmOperator);
             assert!(model.pending_operator.is_some());
-            assert!(!model.confirm_selected);
+            assert_eq!(model.confirm_selected, key == KeyCode::Right);
         }
+        handle_key(&mut model, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         handle_key(
             &mut model,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),

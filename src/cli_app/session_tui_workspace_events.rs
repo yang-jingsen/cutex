@@ -1,5 +1,28 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+/// Repeats may edit or navigate, but never activate an operation or shortcut.
+pub(super) fn accepts_key(key: KeyEvent, text_input: bool) -> bool {
+    match key.kind {
+        KeyEventKind::Release => false,
+        KeyEventKind::Press => true,
+        KeyEventKind::Repeat => {
+            !key.modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                && (matches!(
+                    key.code,
+                    KeyCode::Up
+                        | KeyCode::Down
+                        | KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::Home
+                        | KeyCode::End
+                        | KeyCode::Backspace
+                        | KeyCode::Delete
+                ) || (text_input && matches!(key.code, KeyCode::Char(_))))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WorkspaceEvent {
     Up,

@@ -196,7 +196,7 @@ pub(super) struct RecentSessionsWorkspace {
     loading: bool,
     load_state: RecentLoadState,
     review: Option<AdoptionReview>,
-    query: String,
+    query: tui_input::Input,
     filter_focused: bool,
 }
 
@@ -210,7 +210,7 @@ impl Default for RecentSessionsWorkspace {
             loading: true,
             load_state: RecentLoadState::Loading,
             review: None,
-            query: String::new(),
+            query: tui_input::Input::default(),
             filter_focused: false,
         }
     }
@@ -233,7 +233,14 @@ impl RecentSessionsWorkspace {
             .unwrap_or(0)
     }
     pub(super) fn query(&self) -> &str {
+        self.query.value()
+    }
+    pub(super) fn filter_input(&self) -> &tui_input::Input {
         &self.query
+    }
+    pub(super) fn edit_filter(&mut self, request: tui_input::InputRequest) {
+        self.query.handle(request);
+        self.select_first_visible();
     }
     pub(super) fn filter_focused(&self) -> bool {
         self.filter_focused
@@ -245,16 +252,13 @@ impl RecentSessionsWorkspace {
         self.filter_focused = false;
     }
     pub(super) fn push_filter(&mut self, character: char) {
-        self.query.push(character);
-        self.select_first_visible();
+        self.edit_filter(tui_input::InputRequest::InsertChar(character));
     }
     pub(super) fn pop_filter(&mut self) {
-        self.query.pop();
-        self.select_first_visible();
+        self.edit_filter(tui_input::InputRequest::DeletePrevChar);
     }
     pub(super) fn clear_filter(&mut self) {
-        self.query.clear();
-        self.select_first_visible();
+        self.edit_filter(tui_input::InputRequest::DeleteLine);
     }
     pub(super) fn loading(&self) -> bool {
         self.loading
@@ -463,7 +467,7 @@ impl RecentSessionsWorkspace {
     }
 
     fn visible_indices(&self) -> Vec<usize> {
-        let query = self.query.trim().to_lowercase();
+        let query = self.query.value().trim().to_lowercase();
         self.rows
             .iter()
             .enumerate()
