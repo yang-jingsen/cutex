@@ -160,17 +160,31 @@ fn cmd_session_repair_history(id: &str, json: bool) -> anyhow::Result<()> {
                 "rolloutPath": repair.rollout_path,
                 "backupPath": repair.backup_path,
                 "repairedTurnIds": repair.repaired_turn_ids,
+                "normalizedOrdinals": repair.normalized_ordinals,
             }))?
+        );
+    } else if repair.repaired_turn_ids.is_empty() && !repair.normalized_ordinals {
+        println!(
+            "No interrupted history defects found in {}",
+            repair.rollout_path.display()
         );
     } else if repair.repaired_turn_ids.is_empty() {
         println!(
-            "No orphaned turns found in {}",
+            "Normalized the interrupted history ordinal suffix in {}",
             repair.rollout_path.display()
         );
+        if let Some(backup_path) = repair.backup_path {
+            println!("Backup: {}", backup_path.display());
+        }
     } else {
         println!(
-            "Repaired {} orphaned turn(s) in {}",
+            "Repaired {} orphaned turn(s){} in {}",
             repair.repaired_turn_ids.len(),
+            if repair.normalized_ordinals {
+                " and normalized the broken ordinal suffix"
+            } else {
+                ""
+            },
             repair.rollout_path.display()
         );
         if let Some(backup_path) = repair.backup_path {
