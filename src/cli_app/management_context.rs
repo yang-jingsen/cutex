@@ -16,6 +16,7 @@ pub(crate) fn load_management_v2_registry() -> anyhow::Result<ImRegistry> {
 
 pub(crate) fn management_request_context() -> ManagementRequestContext {
     ManagementRequestContext {
+        explicit_launch_action,
         adopt_saved_native,
         review_agent_archive,
         execute_agent_archive,
@@ -41,6 +42,26 @@ pub(crate) fn management_request_context() -> ManagementRequestContext {
         execute_management_project_mutation,
         query_management_tasks,
     }
+}
+
+fn explicit_launch_action(
+    principal: &cutex::management::control_plane::HumanManagementPrincipal,
+    request: &cutex::agent_management::ExplicitLaunchRequest,
+) -> Result<serde_json::Value, cutex::agent_management::AgentManagementError> {
+    let operation = || -> anyhow::Result<_> {
+        let tasks = cutex::task_service::TaskServiceProvider::open(
+            cutex::task_delivery::provider_adapter::default_task_service_provider_root()?,
+        )?;
+        management_agent_provider()?.explicit_launch_action(
+            principal,
+            &cutex::session::store::cutex_sessions_path()?,
+            request,
+            &tasks,
+        )
+    };
+    operation().map_err(|e| {
+        cutex::agent_management::AgentManagementError::OwnerActionRequired(format!("{e:#}"))
+    })
 }
 
 fn adopt_saved_native(

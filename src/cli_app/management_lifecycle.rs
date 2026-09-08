@@ -91,6 +91,7 @@ pub(crate) fn ensure_managed_tui_peer_with_profile(
     if record.is_retired() {
         anyhow::bail!("cutex session is retired: {key}");
     }
+    cutex::agent_management::require_default_launch(&record)?;
     if record.runtime_backend != CutexSessionRuntimeBackend::CuteAlden {
         return Ok(false);
     }
@@ -283,6 +284,7 @@ fn start_cutex_session_online_with_profile_inner(
     if let Some(validate) = validate_occurrence {
         validate(&record)?;
     }
+    cutex::agent_management::require_default_launch(&record)?;
     ensure_runtime_claim_is_clear(&record)?;
     let next_runtime_generation = record
         .runtime_generation

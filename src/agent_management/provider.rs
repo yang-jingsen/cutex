@@ -1418,6 +1418,20 @@ impl AgentManagementProvider {
                 )
             }
             AgentOperation::Restart { cutex_session_id } => {
+                if let Some(path) = &self.current_names_path {
+                    let sessions = crate::session::store::load_cutex_session_store_from_path(path)
+                        .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
+                    let record = sessions
+                        .sessions
+                        .get(cutex_session_id.as_str())
+                        .ok_or_else(|| {
+                            AgentManagementError::OwnerActionRequired(
+                                "durable record unavailable".into(),
+                            )
+                        })?;
+                    super::explicit_launch::require_default_launch(record)
+                        .map_err(|e| AgentManagementError::OwnerActionRequired(e.to_string()))?;
+                }
                 let agent = self.active_agent(&request.project_id, cutex_session_id)?;
                 let (before, after) = match action.historical_runtime_occurrence_fence.as_ref() {
                     Some(fence) => lifecycle

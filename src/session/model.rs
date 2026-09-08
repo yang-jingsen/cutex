@@ -187,6 +187,9 @@ pub fn parse_cutex_session_quick_action_mode(
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct CutexSessionStore {
     #[serde(default)]
+    pub explicit_launch_receipts:
+        std::collections::BTreeMap<String, crate::agent_management::ExplicitLaunchReceipt>,
+    #[serde(default)]
     pub human_adoption_receipts:
         std::collections::BTreeMap<String, crate::agent_management::HumanAdoptReceipt>,
     /// Archive transition receipt committed atomically with its durable state.
@@ -217,6 +220,9 @@ pub struct FormalAgentNameReceipt {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CutexSessionRecord {
+    /// Execution selection, never identity. Survives all runtime clearing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explicit_launch: Option<crate::agent_management::ExplicitLaunchContract>,
     pub cutex_session_id: String,
     /// Durable specification/lifecycle revision.  Runtime occurrence changes
     /// are fenced separately by `runtime_generation`.
@@ -336,6 +342,7 @@ impl CutexSessionRecord {
             .map(|value| normalize_codex_session_id(&value))
             .transpose()?;
         Ok(Self {
+            explicit_launch: None,
             cutex_session_id,
             revision: default_durable_session_revision(),
             archive_state: CutexSessionArchiveState::Active,

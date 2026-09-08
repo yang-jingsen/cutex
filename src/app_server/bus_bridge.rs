@@ -416,6 +416,8 @@ impl InterAgentMessageSubmitter for AppServerCommands {
 
 #[derive(Debug, Clone)]
 pub struct AppServerAgentBusBridgeOptions {
+    /// Stock outbound-only prototype: maintain registration, never poll/ack.
+    pub registration_only: bool,
     pub registration: AgentBusRegisterRequest,
     pub cutex_session_id: String,
     pub thread_id: String,
@@ -428,6 +430,7 @@ impl AppServerAgentBusBridgeOptions {
     pub fn new(registration: AgentBusRegisterRequest, thread_id: impl Into<String>) -> Self {
         let thread_id = thread_id.into();
         Self {
+            registration_only: false,
             registration,
             cutex_session_id: default_cutex_session_id_for_codex_session(&thread_id),
             thread_id,
@@ -659,6 +662,12 @@ fn run_bridge_worker(
             next_registration = Instant::now() + options.registration_refresh_interval;
         }
 
+        if options.registration_only {
+            if stop_requested(&stop_rx, options.poll_interval) {
+                break;
+            }
+            continue;
+        }
         let poll_started = Instant::now();
         match bus.poll(&options.registration.id) {
             Ok(messages) => {

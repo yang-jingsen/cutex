@@ -171,6 +171,7 @@ fn agent_management_admin_path(path: &str) -> bool {
     matches!(
         path,
         "/v2/agent-management/authority"
+            | "/v2/agent-management/explicit-launch"
             | "/v2/agent-management/durable-candidates"
             | "/v2/agent-management/durable-import"
             | "/v2/agent-management/archive-review"
@@ -256,6 +257,30 @@ fn handle_v2_request_with_repository(
         }
         ("GET", "/v2/agent-management/projects") => {
             handle_management_project_collection(stream, context)
+        }
+        ("POST", "/v2/agent-management/explicit-launch") => {
+            let payload: crate::agent_management::ExplicitLaunchRequest =
+                match serde_json::from_slice(&request.body) {
+                    Ok(payload) => payload,
+                    Err(_) => {
+                        return write_v2_error(
+                            stream,
+                            400,
+                            "Bad Request",
+                            "invalid_request",
+                            "strict explicit launch request required",
+                            false,
+                            json!({}),
+                        )
+                    }
+                };
+            match (context.explicit_launch_action)(
+                &crate::management::control_plane::HumanManagementPrincipal::authenticated(),
+                &payload,
+            ) {
+                Ok(response) => write_json_response(stream, 200, "OK", &response),
+                Err(error) => write_agent_management_control_error(stream, error),
+            }
         }
         ("GET", "/v2/agent-management/durable-candidates") => {
             let principal =

@@ -66,6 +66,10 @@ pub(crate) fn record_cutex_session_user_action(
 }
 
 pub(crate) fn cmd_session_takeover(id: &str) -> anyhow::Result<()> {
+    let store = load_cutex_session_store()?;
+    if let Some(key) = cutex_session_key_for_user_id(&store, id) {
+        cutex::agent_management::require_default_launch(&store.sessions[&key])?;
+    }
     let trimmed = id.trim();
     if trimmed.is_empty() {
         anyhow::bail!("Session id cannot be empty");
@@ -212,6 +216,10 @@ pub(crate) fn cmd_session_close_and_restart_with_profile(
     launch_profile: Option<&str>,
     open_visible_terminal: bool,
 ) -> anyhow::Result<serde_json::Value> {
+    let store = load_cutex_session_store()?;
+    let key =
+        cutex_session_key_for_user_id(&store, id).ok_or_else(|| anyhow!("unknown session"))?;
+    cutex::agent_management::require_default_launch(&store.sessions[&key])?;
     cmd_session_close_and_wait(id)
         .context("Failed to close runtime before restart; restart was not attempted")?;
     cmd_session_online_with_profile(id, launch_profile, open_visible_terminal)
@@ -485,6 +493,7 @@ fn cmd_session_resume_foreground_inner(
     cwd_override: Option<&str>,
     launch_profile: Option<&str>,
 ) -> anyhow::Result<()> {
+    cutex::agent_management::require_default_launch(record)?;
     if record.is_retired() {
         anyhow::bail!(
             "cannot resume retired cutex session {}; restore it first",
