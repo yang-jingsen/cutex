@@ -38,11 +38,26 @@ pub struct StockRuntimeReceipt {
     pub runtime_agent_id: String,
     pub expected_generation: u64,
     pub binding: Option<CutexAppServerRuntimeBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<StockPublication>,
     pub error: Option<String>,
     pub updated_at: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StockPublication {
+    pub path: std::path::PathBuf,
+    pub device: u64,
+    pub inode: u64,
+}
+
 pub trait StockRuntimeExecutor {
+    /// Hold the exact kernel lease through child publication. On replay, a busy,
+    /// missing or replaced lease cannot establish absence and must reject.
+    fn publication(&mut self, receipt: &StockRuntimeReceipt) -> anyhow::Result<StockPublication>;
+    /// Exact published occurrence only; false means still alive. Unknowns reject.
+    fn published_owner_absent(&mut self, receipt: &StockRuntimeReceipt) -> anyhow::Result<bool>;
     fn stop(&mut self, record: &CutexSessionRecord) -> anyhow::Result<()>;
     fn spawn(
         &mut self,
@@ -171,6 +186,7 @@ impl AgentManagementProvider {
                             .filter(|g| *g <= crate::management::v2::model::MAX_SAFE_SEQUENCE)
                             .ok_or_else(|| anyhow::anyhow!("runtime generation exhausted"))?,
                         binding: None,
+                        publication: None,
                         error: None,
                         updated_at: chrono::Utc::now().to_rfc3339(),
                     }
@@ -197,6 +213,29 @@ impl AgentManagementProvider {
             );
             let bundle = StockBundle::load(&review.contract)?;
             validate_native(record, &sessions, &review.contract)?;
+            if receipt.stage == StockRuntimeStage::Spawned
+                && record.runtime_generation == review.subject.runtime_generation
+                && runtime.published_owner_absent(&receipt)?
+            {
+                // A committed gate may lose its creator before release. Same
+                // lease + exact process absence permits only this unregistered
+                // occurrence to return to Claimed under the original action.
+                with_locked_session_store(path, |store| {
+                    let current = store.sessions.get_mut(id.as_str()).ok_or_else(|| anyhow::anyhow!("stock record missing"))?;
+                    anyhow::ensure!(current.app_server_launch_claim_id.as_deref() == Some(&receipt.claim_id)
+                        && current.app_server_runtime == receipt.binding
+                        && current.runtime_generation == review.subject.runtime_generation
+                        && current.revision == review.subject.revision
+                        && current.explicit_launch.as_ref() == Some(&review.contract),
+                        "published recovery occurrence changed");
+                    current.app_server_runtime = None;
+                    current.runtime_pid = None;
+                    receipt.binding = None;
+                    receipt.stage = StockRuntimeStage::Claimed;
+                    store.explicit_launch_receipts.insert(action_id.to_string(), ExplicitLaunchActionReceipt::Runtime(receipt.clone()));
+                    save_locked_session_store(path, store)
+                })?;
+            }
             if receipt.stage == StockRuntimeStage::Prepared {
                 anyhow::ensure!(
                     super::store::request_sha256(record)? == review.subject.durable_sha256,
@@ -206,6 +245,7 @@ impl AgentManagementProvider {
                 if review.restart {
                     runtime.stop(record)?;
                 }
+                receipt.publication = Some(runtime.publication(&receipt)?);
                 with_locked_session_store(path, |store| {
                     let current = store
                         .sessions
@@ -238,10 +278,19 @@ impl AgentManagementProvider {
                     );
                     save_locked_session_store(path, store)
                 })?;
+            }
+            if receipt.stage == StockRuntimeStage::Claimed {
+                anyhow::ensure!(receipt.publication.is_some(), "publication_missing: legacy uncertain claim has no absence proof; no automatic retry");
+                runtime.publication(&receipt)?;
                 let current = load_cutex_session_store_from_path(path)?
                     .sessions
                     .remove(id.as_str())
                     .ok_or_else(|| anyhow::anyhow!("stock durable record missing"))?;
+                anyhow::ensure!(current.app_server_launch_claim_id.as_deref() == Some(&receipt.claim_id)
+                    && current.app_server_runtime.is_none() && current.runtime_pid.is_none()
+                    && current.runtime_generation == review.subject.runtime_generation
+                    && current.revision == review.subject.revision,
+                    "publication conflict: claim/configuration or runtime changed; no spawn");
                 let binding = match runtime.spawn(&current, &bundle, &receipt) {
                     Ok(binding) => binding,
                     Err(error) => {
@@ -252,17 +301,24 @@ impl AgentManagementProvider {
                 };
                 receipt.binding = Some(binding.clone());
                 receipt.stage = StockRuntimeStage::Spawned;
+                #[cfg(feature = "stock-launch-test-hook")]
+                if std::env::var("CUTEX_STOCK_TEST_CREATOR_DEATH_ACTION").ok().as_deref() == Some(action_id.as_str()) {
+                    eprintln!("private precommit creator death; owned child PID {}", binding.pid);
+                    unsafe { libc::_exit(86); }
+                }
                 let persisted = with_locked_session_store(path, |store| {
                     #[cfg(feature = "stock-launch-test-hook")]
+                    { static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                     if std::env::var("CUTEX_STOCK_TEST_COMMIT_FAIL_ACTION")
                         .ok()
                         .as_deref()
-                        == Some(action_id.as_str())
+                        == Some(action_id.as_str()) && !FAILED.swap(true, std::sync::atomic::Ordering::SeqCst)
                     {
                         anyhow::bail!(
                             "private injected precommit failure; owned child PID {}",
                             binding.pid
                         );
+                    }
                     }
                     let current = store
                         .sessions
@@ -279,7 +335,7 @@ impl AgentManagementProvider {
                         "stock claim/configuration changed during spawn"
                     );
                     current.runtime_pid = Some(binding.pid);
-                    current.app_server_runtime = Some(binding);
+                    current.app_server_runtime = Some(binding.clone());
                     store.explicit_launch_receipts.insert(
                         action_id.to_string(),
                         ExplicitLaunchActionReceipt::Runtime(receipt.clone()),
@@ -291,6 +347,11 @@ impl AgentManagementProvider {
                     return Err(
                         error.context("spawned child stopped; commit uncertain, claim retained")
                     );
+                }
+                #[cfg(feature = "stock-launch-test-hook")]
+                if std::env::var("CUTEX_STOCK_TEST_PUBLISHED_DEATH_ACTION").ok().as_deref() == Some(action_id.as_str()) {
+                    eprintln!("private published creator death; owned child PID {}", binding.pid);
+                    unsafe { libc::_exit(87); }
                 }
             }
             anyhow::ensure!(

@@ -7,12 +7,12 @@ use cutex::launch::stock::{StockBundle, STOCK_SCHEMA_SHA256};
 use cutex::session::model::{
     CutexAppServerRuntimeBinding, CutexSessionRecord, LaunchProfileSource,
 };
-use std::process::Child;
 use std::sync::Arc;
 
 #[derive(Default)]
 pub(super) struct StockExecutor {
-    child: Option<Child>,
+    child: Option<super::stock_publication::GatedChild>,
+    publication: Option<(cutex::agent_management::StockPublication, std::fs::File)>,
 }
 impl Drop for StockExecutor {
     fn drop(&mut self) {
@@ -88,6 +88,78 @@ fn configured(
 }
 
 impl StockRuntimeExecutor for StockExecutor {
+    fn published_owner_absent(&mut self, receipt: &StockRuntimeReceipt) -> anyhow::Result<bool> {
+        let binding = receipt
+            .binding
+            .as_ref()
+            .context("published binding missing")?;
+        #[cfg(target_os = "linux")]
+        {
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", binding.pid));
+            match stat {
+                Ok(stat) => {
+                    let state = stat
+                        .rsplit(')')
+                        .next()
+                        .context("invalid owned process stat")?
+                        .split_whitespace()
+                        .next();
+                    if state != Some("Z") {
+                        let actual = cutex::platform::process::process_started_at(binding.pid)?;
+                        let original = chrono::DateTime::parse_from_rfc3339(&binding.started_at)?;
+                        if actual.timestamp() == original.timestamp() {
+                            return Ok(false);
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            // Never signal a reused PID. Also refuse a live endpoint holder.
+            match std::os::unix::net::UnixStream::connect(
+                binding
+                    .endpoint
+                    .strip_prefix("unix://")
+                    .context("invalid stock endpoint")?,
+            ) {
+                Ok(_) => anyhow::bail!("published endpoint remains live; ownership ambiguous"),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    ) => {}
+                Err(error) => return Err(error.into()),
+            }
+            ensure!(
+                receipt.publication.is_some(),
+                "publication_missing: cannot recover legacy binding"
+            );
+            self.publication(receipt)?;
+            Ok(true)
+        }
+        #[cfg(not(target_os = "linux"))]
+        anyhow::bail!("stock publication requires Linux")
+    }
+    fn publication(
+        &mut self,
+        receipt: &StockRuntimeReceipt,
+    ) -> anyhow::Result<cutex::agent_management::StockPublication> {
+        if let Some((publication, _)) = &self.publication {
+            ensure!(
+                receipt
+                    .publication
+                    .as_ref()
+                    .is_none_or(|p| p == publication),
+                "publication changed"
+            );
+            return Ok(publication.clone());
+        }
+        let publication =
+            super::stock_publication::lease(&receipt.claim_id, receipt.publication.as_ref())?;
+        let result = publication.0.clone();
+        self.publication = Some(publication);
+        Ok(result)
+    }
     fn stop(&mut self, record: &CutexSessionRecord) -> anyhow::Result<()> {
         let Some(binding) = &record.app_server_runtime else {
             ensure!(
@@ -156,12 +228,17 @@ impl StockRuntimeExecutor for StockExecutor {
             .env("CUTEX_AGENT_BUS_TOKEN", token);
         let log = std::path::PathBuf::from(layout.binding(0, String::new()).runtime_dir)
             .join("stock.stderr.log");
-        // Existing detached child/setsid adapter, without contacting systemd.
-        // This private subset claims process-group ownership, not a cgroup.
-        self.child = Some(cutex::runtime::lifecycle::spawn_detached_session_launch(
+        // One gated setsid child, without contacting systemd. It cannot exec
+        // native stock until its binding has committed. This is not a cgroup.
+        self.child = Some(super::stock_publication::spawn(
             &launch,
             cutex::session::service::cutex_session_launch_cwd(record),
             &log,
+            &self
+                .publication
+                .as_ref()
+                .context("publication lease missing")?
+                .1,
         )?);
         let child = self.child.as_mut().expect("spawned owned child");
         let mut binding = layout.binding(
@@ -176,7 +253,6 @@ impl StockRuntimeExecutor for StockExecutor {
         });
         binding.schema_version = "stock-0.153.4-app-server-v2".into();
         binding.schema_sha256 = STOCK_SCHEMA_SHA256.into();
-        super::management_lifecycle::wait_for_app_server_endpoint(&layout, child, &log)?;
         Ok(binding)
     }
     fn connect(
@@ -185,6 +261,31 @@ impl StockRuntimeExecutor for StockExecutor {
         receipt: &StockRuntimeReceipt,
     ) -> anyhow::Result<()> {
         let binding = receipt.binding.as_ref().context("stock binding missing")?;
+        if let Some(child) = &mut self.child {
+            child.release()?;
+            self.publication.take();
+        }
+        // Native exec is permitted only after the binding/receipt commit. The
+        // existing manager connect below validates the actual native endpoint.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if verify_stock_process(record, binding).is_ok()
+                && std::path::Path::new(binding.endpoint.trim_start_matches("unix://")).exists()
+            {
+                break;
+            }
+            if let Some(child) = &mut self.child {
+                ensure!(
+                    !child.try_wait()?,
+                    "published stock child exited before readiness"
+                );
+            }
+            ensure!(
+                std::time::Instant::now() < until,
+                "published stock owner not ready; retry exact action, no fallback"
+            );
+            std::thread::park_timeout(std::time::Duration::from_millis(10));
+        }
         verify_stock_process(record, binding)?;
         let manager = super::app_server_runtime::runtime_manager();
         if let Some(status) = manager
@@ -277,31 +378,18 @@ impl StockRuntimeExecutor for StockExecutor {
     }
     fn cleanup_owned(&mut self) -> anyhow::Result<()> {
         if let Some(mut child) = self.child.take() {
-            if child.try_wait()?.is_none() {
-                #[cfg(target_os = "linux")]
-                {
-                    ensure!(
-                        unsafe { libc::getpgid(child.id() as i32) } == child.id() as i32,
-                        "owned child group changed"
-                    );
-                    ensure!(
-                        unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) } == 0,
-                        "owned child cleanup failed"
-                    );
-                }
-                #[cfg(not(target_os = "linux"))]
-                child.kill()?;
-            }
-            child.wait()?;
+            child.cleanup()?;
         }
+        self.publication.take();
         Ok(())
     }
     fn retain_owner(&mut self) {
-        if let Some(child) = self.child.take() {
-            super::management_lifecycle::spawn_detached_child_reaper(
-                child,
-                "private stock owner".into(),
-            );
+        if let Some(mut child) = self.child.take() {
+            let _ = std::thread::Builder::new()
+                .name("stock-child-reaper".into())
+                .spawn(move || {
+                    let _ = child.wait();
+                });
         }
     }
 }

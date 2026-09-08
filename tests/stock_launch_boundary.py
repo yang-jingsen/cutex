@@ -30,6 +30,12 @@ env.update(LD_PRELOAD=str(guard),S4_TEST_ALLOWED_PORTS='')
 env['CUTEX_STOCK_TEST_LOST_READY_ACTION']='s4-launch-alpha'
 env['CUTEX_STOCK_TEST_REGISTER_DENY_ACTION']='s4-launch-alpha'
 env['CUTEX_STOCK_TEST_COMMIT_FAIL_ACTION']='s4-commit-failure'
+repair_mode=sys.argv[2] if len(sys.argv)>2 and sys.argv[2] in ('default-publication','commit-recovery','creator-recovery','published-recovery') else None
+if repair_mode:
+    for key in list(env):
+        if key.startswith('CUTEX_STOCK_TEST_'): del env[key]
+    key={'commit-recovery':'CUTEX_STOCK_TEST_COMMIT_FAIL_ACTION','creator-recovery':'CUTEX_STOCK_TEST_CREATOR_DEATH_ACTION','published-recovery':'CUTEX_STOCK_TEST_PUBLISHED_DEATH_ACTION'}.get(repair_mode)
+    if key: env[key]='s4-launch-alpha'
 # Deterministic refusal proof: no listener or live endpoint is contacted.
 tripwire=subprocess.run(['/usr/bin/python3','-c',"import socket; socket.socket().connect(('127.0.0.1',1))"],
                        env=env,capture_output=True)
@@ -208,6 +214,54 @@ try:
     action(changed,ok=False)
     first=action({'operation':'review_runtime','cutex_session_id':durable,'restart':False})
     launch={'operation':'run','action_id':'s4-launch-alpha','review':first}
+    if repair_mode:
+        unrelated=owner(['/usr/bin/python3','-c','import signal; signal.pause()'],'unrelated')
+        if repair_mode=='commit-recovery':
+            failure=action(launch,ok=False)
+            pid=int(re.search(r'owned child PID (\d+)',json.dumps(failure)).group(1))
+            assert process_identity(pid) is None
+        elif repair_mode in ('creator-recovery','published-recovery'):
+            try: action(launch)
+            except (http.client.RemoteDisconnected, ConnectionResetError): pass
+            else: raise AssertionError('creator did not die at selected boundary')
+            assert management.wait(timeout=10)==(86 if repair_mode=='creator-recovery' else 87)
+        if repair_mode!='default-publication':
+            prior=store()['explicit_launch_receipts']['s4-launch-alpha']['receipt']
+            assert prior['stage']==('spawned' if repair_mode=='published-recovery' else 'claimed')
+            publication=prior['publication']
+            # Kernel lock acquisition observes gate EOF/child exit, never a sleep barrier.
+            with open(publication['path'],'r+') as witness:
+                fcntl.flock(witness,fcntl.LOCK_EX)
+                if repair_mode=='commit-recovery':
+                    denied=action(launch,ok=False)
+                    assert 'publication_busy' in json.dumps(denied)
+                fcntl.flock(witness,fcntl.LOCK_UN)
+            if repair_mode=='commit-recovery':
+                path=Path(publication['path']); retained=path.with_suffix('.retained')
+                path.rename(retained)
+                try:
+                    assert 'publication evidence unavailable' in json.dumps(action(launch,ok=False))
+                    path.touch(mode=0o600)
+                    assert 'publication evidence replaced' in json.dumps(action(launch,ok=False))
+                finally: retained.replace(path)
+                assert store()['explicit_launch_receipts']['s4-launch-alpha']['receipt']==prior
+            if repair_mode in ('creator-recovery','published-recovery'):
+                env.pop(key)
+                management=owner([CUTEX,'management','serve','--port',mp],'management-recovered'); ready(mp,management)
+        recovered=action(launch)
+        assert recovered['stage']=='ready' and action(launch)==recovered
+        if repair_mode!='default-publication':
+            assert recovered['claim_id']==prior['claim_id'] and recovered['runtime_agent_id']==prior['runtime_agent_id'] and recovered['publication']==publication
+        stock_pids.append(recovered['binding']['pid'])
+        observer=RPC(Path(recovered['binding']['endpoint'].removeprefix('unix://')))
+        observer.call('initialize',{'clientInfo':{'name':'s4-recovery-observer','version':'1'},'capabilities':{'experimentalApi':True}}); observer.notify('initialized')
+        assert observer.call('server/diagnostics',{})['process']['id']==recovered['binding']['pid']
+        assert observer.call('thread/read',{'threadId':thread,'includeTurns':True})['thread']['turns']==before['thread']['turns']
+        record=store()['sessions'][durable]
+        assert record['explicit_launch']==contract and record['codex_session_id']==thread and record['runtime_generation']==1 and record.get('app_server_launch_claim_id') is None
+        assert unrelated.poll() is None and sha(NATIVE/'config.toml')==shared_sha
+        (RUN/'PASS.json').write_text(json.dumps({'mode':repair_mode,'same_claim':recovered['claim_id'],'durable':durable,'native':thread,'stage':recovered['stage'],'generation':record['runtime_generation'],'model_calls':Model.calls,'unrelated_alive':True},indent=2))
+        sys.exit(0)
     ready_receipt=action(launch)
     (RUN/'first-receipt.json').write_text(json.dumps(ready_receipt,indent=2))
     if ready_receipt.get('binding'): stock_pids.append(ready_receipt['binding']['pid'])
@@ -243,23 +297,6 @@ try:
     unrelated=owner(['/usr/bin/python3','-c','import signal; signal.pause()'],'unrelated')
     read_owner(ready_receipt).call('mcpServerStatus/list',{'threadId':thread,'detail':'toolsAndAuthOnly'})
     old_tree=owned_tree(ready_receipt['binding']['pid'])
-    if len(sys.argv)>2 and sys.argv[2]=='commit-failure':
-        failed_review=action({'operation':'review_runtime','cutex_session_id':durable,'restart':True})
-        failed_request={'operation':'run','action_id':'s4-commit-failure','review':failed_review}
-        failure=action(failed_request,ok=False)
-        child_pid=int(re.search(r'owned child PID (\d+)',json.dumps(failure)).group(1))
-        assert process_identity(child_pid) is None
-        assert unrelated.poll() is None
-        record=store()['sessions'][durable]
-        assert record['explicit_launch']==contract and record['codex_session_id']==thread
-        assert record['app_server_launch_claim_id'] and record.get('app_server_runtime') is None
-        retained=store()['explicit_launch_receipts']['s4-commit-failure']
-        replay=action(failed_request,ok=False)
-        assert 'no duplicate spawn' in json.dumps(replay)
-        assert store()['explicit_launch_receipts']['s4-commit-failure']==retained
-        action({'operation':'review_runtime','cutex_session_id':durable,'restart':False},ok=False)
-        (RUN/'PASS.json').write_text(json.dumps({'criterion':'injected precommit failure; actual owned child stopped, unrelated alive, same claim retained and replay refused without duplicate','recovery':'no automatic recovery for claim without committed binding'},indent=2))
-        sys.exit(0)
     assert old_tree and unrelated.poll() is None
     # Generic launch is rejected without replacing or stopping this owner.
     generic={'requestId':'s4-generic-online','method':'cutex/runtime/online','params':{'expectedRuntimeGeneration':record['runtime_generation'],'openVisibleTerminal':False}}

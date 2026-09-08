@@ -1,5 +1,9 @@
 # S4r3 private stock launch candidate
 
+Historical report of `1f039dcf58efa2958270e192f782f2203b708919`.
+The requested recovery repair and measured socket-test classification supersede
+the corresponding limitations below: [repair result](stock-launch-s4r3-repair.md).
+
 Base: `11e28adaa9d3629d609e07862f0d468642dbfdfd`, tree
 `a22b8d2a6c8ab42d6c3d2fcf6004c9f091ae1a58`. Descends the S3/S2
 decision/prototype; this is not the current release or a TUI merge.
