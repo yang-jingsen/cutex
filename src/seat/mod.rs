@@ -206,6 +206,16 @@ pub(crate) struct SeatOccupancyStore {
 }
 
 impl SeatOccupancyStore {
+    /// Fence notification resolution and enqueue against concurrent seat rotation.
+    pub(crate) fn with_notification_snapshot<T>(
+        &self,
+        operation: impl FnOnce(&SeatOccupancySnapshot) -> T,
+    ) -> Result<T, SeatAuthorityError> {
+        self.with_locked_state(false, |state| {
+            let result = operation(&state);
+            Ok((state, result, false))
+        })
+    }
     pub(crate) fn open(root: impl Into<PathBuf>) -> Result<Self, SeatAuthorityError> {
         let root = root.into();
         prepare_private_root(&root)?;
@@ -1294,6 +1304,42 @@ fn director_occupancy(state: &SeatOccupancySnapshot) -> Result<&SeatOccupancy, S
         .occupancies
         .get(&seat)
         .ok_or(SeatAuthorityError::Conflict("director_seat_not_bound"))
+}
+
+/// Resolve the intended task seat, never a global Director for a scoped task.
+/// Non-Director policies retain their explicit seat semantics.
+pub(crate) fn task_seat_occupancy<'a>(
+    state: &'a SeatOccupancySnapshot,
+    project_id: Option<&ProjectId>,
+    seat_id: &SeatId,
+) -> Option<&'a SeatOccupancy> {
+    if seat_id.as_str() == "cutex-director" {
+        if let Some(project_id) = project_id {
+            if state
+                .active_project_director_transfers
+                .contains_key(project_id)
+                || state.active_director_transfer.is_some()
+                || !matches!(
+                    state
+                        .project_director_states
+                        .get(project_id)
+                        .copied()
+                        .unwrap_or(ProjectDirectorSeatState::Active),
+                    ProjectDirectorSeatState::Active | ProjectDirectorSeatState::Archived
+                )
+            {
+                return None;
+            }
+            return state
+                .project_director_occupancies
+                .get(project_id)
+                .filter(|occupancy| &occupancy.seat_id == seat_id && occupancy.epoch > 0);
+        }
+    }
+    state
+        .occupancies
+        .get(seat_id)
+        .filter(|occupancy| occupancy.epoch > 0)
 }
 
 fn project_director_occupancy<'a>(

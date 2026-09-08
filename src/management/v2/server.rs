@@ -830,7 +830,7 @@ fn write_owner_task_snapshot(
             );
         }
     };
-    let response = match crate::task_service::project_owner_tasks(
+    let mut response = match crate::task_service::project_owner_tasks(
         snapshot, activity, principal, project_id, &filter, now,
     ) {
         Ok(response) => response,
@@ -879,6 +879,36 @@ fn write_owner_task_snapshot(
             );
         }
     };
+    let seats = match crate::seat::SeatOccupancyStore::open_default()
+        .and_then(|store| store.query().map_err(anyhow::Error::new))
+    {
+        Ok(seats) => seats,
+        Err(_) => {
+            return write_v2_error(
+                stream,
+                503,
+                "Service Unavailable",
+                "projection_unavailable",
+                "Task completion authority is unavailable",
+                true,
+                json!({}),
+            )
+        }
+    };
+    for item in &mut response.items {
+        if let Some(task) = snapshot
+            .task_revisions
+            .get(&item.task.task_id)
+            .and_then(|revisions| revisions.get(&item.task.task_revision))
+        {
+            item.task.completion_authority_cutex_session_id = crate::seat::task_seat_occupancy(
+                &seats,
+                task.project_id.as_ref(),
+                &task.completion_policy.authority_seat_id,
+            )
+            .map(|occupancy| occupancy.occupant_cutex_session.clone());
+        }
+    }
     if filter.task_id.is_some() && response.items.is_empty() {
         return write_v2_error(
             stream,

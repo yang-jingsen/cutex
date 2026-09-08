@@ -236,10 +236,20 @@ impl TaskServiceAgentBusDispatcher {
         state: &Arc<Mutex<AgentBusState>>,
         now_epoch_secs: u64,
     ) -> Result<CompletionNotificationDispatchSummary, ProviderError> {
+        seats
+            .with_notification_snapshot(|seat_snapshot| {
+                Self::dispatch_completion_with_seats(provider, seat_snapshot, state, now_epoch_secs)
+            })
+            .map_err(|_| ProviderError::PersistenceUnavailable)?
+    }
+
+    fn dispatch_completion_with_seats(
+        provider: &TaskServiceProvider,
+        seat_snapshot: &crate::seat::SeatOccupancySnapshot,
+        state: &Arc<Mutex<AgentBusState>>,
+        now_epoch_secs: u64,
+    ) -> Result<CompletionNotificationDispatchSummary, ProviderError> {
         let snapshot = provider.query()?;
-        let seat_snapshot = seats
-            .query()
-            .map_err(|_| ProviderError::PersistenceUnavailable)?;
         let mut summary = CompletionNotificationDispatchSummary::default();
         for notification in snapshot.completion_notifications.values() {
             if notification.is_delivered() {
@@ -260,12 +270,42 @@ impl TaskServiceAgentBusDispatcher {
                     .insert(notification.notification_id.as_str().to_string());
                 continue;
             }
-            let target_session = seat_snapshot
-                .occupancies
-                .get(&notification.target_seat_id)
-                .map(|occupancy| occupancy.occupant_cutex_session.as_str());
+            let target_session = crate::seat::task_seat_occupancy(
+                seat_snapshot,
+                notification.project_id.as_ref(),
+                &notification.target_seat_id,
+            )
+            .map(|occupancy| occupancy.occupant_cutex_session.as_str());
             let target =
                 target_session.and_then(|session| resolve_current_runtime_target(state, session));
+            // A previously queued but not delivered completion can survive a
+            // rotation. Withdraw stale in-memory copies before retrying; the
+            // durable outbox/notification ID and its audit facts stay intact.
+            {
+                let mut bus = state
+                    .lock()
+                    .map_err(|_| ProviderError::PersistenceUnavailable)?;
+                let valid_targets = target
+                    .iter()
+                    .map(|(id, _)| id.clone())
+                    .collect::<BTreeSet<_>>();
+                for (runtime, queue) in &mut bus.messages {
+                    if !valid_targets.contains(runtime) {
+                        queue.retain(|message| {
+                            message.control_type.as_deref()
+                                != Some("cutex.task_service.completion.v1")
+                                || message.external_message_id.as_deref()
+                                    != Some(notification.external_message_id.as_str())
+                        });
+                    }
+                }
+                bus.recent_sends.retain(|_, message| {
+                    message.control_type.as_deref() != Some("cutex.task_service.completion.v1")
+                        || message.external_message_id.as_deref()
+                            != Some(notification.external_message_id.as_str())
+                        || valid_targets.contains(&message.to)
+                });
+            }
             let Some((target_id, target_name)) = target else {
                 summary.target_unavailable += 1;
                 summary
@@ -1674,6 +1714,198 @@ mod tests {
     }
 
     #[test]
+    fn project_completion_routes_current_directors_and_fences_retry_rotation() {
+        use crate::seat::*;
+        use crate::task_service::*;
+        let root =
+            std::env::temp_dir().join(format!("cutex-project-routing-{}", uuid::Uuid::new_v4()));
+        let provider = TaskServiceProvider::open(root.join("provider")).unwrap();
+        let seats = SeatOccupancyStore::open(root.join("seats")).unwrap();
+        let sid = |s: &str| crate::role_revision::CutexSessionId::new(s).unwrap();
+        let aid = |s: &str| ActionId::new(s).unwrap();
+        let director_seat = SeatId::new("cutex-director").unwrap();
+        seats
+            .bind(&SeatOccupancyBindRequest {
+                schema: SeatOccupancyCommandSchema::V1,
+                action_id: aid("global"),
+                seat_id: director_seat.clone(),
+                occupant_cutex_session: sid("r12"),
+            })
+            .unwrap();
+        let state = Arc::new(Mutex::new(AgentBusState::default()));
+        for runtime in ["r12", "r13", "beta-director", "r14"] {
+            state
+                .lock()
+                .unwrap()
+                .agents
+                .insert(runtime.into(), roster(runtime, runtime));
+        }
+        for (project, director) in [("alpha", "r13"), ("beta", "beta-director")] {
+            let project_id = crate::agent_management::ProjectId::new(project).unwrap();
+            let prepare = aid(&format!("prepare-{project}"));
+            seats
+                .prepare_project_director(&prepare, &project_id, &sid(director))
+                .unwrap();
+            seats
+                .activate_project_director(&prepare, &project_id, &sid(director))
+                .unwrap();
+            let principal =
+                AuthenticatedPrincipal::seated_session(sid(director), director_seat.clone(), 1)
+                    .unwrap();
+            let task_id = TaskId::new(format!("task-{project}")).unwrap();
+            let assignment_id = AssignmentId::new(format!("assignment-{project}")).unwrap();
+            let worker = AuthenticatedPrincipal::session(sid(&format!("worker-{project}")));
+            provider
+                .create_project_revision(
+                    &principal,
+                    &CreateProjectRevisionRequest {
+                        schema: ProviderActionSchema::V3,
+                        action_id: aid(&format!("create-{project}")),
+                        project_id: project_id.clone(),
+                        workflow_id: WorkflowId::new(format!("workflow-{project}")).unwrap(),
+                        task_id: task_id.clone(),
+                        task_revision: TaskRevision::new(1).unwrap(),
+                        contract_sha256: sha("contract"),
+                        opaque_contract: "contract".into(),
+                        completion_policy: CompletionPolicy {
+                            kind: CompletionPolicyKind::DirectorAcceptance,
+                            authority_seat_id: director_seat.clone(),
+                        },
+                    },
+                    None,
+                )
+                .unwrap();
+            provider
+                .assign_project_and_dispatch(
+                    &principal,
+                    &AssignProjectAndDispatchRequest {
+                        schema: ProviderActionSchema::V3,
+                        action_id: aid(&format!("assign-{project}")),
+                        project_id,
+                        assignment_id: assignment_id.clone(),
+                        task_id,
+                        task_revision: TaskRevision::new(1).unwrap(),
+                        assignee_cutex_session: sid(&format!("worker-{project}")),
+                        send_attempt_id: SendAttemptId::new(format!("send-{project}")).unwrap(),
+                        external_message_id: format!("message-{project}"),
+                    },
+                    1,
+                    "assignment",
+                )
+                .unwrap();
+            for action in [
+                WorkerActionRequest::Start(AssignmentActionRequest {
+                    schema: ProviderActionSchema::V2,
+                    action_id: aid(&format!("start-{project}")),
+                    assignment_id: assignment_id.clone(),
+                }),
+                WorkerActionRequest::Submit(SubmitActionRequest {
+                    schema: ProviderActionSchema::V2,
+                    action_id: aid(&format!("submit-{project}")),
+                    assignment_id: assignment_id.clone(),
+                    result_sha256: sha("result"),
+                    result_reference: "result".into(),
+                }),
+            ] {
+                let WorkerPrepareOutcome::Prepared(envelope) = provider
+                    .prepare_worker_action(
+                        &worker,
+                        &WorkerPrepareRequest {
+                            schema: WorkerPrepareRequestSchema::V2,
+                            action,
+                        },
+                    )
+                    .unwrap()
+                else {
+                    panic!("prepared")
+                };
+                provider.execute_worker_action(&worker, &envelope).unwrap();
+            }
+            let context = provider
+                .worker_context(
+                    &worker,
+                    &WorkerContextRequest {
+                        schema: WorkerContextRequestSchema::V2,
+                        assignment_id: assignment_id.clone(),
+                    },
+                )
+                .unwrap()
+                .context;
+            provider
+                .execute_terminal_action(
+                    &principal,
+                    &TerminalActionEnvelope {
+                        schema: TerminalRequestSchema::V2,
+                        command: TerminalAuthorityRequest::AcceptResult(TerminalActionRequest {
+                            schema: ProviderActionSchema::V2,
+                            action_id: aid(&format!("accept-{project}")),
+                            assignment_id,
+                            decision_reference: Some("accepted".into()),
+                        }),
+                        context,
+                    },
+                )
+                .unwrap();
+        }
+        let first = TaskServiceAgentBusDispatcher::dispatch_pending_completion_notifications(
+            &provider, &seats, &state, 1,
+        )
+        .unwrap();
+        assert_eq!(first.queued, 4);
+        assert!(state.lock().unwrap().messages.get("r12").is_none());
+        assert_eq!(state.lock().unwrap().messages["r13"].len(), 2);
+        assert_eq!(state.lock().unwrap().messages["beta-director"].len(), 2);
+        let beta_message = state.lock().unwrap().messages["beta-director"][0].clone();
+        let beta_metadata: TaskServiceCompletionMetadata =
+            serde_json::from_value(beta_message.control_payload.unwrap()).unwrap();
+        record_completion_context_inserted_with_provider(
+            &provider,
+            &beta_metadata,
+            &beta_message.id,
+            "a4",
+        )
+        .unwrap();
+        let delivered_before = provider.query().unwrap().completion_notifications
+            [&beta_metadata.notification_id]
+            .clone();
+        let transfer = DirectorSeatTransferRequest {
+            action_id: aid("rotate-alpha"),
+            project_id: crate::agent_management::ProjectId::new("alpha").unwrap(),
+            expected_predecessor_cutex_session: sid("r13"),
+            successor_cutex_session: sid("r14"),
+        };
+        seats.transfer_director(&transfer).unwrap();
+        let fenced = TaskServiceAgentBusDispatcher::dispatch_pending_completion_notifications(
+            &provider, &seats, &state, 2,
+        )
+        .unwrap();
+        assert_eq!(fenced.target_unavailable, 2);
+        assert!(state.lock().unwrap().messages["r13"].is_empty());
+        seats.finish_director_transfer(&transfer).unwrap();
+        let recovered = TaskServiceAgentBusDispatcher::dispatch_pending_completion_notifications(
+            &provider, &seats, &state, 3,
+        )
+        .unwrap();
+        assert_eq!(recovered.queued, 3);
+        assert_eq!(state.lock().unwrap().messages["r14"].len(), 2);
+        assert_eq!(
+            provider.query().unwrap().completion_notifications[&beta_metadata.notification_id],
+            delivered_before
+        );
+        let replay = TaskServiceAgentBusDispatcher::dispatch_pending_completion_notifications(
+            &provider, &seats, &state, 4,
+        )
+        .unwrap();
+        assert_eq!(replay.deduplicated, 3);
+        assert_eq!(state.lock().unwrap().messages["r14"].len(), 2);
+        assert_eq!(
+            seats.query().unwrap().occupancies[&director_seat].occupant_cutex_session,
+            sid("r12")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn completion_dispatch_retries_after_failure_rebinds_seat_and_deduplicates_after_restart() {
         let root = std::env::temp_dir().join(format!(
             "cutex-completion-dispatch-{}",
@@ -2458,6 +2690,14 @@ mod tests {
             "live-director-runtime".to_string(),
             roster("live-director-runtime", director_session.as_str()),
         );
+        let scoped_project = crate::agent_management::ProjectId::new("project-alpha").unwrap();
+        let prepare = ActionId::new("materialize-scoped-director").unwrap();
+        seats
+            .prepare_project_director(&prepare, &scoped_project, &director_session)
+            .unwrap();
+        seats
+            .activate_project_director(&prepare, &scoped_project, &director_session)
+            .unwrap();
         let provider_before = provider.query().unwrap();
         let legacy_ids = provider_before
             .completion_notifications

@@ -439,10 +439,12 @@ impl TaskWorkerActionHost {
                     &queried_seats
                 }
             };
-            let coordinator = seat_snapshot
-                .occupancies
-                .get(&workflow.coordinator_seat_id)
-                .context("Task coordinator seat is not occupied")?;
+            let coordinator = crate::seat::task_seat_occupancy(
+                seat_snapshot,
+                task.project_id.as_ref(),
+                &workflow.coordinator_seat_id,
+            )
+            .context("Task coordinator seat is not occupied")?;
             crate::management::v2::integration_events::append_task_service_transition(
                 &coordinator.occupant_cutex_session,
                 transition,
@@ -515,8 +517,19 @@ impl TaskWorkerActionHost {
             .map(|states| crate::task_service::task_watchdog_activity_projections(&states))
             .unwrap_or_default();
         let outcome = watchdog.scan(&snapshot, &activity)?;
-        let seat_snapshot = seats.query()?;
+        seats.with_notification_snapshot(|seat_snapshot| {
+            self.dispatch_task_watchdog_outcome(state, &snapshot, seat_snapshot, watchdog, outcome)
+        })?
+    }
 
+    fn dispatch_task_watchdog_outcome(
+        &self,
+        state: &Arc<Mutex<AgentBusState>>,
+        snapshot: &crate::task_service::TaskServiceSnapshot,
+        seat_snapshot: &crate::seat::SeatOccupancySnapshot,
+        watchdog: &crate::task_service::TaskStaleWatchdog,
+        outcome: crate::task_service::TaskWatchdogScanOutcome,
+    ) -> anyhow::Result<()> {
         if !outcome.cancelled_notification_ids.is_empty() {
             let cancelled = outcome
                 .cancelled_notification_ids
@@ -569,10 +582,11 @@ impl TaskWorkerActionHost {
             {
                 continue;
             }
-            let Some(director) = seat_snapshot
-                .occupancies
-                .get(&task.completion_policy.authority_seat_id)
-            else {
+            let Some(director) = crate::seat::task_seat_occupancy(
+                &seat_snapshot,
+                task.project_id.as_ref(),
+                &task.completion_policy.authority_seat_id,
+            ) else {
                 continue;
             };
             let presentation_key = (
@@ -610,7 +624,13 @@ impl TaskWorkerActionHost {
                 crate::task_service::TaskWatchdogTarget::AuthoritySeat(seat) => {
                     let seat = crate::task_service::SeatId::new(seat.clone()).ok();
                     seat.as_ref()
-                        .and_then(|seat| seat_snapshot.occupancies.get(seat))
+                        .and_then(|seat| {
+                            crate::seat::task_seat_occupancy(
+                                &seat_snapshot,
+                                notification.project_id.as_ref(),
+                                seat,
+                            )
+                        })
                         .map(|occupancy| occupancy.occupant_cutex_session.as_str())
                 }
             };
@@ -619,6 +639,27 @@ impl TaskWorkerActionHost {
                     state, session,
                 )
             });
+            {
+                let mut bus = state
+                    .lock()
+                    .map_err(|_| anyhow!("agent bus state lock poisoned"))?;
+                for (runtime, queue) in &mut bus.messages {
+                    if target.as_ref().is_none_or(|(id, _)| id != runtime) {
+                        queue.retain(|message| {
+                            message.control_type.as_deref()
+                                != Some("cutex.task_service.watchdog.v1")
+                                || message.external_message_id.as_deref()
+                                    != Some(notification.external_message_id.as_str())
+                        });
+                    }
+                }
+                bus.recent_sends.retain(|_, message| {
+                    message.control_type.as_deref() != Some("cutex.task_service.watchdog.v1")
+                        || message.external_message_id.as_deref()
+                            != Some(notification.external_message_id.as_str())
+                        || target.as_ref().is_some_and(|(id, _)| id == &message.to)
+                });
+            }
             let Some((target_id, target_name)) = target else {
                 watchdog.record_delivery_fact(
                     &notification.notification_id,
@@ -792,8 +833,9 @@ impl TaskWorkerActionHost {
                         snapshot
                         .occupancies
                         .values()
-                        .find(|occupancy| occupancy.seat_id.as_str() == target_seat)
-                        .is_some_and(|occupancy| {
+                        .chain(snapshot.project_director_occupancies.values())
+                        .filter(|occupancy| occupancy.seat_id.as_str() == target_seat)
+                        .any(|occupancy| {
                             crate::task_delivery::provider_adapter::completion_target_is_current(
                                 state,
                                 occupancy.occupant_cutex_session.as_str(),
@@ -839,7 +881,9 @@ impl TaskWorkerActionHost {
                 if let Ok(mut sessions) = self.completion_unavailable_target_sessions.lock() {
                     *sessions = summary.unavailable_target_sessions;
                 }
-                if summary.uncertain > summary.target_unavailable {
+                // Queued is not Delivered. Keep bounded retries alive so a
+                // rotation can reroute outstanding work without an old-owner poll.
+                if summary.uncertain > summary.target_unavailable || summary.queued > 0 {
                     self.completion_drain_requested
                         .store(true, Ordering::Release);
                     self.completion_drain_retry_at.store(
@@ -1699,6 +1743,19 @@ impl TaskWorkerActionHost {
                 "completion_authority_not_current",
             );
         };
+        if crate::seat::task_seat_occupancy(
+            seat_snapshot,
+            request.project_id.as_ref(),
+            &authority_seat_id,
+        )
+        .is_none_or(|occupancy| &occupancy.occupant_cutex_session != authority_session)
+        {
+            return director_no_write(
+                semantic_action_id,
+                "create_revision",
+                "completion_authority_not_current_for_project",
+            );
+        }
         let completion_policy = crate::task_service::CompletionPolicy {
             kind: match request.completion_policy {
                 crate::task_service::SemanticCompletionPolicy::DirectorAcceptance => {
@@ -1915,13 +1972,12 @@ impl TaskWorkerActionHost {
                 {
                     continue;
                 }
-                let authority = Some(seat_snapshot)
-                    .and_then(|snapshot| {
-                        snapshot
-                            .occupancies
-                            .get(&task.completion_policy.authority_seat_id)
-                    })
-                    .map(|occupancy| occupancy.occupant_cutex_session.clone());
+                let authority = crate::seat::task_seat_occupancy(
+                    seat_snapshot,
+                    task.project_id.as_ref(),
+                    &task.completion_policy.authority_seat_id,
+                )
+                .map(|occupancy| occupancy.occupant_cutex_session.clone());
                 tasks.push(crate::task_service::DirectorTaskView {
                     project_id: task.project_id.clone(),
                     task_id: task.task_id.clone(),
@@ -3484,8 +3540,28 @@ pub fn handle_agent_bus_request(
                 .as_deref()
                 .is_some_and(|value| matches!(value, "1" | "true" | "yes"));
             let wait = poll_wait_duration(&request.path);
-            let (agent_name, messages) =
-                poll_agent_messages_with_wait(state, &agent_id, ack_mode, wait)?;
+            let pending_completion = state
+                .lock()
+                .map_err(|_| anyhow!("agent bus state lock poisoned"))?
+                .messages
+                .get(&agent_id)
+                .is_some_and(|queue| {
+                    queue.iter().any(|m| {
+                        m.control_type.as_deref() == Some("cutex.task_service.completion.v1")
+                    })
+                });
+            if pending_completion {
+                task_actions.request_completion_notification_drain();
+                task_actions.dispatch_completion_notifications_blocking(state);
+            }
+            let (agent_name, messages) = poll_agent_messages_with_wait(
+                state,
+                &agent_id,
+                ack_mode,
+                wait,
+                task_actions.seat_authority.as_ref(),
+                task_actions.provider.as_ref(),
+            )?;
             if !messages.is_empty() {
                 if let Err(err) = append_agent_bus_audit_record(serde_json::json!({
                     "event": "polled",
@@ -4422,6 +4498,8 @@ fn poll_agent_messages_with_wait(
     agent_id: &str,
     ack_mode: bool,
     wait: Duration,
+    seats: Option<&crate::seat::SeatOccupancyStore>,
+    provider: Option<&crate::task_service::TaskServiceProvider>,
 ) -> anyhow::Result<(String, Vec<AgentBusMessage>)> {
     let deadline = Instant::now() + wait;
     loop {
@@ -4430,7 +4508,8 @@ fn poll_agent_messages_with_wait(
             .generation
             .lock()
             .map_err(|_| anyhow!("agent bus poll signal lock poisoned"))?;
-        let result = poll_agent_messages(state, agent_id, ack_mode, now_epoch_secs())?;
+        let result =
+            poll_messages_with_completion_fence(state, agent_id, ack_mode, seats, provider)?;
         if !result.1.is_empty() || wait.is_zero() || !agent_is_registered(state, agent_id)? {
             return Ok(result);
         }
@@ -4450,9 +4529,119 @@ fn poll_agent_messages_with_wait(
             .wait_timeout(generation, remaining)
             .map_err(|_| anyhow!("agent bus poll signal lock poisoned"))?;
         if wait_result.timed_out() {
-            return poll_agent_messages(state, agent_id, ack_mode, now_epoch_secs());
+            return poll_messages_with_completion_fence(state, agent_id, ack_mode, seats, provider);
         }
     }
+}
+
+fn poll_messages_with_completion_fence(
+    state: &Arc<Mutex<AgentBusState>>,
+    agent_id: &str,
+    ack_mode: bool,
+    seats: Option<&crate::seat::SeatOccupancyStore>,
+    provider: Option<&crate::task_service::TaskServiceProvider>,
+) -> anyhow::Result<(String, Vec<AgentBusMessage>)> {
+    // Validate the actual poll result, not a pre-poll peek that could race an enqueue.
+    let (agent_name, mut messages) = poll_agent_messages(state, agent_id, true, now_epoch_secs())?;
+    let finish =
+        |messages: Vec<AgentBusMessage>| -> anyhow::Result<(String, Vec<AgentBusMessage>)> {
+            if !ack_mode {
+                let ids = messages
+                    .iter()
+                    .map(|message| message.id.as_str())
+                    .collect::<BTreeSet<_>>();
+                let mut bus = state
+                    .lock()
+                    .map_err(|_| anyhow!("agent bus state lock poisoned"))?;
+                if let Some(queue) = bus.messages.get_mut(agent_id) {
+                    queue.retain(|message| !ids.contains(message.id.as_str()));
+                }
+            }
+            Ok((agent_name, messages))
+        };
+    let has_completion = messages.iter().any(|m| {
+        m.control_type.as_deref() == Some("cutex.task_service.completion.v1")
+            || (m.control_type.as_deref() == Some("cutex.task_service.watchdog.v1")
+                && m.control_payload
+                    .clone()
+                    .and_then(|value| {
+                        serde_json::from_value::<crate::task_service::TaskWatchdogMessageMetadata>(
+                            value,
+                        )
+                        .ok()
+                    })
+                    .is_none_or(|metadata| {
+                        metadata.stage != crate::task_service::TaskWatchdogStage::FirstStale
+                    }))
+    });
+    if !has_completion {
+        return finish(messages);
+    }
+    let seats = seats.context("completion recipient authority unavailable")?;
+    seats
+        .with_notification_snapshot(|snapshot| {
+            let queued = messages.clone();
+            let tasks = if queued.iter().any(|message| message.control_type.as_deref() == Some("cutex.task_service.watchdog.v1")) {
+                provider.map(|provider| provider.query()).transpose().map_err(anyhow::Error::new)?
+            } else { None };
+            let allowed = queued
+                .iter()
+                .filter(|message| {
+                    if message.control_type.as_deref() == Some("cutex.task_service.watchdog.v1") {
+                        let Some(metadata) = message.control_payload.clone().and_then(|value| serde_json::from_value::<crate::task_service::TaskWatchdogMessageMetadata>(value).ok()) else { return false; };
+                        if metadata.stage == crate::task_service::TaskWatchdogStage::FirstStale { return true; }
+                        return tasks.as_ref().and_then(|tasks| {
+                            let id = crate::task_service::AssignmentId::new(metadata.assignment_id.clone()).ok()?;
+                            let assignment = tasks.assignments.get(&id)?;
+                            let task = tasks.task_revisions.get(&assignment.task_id)?.get(&assignment.task_revision)?;
+                            if task.project_id != metadata.project_id || assignment.project_id != metadata.project_id { return None; }
+                            crate::seat::task_seat_occupancy(snapshot, task.project_id.as_ref(), &task.completion_policy.authority_seat_id)
+                        }).and_then(|occupancy| crate::task_delivery::provider_adapter::resolve_current_runtime_target(state, occupancy.occupant_cutex_session.as_str())).is_some_and(|(runtime, _)| runtime == agent_id);
+                    }
+                    if message.control_type.as_deref() != Some("cutex.task_service.completion.v1") {
+                        return true;
+                    }
+                    message
+                        .control_payload
+                        .clone()
+                        .and_then(|value| {
+                            serde_json::from_value::<
+                                crate::agent_bus::model::TaskServiceCompletionMetadata,
+                            >(value)
+                            .ok()
+                        })
+                        .and_then(|m| {
+                            crate::seat::task_seat_occupancy(
+                                snapshot,
+                                m.project_id.as_ref(),
+                                &m.target_seat_id,
+                            )
+                        })
+                        .and_then(|occupancy| {
+                            crate::task_delivery::provider_adapter::resolve_current_runtime_target(
+                                state,
+                                occupancy.occupant_cutex_session.as_str(),
+                            )
+                        })
+                        .is_some_and(|(runtime, _)| runtime == agent_id)
+                })
+                .map(|message| message.id.clone())
+                .collect::<BTreeSet<_>>();
+            {
+                let rejected = queued.iter().filter(|message| !allowed.contains(&message.id)).map(|message| message.id.clone()).collect::<BTreeSet<_>>();
+                let mut bus = state
+                    .lock()
+                    .map_err(|_| anyhow!("agent bus state lock poisoned"))?;
+                if let Some(queue) = bus.messages.get_mut(agent_id) {
+                    queue.retain(|message| {
+                        !rejected.contains(&message.id)
+                    });
+                }
+            }
+            messages.retain(|message| allowed.contains(&message.id));
+            finish(messages)
+        })
+        .map_err(anyhow::Error::new)?
 }
 
 fn agent_is_registered(state: &Arc<Mutex<AgentBusState>>, agent_id: &str) -> anyhow::Result<bool> {
@@ -4849,8 +5038,15 @@ mod tests {
         let poll_state = Arc::clone(&state);
         let started = Instant::now();
         let poller = std::thread::spawn(move || {
-            poll_agent_messages_with_wait(&poll_state, "target", true, Duration::from_secs(1))
-                .expect("long poll should complete")
+            poll_agent_messages_with_wait(
+                &poll_state,
+                "target",
+                true,
+                Duration::from_secs(1),
+                None,
+                None,
+            )
+            .expect("long poll should complete")
         });
 
         std::thread::sleep(Duration::from_millis(25));
@@ -4898,8 +5094,15 @@ mod tests {
         let poll_state = state.clone();
         let started = Instant::now();
         let poller = std::thread::spawn(move || {
-            poll_agent_messages_with_wait(&poll_state, "target", true, Duration::from_secs(1))
-                .expect("long poll should complete")
+            poll_agent_messages_with_wait(
+                &poll_state,
+                "target",
+                true,
+                Duration::from_secs(1),
+                None,
+                None,
+            )
+            .expect("long poll should complete")
         });
 
         std::thread::sleep(Duration::from_millis(25));
@@ -7765,6 +7968,340 @@ mod tests {
         );
         assert!(fixture.state.lock().unwrap().messages.is_empty());
         fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn watchdog_owner_routing_rotates_without_changing_assignee_reminders() {
+        use crate::task_service::*;
+        let fixture = completion_drain_fixture("watchdog-project-routing");
+        let project = crate::agent_management::ProjectId::new("alpha").unwrap();
+        let old = crate::role_revision::CutexSessionId::new("r13").unwrap();
+        let new = crate::role_revision::CutexSessionId::new("r14").unwrap();
+        let prepare = ActionId::new("prepare-watchdog").unwrap();
+        fixture
+            .seats
+            .prepare_project_director(&prepare, &project, &old)
+            .unwrap();
+        fixture
+            .seats
+            .activate_project_director(&prepare, &project, &old)
+            .unwrap();
+        // Isolated observation fixture, not a persisted task-state repair.
+        let mut snapshot = fixture.provider.query().unwrap();
+        let assignment = snapshot
+            .assignments
+            .get_mut(&fixture.assignment_id)
+            .unwrap();
+        assignment.project_id = Some(project.clone());
+        let worker = assignment.assignee_cutex_session.clone();
+        let task = snapshot
+            .task_revisions
+            .get_mut(&assignment.task_id)
+            .unwrap()
+            .get_mut(&assignment.task_revision)
+            .unwrap();
+        task.project_id = Some(project.clone());
+        task.completion_policy.authority_seat_id = SeatId::new("cutex-director").unwrap();
+        let attempt = snapshot
+            .attempts
+            .get_mut(&fixture.assignment_id)
+            .unwrap()
+            .get_mut(&assignment.active_attempt.unwrap())
+            .unwrap();
+        attempt.project_id = Some(project.clone());
+        attempt.phase = AttemptPhase::Running;
+        let watchdog = TaskStaleWatchdog::open(
+            fixture.root.join("watchdog"),
+            TaskWatchdogConfig {
+                poll_interval: Duration::from_secs(1),
+                first_stale_threshold: Duration::ZERO,
+                director_escalation_interval: Duration::ZERO,
+            },
+        )
+        .unwrap();
+        for id in [
+            old.as_str(),
+            new.as_str(),
+            worker.as_str(),
+            fixture.director_session.as_str(),
+        ] {
+            fixture
+                .state
+                .lock()
+                .unwrap()
+                .agents
+                .insert(id.into(), active_route_roster(id, id));
+        }
+        let dispatch = || {
+            let mut outcome = watchdog.scan(&snapshot, &[]).unwrap();
+            outcome.presentations.clear();
+            fixture
+                .seats
+                .with_notification_snapshot(|seats| {
+                    fixture.host.dispatch_task_watchdog_outcome(
+                        &fixture.state,
+                        &snapshot,
+                        seats,
+                        &watchdog,
+                        outcome,
+                    )
+                })
+                .unwrap()
+                .unwrap();
+        };
+        dispatch();
+        assert_eq!(
+            fixture.state.lock().unwrap().messages[old.as_str()].len(),
+            1
+        );
+        assert_eq!(
+            fixture.state.lock().unwrap().messages[worker.as_str()].len(),
+            1
+        );
+        let worker_message = fixture.state.lock().unwrap().messages[worker.as_str()][0].clone();
+        let transfer = crate::seat::DirectorSeatTransferRequest {
+            action_id: ActionId::new("rotate-watchdog").unwrap(),
+            project_id: project,
+            expected_predecessor_cutex_session: old.clone(),
+            successor_cutex_session: new.clone(),
+        };
+        fixture.seats.transfer_director(&transfer).unwrap();
+        dispatch();
+        assert!(fixture.state.lock().unwrap().messages[old.as_str()].is_empty());
+        fixture.seats.finish_director_transfer(&transfer).unwrap();
+        dispatch();
+        assert_eq!(
+            fixture.state.lock().unwrap().messages[new.as_str()].len(),
+            1
+        );
+        assert_eq!(
+            serde_json::to_value(&fixture.state.lock().unwrap().messages[worker.as_str()][0])
+                .unwrap(),
+            serde_json::to_value(&worker_message).unwrap()
+        );
+        assert!(fixture
+            .state
+            .lock()
+            .unwrap()
+            .messages
+            .get(fixture.director_session.as_str())
+            .is_none());
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn project_task_create_and_fresh_query_ignore_stale_global_director() {
+        use crate::seat::*;
+        use crate::task_service::*;
+        let fixture = completion_drain_fixture("project-owner-routing");
+        let sid = |s: &str| crate::role_revision::CutexSessionId::new(s).unwrap();
+        let aid = |s: &str| ActionId::new(s).unwrap();
+        let director_seat = SeatId::new("cutex-director").unwrap();
+        for (project, director) in [("alpha", "r13"), ("beta", "beta-director")] {
+            let project_id = crate::agent_management::ProjectId::new(project).unwrap();
+            let prepare = aid(&format!("prepare-{project}"));
+            fixture
+                .seats
+                .prepare_project_director(&prepare, &project_id, &sid(director))
+                .unwrap();
+            fixture
+                .seats
+                .activate_project_director(&prepare, &project_id, &sid(director))
+                .unwrap();
+            let principal =
+                AuthenticatedPrincipal::seated_session(sid(director), director_seat.clone(), 1)
+                    .unwrap();
+            let request = CreateRevisionSemanticRequest {
+                project_id: Some(project_id.clone()),
+                workflow_id: WorkflowId::new(format!("workflow-{project}")).unwrap(),
+                task_id: crate::role_revision::TaskId::new(format!("task-{project}")).unwrap(),
+                task_revision: crate::role_revision::TaskRevision::new(1).unwrap(),
+                contract_sha256: sha256_bytes(b"contract"),
+                opaque_contract: "contract".into(),
+                completion_policy: SemanticCompletionPolicy::DirectorAcceptance,
+                completion_authority_cutex_session_id: None,
+            };
+            let seats = fixture.seats.query().unwrap();
+            let run = |request: &CreateRevisionSemanticRequest, action: &str| {
+                fixture.host.director_create_revision(
+                    &fixture.provider,
+                    &principal,
+                    &seats,
+                    &sid(director),
+                    aid(action),
+                    aid(action),
+                    request,
+                )
+            };
+            let action = format!("create-{project}");
+            assert_eq!(
+                run(&request, &action).status,
+                DirectorActionStatus::Committed
+            );
+            let before = fixture.provider.query().unwrap();
+            run(&request, &action);
+            assert_eq!(
+                fixture.provider.query().unwrap().journal_sequence,
+                before.journal_sequence
+            );
+            let mut wrong = request.clone();
+            wrong.completion_authority_cutex_session_id = Some(fixture.director_session.clone());
+            assert_eq!(
+                run(&wrong, "wrong-global").code.as_deref(),
+                Some("completion_authority_not_current_for_project")
+            );
+            wrong.completion_authority_cutex_session_id = Some(sid(if director == "r13" {
+                "beta-director"
+            } else {
+                "r13"
+            }));
+            // First project has no beta seat yet; either rejection code is safe.
+            assert_eq!(
+                run(&wrong, "wrong-project").status,
+                DirectorActionStatus::NoWrite
+            );
+            let scope = BTreeSet::from([project_id]);
+            let query = TaskWorkerActionHost::director_query(
+                &fixture.provider,
+                &seats,
+                Some(&director_seat),
+                aid("query"),
+                &DirectorQuerySelector::All {},
+                Some(&scope),
+            );
+            assert_eq!(query.tasks.len(), 1);
+            assert_eq!(
+                query.tasks[0].completion_authority_cutex_session_id,
+                Some(sid(director))
+            );
+            if project == "beta" {
+                let mut release = request.clone();
+                release.workflow_id = WorkflowId::new("release-workflow").unwrap();
+                release.task_id = crate::role_revision::TaskId::new("release-task").unwrap();
+                release.completion_policy = SemanticCompletionPolicy::ReleaseReview;
+                let release_session = seats.occupancies[&fixture.release_seat]
+                    .occupant_cutex_session
+                    .clone();
+                release.completion_authority_cutex_session_id = Some(release_session.clone());
+                assert_eq!(
+                    run(&release, "create-release-policy").status,
+                    DirectorActionStatus::Committed
+                );
+                let release_query = TaskWorkerActionHost::director_query(
+                    &fixture.provider,
+                    &seats,
+                    Some(&director_seat),
+                    aid("query-release"),
+                    &DirectorQuerySelector::Task {
+                        task_id: release.task_id,
+                    },
+                    Some(&scope),
+                );
+                assert_eq!(
+                    release_query.tasks[0].completion_authority_cutex_session_id,
+                    Some(release_session)
+                );
+            }
+        }
+        let project = crate::agent_management::ProjectId::new("alpha").unwrap();
+        let transfer = DirectorSeatTransferRequest {
+            action_id: aid("rotate"),
+            project_id: project.clone(),
+            expected_predecessor_cutex_session: sid("r13"),
+            successor_cutex_session: sid("r14"),
+        };
+        fixture.seats.transfer_director(&transfer).unwrap();
+        let query = |seats: &SeatOccupancySnapshot| {
+            TaskWorkerActionHost::director_query(
+                &fixture.provider,
+                seats,
+                Some(&director_seat),
+                aid("current-query"),
+                &DirectorQuerySelector::All {},
+                Some(&BTreeSet::from([project.clone()])),
+            )
+        };
+        assert!(query(&fixture.seats.query().unwrap()).tasks[0]
+            .completion_authority_cutex_session_id
+            .is_none());
+        fixture.seats.finish_director_transfer(&transfer).unwrap();
+        let seats = fixture.seats.query().unwrap();
+        assert_eq!(
+            query(&seats).tasks[0].completion_authority_cutex_session_id,
+            Some(sid("r14"))
+        );
+        let mut missing = seats.clone();
+        missing.project_director_occupancies.remove(&project);
+        assert!(query(&missing).tasks[0]
+            .completion_authority_cutex_session_id
+            .is_none());
+        assert_eq!(
+            task_seat_occupancy(&seats, Some(&project), &fixture.release_seat)
+                .unwrap()
+                .occupant_cutex_session,
+            seats.occupancies[&fixture.release_seat].occupant_cutex_session
+        );
+        assert_eq!(
+            task_seat_occupancy(&seats, None, &director_seat)
+                .unwrap()
+                .occupant_cutex_session,
+            fixture.director_session
+        );
+        // Production polling must not expose an old queued completion even
+        // before the next retry cycle; predecessor is still online.
+        for runtime in ["r13", "r14"] {
+            fixture
+                .state
+                .lock()
+                .unwrap()
+                .agents
+                .insert(runtime.into(), active_route_roster(runtime, runtime));
+        }
+        let notification = fixture
+            .provider
+            .query()
+            .unwrap()
+            .completion_notifications
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        let metadata = crate::agent_bus::model::TaskServiceCompletionMetadata {
+            schema: TASK_SERVICE_PROVIDER_ACTION_SCHEMA.into(),
+            project_id: Some(project),
+            notification_id: notification.notification_id,
+            assignment_id: notification.assignment_id,
+            task_id: notification.task_id,
+            task_revision: notification.task_revision,
+            attempt_number: notification.attempt_number,
+            transition_action_id: notification.transition_action_id.clone(),
+            kind: notification.kind,
+            target_seat_id: director_seat,
+        };
+        crate::agent_bus::queue::enqueue_task_service_completion_message_once(
+            &fixture.state,
+            &crate::agent_bus::identity::task_service_system_principal(),
+            "r13",
+            "r13",
+            "completion",
+            &metadata,
+            AgentDeliveryMode::AfterTurn,
+            notification.transition_action_id.as_str(),
+            &notification.external_message_id,
+            now_epoch_secs(),
+        )
+        .unwrap();
+        assert!(poll_messages_with_completion_fence(
+            &fixture.state,
+            "r13",
+            true,
+            Some(&fixture.seats),
+            Some(&fixture.provider)
+        )
+        .unwrap()
+        .1
+        .is_empty());
+        std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
     #[test]
