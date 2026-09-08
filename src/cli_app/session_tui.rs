@@ -30,7 +30,6 @@ use cutex::config::store::save_codez_config;
 use cutex::management::v2::activity::load_session_activity_states;
 use cutex::management::v2::activity::SessionActivityState;
 use cutex::observability::{SafeToolCallClass, SafeToolCallStatus};
-use cutex::platform::host::current_host_name;
 use cutex::profiles::model::CodezConfig;
 use cutex::runtime::alden::{cute_alden_sessions, CuteAldenSession};
 use cutex::session::model::{CutexSessionQuickActionMode, CutexSessionRecord, CutexSessionStore};
@@ -363,10 +362,15 @@ enum RuntimeCloseWorkerResult {
     Failed(String),
 }
 
-type SelectorEvent = WorkspaceEvent;
+pub(super) type SelectorEvent = WorkspaceEvent;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SelectorControl {
+    NativeResume {
+        catalog: String,
+        thread: String,
+        cwd: String,
+    },
     ExecuteArchive(cutex::agent_management::AgentArchiveRequest),
     Continue,
     Exit,
@@ -471,6 +475,11 @@ struct ProfileManagerStartup {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SessionTuiCycleOutcome {
+    NativeResume {
+        catalog: String,
+        thread: String,
+        cwd: String,
+    },
     Exit,
     Selected(SessionTuiIntent),
     LoginProfile,
@@ -781,6 +790,7 @@ struct SelectorModel {
     settings_return_panel: Option<PrimaryPanel>,
     confirmation_returns_to_list: bool,
     archive_confirmation: Option<cutex::agent_management::AgentArchiveRequest>,
+    object_return: Option<(PrimaryPanel, Option<SelectorTarget>)>,
     show_thread_titles: bool,
     enhanced_keyboard: bool,
     refreshing: bool,
@@ -827,6 +837,7 @@ impl SelectorModel {
             settings_return_panel: None,
             confirmation_returns_to_list: false,
             archive_confirmation: None,
+            object_return: None,
             show_thread_titles: false,
             enhanced_keyboard,
             refreshing,
@@ -1512,6 +1523,11 @@ impl SelectorModel {
             return SelectorControl::Continue;
         }
         if self.recent.review().is_some() {
+            if matches!(event, SelectorEvent::Activate | SelectorEvent::Escape)
+                && self.recent.blur_adoption_name()
+            {
+                return SelectorControl::Continue;
+            }
             match event {
                 SelectorEvent::Up | SelectorEvent::First | SelectorEvent::Back => {
                     self.recent.set_review_confirmed(false)
@@ -1521,9 +1537,11 @@ impl SelectorModel {
                 }
                 SelectorEvent::Activate if self.recent.review_confirmed() => {
                     if let Some(request) = self.recent.adoption_request() {
-                        self.recent.cancel_review();
+                        self.recent.set_review_confirmed(false);
                         return SelectorControl::AdoptRecent(request);
                     }
+                    self.warning = Some("Enter an explicit formal Agent name before confirming adoption and import.".into());
+                    self.recent.focus_adoption_name();
                 }
                 SelectorEvent::Activate | SelectorEvent::Escape => self.recent.cancel_review(),
                 SelectorEvent::Exit => return SelectorControl::Exit,
@@ -1548,7 +1566,41 @@ impl SelectorModel {
                 if retry && !self.recent.loading() {
                     return SelectorControl::Recent(RecentCommand::Retry);
                 }
-                self.recent.begin_review();
+                if let Some(row) = self
+                    .recent
+                    .visible_rows()
+                    .get(self.recent.selected_visible())
+                    .copied()
+                    .cloned()
+                {
+                    match row.view.subject {
+                        super::session_tui_view::SubjectRef::Managed(id) => {
+                            return self.open_subject_context(
+                                &id,
+                                SelectorEvent::Activate,
+                                PrimaryPanel::Recent,
+                            )
+                        }
+                        super::session_tui_view::SubjectRef::Native { catalog, thread }
+                            if row.state
+                                == super::session_tui_recent::RecentThreadState::Unmanaged =>
+                        {
+                            if let Some(cwd) = row.cwd {
+                                return SelectorControl::NativeResume {
+                                    catalog,
+                                    thread,
+                                    cwd,
+                                };
+                            }
+                        }
+                        _ => {
+                            self.warning = Some(
+                                "Native resume unavailable: refresh identity and cwd observations"
+                                    .into(),
+                            )
+                        }
+                    }
+                }
             }
             SelectorEvent::Insert('n' | 'N')
                 if self.recent.next_cursor().is_some() && !self.recent.loading() =>
@@ -1557,7 +1609,22 @@ impl SelectorModel {
             }
             SelectorEvent::Insert('/') => self.recent.focus_filter(),
             SelectorEvent::OpenActions => {
-                self.recent.begin_review();
+                if let Some(row) = self
+                    .recent
+                    .visible_rows()
+                    .get(self.recent.selected_visible())
+                    .copied()
+                    .cloned()
+                {
+                    if let super::session_tui_view::SubjectRef::Managed(id) = row.view.subject {
+                        return self.open_subject_context(
+                            &id,
+                            SelectorEvent::OpenActions,
+                            PrimaryPanel::Recent,
+                        );
+                    }
+                    self.recent.begin_review();
+                }
             }
             SelectorEvent::Back | SelectorEvent::Escape | SelectorEvent::OpenSettings => {
                 self.activate_primary_panel(PrimaryPanel::Agents);
@@ -1599,12 +1666,6 @@ impl SelectorModel {
                         .filter_map(|r| r.view.clone())
                         .collect::<Vec<_>>(),
                 );
-                if archived
-                    .iter()
-                    .any(|r| r.view.as_ref().is_some_and(|v| v.retirement_note.is_some()))
-                {
-                    self.warning = Some("Retirement mismatch in hidden archived Recent identities; Archive/provider reconciliation deferred to phase D".into());
-                }
                 self.recent.enrich_views(
                     &self
                         .rows
@@ -1635,7 +1696,7 @@ impl SelectorModel {
         self.recent.adoption_succeeded(&result.store);
         self.workspace_selection.select(selected.clone());
         self.ensure_selection();
-        self.notice = Some(format!("Adopted native thread {}", request.title));
+        self.notice = Some(format!("Adopted and imported Agent {}; unassigned. Use Projects Create/Add for explicit assignment.", request.formal_name));
         match result.snapshot {
             Ok(snapshot) => {
                 self.rows = snapshot.rows;
@@ -3364,6 +3425,47 @@ impl SelectorModel {
         };
     }
 
+    fn open_subject_context(
+        &mut self,
+        id: &str,
+        event: SelectorEvent,
+        origin: PrimaryPanel,
+    ) -> SelectorControl {
+        let Some(target) = self
+            .rows
+            .iter()
+            .find(|row| row.target.agent_key() == Some(id))
+            .map(|row| row.target.clone())
+        else {
+            self.warning = Some(format!(
+                "Agent {id} is absent from the current action snapshot; refresh or use Archive"
+            ));
+            return SelectorControl::Continue;
+        };
+        self.object_return = Some((origin, self.workspace_selection.selected().cloned()));
+        self.workspace_selection.select(Some(target));
+        self.mode = SelectorMode::Agents;
+        match event {
+            SelectorEvent::Activate => self.activate_primary_action(),
+            SelectorEvent::OpenSettings => {
+                self.open_settings();
+                SelectorControl::Continue
+            }
+            _ => {
+                self.open_action_menu();
+                SelectorControl::Continue
+            }
+        }
+    }
+
+    fn finish_subject_context(&mut self) -> Option<PrimaryPanel> {
+        let (panel, selection) = self.object_return.take()?;
+        self.workspace_selection.select(selection);
+        self.mode = SelectorMode::Agents;
+        self.activate_primary_panel(panel);
+        Some(panel)
+    }
+
     fn open_settings(&mut self) {
         let Some(row) = self.selected_row() else {
             return;
@@ -4347,6 +4449,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
     let mut shell = TerminalShell::open()?;
     let mut events = ShellEvents;
     let mut projects_model = None;
+    let mut refresh_project_members = false;
     let mut tasks_model = None;
     loop {
         let outcome = match panel {
@@ -4369,6 +4472,11 @@ pub(crate) fn run() -> anyhow::Result<()> {
                 outcome
             }
             PrimaryPanel::Projects => {
+                if std::mem::take(&mut refresh_project_members) {
+                    if let Some(model) = projects_model.as_mut() {
+                        super::session_tui_cutex_projects::refresh_after_member_action(model);
+                    }
+                }
                 let (outcome, mut model) = super::session_tui_cutex_projects::run(
                     shell.terminal(),
                     &mut events,
@@ -4378,12 +4486,33 @@ pub(crate) fn run() -> anyhow::Result<()> {
                     selector_command(&mut selector_model, Command::Settings);
                     selector_model.settings_return_panel = Some(PrimaryPanel::Projects);
                 }
+                let member_action = model.member_action_requested.take();
                 projects_model = Some(model);
-                match outcome {
-                    PrimaryPanelOutcome::Exit => return Ok(()),
-                    PrimaryPanelOutcome::Switch(next) => {
-                        panel = next;
-                        continue;
+                if let Some((id, event)) = member_action {
+                    refresh_project_members = true;
+                    match selector_model.open_subject_context(&id, event, PrimaryPanel::Projects) {
+                        SelectorControl::Selected(intent) => {
+                            SessionTuiCycleOutcome::Selected(intent)
+                        }
+                        _ => {
+                            if selector_model.object_return.is_some() {
+                                panel = PrimaryPanel::Agents;
+                            } else {
+                                if let Some(model) = projects_model.as_mut() {
+                                    model.failure = selector_model.warning.take();
+                                }
+                                panel = PrimaryPanel::Projects;
+                            }
+                            continue;
+                        }
+                    }
+                } else {
+                    match outcome {
+                        PrimaryPanelOutcome::Exit => return Ok(()),
+                        PrimaryPanelOutcome::Switch(next) => {
+                            panel = next;
+                            continue;
+                        }
                     }
                 }
             }
@@ -4401,6 +4530,24 @@ pub(crate) fn run() -> anyhow::Result<()> {
             }
         };
         match outcome {
+            SessionTuiCycleOutcome::NativeResume {
+                catalog,
+                thread,
+                cwd,
+            } => {
+                let result = shell.handoff(|| resume_recent_native(&catalog, &thread, &cwd))?;
+                match result {
+                    Ok(status) => {
+                        selector_model.notice = Some(format!(
+                            "Native session returned ({status}); no adoption requested"
+                        ))
+                    }
+                    Err(error) => {
+                        selector_model.warning = Some(format!("Native resume failed: {error:#}"))
+                    }
+                }
+                panel = PrimaryPanel::Recent;
+            }
             SessionTuiCycleOutcome::Exit => return Ok(()),
             SessionTuiCycleOutcome::Selected(intent) => {
                 let key = intent.key.clone();
@@ -4414,6 +4561,9 @@ pub(crate) fn run() -> anyhow::Result<()> {
                         selector_model.warning =
                             Some(format!("Foreground action for {key} failed: {error:#}"));
                     }
+                }
+                if let Some(origin) = selector_model.finish_subject_context() {
+                    panel = origin;
                 }
             }
             SessionTuiCycleOutcome::LoginProfile => {
@@ -4439,6 +4589,49 @@ pub(crate) fn run() -> anyhow::Result<()> {
             }
         }
     }
+}
+
+fn resume_recent_native(
+    catalog: &str,
+    thread: &str,
+    cwd: &str,
+) -> anyhow::Result<std::process::ExitStatus> {
+    anyhow::ensure!(
+        catalog == "paired-local-app-server",
+        "unsupported native catalog source"
+    );
+    let store = load_cutex_session_store()?;
+    anyhow::ensure!(
+        !store
+            .sessions
+            .values()
+            .any(|r| r.codex_session_id.as_deref() == Some(thread)
+                && (cutex_session_is_managed(r) || r.is_retired())),
+        "native identity became managed/archived; refresh and use its existing Agent action"
+    );
+    let launch = super::session_native_workflow::NativeLaunch {
+        cwd: std::path::PathBuf::from(cwd),
+        native_home: cutex::config::paths::host_codex_home_dir()?,
+        profile: None,
+        model: None,
+    };
+    // Read the selected provider identity before terminal launch. No ensure,
+    // adopt, import, profile selection or management initialization is called.
+    use cutex::catalog::CatalogEndpoint;
+    let mut endpoint = launch.endpoint()?;
+    let observed = endpoint.request(
+        "thread/read",
+        serde_json::json!({"threadId":thread, "includeTurns":false}),
+    )?;
+    anyhow::ensure!(
+        observed
+            .pointer("/thread/id")
+            .and_then(serde_json::Value::as_str)
+            == Some(thread),
+        "native source identity mismatch"
+    );
+    drop(endpoint);
+    launch.interactive(Some(thread))
 }
 
 fn ensure_recent<T>(
@@ -5439,6 +5632,9 @@ enum SelectorKeyRoute {
 
 /// Shared by the terminal loop and key-sequence tests; effects run only after routing.
 fn selector_input(model: &mut SelectorModel) -> Option<&mut Input> {
+    if matches!(model.mode, SelectorMode::RecentSessions) && model.recent.review().is_some() {
+        return model.recent.adoption_name_input();
+    }
     if matches!(model.mode, SelectorMode::RecentSessions) && model.recent.filter_focused() {
         return Some(model.recent.filter_input_mut());
     }
@@ -5516,7 +5712,7 @@ fn selector_commands(model: &SelectorModel) -> Vec<(Command, Option<&'static str
                     Some("Available on Managed")
                 }
                 Command::NewProject => {
-                    Some("Available on Projects; native creation is not implemented here")
+                    Some("New Agent unavailable: native bootstrap persistence is unverified. Select/Adopt an existing saved session; New Project is on Projects")
                 }
                 Command::LoadMore
                     if !matches!(model.mode, SelectorMode::RecentSessions)
@@ -5531,7 +5727,7 @@ fn selector_commands(model: &SelectorModel) -> Vec<(Command, Option<&'static str
                 {
                     Some("Select an Agent")
                 }
-                Command::Edit | Command::Titles
+                Command::Titles
                     if matches!(model.mode, SelectorMode::RecentSessions) =>
                 {
                     Some("Use Managed for this command")
@@ -5608,12 +5804,16 @@ fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyR
             SelectorKeyRoute::Control(None)
         }
         Command::Page(panel) => {
+            model.finish_subject_context();
             model.settings_return_panel = None;
             model.filter_focused = false;
             model.recent.blur_filter();
             SelectorKeyRoute::Switch(panel)
         }
         Command::Settings => {
+            if let Some(origin) = model.finish_subject_context() {
+                model.settings_return_panel = Some(origin);
+            }
             if model.settings_return_panel.is_none() {
                 model.settings_return_panel =
                     Some(if matches!(model.mode, SelectorMode::RecentSessions) {
@@ -5689,7 +5889,28 @@ fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyR
             model.filter_focused = false;
             model.recent.blur_filter();
             model.inspector_overview_focused = false;
-            model.open_settings();
+            if matches!(model.mode, SelectorMode::RecentSessions) {
+                if let Some(id) = model
+                    .recent
+                    .visible_rows()
+                    .get(model.recent.selected_visible())
+                    .and_then(|row| match &row.view.subject {
+                        super::session_tui_view::SubjectRef::Managed(id) => Some(id.clone()),
+                        _ => None,
+                    })
+                {
+                    return SelectorKeyRoute::Control(Some(model.open_subject_context(
+                        &id,
+                        SelectorEvent::OpenSettings,
+                        PrimaryPanel::Recent,
+                    )));
+                }
+                model.notice = Some(
+                    "Unmanaged native session: no Agent settings; explicitly Adopt first".into(),
+                );
+            } else {
+                model.open_settings();
+            }
             SelectorKeyRoute::Control(None)
         }
     }
@@ -5771,6 +5992,24 @@ fn route_selector_key(model: &mut SelectorModel, key: KeyEvent) -> SelectorKeyRo
         }
     }
     let recent = matches!(model.mode, SelectorMode::RecentSessions);
+    if recent
+        && model.recent.review().is_some()
+        && !model.recent.adoption_name_focused()
+        && key.code == KeyCode::BackTab
+        && !model.recent.review_confirmed()
+    {
+        model.recent.focus_adoption_name();
+        return SelectorKeyRoute::Control(None);
+    }
+    if recent
+        && matches!(
+            key.code,
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Enter | KeyCode::Esc
+        )
+        && model.recent.blur_adoption_name()
+    {
+        return SelectorKeyRoute::Control(None);
+    }
     if recent && model.recent_inspecting {
         if let Some(command) = input_policy::resolve(key) {
             return selector_command(model, command);
@@ -5890,6 +6129,12 @@ fn route_selector_key(model: &mut SelectorModel, key: KeyEvent) -> SelectorKeyRo
     } else {
         selector_event_from_key(key, model.enhanced_keyboard).map(|e| model.handle(e))
     };
+    if matches!(control, Some(SelectorControl::Continue))
+        && matches!(model.mode, SelectorMode::Agents)
+        && model.object_return.is_some()
+    {
+        return SelectorKeyRoute::Switch(model.finish_subject_context().unwrap());
+    }
     SelectorKeyRoute::Control(control)
 }
 
@@ -5930,6 +6175,11 @@ fn run_event_loop(
         }
         if receive_runtime_close(model, &mut runtime_close) {
             terminal.clear()?;
+            if matches!(model.mode, SelectorMode::Agents) {
+                if let Some(origin) = model.finish_subject_context() {
+                    return Ok(SessionTuiCycleOutcome::Switch(origin));
+                }
+            }
         }
         if let SelectorMode::ConfirmRuntimeAction {
             agent_key, action, ..
@@ -6016,6 +6266,17 @@ fn run_event_loop(
                 };
                 if let Some(control) = control {
                     match control {
+                        SelectorControl::NativeResume {
+                            catalog,
+                            thread,
+                            cwd,
+                        } => {
+                            return Ok(SessionTuiCycleOutcome::NativeResume {
+                                catalog,
+                                thread,
+                                cwd,
+                            })
+                        }
                         SelectorControl::ExecuteArchive(request) => {
                             model.archive_confirmation = Some(request.clone());
                             let intent = SessionTuiIntent {
@@ -6259,35 +6520,18 @@ fn apply_session_management(
 /// The fresh store read makes a second adoption (including a retired identity)
 /// fail safely if another Cutex client changed state during the review.
 fn adopt_recent_thread(request: &RecentAdoptionRequest) -> anyhow::Result<RecentAdoptionResult> {
-    let mut store = load_cutex_session_store()?;
-    if store.sessions.values().any(|record| {
-        record.codex_session_id.as_deref() == Some(request.thread_id.as_str())
-            && (record.is_retired() || cutex_session_is_managed(record))
-    }) {
-        anyhow::bail!("native thread is already managed or retired");
-    }
-    let outcome = adopt_cutex_session(
-        &mut store,
-        &request.thread_id,
-        CutexSessionEnsureSeed {
-            host_id: current_host_name(),
-            cwd: request.cwd.clone(),
-            profile: None,
-        },
-        CutexSessionAdoptOptions {
-            // Recent supplies a native title, not an explicit Cutex Agent name.
-            display_name: None,
-            managed_cwd: None,
-            groups: Vec::new(),
-            expose_to_im: false,
-            pin: false,
-        },
-    )?;
-    if let Some(record) = store.sessions.get_mut(&outcome.key) {
-        record.thread_name = Some(request.title.clone());
-        record.display_name_hint = Some(request.title.clone());
-    }
-    persist_cutex_session_store_and_im_record(&store, &outcome.key)?;
+    let client = super::management_control_plane::ManagementControlClient::connect()?;
+    let result = client.adopt_saved_native(&cutex::agent_management::HumanAdoptRequest {
+        action_id: cutex::agent_management::AgentActionId::new(request.action_id.clone())?, native_id:request.thread_id.clone(), cwd:request.cwd.clone(), formal_name:request.formal_name.clone(),
+    }).map_err(|e| anyhow::anyhow!("Adoption response unconfirmed: {e:#}. Retry same action {}; no rollback or new identity retry claimed", request.action_id))?;
+    anyhow::ensure!(
+        result.imported.as_ref().is_some_and(|r| r.complete),
+        "Durable identity {} adopted; import incomplete: {}. Retry same action {}",
+        result.adopted.record.cutex_session_id,
+        result.error.as_deref().unwrap_or("unknown import stage"),
+        request.action_id
+    );
+    let store = load_cutex_session_store()?;
     Ok(RecentAdoptionResult {
         store,
         snapshot: load_live_snapshot().map_err(|error| format!("{error:#}")),
@@ -7031,6 +7275,15 @@ fn render_recent_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorMo
         return;
     }
     if let Some(row) = model.recent.review() {
+        let [name_area, area] =
+            Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).areas(area);
+        input_policy::render_input(
+            frame,
+            name_area,
+            model.recent.adoption_name().expect("review name"),
+            " Formal Agent name · Tab to confirmation ",
+            model.recent.adoption_name_focused(),
+        );
         let lines = vec![
             Line::from(vec![
                 Span::styled("Native title / preview (not Agent name): ", Style::new().fg(Color::DarkGray)),
@@ -7069,12 +7322,12 @@ fn render_recent_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorMo
             Line::from(""),
             Line::from(if model.recent.review_confirmed() {
                 Span::styled(
-                    "Confirm adoption?  [Adopt]  Cancel",
+                    "Confirm durable adoption + roster import (no assignment)?  [Adopt]  Cancel",
                     Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 )
             } else {
                 Span::styled(
-                    "Confirm adoption?  Adopt  [Cancel]",
+                    "Confirm durable adoption + roster import (no assignment)?  Adopt  [Cancel]",
                     Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 )
             }),
@@ -8879,9 +9132,9 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
             }
             SelectorMode::RecentSessions => footer_hints(&[
                 ("Up/Down", "move"),
-                ("Enter", "review adoption"),
+                ("Enter", "native resume"),
                 ("Alt+A", "actions"),
-                ("n", "load more"),
+                ("Alt+L", "load more"),
                 ("Tab", "review"),
                 ("Left/Right", "tabs"),
                 ("F5", "refresh"),
@@ -9352,8 +9605,6 @@ mod tests {
     use cutex::role_revision::{CutexSessionId, Rfc3339};
     use cutex::session::model::CutexSessionRuntimeBackend;
     use ratatui::backend::TestBackend;
-
-    use super::super::test_home::IsolatedTestHome;
 
     fn output_projection(updated_at: &str) -> SafeOutputProjection {
         SafeOutputProjection {
@@ -14899,9 +15150,17 @@ mod tests {
     #[test]
     fn ui_contract_k07_k08_recent_review_horizontal_and_single_submission() {
         let mut model = contract_recent_model();
-        contract_key(&mut model, KeyCode::Enter);
+        route_selector_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT),
+        );
         assert!(model.recent.review().is_some());
         assert!(!model.recent.review_confirmed());
+        assert_eq!(model.recent.adoption_name().unwrap().value(), "");
+        for ch in "Explicit name".chars() {
+            contract_key(&mut model, KeyCode::Char(ch));
+        }
+        contract_key(&mut model, KeyCode::Tab);
         contract_key(&mut model, KeyCode::Right);
         assert!(model.recent.review_confirmed());
         contract_key(&mut model, KeyCode::Left);
@@ -14913,7 +15172,14 @@ mod tests {
         assert!(!model.recent.review_confirmed());
         contract_key(&mut model, KeyCode::Enter);
         assert!(model.recent.review().is_none());
-        contract_key(&mut model, KeyCode::Enter);
+        route_selector_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT),
+        );
+        for ch in "Explicit name".chars() {
+            contract_key(&mut model, KeyCode::Char(ch));
+        }
+        contract_key(&mut model, KeyCode::Tab);
         contract_key(&mut model, KeyCode::Right);
         for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
             assert!(matches!(
@@ -14931,10 +15197,89 @@ mod tests {
             ),
             SelectorKeyRoute::Control(Some(SelectorControl::AdoptRecent(_)))
         ));
-        assert!(model.recent.review().is_none());
-        contract_key(&mut model, KeyCode::Enter); // a fresh review, never a second effect
+        assert!(model.recent.review().is_some()); // Same action retained for uncertain-result retry.
+        model.recent.cancel_review();
+        route_selector_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT),
+        ); // explicit fresh review
+        contract_key(&mut model, KeyCode::Esc);
+        assert!(model.recent.review().is_some()); // First Esc leaves the name editor.
         contract_key(&mut model, KeyCode::Esc);
         assert!(model.recent.review().is_none());
+    }
+
+    #[test]
+    fn ui_contract_d06_recent_enter_native_effect_never_adopts_and_repeat_is_ignored() {
+        let mut model = contract_recent_model();
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            assert!(matches!(
+                route_selector_key(
+                    &mut model,
+                    KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, kind)
+                ),
+                SelectorKeyRoute::Control(None)
+            ));
+        }
+        assert!(
+            matches!(route_selector_key(&mut model, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            SelectorKeyRoute::Control(Some(SelectorControl::NativeResume { catalog, thread, cwd })) if catalog == "paired-local-app-server" && thread == "native-one" && cwd == "/work")
+        );
+        assert!(model.recent.review().is_none());
+        assert!(matches!(model.mode, SelectorMode::RecentSessions));
+    }
+
+    #[test]
+    #[ignore = "real PTY, saved private native fixture only; no creation or model turn"]
+    fn ui_contract_d20_real_native_resume_terminal_child() {
+        let home = crate::cli_app::test_home::IsolatedTestHome::new("cutex-d2-native-pty").unwrap();
+        let native_home =
+            std::path::PathBuf::from(std::env::var("CUTEX_D2_PRIVATE_SAVED_HOME").unwrap());
+        assert!(native_home
+            .to_string_lossy()
+            .starts_with("/tmp/cutex-d2-native-"));
+        let id = std::env::var("CUTEX_D2_PRIVATE_SAVED_ID").unwrap();
+        cutex::session::store::save_cutex_session_store(&CutexSessionStore::default()).unwrap();
+        let durable_path = cutex::session::store::cutex_sessions_path().unwrap();
+        let before = std::fs::read(&durable_path).unwrap();
+        let roster = AgentManagementStore::open_default().unwrap();
+        let roster_before = roster.snapshot().unwrap();
+        let launch = super::super::session_native_workflow::NativeLaunch {
+            cwd: home.root().into(),
+            native_home,
+            profile: None,
+            model: None,
+        };
+        let mut shell = TerminalShell::open().unwrap();
+        println!("D2_NATIVE_READY");
+        use std::io::Write;
+        std::io::stdout().flush().unwrap();
+        let outcome = shell.handoff(|| launch.interactive(Some(&id))).unwrap();
+        println!("D2_NATIVE_RETURNED {:?}", outcome.map(|s| s.code()));
+        assert_eq!(std::fs::read(durable_path).unwrap(), before);
+        assert_eq!(roster.snapshot().unwrap(), roster_before);
+        drop(shell);
+        println!("D2_NATIVE_COOKED");
+    }
+
+    #[test]
+    fn ui_contract_d19_d20_shared_member_actions_cancel_preserves_origin_selection_query() {
+        let mut model = editable_model(&editable_record());
+        let original = model.workspace_selection.selected().cloned();
+        model.query = tui_input::Input::new("kept query".into());
+        let id = model.rows[0].target.agent_key().unwrap().to_string();
+        assert_eq!(
+            model.open_subject_context(&id, SelectorEvent::OpenActions, PrimaryPanel::Projects),
+            SelectorControl::Continue
+        );
+        assert!(matches!(&model.mode, SelectorMode::Actions { agent_key, .. } if agent_key == &id));
+        assert!(matches!(
+            route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            SelectorKeyRoute::Switch(PrimaryPanel::Projects)
+        ));
+        assert_eq!(model.workspace_selection.selected().cloned(), original);
+        assert_eq!(model.query.value(), "kept query");
+        assert!(model.object_return.is_none());
     }
 
     #[test]
@@ -15353,33 +15698,24 @@ mod tests {
     }
 
     #[test]
-    fn successful_recent_adoption_persists_native_thread_identity_and_refreshes_projection() {
-        let _home = IsolatedTestHome::new("cutex-recent-adopt").expect("isolated home");
+    fn recent_adoption_request_keeps_formal_name_distinct_from_native_title() {
         let request = RecentAdoptionRequest {
+            action_id: "test-adopt".into(),
+            formal_name: "Explicit Agent".into(),
             thread_id: "native-thread-123".to_string(),
             title: "Native preview".to_string(),
             cwd: "/native/work".to_string(),
         };
 
-        let result = adopt_recent_thread(&request).expect("adopt native thread");
-        let snapshot = result.snapshot.expect("agent projection");
-        let record = result
-            .store
-            .sessions
-            .values()
-            .find(|record| record.codex_session_id.as_deref() == Some("native-thread-123"))
-            .expect("adopted record");
-        assert!(cutex_session_is_managed(record));
-        assert!(snapshot.rows.iter().any(|row| {
-            row.target
-                .agent_key()
-                .is_some_and(|key| key == record.cutex_session_id)
-        }));
+        assert_ne!(request.formal_name, request.title);
+        assert_eq!(request.thread_id, "native-thread-123");
     }
 
     #[test]
     fn persisted_recent_adoption_stays_successful_when_agent_projection_fails() {
         let request = RecentAdoptionRequest {
+            action_id: "test-adopt".into(),
+            formal_name: "Explicit Agent".into(),
             thread_id: "native-thread-123".to_string(),
             title: "Native preview".to_string(),
             cwd: "/native/work".to_string(),
@@ -15395,7 +15731,7 @@ mod tests {
 
         assert_eq!(
             model.notice.as_deref(),
-            Some("Adopted native thread Native preview")
+            Some("Adopted and imported Agent Explicit Agent; unassigned. Use Projects Create/Add for explicit assignment.")
         );
         assert!(model.warning.as_deref().is_some_and(|warning| {
             warning.starts_with("Native thread was adopted, but agent refresh failed:")

@@ -174,6 +174,7 @@ fn agent_management_admin_path(path: &str) -> bool {
             | "/v2/agent-management/durable-candidates"
             | "/v2/agent-management/durable-import"
             | "/v2/agent-management/archive-review"
+            | "/v2/agent-management/adopt-saved-native"
             | "/v2/agent-management/archive-actions"
             | "/v2/agent-management/legacy-director-ownership-import"
             | "/v2/agent-management/reservation-reconciliation"
@@ -260,6 +261,31 @@ fn handle_v2_request_with_repository(
             let principal =
                 crate::management::control_plane::HumanManagementPrincipal::authenticated();
             match (context.durable_agent_candidates)(&principal) {
+                Ok(response) => {
+                    write_json_response(stream, 200, "OK", &serde_json::to_value(response)?)
+                }
+                Err(error) => write_agent_management_control_error(stream, error),
+            }
+        }
+        ("POST", "/v2/agent-management/adopt-saved-native") => {
+            let payload = match serde_json::from_slice(&request.body) {
+                Ok(payload) => payload,
+                Err(_) => {
+                    return write_v2_error(
+                        stream,
+                        400,
+                        "Bad Request",
+                        "invalid_request",
+                        "strict Human adoption request required",
+                        false,
+                        json!({}),
+                    )
+                }
+            };
+            match (context.adopt_saved_native)(
+                &crate::management::control_plane::HumanManagementPrincipal::authenticated(),
+                &payload,
+            ) {
                 Ok(response) => {
                     write_json_response(stream, 200, "OK", &serde_json::to_value(response)?)
                 }

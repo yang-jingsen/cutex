@@ -186,6 +186,9 @@ pub fn parse_cutex_session_quick_action_mode(
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct CutexSessionStore {
+    #[serde(default)]
+    pub human_adoption_receipts:
+        std::collections::BTreeMap<String, crate::agent_management::HumanAdoptReceipt>,
     /// Archive transition receipt committed atomically with its durable state.
     #[serde(default)]
     pub agent_archive_receipts:

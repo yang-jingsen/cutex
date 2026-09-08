@@ -24,6 +24,16 @@ pub(super) struct ManagementControlClient {
 }
 
 impl ManagementControlClient {
+    pub(super) fn adopt_saved_native(
+        &self,
+        request: &cutex::agent_management::HumanAdoptRequest,
+    ) -> anyhow::Result<cutex::agent_management::HumanAdoptResult> {
+        self.request(
+            "POST",
+            "/v2/agent-management/adopt-saved-native",
+            Some(&serde_json::to_vec(request)?),
+        )
+    }
     pub(super) fn review_agent_archive(
         &self,
         request: &cutex::agent_management::AgentArchiveReviewRequest,

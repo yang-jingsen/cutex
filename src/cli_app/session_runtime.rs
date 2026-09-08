@@ -584,7 +584,7 @@ fn cmd_session_resume_foreground_inner(
         .with_context(|| "Failed to start foreground session resume command")?
         .code()
         .unwrap_or(1);
-    std::process::exit(exit_code);
+    super::session_attach::foreground_status(exit_code)
 }
 
 fn cmd_session_attach_host_foreground_tui(
@@ -677,7 +677,7 @@ fn cmd_session_attach_host_foreground_tui(
         .context("Failed to attach visible TUI to manager-owned app-server")?
         .code()
         .unwrap_or(1);
-    std::process::exit(exit_code);
+    super::session_attach::foreground_status(exit_code)
 }
 
 fn host_foreground_app_server_layout(

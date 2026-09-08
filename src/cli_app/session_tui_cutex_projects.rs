@@ -127,6 +127,7 @@ pub(super) struct CutexProjectsModel {
     leave_review: Option<LeaveReview>,
     text_cursors: [Option<usize>; 4],
     pub(super) open_settings_requested: bool,
+    pub(super) member_action_requested: Option<(String, super::session_tui::SelectorEvent)>,
     durable_candidates: Vec<cutex::agent_management::DurableAgentCandidate>,
     import_request: Option<cutex::agent_management::DurableImportRequest>,
     import_name: Input,
@@ -150,7 +151,7 @@ pub(super) struct CutexProjectsModel {
     create_editor: Option<ProjectCreateEditor>,
     view: ProjectView,
     client: Option<ManagementControlClient>,
-    failure: Option<String>,
+    pub(super) failure: Option<String>,
     notice: Option<String>,
 }
 
@@ -178,6 +179,7 @@ impl CutexProjectsModel {
             filter_focused: false,
             show_archived: false,
             show_archived_members: false,
+            member_action_requested: None,
             details: None,
             section: ProjectSection::Members,
             operator_selected: 0,
@@ -298,7 +300,6 @@ impl CutexProjectsModel {
             self.notice = Some(
                 "No persistent durable Agent candidates are available. Adopt an Agent first; an Online runtime is not required.".to_string(),
             );
-            return;
         }
         self.create_editor = Some(ProjectCreateEditor {
             project_id: String::new(),
@@ -418,9 +419,54 @@ pub(super) fn run(
         model = load_model().unwrap_or_else(|error| {
             CutexProjectsModel::empty_with_failure(format!("Cutex Projects unavailable: {error:#}"))
         });
+    } else if model.view == ProjectView::Create {
+        // Return from saved-session selection without replacing the draft.
+        match model
+            .client
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Management unavailable"))
+            .and_then(|c| c.durable_candidates())
+        {
+            Ok(candidates) => {
+                let selected = model
+                    .create_editor
+                    .as_ref()
+                    .and_then(|e| model.available_agents.get(e.director))
+                    .map(|a| a.cutex_session_id.clone());
+                model.available_agents = candidate_choices(&candidates);
+                model.durable_candidates = candidates;
+                if let Some(editor) = model.create_editor.as_mut() {
+                    editor.director = selected
+                        .and_then(|id| {
+                            model
+                                .available_agents
+                                .iter()
+                                .position(|a| a.cutex_session_id == id)
+                        })
+                        .unwrap_or_else(|| {
+                            editor
+                                .director
+                                .min(model.available_agents.len().saturating_sub(1))
+                        });
+                }
+            }
+            Err(error) => {
+                model.failure = Some(format!(
+                    "Candidate refresh failed; draft retained: {error:#}"
+                ))
+            }
+        }
     }
     let result = run_loop(terminal, events, &mut model);
     Ok((result?, model))
+}
+
+pub(super) fn refresh_after_member_action(model: &mut CutexProjectsModel) {
+    if let Err(error) = load_details(model) {
+        model.failure = Some(format!(
+            "Member snapshot is stale after action/return: {error:#}"
+        ));
+    }
 }
 
 fn load_model() -> anyhow::Result<CutexProjectsModel> {
@@ -454,6 +500,7 @@ fn load_model() -> anyhow::Result<CutexProjectsModel> {
         filter_focused: false,
         show_archived: false,
         show_archived_members: false,
+        member_action_requested: None,
         details: None,
         section: ProjectSection::Members,
         operator_selected: 0,
@@ -509,6 +556,25 @@ fn selected_member(model: &CutexProjectsModel) -> Option<AgentSessionView> {
         .and_then(|id| rows.iter().find(|r| r.subject == *id))
         .or_else(|| rows.get(model.member_index))
         .cloned()
+}
+fn request_member_action(
+    model: &mut CutexProjectsModel,
+    event: super::session_tui::SelectorEvent,
+) -> Option<PrimaryPanelOutcome> {
+    let Some(member) = selected_member(model) else {
+        model.notice =
+            Some("Select a current member; refresh unavailable observations first".into());
+        return None;
+    };
+    if member.retirement_note.is_some() {
+        model.notice = Some("Archived/permanently retired member: use Archive to review supported Restore; permanent retirement cannot restore".into());
+        return None;
+    }
+    let SubjectRef::Managed(id) = member.subject else {
+        return None;
+    };
+    model.member_action_requested = Some((id, event));
+    Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Agents))
 }
 fn visible_members(model: &CutexProjectsModel) -> Vec<AgentSessionView> {
     let Some(project) = &model.details else {
@@ -922,7 +988,6 @@ fn project_commands(model: &CutexProjectsModel) -> Vec<(Command, Option<&'static
         .iter()
         .map(|b| {
             let reason = match b.command {
-                Command::Actions | Command::Edit if model.view == ProjectView::Details && model.section == ProjectSection::Members => Some("Member actions deferred; Project list Actions/Edit retains project operations"),
                 Command::Profiles
                 | Command::Workspaces
                 | Command::Archive
@@ -937,9 +1002,8 @@ fn project_commands(model: &CutexProjectsModel) -> Vec<(Command, Option<&'static
                 {
                     Some("Finish the current editor/review")
                 }
-                Command::LoadMore | Command::Titles | Command::Scope => Some("Available on Recent / Managed"),
-                Command::NewProject if model.available_agents.is_empty() => {
-                    Some("No eligible persistent Director candidate")
+                Command::LoadMore | Command::Titles | Command::Scope => {
+                    Some("Available on Recent / Managed")
                 }
                 Command::Actions | Command::Edit | Command::Inspect
                     if model.visible_indices().is_empty() =>
@@ -956,6 +1020,19 @@ fn project_command(
     model: &mut CutexProjectsModel,
     command: Command,
 ) -> Option<PrimaryPanelOutcome> {
+    if model.view == ProjectView::Details
+        && model.section == ProjectSection::Members
+        && matches!(command, Command::Actions | Command::Edit)
+    {
+        return request_member_action(
+            model,
+            if command == Command::Actions {
+                super::session_tui::SelectorEvent::OpenActions
+            } else {
+                super::session_tui::SelectorEvent::OpenSettings
+            },
+        );
+    }
     if let Some((_, Some(reason))) = project_commands(model)
         .into_iter()
         .find(|(c, _)| *c == command)
@@ -1352,7 +1429,10 @@ fn handle_project_widget_key(
             KeyCode::Enter => match model.section {
                 ProjectSection::Operators => model.begin_operator_confirmation(),
                 ProjectSection::Members => {
-                    model.member_inspecting = selected_member(model).is_some()
+                    return request_member_action(
+                        model,
+                        super::session_tui::SelectorEvent::Activate,
+                    );
                 }
                 ProjectSection::Overview | ProjectSection::Appearance => {
                     model.notice = Some("This section has no mutating action.".to_string())
@@ -1445,6 +1525,9 @@ fn handle_project_widget_key(
                     .is_some_and(|editor| editor.field < 4)
                 {
                     model.create_editor.as_mut().unwrap().field += 1;
+                } else if model.available_agents.is_empty() {
+                    model.notice = Some("Draft kept. Select/Adopt an existing saved session in Recent, then Alt+P returns here. New Agent is unavailable until native persistence is verified.".into());
+                    return Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Recent));
                 } else {
                     match save_project_create(model) {
                         Ok(()) => model.failure = None,
@@ -2067,7 +2150,9 @@ fn render_create_editor(frame: &mut Frame<'_>, area: Rect, model: &CutexProjects
         .available_agents
         .get(editor.director)
         .map(|agent| format!("{} ({})", agent.name, agent.cutex_session_id.as_str()))
-        .unwrap_or_else(|| "No durable Agent with a validated identity".to_string());
+        .unwrap_or_else(|| {
+            "None — Enter: saved Recent; New Agent unavailable (persistence unverified)".to_string()
+        });
     let field = |index, label: &str, value: String| {
         Line::from(vec![
             Span::styled(
@@ -2278,6 +2363,37 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ui_contract_d11_no_candidate_saved_recent_roundtrip_keeps_draft() {
+        let mut model = model_with_projects();
+        model.available_agents.clear();
+        assert_eq!(
+            handle_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT)
+            ),
+            None
+        );
+        handle_paste(&mut model, "draft-id");
+        for _ in 0..4 {
+            handle_key(&mut model, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        }
+        assert_eq!(
+            handle_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Recent))
+        );
+        assert_eq!(model.create_editor.as_ref().unwrap().project_id, "draft-id");
+        assert_eq!(model.view, ProjectView::Create);
+        assert!(model.import_request.is_none());
+        assert!(model
+            .notice
+            .as_ref()
+            .unwrap()
+            .contains("New Agent is unavailable"));
+    }
     use super::*;
     use std::time::Duration;
 
@@ -2344,6 +2460,24 @@ mod tests {
                     Ok((mut stream, _)) => {
                         let request =
                             cutex::http::server::read_simple_http_request(&mut stream).unwrap();
+                        let mut context =
+                            crate::cli_app::management_context::management_request_context();
+                        // Only fresh native observation is simulated here. Root
+                        // authentication, provider persistence and replay are real.
+                        context.adopt_saved_native = |principal, request| {
+                            if load_cutex_session_store()
+                                .unwrap()
+                                .human_adoption_receipts
+                                .contains_key(request.action_id.as_str())
+                            {
+                                return (crate::cli_app::management_context::management_request_context().adopt_saved_native)(principal, request);
+                            }
+                            cutex::agent_management::AgentManagementProvider::open_default().unwrap().adopt_saved_native(
+                                principal, &cutex::session::store::cutex_sessions_path().unwrap(), request,
+                                &cutex::platform::host::current_host_name(),
+                                &|_: &cutex::agent_management::ProjectId, _: Option<&cutex::role_revision::CutexSessionId>| Ok(false),
+                            ).map_err(|e| cutex::agent_management::AgentManagementError::OwnerActionRequired(e.to_string()))
+                        };
                         cutex::management::v2::server::handle_v2_request(
                             &mut stream,
                             &request,
@@ -2351,7 +2485,7 @@ mod tests {
                             Some("seat"),
                             Some("human-root"),
                             &[],
-                            crate::cli_app::management_context::management_request_context(),
+                            context,
                         )
                         .unwrap();
                     }
@@ -2374,6 +2508,14 @@ mod tests {
         for wrong in ["ordinary", "seat", "bus", ""] {
             let denied = ManagementControlClient::test_endpoint(base.clone(), wrong.into());
             assert!(denied.durable_candidates().is_err());
+            assert!(denied
+                .adopt_saved_native(&cutex::agent_management::HumanAdoptRequest {
+                    action_id: cutex::agent_management::AgentActionId::new("denied-adopt").unwrap(),
+                    native_id: "saved-native".into(),
+                    cwd: "/private/fixture".into(),
+                    formal_name: "Human Name".into(),
+                })
+                .is_err());
             assert!(denied
                 .review_agent_archive(&cutex::agent_management::AgentArchiveReviewRequest {
                     cutex_session_id: cutex::role_revision::CutexSessionId::new("cutex.worker")
@@ -2472,6 +2614,14 @@ mod tests {
             &mut model,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         );
+        assert_eq!(
+            model.member_action_requested.take(),
+            Some((
+                "cutex.director".into(),
+                super::super::session_tui::SelectorEvent::Activate
+            ))
+        );
+        project_command(&mut model, Command::Inspect);
         assert!(model.member_inspecting);
         assert!(rendered(&model, 80, 30).contains("Inspector"));
         handle_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -2483,7 +2633,13 @@ mod tests {
             KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT),
         );
         assert_eq!(model.view, ProjectView::Details);
-        assert!(model.notice.as_deref().unwrap().contains("deferred"));
+        assert_eq!(
+            model.member_action_requested.take(),
+            Some((
+                "cutex.director".into(),
+                super::super::session_tui::SelectorEvent::OpenActions
+            ))
+        );
         model.view = ProjectView::List;
         model.durable_candidates = client.durable_candidates().unwrap();
         let worker = model
@@ -2862,6 +3018,20 @@ mod tests {
                 "historical replay unchanged after Restore"
             );
         }
+        // The real root HTTP route must replay an already committed adoption
+        // without launching a native process, and retain its exact snapshot.
+        let adoption = cutex::agent_management::HumanAdoptRequest {
+            action_id: cutex::agent_management::AgentActionId::new("http-adopt-replay").unwrap(),
+            native_id: "saved-http-native".into(),
+            cwd: _home.root().to_string_lossy().into_owned(),
+            formal_name: "Explicit HTTP Agent".into(),
+        };
+        let adopted = client.adopt_saved_native(&adoption).unwrap();
+        assert!(adopted.imported.as_ref().unwrap().complete);
+        assert_eq!(client.adopt_saved_native(&adoption).unwrap(), adopted);
+        let mut changed = adoption;
+        changed.formal_name = "Changed request".into();
+        assert!(client.adopt_saved_native(&changed).is_err());
     }
     use ratatui::backend::TestBackend;
 

@@ -88,13 +88,18 @@ pub(super) enum RecentCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RecentAdoptionRequest {
+    pub(super) action_id: String,
+    pub(super) formal_name: String,
     pub(super) thread_id: String,
     pub(super) title: String,
     pub(super) cwd: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct AdoptionReview {
+    name: tui_input::Input,
+    name_focused: bool,
+    action_id: String,
     thread_id: String,
     confirmed: bool,
 }
@@ -527,6 +532,9 @@ impl RecentSessionsWorkspace {
             return false;
         }
         self.review = Some(AdoptionReview {
+            name: tui_input::Input::default(),
+            name_focused: true,
+            action_id: format!("human-adopt-{}", uuid::Uuid::new_v4()),
             thread_id: row.thread_id.clone(),
             confirmed: false,
         });
@@ -538,6 +546,31 @@ impl RecentSessionsWorkspace {
             review.confirmed = confirmed;
         }
     }
+    pub(super) fn adoption_name(&self) -> Option<&tui_input::Input> {
+        self.review.as_ref().map(|r| &r.name)
+    }
+    pub(super) fn adoption_name_focused(&self) -> bool {
+        self.review.as_ref().is_some_and(|r| r.name_focused)
+    }
+    pub(super) fn focus_adoption_name(&mut self) {
+        if let Some(r) = self.review.as_mut() {
+            r.name_focused = true;
+            r.confirmed = false;
+        }
+    }
+    pub(super) fn adoption_name_input(&mut self) -> Option<&mut tui_input::Input> {
+        self.review
+            .as_mut()
+            .filter(|r| r.name_focused)
+            .map(|r| &mut r.name)
+    }
+    pub(super) fn blur_adoption_name(&mut self) -> bool {
+        if let Some(review) = self.review.as_mut().filter(|r| r.name_focused) {
+            review.name_focused = false;
+            return true;
+        }
+        false
+    }
 
     pub(super) fn cancel_review(&mut self) {
         self.review = None;
@@ -545,7 +578,7 @@ impl RecentSessionsWorkspace {
 
     pub(super) fn adoption_request(&self) -> Option<RecentAdoptionRequest> {
         let review = self.review.as_ref()?;
-        if !review.confirmed {
+        if !review.confirmed || review.name.value().trim().is_empty() {
             return None;
         }
         let row = self
@@ -553,6 +586,8 @@ impl RecentSessionsWorkspace {
             .iter()
             .find(|row| row.thread_id == review.thread_id)?;
         (row.state == RecentThreadState::Unmanaged).then(|| RecentAdoptionRequest {
+            action_id: review.action_id.clone(),
+            formal_name: review.name.value().trim().to_string(),
             thread_id: row.thread_id.clone(),
             title: row.title.clone(),
             cwd: row.cwd.clone().expect("unmanaged native thread has cwd"),
@@ -1063,6 +1098,7 @@ mod tests {
         assert!(workspace.adoption_request().is_none());
         assert!(workspace.begin_review());
         workspace.set_review_confirmed(true);
+        *workspace.adoption_name_input().unwrap() = tui_input::Input::new("Explicit name".into());
         assert_eq!(workspace.adoption_request().unwrap().thread_id, "thread-1");
     }
 
@@ -1085,6 +1121,7 @@ mod tests {
         let mut workspace = RecentSessionsWorkspace::default();
         workspace.rows = vec![row];
         assert!(workspace.begin_review());
+        *workspace.adoption_name_input().unwrap() = tui_input::Input::new("Explicit name".into());
         workspace.set_review_confirmed(true);
         assert_eq!(workspace.adoption_request().unwrap().cwd, long_cwd);
 

@@ -6,7 +6,7 @@ use cutex::catalog::{CatalogEndpoint, OwnedStdioEndpoint, StdioAppServerOptions}
 use cutex::launch::command::LaunchCommand;
 use serde_json::{json, Value};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct NativeLaunch {
     pub cwd: PathBuf,
     pub native_home: PathBuf,
@@ -99,7 +99,8 @@ impl NativeLaunch {
     /// Call only after the owning workflow has durably recorded its intent.
     /// A returned native ID is not success until the native provider can read
     /// its persisted metadata. Never create a second thread on this path.
-    pub(super) fn bootstrap(&self) -> anyhow::Result<String> {
+    #[cfg(test)]
+    fn bootstrap(&self) -> anyhow::Result<String> {
         let mut endpoint = self.endpoint()?;
         let created = endpoint.request("thread/start", json!({"cwd":self.cwd, "model":self.model,
             "ephemeral":false, "approvalPolicy":"never", "sandbox":"read-only", "sessionStartSource":"startup"}))?;
@@ -184,6 +185,43 @@ fn isolated_command(launch: &LaunchCommand, cwd: &Path, native_home: &Path) -> C
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "explicit saved private fixture only; no bootstrap or model turn"]
+    fn ui_contract_d06_real_saved_native_resume_no_cutex_adoption() {
+        let home = crate::cli_app::test_home::IsolatedTestHome::new("cutex-d2-resume").unwrap();
+        let native_home = PathBuf::from(
+            std::env::var("CUTEX_D2_PRIVATE_SAVED_HOME").expect("owned saved fixture required"),
+        );
+        assert!(native_home
+            .to_string_lossy()
+            .starts_with("/tmp/cutex-d2-native-"));
+        let id = std::env::var("CUTEX_D2_PRIVATE_SAVED_ID").unwrap();
+        cutex::session::store::save_cutex_session_store(
+            &cutex::session::model::CutexSessionStore::default(),
+        )
+        .unwrap();
+        let path = cutex::session::store::cutex_sessions_path().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let provider = cutex::agent_management::AgentManagementStore::open_default().unwrap();
+        let roster = provider.snapshot().unwrap();
+        let launch = NativeLaunch {
+            cwd: home.root().into(),
+            native_home,
+            profile: None,
+            model: None,
+        };
+        let mut endpoint = launch.endpoint().unwrap();
+        let resumed = endpoint
+            .request("thread/resume", json!({"threadId":id}))
+            .unwrap();
+        assert_eq!(
+            resumed.pointer("/thread/id").and_then(Value::as_str),
+            Some(id.as_str())
+        );
+        drop(endpoint);
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert_eq!(provider.snapshot().unwrap(), roster);
+    }
     #[test]
     fn ui_contract_d2_native_environment_drops_authority_and_notifications() {
         let launch = LaunchCommand::new("native")
