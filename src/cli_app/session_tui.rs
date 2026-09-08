@@ -69,6 +69,7 @@ use super::session_tui_actions::{
     session_tui_actions_for_record, SessionTuiAction, SessionTuiActionItem,
 };
 use super::session_tui_cutex_projects::palette_color as project_palette_color;
+use super::session_tui_input::{self as input_policy, Command, Gate, Help, LeaveReview};
 use super::session_tui_profile_settings::{
     ProfileSettingsDraft, ProfileSettingsField, ProfileSettingsSnapshot,
 };
@@ -82,8 +83,7 @@ use super::session_tui_settings::{
     SessionTuiSettingOption,
 };
 use super::session_tui_workspace::{
-    primary_panel_shortcut, primary_panel_tabs, PrimaryPanel, PrimaryPanelOutcome,
-    SessionTuiWorkspace, WorkspaceSelection,
+    primary_panel_tabs, PrimaryPanel, PrimaryPanelOutcome, SessionTuiWorkspace, WorkspaceSelection,
 };
 use super::session_tui_workspace_events::{workspace_event_from_key, WorkspaceEvent};
 use super::session_tui_workspace_loading::{WorkspaceLoad, WorkspaceLoadPoll};
@@ -726,6 +726,9 @@ impl SettingsView {
 
 #[derive(Debug, Clone)]
 struct SelectorModel {
+    filter_focused: bool,
+    help: Option<Help>,
+    leave_review: Option<LeaveReview>,
     rows: Vec<SelectorRow>,
     retired_rows: Vec<SelectorRow>,
     recent: RecentSessionsWorkspace,
@@ -759,6 +762,9 @@ impl SelectorModel {
             .all(|row| { SessionTuiWorkspace::PRODUCTION.contains(&row.target.workspace()) }));
         sort_rows(&mut rows);
         let mut model = Self {
+            filter_focused: false,
+            help: None,
+            leave_review: None,
             rows,
             retired_rows: Vec::new(),
             recent: RecentSessionsWorkspace::default(),
@@ -3566,6 +3572,30 @@ impl SelectorModel {
     }
 
     fn replace_snapshot(&mut self, snapshot: SelectorSnapshot) {
+        let stale_confirmation =
+            if let SelectorMode::ConfirmRuntimeAction { agent_key, .. } = &self.mode {
+                let old = self
+                    .rows
+                    .iter()
+                    .chain(self.retired_rows.iter())
+                    .find(|r| r.target.agent_key() == Some(agent_key.as_str()));
+                let new = snapshot
+                    .rows
+                    .iter()
+                    .find(|r| r.target.agent_key() == Some(agent_key.as_str()));
+                old.zip(new).is_none_or(|(old, new)| {
+                    old.revision != new.revision
+                        || old.agent != new.agent
+                        || old.lifecycle != new.lifecycle
+                })
+            } else {
+                false
+            };
+        if stale_confirmation {
+            self.mode = SelectorMode::Agents;
+            self.notice =
+                Some("Confirmation target changed; review the current Agent again".into());
+        }
         let active_settings_target = match &self.mode {
             SelectorMode::Settings { target, .. } => Some(target.clone()),
             _ => None,
@@ -4080,7 +4110,9 @@ impl SelectorModel {
             return;
         }
         let current = self.selected_visible_index().unwrap_or(0);
-        let next = wrapped_index(current, direction, visible.len());
+        let next = current
+            .saturating_add_signed(direction)
+            .min(visible.len() - 1);
         self.workspace_selection
             .select(Some(self.rows[visible[next]].target.clone()));
     }
@@ -4190,8 +4222,13 @@ pub(crate) fn run() -> anyhow::Result<()> {
                 outcome
             }
             PrimaryPanel::Projects => {
-                let (outcome, model) =
+                let (outcome, mut model) =
                     super::session_tui_cutex_projects::run(projects_model.take())?;
+                if std::mem::take(&mut model.open_settings_requested) {
+                    if let Some(selector) = selector_model.as_mut() {
+                        selector_command(selector, Command::Settings);
+                    }
+                }
                 projects_model = Some(model);
                 match outcome {
                     PrimaryPanelOutcome::Exit => return Ok(()),
@@ -5089,75 +5126,372 @@ enum SelectorKeyRoute {
 }
 
 /// Shared by the terminal loop and key-sequence tests; effects run only after routing.
-fn route_selector_key(model: &mut SelectorModel, key: KeyEvent) -> SelectorKeyRoute {
-    let recent_input =
-        matches!(model.mode, SelectorMode::RecentSessions) && model.recent.filter_focused();
-    let managed_input =
-        matches!(model.mode, SelectorMode::Agents) && !model.inspector_overview_focused;
-    if !super::session_tui_workspace_events::accepts_key(key, recent_input || managed_input) {
-        return SelectorKeyRoute::Control(None);
+fn selector_input(model: &mut SelectorModel) -> Option<&mut Input> {
+    if matches!(model.mode, SelectorMode::RecentSessions) && model.recent.filter_focused() {
+        return Some(model.recent.filter_input_mut());
     }
-    // Focused input consumes keys before page/action shortcuts. Alt shortcuts
-    // are deliberately inert until editing ends; they cannot leak into review.
-    if recent_input {
-        match key.code {
-            KeyCode::Tab | KeyCode::BackTab => model.recent.blur_filter(),
-            KeyCode::Left => model.recent.edit_filter(InputRequest::GoToPrevChar),
-            KeyCode::Right => model.recent.edit_filter(InputRequest::GoToNextChar),
-            _ => {
-                if let Some(event) = selector_event_from_key(key, model.enhanced_keyboard) {
-                    return SelectorKeyRoute::Control(Some(model.handle(event)));
+    if matches!(model.mode, SelectorMode::Agents) && model.filter_focused {
+        return Some(&mut model.query);
+    }
+    if !matches!(
+        model.mode,
+        SelectorMode::Settings { .. } | SelectorMode::ProfileManager { .. }
+    ) {
+        return None;
+    }
+    if let Some(overlay) = model.settings_overlay.as_mut() {
+        match overlay {
+            SettingsOverlay::Text { input, .. } => return Some(input),
+            SettingsOverlay::Groups {
+                inputs, selected, ..
+            } => return inputs.get_mut(*selected),
+            _ => {}
+        }
+    }
+    if let Some(ProfileOverlay::RenameInput { input, .. }) = model.profile_overlay.as_mut() {
+        return Some(input);
+    }
+    None
+}
+
+fn selector_dirty(model: &SelectorModel) -> bool {
+    model.settings_draft.is_dirty()
+        || model.global_settings_draft.is_dirty()
+        || model.profile_settings_draft.is_dirty()
+        || matches!(
+            model.settings_overlay,
+            Some(SettingsOverlay::Text { .. } | SettingsOverlay::Groups { .. })
+        )
+        || matches!(
+            model.profile_overlay,
+            Some(ProfileOverlay::RenameInput { .. })
+        )
+}
+fn selector_modal(model: &SelectorModel) -> bool {
+    matches!(model.mode, SelectorMode::ConfirmRuntimeAction { .. })
+        || (matches!(model.mode, SelectorMode::RecentSessions) && model.recent.review().is_some())
+        || model.action_overlay.is_some()
+        || model.settings_overlay.as_ref().is_some_and(|o| {
+            !matches!(
+                o,
+                SettingsOverlay::Text { .. } | SettingsOverlay::Groups { .. }
+            )
+        })
+        || model
+            .profile_overlay
+            .as_ref()
+            .is_some_and(|o| !matches!(o, ProfileOverlay::RenameInput { .. }))
+}
+fn selector_commands(model: &SelectorModel) -> Vec<(Command, Option<&'static str>)> {
+    input_policy::BINDINGS
+        .iter()
+        .map(|b| {
+            let reason = match b.command {
+                Command::Archived => Some("Available on Projects"),
+                Command::NewProject => {
+                    Some("Available on Projects; native creation is not implemented here")
                 }
-            }
-        }
+                Command::LoadMore
+                    if !matches!(model.mode, SelectorMode::RecentSessions)
+                        || model.recent.next_cursor().is_none()
+                        || model.recent.loading() =>
+                {
+                    Some("No next Recent page")
+                }
+                Command::Actions | Command::Inspect | Command::Edit | Command::Titles
+                    if !matches!(model.mode, SelectorMode::RecentSessions)
+                        && model.selected_managed_agent().is_none() =>
+                {
+                    Some("Select an Agent")
+                }
+                Command::Edit | Command::Titles
+                    if matches!(model.mode, SelectorMode::RecentSessions) =>
+                {
+                    Some("Use Managed for this command")
+                }
+                _ => None,
+            };
+            (b.command, reason)
+        })
+        .collect()
+}
+fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyRoute {
+    if let Some((_, Some(reason))) = selector_commands(model)
+        .into_iter()
+        .find(|(c, _)| *c == command)
+    {
+        model.notice = Some(reason.into());
         return SelectorKeyRoute::Control(None);
     }
-    if let Some(panel) = primary_panel_shortcut(key) {
-        if matches!(
-            model.mode,
-            SelectorMode::ClosingRuntime { .. } | SelectorMode::ConfirmRuntimeAction { .. }
-        ) || (matches!(model.mode, SelectorMode::RecentSessions)
-            && model.recent.review().is_some())
-        {
-            return SelectorKeyRoute::Control(None);
+    let navigation = matches!(
+        command,
+        Command::Page(_)
+            | Command::Settings
+            | Command::Exit
+            | Command::Back
+            | Command::Actions
+            | Command::Edit
+            | Command::Inspect
+    );
+    if navigation {
+        match input_policy::navigation_gate(
+            matches!(model.mode, SelectorMode::ClosingRuntime { .. }),
+            selector_modal(model),
+            selector_dirty(model),
+        ) {
+            Gate::Block => return SelectorKeyRoute::Control(None),
+            Gate::Review => {
+                model.leave_review = Some(LeaveReview::new(
+                    command,
+                    model.settings_overlay.is_none()
+                        && model.profile_overlay.is_none()
+                        && matches!(
+                            model.mode,
+                            SelectorMode::Settings { .. } | SelectorMode::ProfileManager { .. }
+                        ),
+                ));
+                return SelectorKeyRoute::Control(None);
+            }
+            Gate::Allow => {}
         }
-        let active = if matches!(model.mode, SelectorMode::RecentSessions) {
-            PrimaryPanel::Recent
-        } else {
-            PrimaryPanel::Agents
-        };
-        return if panel != active {
+    }
+    match command {
+        Command::Archived => SelectorKeyRoute::Control(None),
+        Command::Help => {
+            model.help = Some(Help::default());
+            SelectorKeyRoute::Control(None)
+        }
+        Command::Page(panel) => {
+            model.filter_focused = false;
             model.recent.blur_filter();
             SelectorKeyRoute::Switch(panel)
-        } else {
+        }
+        Command::Settings => {
+            model.activate_primary_panel(PrimaryPanel::Agents);
+            model
+                .workspace_selection
+                .select(Some(SelectorTarget::GlobalSettings));
+            model.open_settings();
             SelectorKeyRoute::Control(None)
-        };
+        }
+        Command::Exit => SelectorKeyRoute::Control(Some(SelectorControl::Exit)),
+        Command::Back => {
+            model.leave_settings();
+            SelectorKeyRoute::Control(None)
+        }
+        Command::Refresh => SelectorKeyRoute::Refresh,
+        Command::LoadMore => {
+            if matches!(model.mode, SelectorMode::RecentSessions)
+                && model.recent.next_cursor().is_some()
+                && !model.recent.loading()
+            {
+                SelectorKeyRoute::Control(Some(SelectorControl::Recent(RecentCommand::LoadMore)))
+            } else {
+                SelectorKeyRoute::Control(None)
+            }
+        }
+        Command::NewProject => SelectorKeyRoute::Control(None),
+        Command::Titles => {
+            if matches!(model.mode, SelectorMode::Agents) {
+                model.show_thread_titles = !model.show_thread_titles;
+            }
+            SelectorKeyRoute::Control(None)
+        }
+        Command::Inspect => {
+            model.filter_focused = false;
+            model.recent.blur_filter();
+            if matches!(model.mode, SelectorMode::Agents) {
+                model.inspector_overview_focused = model.selected_managed_agent().is_some();
+                SelectorKeyRoute::Control(None)
+            } else {
+                SelectorKeyRoute::Control(Some(model.handle(SelectorEvent::OpenActions)))
+            }
+        }
+        Command::Actions => {
+            model.filter_focused = false;
+            model.recent.blur_filter();
+            SelectorKeyRoute::Control(Some(model.handle(SelectorEvent::OpenActions)))
+        }
+        Command::Edit => {
+            model.filter_focused = false;
+            model.recent.blur_filter();
+            model.inspector_overview_focused = false;
+            model.open_settings();
+            SelectorKeyRoute::Control(None)
+        }
     }
-    if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::F(5) {
-        return SelectorKeyRoute::Refresh;
+}
+fn route_selector_key(model: &mut SelectorModel, key: KeyEvent) -> SelectorKeyRoute {
+    let text_input = selector_input(model).is_some();
+    if !super::session_tui_workspace_events::accepts_key(key, text_input) {
+        return SelectorKeyRoute::Control(None);
+    }
+    if let Some(mut review) = model.leave_review.take() {
+        match review.handle(key) {
+            Some(0) => {}
+            Some(1) => {
+                let command = review.command;
+                model.leave_settings();
+                return selector_command(model, command);
+            }
+            Some(2) => {
+                return SelectorKeyRoute::Control(Some(model.handle(SelectorEvent::Insert('S'))))
+            }
+            _ => model.leave_review = Some(review),
+        }
+        return SelectorKeyRoute::Control(None);
+    }
+    if let Some(mut help) = model.help.take() {
+        let entries = selector_commands(model);
+        match help.handle(key, &entries) {
+            Some(Some(command)) => return selector_command(model, command),
+            Some(None) => {}
+            None => model.help = Some(help),
+        }
+        return SelectorKeyRoute::Control(None);
+    }
+    if matches!(model.mode, SelectorMode::ClosingRuntime { .. }) {
+        return SelectorKeyRoute::Control(None);
+    }
+    if input_policy::resolve(key) == Some(Command::Help) && !selector_modal(model) {
+        model.help = Some(Help::default());
+        return SelectorKeyRoute::Control(None);
+    }
+    // Editors consume plain text and cursor keys, not page/exit commands.
+    if let Some(input) = selector_input(model) {
+        if input_policy::edit(input, key) {
+            model.ensure_selection();
+            model.recent.filter_edited();
+            if let Some(SettingsOverlay::Groups { inputs, .. }) = model.settings_overlay.as_mut() {
+                ensure_group_editor_trailing_input(inputs);
+            }
+            return SelectorKeyRoute::Control(None);
+        }
+    }
+    let recent = matches!(model.mode, SelectorMode::RecentSessions);
+    let filter = (recent && model.recent.filter_focused())
+        || (matches!(model.mode, SelectorMode::Agents) && model.filter_focused);
+    if filter
+        && matches!(
+            key.code,
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab
+        )
+    {
+        model.filter_focused = false;
+        model.recent.blur_filter();
+        return SelectorKeyRoute::Control(None);
+    }
+    if let Some(command) = input_policy::resolve(key) {
+        if selector_modal(model) {
+            return SelectorKeyRoute::Control(None);
+        }
+        return selector_command(model, command);
+    }
+    if matches!(key.code, KeyCode::Esc) && !selector_modal(model) && !text_input {
+        if selector_dirty(model) {
+            return selector_command(model, Command::Back);
+        }
+        if matches!(model.mode, SelectorMode::Agents) && !model.inspector_overview_focused {
+            if model.query.value().is_empty() {
+                model.notice = Some("Ctrl+C exits Cutex".into());
+            } else {
+                model.query.reset();
+                model.ensure_selection();
+            }
+            return SelectorKeyRoute::Control(None);
+        }
+        if recent && model.recent.review().is_none() {
+            if !model.recent.query().is_empty() {
+                model.recent.clear_filter();
+            } else {
+                model.notice = Some("Ctrl+C exits Cutex".into());
+            }
+            return SelectorKeyRoute::Control(None);
+        }
+    }
+    if !selector_modal(model)
+        && ((matches!(model.mode, SelectorMode::Agents) && !model.inspector_overview_focused)
+            || recent)
+    {
+        if let KeyCode::Char(c) = key.code {
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
+                && !c.is_control()
+            {
+                if recent {
+                    model.recent.focus_filter();
+                    if c != '/' {
+                        model.recent.push_filter(c);
+                    }
+                } else {
+                    model.filter_focused = true;
+                    if c != '/' {
+                        input_policy::edit(&mut model.query, key);
+                        model.ensure_selection();
+                    }
+                }
+                return SelectorKeyRoute::Control(None);
+            }
+        }
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            if recent {
+                model.recent.focus_filter();
+            } else {
+                model.filter_focused = true;
+            }
+            return SelectorKeyRoute::Control(None);
+        }
+    }
+    if !filter
+        && !selector_modal(model)
+        && matches!(
+            model.mode,
+            SelectorMode::Agents | SelectorMode::RecentSessions
+        )
+    {
+        let delta = match key.code {
+            KeyCode::PageUp => Some(-10),
+            KeyCode::PageDown => Some(10),
+            _ => None,
+        };
+        if let Some(delta) = delta {
+            if recent {
+                model.recent.move_selection(delta);
+            } else {
+                model.move_selection(delta);
+            }
+            return SelectorKeyRoute::Control(None);
+        }
     }
     if let Some(panel) = selector_list_panel_from_horizontal_key(model, key) {
-        return panel.map_or(SelectorKeyRoute::Control(None), SelectorKeyRoute::Switch);
-    }
-    if handle_managed_inspector_shortcut(model, key) || handle_recent_actions_shortcut(model, key) {
-        return SelectorKeyRoute::Control(None);
+        return panel.map_or(SelectorKeyRoute::Control(None), |p| {
+            selector_command(model, Command::Page(p))
+        });
     }
     let control = if let Some(control) = selector_navigation_control_from_key(model, key) {
         Some(control)
-    } else if toggle_managed_thread_titles_from_key(model, key) {
-        None
-    } else if close_runtime_shortcut_from_key(key) {
+    } else if close_runtime_shortcut_from_key(key)
+        && !text_input
+        && matches!(model.mode, SelectorMode::Agents)
+    {
         Some(model.activate_close_shortcut())
     } else {
-        selector_event_from_key(key, model.enhanced_keyboard).map(|event| model.handle(event))
+        selector_event_from_key(key, model.enhanced_keyboard).map(|e| model.handle(e))
     };
     SelectorKeyRoute::Control(control)
 }
 
 fn handle_selector_paste(model: &mut SelectorModel, text: &str) {
-    if matches!(model.mode, SelectorMode::RecentSessions) && model.recent.filter_focused() {
-        for character in text.chars().filter(|c| !c.is_control()) {
-            model.handle(SelectorEvent::Insert(character));
+    if model.help.is_some() || model.leave_review.is_some() {
+        return;
+    }
+    if let Some(input) = selector_input(model) {
+        input_policy::paste(input, text);
+        model.ensure_selection();
+        model.recent.filter_edited();
+        if let Some(SettingsOverlay::Groups { inputs, .. }) = model.settings_overlay.as_mut() {
+            ensure_group_editor_trailing_input(inputs);
         }
     }
 }
@@ -5762,6 +6096,7 @@ fn selector_list_panel_from_horizontal_key(
     }
 }
 
+#[cfg(test)]
 fn handle_managed_inspector_shortcut(model: &mut SelectorModel, key: KeyEvent) -> bool {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
         || key.modifiers != KeyModifiers::ALT
@@ -5800,6 +6135,7 @@ fn handle_managed_inspector_shortcut(model: &mut SelectorModel, key: KeyEvent) -
     }
 }
 
+#[cfg(test)]
 fn toggle_managed_thread_titles_from_key(model: &mut SelectorModel, key: KeyEvent) -> bool {
     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
         && key.modifiers == KeyModifiers::ALT
@@ -5814,27 +6150,18 @@ fn toggle_managed_thread_titles_from_key(model: &mut SelectorModel, key: KeyEven
     }
 }
 
-fn handle_recent_actions_shortcut(model: &mut SelectorModel, key: KeyEvent) -> bool {
-    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-        && key.modifiers == KeyModifiers::ALT
-        && matches!(key.code, KeyCode::Char('a' | 'A'))
-        && matches!(model.mode, SelectorMode::RecentSessions)
-        && model.recent.review().is_none()
-        && !model.recent.filter_focused()
-    {
-        let _ = model.handle(SelectorEvent::OpenActions);
-        true
-    } else {
-        false
-    }
-}
-
 fn selector_event_from_key(key: KeyEvent, enhanced_keyboard: bool) -> Option<SelectorEvent> {
     workspace_event_from_key(key, enhanced_keyboard)
 }
 
 fn render_selector(frame: &mut Frame<'_>, model: &SelectorModel) {
     render_workspace(frame, model, &SelectorWorkspaceRenderer);
+    if let Some(help) = &model.help {
+        help.render(frame, &selector_commands(model));
+    }
+    if let Some(review) = &model.leave_review {
+        review.render(frame);
+    }
 }
 
 struct SelectorWorkspaceRenderer;
@@ -5872,7 +6199,7 @@ fn render_selector_contents(frame: &mut Frame<'_>, model: &SelectorModel) {
     } else {
         match &model.mode {
             SelectorMode::Agents => {
-                render_filter(frame, chunks[2], model, true);
+                render_filter(frame, chunks[2], model, model.filter_focused);
                 render_table(frame, chunks[3], model);
             }
             SelectorMode::RecentSessions => {
@@ -6165,7 +6492,7 @@ fn render_recent_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorMo
             ]),
             Line::from(""),
             Line::from(Span::styled(
-                "Cutex defaults: persistent management; native title as display name; default runtime; no groups; IM hidden; unpinned.",
+                "Cutex defaults: persistent management; native title is metadata, never a formal Agent name; default runtime; no groups; IM hidden; unpinned.",
                 Style::new().fg(Color::Cyan),
             )),
             Line::from(""),
@@ -6191,32 +6518,13 @@ fn render_recent_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorMo
     }
     let [filter_area, table_area] =
         Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).areas(area);
-    let input_width = filter_area.width.saturating_sub(2) as usize;
-    let input = model.recent.filter_input();
-    let scroll = input.visual_scroll(input_width.saturating_sub(1).max(1));
-    frame.render_widget(
-        Paragraph::new(model.recent.query()).scroll((0, scroll as u16)).block(
-            Block::bordered()
-                .title(" Filter loaded rows: title / name / cwd / provider / project / state  [/] ")
-                .border_style(Style::new().fg(if model.recent.filter_focused() {
-                    Color::Cyan
-                } else {
-                    Color::DarkGray
-                })),
-        ),
+    input_policy::render_input(
+        frame,
         filter_area,
+        model.recent.filter_input(),
+        " Filter loaded rows: title / name / cwd / provider / project / state  [/] ",
+        model.recent.filter_focused(),
     );
-    if model.recent.filter_focused() && input_width > 0 && filter_area.height >= 3 {
-        frame.set_cursor_position((
-            filter_area.x
-                + 1
-                + input
-                    .visual_cursor()
-                    .saturating_sub(scroll)
-                    .min(input_width.saturating_sub(1)) as u16,
-            filter_area.y + 1,
-        ));
-    }
     match model.recent.load_state() {
         RecentLoadState::Loading
         | RecentLoadState::Empty
@@ -7049,26 +7357,13 @@ fn render_inspector_settings(
 }
 
 fn render_filter(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel, focused: bool) {
-    let input_width = area.width.saturating_sub(2) as usize;
-    let cursor_width = input_width.saturating_sub(1).max(1);
-    let scroll = model.query.visual_scroll(cursor_width);
-    let input = Paragraph::new(model.query.value())
-        .scroll((0, scroll as u16))
-        .block(
-            Block::bordered()
-                .title(" Filter agents / Projects ")
-                .border_style(Style::new().fg(Color::DarkGray)),
-        );
-    frame.render_widget(input, area);
-
-    if focused && area.height >= 3 && input_width > 0 {
-        let cursor = model
-            .query
-            .visual_cursor()
-            .saturating_sub(scroll)
-            .min(input_width.saturating_sub(1));
-        frame.set_cursor_position((area.x + 1 + cursor as u16, area.y + 1));
-    }
+    input_policy::render_input(
+        frame,
+        area,
+        &model.query,
+        " Filter agents / Projects ",
+        focused && model.filter_focused,
+    );
 }
 
 fn render_table(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
@@ -8061,6 +8356,23 @@ fn read_only_footer_hints(hints: &[(&'static str, &'static str)]) -> Vec<Span<'s
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
+    if matches!(
+        model.mode,
+        SelectorMode::Agents | SelectorMode::RecentSessions
+    ) && !selector_modal(model)
+    {
+        let line = if let Some(message) = model.warning.as_deref().or(model.notice.as_deref()) {
+            Line::from(format!("{message} · F1 commands"))
+        } else if (matches!(model.mode, SelectorMode::Agents) && model.filter_focused)
+            || (matches!(model.mode, SelectorMode::RecentSessions) && model.recent.filter_focused())
+        {
+            Line::from("Type · ←/→ Home/End · Backspace/Delete · Ctrl+U clear · Enter/Esc/Tab finish · F1 commands")
+        } else {
+            input_policy::footer(&selector_commands(model))
+        };
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
     let narrow = area.width < WIDE_LAYOUT_MIN_WIDTH;
     let very_narrow = area.width < 66;
     let mut spans = if model.action_overlay.is_some() {
@@ -9716,7 +10028,7 @@ mod tests {
     }
 
     #[test]
-    fn main_navigation_wraps_between_first_agent_and_final_global_settings() {
+    fn main_navigation_stops_at_first_agent_and_final_global_settings() {
         let mut model = SelectorModel::new(
             vec![
                 row(
@@ -9747,12 +10059,12 @@ mod tests {
         model.handle(SelectorEvent::Up);
         assert_eq!(
             model.selected_target(),
-            Some(SelectorTarget::GlobalSettings)
+            Some(SelectorTarget::Agent("alpha".to_string()))
         );
         model.handle(SelectorEvent::Down);
         assert_eq!(
             model.selected_target(),
-            Some(SelectorTarget::Agent("alpha".to_string()))
+            Some(SelectorTarget::Agent("beta".to_string()))
         );
         model.handle(SelectorEvent::Last);
         assert_eq!(
@@ -9762,7 +10074,7 @@ mod tests {
         model.handle(SelectorEvent::Down);
         assert_eq!(
             model.selected_target(),
-            Some(SelectorTarget::Agent("alpha".to_string()))
+            Some(SelectorTarget::GlobalSettings)
         );
     }
 
@@ -13334,8 +13646,8 @@ mod tests {
         assert!(!narrow.contains("MANAGED PATH"));
         assert!(!narrow.contains("~ global profile"));
         assert!(narrow.contains("aemeath"));
-        assert!(narrow.contains("Ctrl+X"));
-        assert!(narrow.contains("Ctrl+C exit"));
+        assert!(narrow.contains("F1"));
+        assert!(narrow.contains("Commands"));
     }
 
     #[test]
@@ -13907,7 +14219,7 @@ mod tests {
                 &mut model,
                 KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)
             ),
-            SelectorKeyRoute::Control(Some(SelectorControl::Continue))
+            SelectorKeyRoute::Control(None | Some(SelectorControl::Continue))
         ));
         assert_eq!(model.recent.query(), "");
         assert_eq!(model.query.value(), "");
@@ -13921,15 +14233,6 @@ mod tests {
         for c in "nNqaev /".chars() {
             contract_key(&mut model, KeyCode::Char(c));
         }
-        for c in ['a', 'm', 'r', 'p', 't'] {
-            assert!(matches!(
-                route_selector_key(
-                    &mut model,
-                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
-                ),
-                SelectorKeyRoute::Control(None)
-            ));
-        }
         assert_eq!(model.recent.query(), "nNqaev /");
         contract_key(&mut model, KeyCode::Enter);
         assert!(!model.recent.filter_focused());
@@ -13941,8 +14244,14 @@ mod tests {
             assert!(model.recent.review().is_none());
             assert!(matches!(model.mode, SelectorMode::RecentSessions));
         }
-        contract_key(&mut model, KeyCode::Esc);
-        assert!(matches!(model.mode, SelectorMode::Agents));
+        assert!(matches!(
+            route_selector_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT)
+            ),
+            SelectorKeyRoute::Switch(PrimaryPanel::Agents)
+        ));
+        model.activate_primary_panel(PrimaryPanel::Agents);
         contract_key(&mut model, KeyCode::Char('z'));
         assert_eq!(model.query.value(), "z");
         assert_eq!(model.recent.query(), "nNqaev /");
@@ -14089,6 +14398,232 @@ mod tests {
         model.activate_primary_panel(PrimaryPanel::Agents);
         handle_selector_paste(&mut model, "hidden");
         assert_eq!(model.recent.query(), text);
+    }
+
+    #[test]
+    fn ui_contract_b1_managed_recent_filter_parity_and_root_escape() {
+        for recent in [false, true] {
+            let mut model = contract_recent_model();
+            if !recent {
+                model.activate_primary_panel(PrimaryPanel::Agents);
+            }
+            let text = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 /中文🙂";
+            for c in text.chars() {
+                contract_key(&mut model, KeyCode::Char(c));
+            }
+            let query = |m: &SelectorModel| {
+                if recent {
+                    m.recent.query().to_owned()
+                } else {
+                    m.query.value().to_owned()
+                }
+            };
+            assert_eq!(query(&model), text);
+            assert!(selector_input(&mut model).is_some());
+            assert!(matches!(
+                route_selector_key(
+                    &mut model,
+                    KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)
+                ),
+                SelectorKeyRoute::Control(None)
+            ));
+            contract_key(&mut model, KeyCode::Home);
+            contract_key(&mut model, KeyCode::Delete);
+            assert!(query(&model).starts_with('b'));
+            handle_selector_paste(&mut model, "中e\u{301}🙂\n\r\t\u{1b}");
+            assert!(query(&model).starts_with("中e\u{301}🙂b"));
+            contract_key(&mut model, KeyCode::Esc);
+            assert!(selector_input(&mut model).is_none());
+            assert!(!query(&model).is_empty());
+            contract_key(&mut model, KeyCode::Esc);
+            assert_eq!(query(&model), "");
+            contract_key(&mut model, KeyCode::Esc);
+            assert!(model.notice.as_deref().unwrap().contains("Ctrl+C"));
+            for key in [KeyCode::Tab, KeyCode::BackTab] {
+                contract_key(&mut model, key);
+                assert!(model.recent.review().is_none());
+            }
+        }
+    }
+
+    fn contract_help_command(model: &mut SelectorModel, command: Command) -> SelectorKeyRoute {
+        contract_key(model, KeyCode::F(1));
+        let index = selector_commands(model)
+            .iter()
+            .position(|(c, _)| *c == command)
+            .unwrap();
+        for _ in 0..index {
+            contract_key(model, KeyCode::Down);
+        }
+        route_selector_key(model, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn ui_contract_b1_f1_actions_inspect_settings_and_load_more() {
+        let mut model = SelectorModel::new(
+            vec![row(
+                "cutex.one",
+                "Formal One",
+                CutexSessionLifecycleState::Online,
+                true,
+                true,
+            )],
+            false,
+            false,
+        );
+        assert!(matches!(
+            contract_help_command(&mut model, Command::Inspect),
+            SelectorKeyRoute::Control(_)
+        ));
+        assert!(model.inspector_overview_focused);
+        contract_help_command(&mut model, Command::Actions);
+        assert!(matches!(model.mode, SelectorMode::Actions { .. }));
+        contract_help_command(&mut model, Command::Edit);
+        assert!(matches!(model.mode, SelectorMode::Settings { .. }));
+        let mut model = SelectorModel::new(vec![global_row()], false, false);
+        contract_help_command(&mut model, Command::Settings);
+        assert!(matches!(
+            model.mode,
+            SelectorMode::Settings {
+                target: SelectorTarget::GlobalSettings,
+                ..
+            }
+        ));
+        let mut recent = contract_recent_model();
+        assert!(matches!(
+            contract_help_command(&mut recent, Command::LoadMore),
+            SelectorKeyRoute::Control(Some(SelectorControl::Recent(RecentCommand::LoadMore)))
+        ));
+        contract_key(&mut recent, KeyCode::Char('n'));
+        assert_eq!(recent.recent.query(), "n");
+    }
+
+    #[test]
+    fn ui_contract_b1_dirty_editor_navigation_cancel_discard_save_and_ctrl_x() {
+        let mut model = editable_model(&editable_record());
+        model.handle(SelectorEvent::OpenSettings);
+        model.settings_overlay = Some(SettingsOverlay::Text {
+            field: SettingsEditField::Session(SessionSettingsField::AgentName),
+            input: Input::new("Formal name".into()),
+            tags: false,
+            masked: false,
+        });
+        route_selector_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(
+            model.settings_overlay,
+            Some(SettingsOverlay::Text { .. })
+        ));
+        contract_key(&mut model, KeyCode::Home);
+        handle_selector_paste(&mut model, "中文\n");
+        assert!(selector_input(&mut model)
+            .unwrap()
+            .value()
+            .starts_with("中文Formal"));
+        route_selector_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(!model.leave_review.as_ref().unwrap().can_save); // unstaged field has no direct save
+        contract_key(&mut model, KeyCode::Enter); // default Cancel keeps text
+        assert!(model.settings_overlay.is_some());
+        contract_key(&mut model, KeyCode::Enter); // stage the field through its existing validator
+        assert!(model.settings_draft.is_dirty());
+        route_selector_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(model.leave_review.as_ref().unwrap().can_save);
+        contract_key(&mut model, KeyCode::Right);
+        contract_key(&mut model, KeyCode::Right);
+        assert!(matches!(
+            route_selector_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            SelectorKeyRoute::Control(Some(SelectorControl::ApplySettings(_)))
+        ));
+        // Save stays in the editor until its real effect result; no fake exit.
+        assert!(matches!(model.mode, SelectorMode::Settings { .. }));
+        route_selector_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT),
+        );
+        contract_key(&mut model, KeyCode::Right);
+        assert!(matches!(
+            route_selector_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            SelectorKeyRoute::Switch(PrimaryPanel::Recent)
+        ));
+        assert!(!selector_dirty(&model));
+    }
+
+    #[test]
+    fn ui_contract_b1_confirmation_revision_change_requires_fresh_review() {
+        let mut model = SelectorModel::new(
+            vec![row(
+                "cutex.one",
+                "Formal One",
+                CutexSessionLifecycleState::Online,
+                true,
+                true,
+            )],
+            false,
+            false,
+        );
+        model.activate_close_shortcut();
+        assert!(matches!(
+            model.mode,
+            SelectorMode::ConfirmRuntimeAction { .. }
+        ));
+        let mut rows = model.rows.clone();
+        rows[0].revision += 1;
+        model.replace_snapshot(SelectorSnapshot {
+            rows,
+            warning: None,
+        });
+        assert!(matches!(model.mode, SelectorMode::Agents));
+    }
+
+    #[test]
+    fn ui_contract_b1_production_list_navigation_stops_and_takeover_is_unchanged() {
+        let mut model = SelectorModel::new(
+            vec![
+                row(
+                    "cutex.one",
+                    "One",
+                    CutexSessionLifecycleState::Online,
+                    true,
+                    true,
+                ),
+                row(
+                    "cutex.two",
+                    "Two",
+                    CutexSessionLifecycleState::Online,
+                    true,
+                    true,
+                ),
+            ],
+            false,
+            false,
+        );
+        contract_key(&mut model, KeyCode::Up);
+        assert_eq!(model.selected_visible_index(), Some(0));
+        contract_key(&mut model, KeyCode::End);
+        contract_key(&mut model, KeyCode::Down);
+        assert_eq!(model.selected_visible_index(), Some(1));
+        let SelectorKeyRoute::Control(Some(SelectorControl::Selected(intent))) = route_selector_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ) else {
+            panic!("primary intent")
+        };
+        assert_eq!(intent.action, SessionTuiAction::ResumeAttach);
+        assert_eq!(intent.key, "cutex.two");
     }
 
     #[test]

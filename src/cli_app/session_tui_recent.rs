@@ -238,6 +238,12 @@ impl RecentSessionsWorkspace {
     pub(super) fn filter_input(&self) -> &tui_input::Input {
         &self.query
     }
+    pub(super) fn filter_input_mut(&mut self) -> &mut tui_input::Input {
+        &mut self.query
+    }
+    pub(super) fn filter_edited(&mut self) {
+        self.select_first_visible();
+    }
     pub(super) fn edit_filter(&mut self, request: tui_input::InputRequest) {
         self.query.handle(request);
         self.select_first_visible();
@@ -395,15 +401,9 @@ impl RecentSessionsWorkspace {
             .iter()
             .position(|index| *index == self.selected)
             .unwrap_or(0);
-        let next = if direction < 0 {
-            if position == 0 {
-                visible.len() - 1
-            } else {
-                position - 1
-            }
-        } else {
-            (position + 1) % visible.len()
-        };
+        let next = position
+            .saturating_add_signed(direction)
+            .min(visible.len() - 1);
         self.selected = visible[next];
     }
 

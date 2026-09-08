@@ -29,14 +29,13 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{Frame, Terminal};
-use tui_input::{Input, InputRequest};
+use tui_input::Input;
 use uuid::Uuid;
 
 use super::management_control_plane::ManagementControlClient;
 use super::session_tui::footer_hints;
-use super::session_tui_workspace::{
-    primary_panel_shortcut, primary_panel_tabs, PrimaryPanel, PrimaryPanelOutcome,
-};
+use super::session_tui_input::{self as input_policy, Command, Gate, Help, LeaveReview};
+use super::session_tui_workspace::{primary_panel_tabs, PrimaryPanel, PrimaryPanelOutcome};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(80);
 type ProjectTerminal = Terminal<CrosstermBackend<Stdout>>;
@@ -123,9 +122,14 @@ struct ProjectMutationTarget {
 
 #[derive(Debug)]
 pub(super) struct CutexProjectsModel {
+    help: Option<Help>,
+    leave_review: Option<LeaveReview>,
+    text_cursors: [Option<usize>; 4],
+    pub(super) open_settings_requested: bool,
     durable_candidates: Vec<cutex::agent_management::DurableAgentCandidate>,
     import_request: Option<cutex::agent_management::DurableImportRequest>,
     import_name: Input,
+    import_name_focused: bool,
     projects: Vec<CutexProjectSummary>,
     archived_projects: Vec<CutexProjectSummary>,
     available_agents: Vec<ProjectAgentChoice>,
@@ -151,9 +155,14 @@ pub(super) struct CutexProjectsModel {
 impl CutexProjectsModel {
     fn empty_with_failure(error: impl Into<String>) -> Self {
         Self {
+            help: None,
+            leave_review: None,
+            text_cursors: [None; 4],
+            open_settings_requested: false,
             durable_candidates: Vec::new(),
             import_request: None,
             import_name: Input::default(),
+            import_name_focused: false,
             projects: Vec::new(),
             archived_projects: Vec::new(),
             available_agents: Vec::new(),
@@ -261,6 +270,7 @@ impl CutexProjectsModel {
     }
 
     fn begin_editor(&mut self) {
+        self.text_cursors = [None; 4];
         let Some(details) = self.details.as_ref() else {
             return;
         };
@@ -275,6 +285,7 @@ impl CutexProjectsModel {
     }
 
     fn begin_create(&mut self) {
+        self.text_cursors = [None; 4];
         if self.available_agents.is_empty() {
             self.notice = Some(
                 "No persistent durable Agent candidates are available. Adopt an Agent first; an Online runtime is not required.".to_string(),
@@ -415,6 +426,11 @@ fn load_model() -> anyhow::Result<CutexProjectsModel> {
     let durable_candidates = client.durable_candidates()?;
     let available_agents = candidate_choices(&durable_candidates);
     Ok(CutexProjectsModel {
+        help: None,
+        leave_review: None,
+        text_cursors: [None; 4],
+        open_settings_requested: false,
+        import_name_focused: false,
         durable_candidates,
         import_request: None,
         import_name: Input::default(),
@@ -637,6 +653,7 @@ fn begin_import_confirmation(
         None
     };
     model.import_name = Input::new(candidate.formal_name.clone().unwrap_or_default());
+    model.import_name_focused = candidate.formal_name.is_none();
     model.import_request = Some(cutex::agent_management::DurableImportRequest {
         action_id: AgentActionId::new(format!("management-import-{}", Uuid::new_v4()))?,
         confirmed_formal_name: candidate.formal_name.clone().unwrap_or_default(),
@@ -784,185 +801,363 @@ fn run_loop(
     }
 }
 
-fn handle_paste(model: &mut CutexProjectsModel, text: &str) {
-    let text: String = text.chars().filter(|c| !c.is_control()).collect();
-    let text = text.as_str();
-    match model.view {
-        ProjectView::List if model.filter_focused => {
-            for character in text.chars() {
-                model.query.handle(InputRequest::InsertChar(character));
-            }
-            model.retain_selection();
-        }
-        ProjectView::ConfirmImport
-            if model
-                .import_request
-                .as_ref()
-                .is_some_and(|r| r.candidate.formal_name.is_none()) =>
-        {
-            for character in text.chars().filter(|c| !c.is_control()) {
-                model
-                    .import_name
-                    .handle(InputRequest::InsertChar(character));
-            }
-        }
+fn project_text_field(model: &mut CutexProjectsModel) -> Option<(&mut String, &mut Option<usize>)> {
+    let (value, field) = match model.view {
         ProjectView::Editor => {
-            let Some(editor) = model.editor.as_mut() else {
-                return;
-            };
-            match editor.field {
-                0 => editor.display_name.push_str(text),
-                1 => editor.badge_label.push_str(text),
-                2 => editor.color.push_str(text),
-                _ => unreachable!(),
-            }
+            let e = model.editor.as_mut()?;
+            (
+                match e.field {
+                    0 => &mut e.display_name,
+                    1 => &mut e.badge_label,
+                    2 => &mut e.color,
+                    _ => return None,
+                },
+                e.field,
+            )
         }
         ProjectView::Create => {
-            let Some(editor) = model.create_editor.as_mut() else {
-                return;
-            };
-            match editor.field {
-                0 => editor.project_id.push_str(text),
-                1 => editor.display_name.push_str(text),
-                2 => editor.badge_label.push_str(text),
-                3 => editor.color.push_str(text),
-                4 => {}
-                _ => unreachable!(),
-            }
+            let e = model.create_editor.as_mut()?;
+            (
+                match e.field {
+                    0 => &mut e.project_id,
+                    1 => &mut e.display_name,
+                    2 => &mut e.badge_label,
+                    3 => &mut e.color,
+                    _ => return None,
+                },
+                e.field,
+            )
         }
-        _ => {}
-    }
+        _ => return None,
+    };
+    Some((value, &mut model.text_cursors[field]))
 }
-
-fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPanelOutcome> {
-    let text_input = (model.view == ProjectView::List && model.filter_focused)
-        || matches!(
-            model.view,
-            ProjectView::Editor | ProjectView::Create | ProjectView::ConfirmImport
-        );
-    if !super::session_tui_workspace_events::accepts_key(key, text_input) {
-        return None;
-    }
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
-    {
-        return Some(PrimaryPanelOutcome::Exit);
+fn handle_paste(model: &mut CutexProjectsModel, text: &str) {
+    if model.help.is_some() || model.leave_review.is_some() {
+        return;
     }
     if model.view == ProjectView::List && model.filter_focused {
-        match key.code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab => {
-                model.filter_focused = false
-            }
-            KeyCode::Left => {
-                model.query.handle(InputRequest::GoToPrevChar);
-            }
-            KeyCode::Right => {
-                model.query.handle(InputRequest::GoToNextChar);
-            }
-            KeyCode::Home => {
-                model.query.handle(InputRequest::GoToStart);
-            }
-            KeyCode::End => {
-                model.query.handle(InputRequest::GoToEnd);
-            }
-            KeyCode::Backspace => {
-                model.query.handle(InputRequest::DeletePrevChar);
-            }
-            KeyCode::Delete => {
-                model.query.handle(InputRequest::DeleteNextChar);
-            }
-            KeyCode::Char('u' | 'U') if key.modifiers == KeyModifiers::CONTROL => {
-                model.query.handle(InputRequest::DeleteLine);
-            }
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                model.query.handle(InputRequest::InsertChar(character));
-            }
-            _ => {}
-        }
+        input_policy::paste(&mut model.query, text);
         model.retain_selection();
-        return None;
+    } else if model.view == ProjectView::ConfirmImport && model.import_name_focused {
+        input_policy::paste(&mut model.import_name, text);
+    } else if let Some((value, cursor)) = project_text_field(model) {
+        input_policy::paste_string(value, cursor, text);
     }
-    if key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Char('a' | 'A')) {
-        match model.view {
-            ProjectView::List => model.begin_create(),
-            ProjectView::Details => model.begin_project_actions(),
-            _ => {}
-        }
-        return None;
-    }
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('h' | 'H'))
+}
+fn project_modal(model: &CutexProjectsModel) -> bool {
+    matches!(
+        model.view,
+        ProjectView::ConfirmImport
+            | ProjectView::ConfirmOperator
+            | ProjectView::ConfirmProjectMutation
+    )
+}
+fn project_dirty(model: &CutexProjectsModel) -> bool {
+    model.editor.is_some() || model.create_editor.is_some()
+}
+fn project_commands(model: &CutexProjectsModel) -> Vec<(Command, Option<&'static str>)> {
+    input_policy::BINDINGS
+        .iter()
+        .map(|b| {
+            let reason = match b.command {
+                Command::NewProject | Command::Archived if model.view != ProjectView::List => {
+                    Some("Return to the Project list")
+                }
+                Command::Actions | Command::Edit | Command::Inspect
+                    if !matches!(model.view, ProjectView::List | ProjectView::Details) =>
+                {
+                    Some("Finish the current editor/review")
+                }
+                Command::LoadMore | Command::Titles => Some("Available on Recent / Managed"),
+                Command::NewProject if model.available_agents.is_empty() => {
+                    Some("No eligible persistent Director candidate")
+                }
+                Command::Actions | Command::Edit | Command::Inspect
+                    if model.visible_indices().is_empty() =>
+                {
+                    Some("Select a Project")
+                }
+                _ => None,
+            };
+            (b.command, reason)
+        })
+        .collect()
+}
+fn project_command(
+    model: &mut CutexProjectsModel,
+    command: Command,
+) -> Option<PrimaryPanelOutcome> {
+    if let Some((_, Some(reason))) = project_commands(model)
+        .into_iter()
+        .find(|(c, _)| *c == command)
     {
-        model.show_archived = !model.show_archived;
-        model.retain_selection();
-        model.notice = Some(
-            if model.show_archived {
-                "Archived Projects are visible; use Alt+A for Restore/Remove."
-            } else {
-                "Archived Projects are hidden."
-            }
-            .to_string(),
-        );
+        model.notice = Some(reason.into());
         return None;
     }
-    if key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Char('e' | 'E')) {
-        match model.view {
-            ProjectView::List => {
-                model.section = ProjectSection::Appearance;
-                match load_details(model) {
-                    Ok(()) => model.begin_editor(),
-                    Err(error) => model.failure = Some(format!("{error:#}")),
+    if matches!(
+        command,
+        Command::Page(_) | Command::Settings | Command::Exit | Command::Back
+    ) {
+        match input_policy::navigation_gate(false, project_modal(model), project_dirty(model)) {
+            Gate::Block => return None,
+            Gate::Review => {
+                model.leave_review = Some(LeaveReview::new(
+                    command,
+                    matches!(model.view, ProjectView::Editor | ProjectView::Create),
+                ));
+                return None;
+            }
+            Gate::Allow => {}
+        }
+    }
+    match command {
+        Command::Archived => {
+            if model.view == ProjectView::List {
+                model.show_archived = !model.show_archived;
+                model.retain_selection();
+            }
+            None
+        }
+        Command::Help => {
+            model.help = Some(Help::default());
+            None
+        }
+        Command::Page(panel) => {
+            model.filter_focused = false;
+            (panel != PrimaryPanel::Projects).then_some(PrimaryPanelOutcome::Switch(panel))
+        }
+        Command::Settings => {
+            model.open_settings_requested = true;
+            Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Agents))
+        }
+        Command::Exit => Some(PrimaryPanelOutcome::Exit),
+        Command::Back => {
+            model.view = ProjectView::List;
+            None
+        }
+        Command::NewProject => {
+            if model.view == ProjectView::List {
+                model.begin_create();
+            }
+            None
+        }
+        Command::Actions | Command::Edit | Command::Inspect => {
+            if model.view == ProjectView::List {
+                if let Err(e) = load_details(model) {
+                    model.failure = Some(format!("{e:#}"));
+                    return None;
                 }
             }
-            ProjectView::Details => {
-                model.section = ProjectSection::Appearance;
-                model.begin_editor();
+            if model.view == ProjectView::Details {
+                match command {
+                    Command::Actions => model.begin_project_actions(),
+                    Command::Edit => model.begin_editor(),
+                    _ => {}
+                }
+            }
+            None
+        }
+        Command::Refresh => {
+            // Keep reviewed identity/version and draft context frozen. A fresh
+            // observation is requested after leaving this editor/review.
+            if project_modal(model) || project_dirty(model) {
+                model.notice = Some("Finish the draft/review before refreshing its target".into());
+                return None;
+            }
+            let result = if model.view == ProjectView::List {
+                reload(model, false)
+            } else {
+                load_details(model)
+            };
+            if let Err(e) = result {
+                model.failure = Some(format!("{e:#}"));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPanelOutcome> {
+    let text = (model.view == ProjectView::List && model.filter_focused)
+        || (model.view == ProjectView::ConfirmImport && model.import_name_focused)
+        || matches!(model.view, ProjectView::Editor | ProjectView::Create);
+    if !super::session_tui_workspace_events::accepts_key(key, text) {
+        return None;
+    }
+    if let Some(mut review) = model.leave_review.take() {
+        match review.handle(key) {
+            Some(0) => {}
+            Some(1) => {
+                model.editor = None;
+                model.create_editor = None;
+                model.view = ProjectView::List;
+                return project_command(model, review.command);
+            }
+            Some(2) => {
+                let result = if model.view == ProjectView::Editor {
+                    save_editor(model)
+                } else {
+                    save_project_create(model)
+                };
+                if let Err(e) = result {
+                    model.failure = Some(format!("{e:#}"));
+                }
+            }
+            _ => model.leave_review = Some(review),
+        }
+        return None;
+    }
+    if let Some(mut help) = model.help.take() {
+        match help.handle(key, &project_commands(model)) {
+            Some(Some(command)) => return project_command(model, command),
+            Some(None) => {}
+            None => model.help = Some(help),
+        }
+        return None;
+    }
+    if input_policy::resolve(key) == Some(Command::Help) && !project_modal(model) {
+        model.help = Some(Help::default());
+        return None;
+    }
+    if model.view == ProjectView::List && model.filter_focused {
+        if input_policy::edit(&mut model.query, key) {
+            model.retain_selection();
+            return None;
+        }
+        if matches!(
+            key.code,
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab
+        ) {
+            model.filter_focused = false;
+            return None;
+        }
+    }
+    if model.view == ProjectView::ConfirmImport && model.import_name_focused {
+        if input_policy::edit(&mut model.import_name, key) {
+            return None;
+        }
+        if matches!(
+            key.code,
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab
+        ) {
+            model.import_name_focused = false;
+            model.confirm_selected = key.code == KeyCode::BackTab;
+            return None;
+        }
+    }
+    if model.view == ProjectView::ConfirmImport
+        && model
+            .import_request
+            .as_ref()
+            .is_some_and(|r| r.candidate.formal_name.is_none())
+    {
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            if (key.code == KeyCode::Tab && model.confirm_selected)
+                || (key.code == KeyCode::BackTab && !model.confirm_selected)
+            {
+                model.import_name_focused = true;
+            } else {
+                model.confirm_selected = !model.confirm_selected;
+            }
+            return None;
+        }
+    }
+    let palette = model.view == ProjectView::Editor
+        && model.editor.as_ref().is_some_and(|e| e.field == 2)
+        || model.view == ProjectView::Create
+            && model.create_editor.as_ref().is_some_and(|e| e.field == 3);
+    if !(palette
+        && matches!(
+            key.code,
+            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+        ))
+    {
+        if let Some((value, cursor)) = project_text_field(model) {
+            if input_policy::edit_string(value, cursor, key) {
+                return None;
+            }
+        }
+    }
+    if let Some(command) = input_policy::resolve(key) {
+        return project_command(model, command);
+    }
+    if key.code == KeyCode::Esc && matches!(model.view, ProjectView::Editor | ProjectView::Create) {
+        return project_command(model, Command::Back);
+    }
+    if model.view == ProjectView::List {
+        match key.code {
+            KeyCode::Esc => {
+                if model.query.value().is_empty() {
+                    model.notice = Some("Ctrl+C exits Cutex".into());
+                } else {
+                    model.query.reset();
+                    model.retain_selection();
+                }
+                return None;
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                model.filter_focused = true;
+                return None;
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
+                    && !c.is_control() =>
+            {
+                model.filter_focused = true;
+                if c != '/' {
+                    input_policy::edit(&mut model.query, key);
+                    model.retain_selection();
+                }
+                return None;
+            }
+            KeyCode::Home => {
+                model.selected = 0;
+                return None;
+            }
+            KeyCode::End => {
+                model.selected = model.visible_indices().len().saturating_sub(1);
+                return None;
+            }
+            KeyCode::PageUp => {
+                model.selected = model.selected.saturating_sub(10);
+                return None;
+            }
+            KeyCode::PageDown => {
+                model.selected =
+                    (model.selected + 10).min(model.visible_indices().len().saturating_sub(1));
+                return None;
             }
             _ => {}
         }
-        return None;
     }
-    if let Some(panel) = primary_panel_shortcut(key) {
-        if matches!(
-            model.view,
-            ProjectView::ConfirmImport
-                | ProjectView::ConfirmOperator
-                | ProjectView::ConfirmProjectMutation
-        ) {
-            return None;
-        }
-        return (panel != PrimaryPanel::Projects).then_some(PrimaryPanelOutcome::Switch(panel));
-    }
-    if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::F(5) {
-        let view = model.view;
-        let editor = model.editor.clone();
-        let create_editor = model.create_editor.clone();
-        let pending_operator = model.pending_operator.clone();
-        let pending_project_mutation = model.pending_project_mutation.clone();
-        let confirm_selected = model.confirm_selected;
-        let result = if view == ProjectView::List {
-            reload(model, false)
-        } else {
-            load_details(model)
-        };
-        if view != ProjectView::List {
-            // Refresh the backing projection without consuming a draft or
-            // review that belongs to this workspace.
-            model.view = view;
-            model.editor = editor;
-            model.create_editor = create_editor;
-            model.pending_operator = pending_operator;
-            model.pending_project_mutation = pending_project_mutation;
-            model.confirm_selected = confirm_selected;
-        }
-        match result {
-            Ok(()) => model.failure = None,
-            Err(error) => model.failure = Some(format!("{error:#}")),
+    // The palette is a widget, not a text cursor or a page-navigation command.
+    if palette && matches!(key.code, KeyCode::Left | KeyCode::Right) {
+        if let Some((value, cursor)) = project_text_field(model) {
+            let colors = ProjectPaletteColor::ALL;
+            let index = colors
+                .iter()
+                .position(|color| color.token() == *value)
+                .map_or(0, |index| {
+                    if key.code == KeyCode::Left {
+                        (index + colors.len() - 1) % colors.len()
+                    } else {
+                        (index + 1) % colors.len()
+                    }
+                });
+            *value = colors[index].token();
+            *cursor = None;
         }
         return None;
     }
+    handle_project_widget_key(model, key)
+}
+fn handle_project_widget_key(
+    model: &mut CutexProjectsModel,
+    key: KeyEvent,
+) -> Option<PrimaryPanelOutcome> {
     model.notice = None;
     match model.view {
         ProjectView::ConfirmImport => match key.code {
@@ -993,27 +1188,6 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                 } else {
                     ProjectView::Details
                 };
-            }
-            KeyCode::Char(character)
-                if model
-                    .import_request
-                    .as_ref()
-                    .is_some_and(|r| r.candidate.formal_name.is_none())
-                    && !key
-                        .modifiers
-                        .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
-            {
-                model
-                    .import_name
-                    .handle(InputRequest::InsertChar(character));
-            }
-            KeyCode::Backspace
-                if model
-                    .import_request
-                    .as_ref()
-                    .is_some_and(|r| r.candidate.formal_name.is_none()) =>
-            {
-                model.import_name.handle(InputRequest::DeletePrevChar);
             }
             _ => {}
         },
@@ -1095,36 +1269,6 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                     .token();
                 }
             }
-            KeyCode::Backspace => {
-                if let Some(editor) = model.editor.as_mut() {
-                    match editor.field {
-                        0 => {
-                            editor.display_name.pop();
-                        }
-                        1 => {
-                            editor.badge_label.pop();
-                        }
-                        2 => {
-                            editor.color.pop();
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-            }
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                if let Some(editor) = model.editor.as_mut() {
-                    match editor.field {
-                        0 => editor.display_name.push(character),
-                        1 => editor.badge_label.push(character),
-                        2 => editor.color.push(character),
-                        _ => unreachable!(),
-                    }
-                }
-            }
             KeyCode::Enter => match save_editor(model) {
                 Ok(()) => model.failure = None,
                 Err(error) => model.failure = Some(format!("{error:#}")),
@@ -1175,42 +1319,6 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                     editor.color = ProjectPaletteColor::ALL
                         [index.map_or(0, |index| index + 1) % ProjectPaletteColor::ALL.len()]
                     .token();
-                }
-            }
-            KeyCode::Backspace => {
-                if let Some(editor) = model.create_editor.as_mut() {
-                    match editor.field {
-                        0 => {
-                            editor.project_id.pop();
-                        }
-                        1 => {
-                            editor.display_name.pop();
-                        }
-                        2 => {
-                            editor.badge_label.pop();
-                        }
-                        3 => {
-                            editor.color.pop();
-                        }
-                        4 => {}
-                        _ => unreachable!(),
-                    }
-                }
-            }
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                if let Some(editor) = model.create_editor.as_mut() {
-                    match editor.field {
-                        0 => editor.project_id.push(character),
-                        1 => editor.display_name.push(character),
-                        2 => editor.badge_label.push(character),
-                        3 => editor.color.push(character),
-                        4 => {}
-                        _ => unreachable!(),
-                    }
                 }
             }
             KeyCode::Enter => {
@@ -1421,6 +1529,71 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
             })),
         areas[3],
     );
+    let field = match model.view {
+        ProjectView::Editor => model.editor.as_ref().map(|e| {
+            (
+                e.field,
+                match e.field {
+                    0 => e.display_name.as_str(),
+                    1 => e.badge_label.as_str(),
+                    _ => e.color.as_str(),
+                },
+            )
+        }),
+        ProjectView::Create => model.create_editor.as_ref().and_then(|e| {
+            Some((
+                e.field,
+                match e.field {
+                    0 => e.project_id.as_str(),
+                    1 => e.display_name.as_str(),
+                    2 => e.badge_label.as_str(),
+                    3 => e.color.as_str(),
+                    _ => return None,
+                },
+            ))
+        }),
+        _ => None,
+    };
+    let input_area = Rect {
+        x: areas[2].x,
+        y: areas[2].bottom().saturating_sub(3),
+        width: areas[2].width,
+        height: 3.min(areas[2].height),
+    };
+    if let Some((index, value)) = field {
+        input_policy::render_input(
+            frame,
+            input_area,
+            &input_policy::string_input(value, model.text_cursors[index]),
+            " Focused field · Tab next · Enter save/next ",
+            true,
+        );
+    } else if model.view == ProjectView::ConfirmImport && model.import_name_focused {
+        input_policy::render_input(
+            frame,
+            input_area,
+            &model.import_name,
+            " Formal Agent name · Tab to choices ",
+            true,
+        );
+    }
+    if model.view == ProjectView::List
+        && !model.filter_focused
+        && model.failure.is_none()
+        && model.notice.is_none()
+    {
+        frame.render_widget(
+            Paragraph::new(input_policy::footer(&project_commands(model)))
+                .wrap(Wrap { trim: true }),
+            areas[3],
+        );
+    }
+    if let Some(help) = &model.help {
+        help.render(frame, &project_commands(model));
+    }
+    if let Some(review) = &model.leave_review {
+        review.render(frame);
+    }
 }
 
 fn render_list(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel) {
@@ -1430,22 +1603,13 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel) {
     } else {
         " Filter name / project id / badge  [/] "
     };
-    let filter_block =
-        Block::bordered()
-            .title(filter_title)
-            .border_style(if model.filter_focused {
-                Style::new().fg(Color::Cyan)
-            } else {
-                Style::new()
-            });
-    frame.render_widget(
-        Paragraph::new(model.query.value()).block(filter_block),
+    input_policy::render_input(
+        frame,
         chunks[0],
+        &model.query,
+        filter_title,
+        model.filter_focused,
     );
-    if model.filter_focused {
-        let cursor = model.query.visual_cursor() as u16;
-        frame.set_cursor_position((chunks[0].x + 1 + cursor, chunks[0].y + 1));
-    }
     let visible = model.visible_indices();
     let rows = visible.iter().map(|index| {
         let project = &model.projects[*index];
@@ -2252,6 +2416,14 @@ mod tests {
         begin_import_confirmation(&mut model, add).unwrap();
         assert_eq!(model.import_name.value(), "");
         handle_paste(&mut model, "Explicit Worker");
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+        );
+        assert!(!model.import_name_focused && model.confirm_selected);
+        handle_key(&mut model, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(model.import_name_focused);
+        handle_key(&mut model, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         let mut add = model.import_request.clone().unwrap();
         add.confirmed_formal_name = model.import_name.value().into();
         let wrong = ManagementControlClient::test_endpoint(base, "ordinary".into());
@@ -2274,6 +2446,11 @@ mod tests {
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         );
         assert!(model.failure.is_none(), "{:?}", model.failure);
+        assert!(client
+            .durable_candidates()
+            .unwrap()
+            .iter()
+            .any(|c| c.cutex_session_id == worker.cutex_session_id && c.in_roster));
         let receipt = client.import_durable_agent(&add).unwrap();
         assert!(receipt.complete && receipt.named && receipt.imported);
         let mut sessions = load_cutex_session_store().unwrap();
@@ -2533,6 +2710,122 @@ mod tests {
     }
 
     #[test]
+    fn ui_contract_b1_project_filter_and_editor_cursor_parity() {
+        let mut model = model_with_projects();
+        let text = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 /中文🙂";
+        for c in text.chars() {
+            handle_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            );
+        }
+        assert_eq!(model.query.value(), text);
+        for code in [KeyCode::Enter, KeyCode::Esc, KeyCode::Esc] {
+            assert_eq!(
+                handle_key(&mut model, KeyEvent::new(code, KeyModifiers::NONE)),
+                None
+            );
+        }
+        assert!(model.query.value().is_empty());
+        assert!(model.notice.as_deref().unwrap().contains("Ctrl+C"));
+        model.view = ProjectView::Editor;
+        model.editor = Some(PresentationEditor {
+            display_name: "ab".into(),
+            badge_label: "CX".into(),
+            color: "green".into(),
+            field: 0,
+        });
+        handle_key(&mut model, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        handle_paste(&mut model, "中文e\u{301}🙂\n\t\u{1b}");
+        assert_eq!(
+            model.editor.as_ref().unwrap().display_name,
+            "a中文e\u{301}🙂b"
+        );
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(model.editor.as_ref().unwrap().field, 0);
+        handle_key(&mut model, KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+        );
+        assert!(model
+            .editor
+            .as_ref()
+            .unwrap()
+            .display_name
+            .starts_with('中'));
+        let mut terminal = Terminal::new(TestBackend::new(38, 18)).unwrap();
+        terminal.draw(|frame| render(frame, &model)).unwrap();
+        assert!(terminal.get_cursor_position().unwrap().x < 37);
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert!(model.editor.as_ref().unwrap().display_name.is_empty());
+    }
+
+    #[test]
+    fn ui_contract_b1_project_f1_new_settings_and_dirty_navigation_gate() {
+        let mut model = model_with_projects();
+        model.available_agents.push(ProjectAgentChoice {
+            cutex_session_id: cutex::role_revision::CutexSessionId::new("cutex.director").unwrap(),
+            name: "Formal Director".into(),
+            current_project_id: None,
+        });
+        handle_key(&mut model, KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+        let index = project_commands(&model)
+            .iter()
+            .position(|(c, _)| *c == Command::NewProject)
+            .unwrap();
+        for _ in 0..index {
+            handle_key(&mut model, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(model.view, ProjectView::Create);
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT),
+        );
+        assert!(model.leave_review.is_some());
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(model.create_editor.is_some()); // Cancel is default
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT),
+        );
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        );
+        assert_eq!(
+            handle_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Agents))
+        );
+        assert!(model.open_settings_requested);
+        assert!(model.create_editor.is_none());
+        model.view = ProjectView::ConfirmProjectMutation;
+        for key in [
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE),
+        ] {
+            assert_eq!(handle_key(&mut model, key), None);
+            assert_eq!(model.view, ProjectView::ConfirmProjectMutation);
+        }
+    }
+
+    #[test]
     fn project_filter_matches_name_id_and_badge() {
         let mut model = model_with_projects();
         for query in ["render lab", "render-lab", "cx"] {
@@ -2544,7 +2837,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_action_letters_are_inert_and_filter_text_while_alt_a_opens_create() {
+    fn bare_action_letters_filter_while_alt_n_opens_create() {
         let mut model = model_with_projects();
         for character in ['a', 'e'] {
             handle_key(
@@ -2552,7 +2845,7 @@ mod tests {
                 KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
             );
             assert_eq!(model.view, ProjectView::List);
-            assert!(model.query.value().is_empty());
+            assert!(model.filter_focused);
         }
 
         handle_key(
@@ -2563,7 +2856,7 @@ mod tests {
             &mut model,
             KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
         );
-        assert_eq!(model.query.value(), "a");
+        assert_eq!(model.query.value(), "ae/a");
         model.filter_focused = false;
         model.available_agents.push(ProjectAgentChoice {
             cutex_session_id: cutex::role_revision::CutexSessionId::new("cutex.director-new")
@@ -2573,14 +2866,14 @@ mod tests {
         });
         handle_key(
             &mut model,
-            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT),
         );
         assert_eq!(model.view, ProjectView::Create);
         assert!(model.create_editor.is_some());
     }
 
     #[test]
-    fn list_arrows_switch_adjacent_tabs_and_editor_arrows_only_move_focus() {
+    fn list_arrows_switch_tabs_palette_arrows_stay_in_widget() {
         let mut model = model_with_projects();
         assert_eq!(
             handle_key(&mut model, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
@@ -2603,10 +2896,10 @@ mod tests {
             field: 2,
         });
         handle_key(&mut model, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-        assert_eq!(model.editor.as_ref().map(|editor| editor.field), Some(1));
+        assert_eq!(model.editor.as_ref().map(|editor| editor.field), Some(2));
         assert_eq!(
             model.editor.as_ref().map(|editor| editor.color.as_str()),
-            Some("green")
+            Some("blue")
         );
         handle_key(
             &mut model,
@@ -2636,8 +2929,9 @@ mod tests {
                 &mut model,
                 KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT)
             ),
-            Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Tasks))
+            None
         );
+        assert!(model.leave_review.is_some());
         assert_eq!(model.query.value(), "render");
         assert_eq!(model.view, ProjectView::Editor);
         assert_eq!(
@@ -2672,7 +2966,12 @@ mod tests {
                 .map(|editor| editor.display_name.as_str()),
             Some("Uncommitted Draft")
         );
-        assert!(model.failure.is_some());
+        assert!(model.failure.is_none());
+        assert!(model
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("before refreshing"));
     }
 
     #[test]
@@ -2830,8 +3129,9 @@ mod tests {
                 &mut model,
                 KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT),
             ),
-            Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Agents))
+            None
         );
+        assert!(model.leave_review.is_some());
         let after = model.editor.as_ref().unwrap();
         assert_eq!(after.display_name, before.display_name);
         assert_eq!(after.badge_label, before.badge_label);

@@ -48,6 +48,7 @@ mod session_tui;
 mod session_tui_actions;
 mod session_tui_cutex_projects;
 mod session_tui_dispatch;
+mod session_tui_input;
 mod session_tui_profile_settings;
 mod session_tui_projects;
 mod session_tui_recent;

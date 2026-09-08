@@ -16,6 +16,8 @@ pub(super) fn accepts_key(key: KeyEvent, text_input: bool) -> bool {
                         | KeyCode::Right
                         | KeyCode::Home
                         | KeyCode::End
+                        | KeyCode::PageUp
+                        | KeyCode::PageDown
                         | KeyCode::Backspace
                         | KeyCode::Delete
                 ) || (text_input && matches!(key.code, KeyCode::Char(_))))
