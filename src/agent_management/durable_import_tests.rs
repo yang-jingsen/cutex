@@ -59,7 +59,11 @@ impl Fixture {
             .durable_agent_candidates(&HumanManagementPrincipal::authenticated(), &self.path)
             .unwrap()
             .into_iter()
-            .find(|c| c.cutex_session_id.as_str() == id)
+            .find(|c| {
+                c.cutex_session_id
+                    .as_ref()
+                    .is_some_and(|value| value.as_str() == id)
+            })
             .unwrap()
     }
     fn request(&self, id: &str, name: &str, action: &str) -> DurableImportRequest {
@@ -144,6 +148,79 @@ fn member(
             }
         },
     }
+}
+
+#[test]
+fn rejected_rows_preserve_valid_candidates_and_reject_duplicate_native_ids() {
+    let f = Fixture::new();
+    f.add("cutex.valid", Some("Valid"));
+    let mut sessions = load_cutex_session_store_from_path(&f.path).unwrap();
+    let mut malformed = sessions.sessions["cutex.valid"].clone();
+    malformed.codex_session_id = Some("native-bad".into());
+    sessions.sessions.insert("bad key".into(), malformed);
+    save_cutex_session_store_to_path(&f.path, &sessions).unwrap();
+    let rows = f
+        .provider
+        .durable_agent_candidates(&HumanManagementPrincipal::authenticated(), &f.path)
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let bad = rows.iter().find(|r| r.raw_store_key == "bad key").unwrap();
+    assert!(bad.cutex_session_id.is_none());
+    assert!(bad.rejection.as_deref().unwrap().contains("malformed"));
+    let invalid_request = DurableImportRequest {
+        action_id: AgentActionId::new("bad").unwrap(),
+        candidate: bad.clone(),
+        confirmed_formal_name: "Bad".into(),
+        assignment: None,
+        detach: None,
+    };
+    assert!(f.run(&invalid_request).is_err());
+    assert!(f.candidate("cutex.valid").rejection.is_none());
+    f.create("cutex.valid", "alpha");
+    sessions.sessions.remove("cutex.valid");
+    save_cutex_session_store_to_path(&f.path, &sessions).unwrap();
+    let rows = f
+        .provider
+        .durable_agent_candidates(&HumanManagementPrincipal::authenticated(), &f.path)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].cutex_session_id.is_none() && rows[0].rejection.is_some());
+
+    f.add("cutex.one", Some("Same"));
+    f.add("cutex.two", Some("Same"));
+    f.mutate("cutex.two", |r| {
+        r.codex_session_id = Some("native-cutex.one".into())
+    });
+    for id in ["cutex.one", "cutex.two"] {
+        assert_eq!(
+            f.candidate(id).rejection.as_deref(),
+            Some("ambiguous_durable_native_identity")
+        );
+    }
+    // Corrupt whole stores must remain an error, not an empty successful query.
+    std::fs::write(&f.path, b"not json").unwrap();
+    assert!(f
+        .provider
+        .durable_agent_candidates(&HumanManagementPrincipal::authenticated(), &f.path)
+        .is_err());
+}
+
+#[test]
+fn pre_repair_candidate_wire_shape_replays_without_digest_changes() {
+    let f = Fixture::new();
+    f.add("cutex.legacy-wire", Some("Original"));
+    let mut request = f.request("cutex.legacy-wire", "Original", "legacy-wire-import");
+    request.candidate.raw_store_key.clear();
+    let wire = serde_json::to_value(&request).unwrap();
+    assert!(wire["candidate"].get("raw_store_key").is_none());
+    let request: DurableImportRequest = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&request).unwrap(), wire);
+    let original = f.run(&request).unwrap();
+    assert!(original.complete);
+    f.mutate("cutex.legacy-wire", |r| {
+        r.formal_agent_name = Some("Renamed".into())
+    });
+    assert_eq!(f.run(&request).unwrap(), original);
 }
 
 #[test]
@@ -244,7 +321,7 @@ fn replay_after_retirement_is_exact_but_new_import_cannot_resurrect_roster() {
         .with_state(true, |mut state| {
             state
                 .agents
-                .get_mut(&request.candidate.cutex_session_id)
+                .get_mut(request.candidate.cutex_session_id.as_ref().unwrap())
                 .unwrap()
                 .retired_at = Some(super::super::now());
             Ok((state, (), true))
@@ -367,7 +444,8 @@ fn interrupted_name_and_assignment_recover_the_exact_action_without_duplicate_ef
         assert_eq!(state.human_management_project_mutations.len(), 1);
         assert_eq!(state.durable_import_audit.len(), 3);
         assert_eq!(
-            state.current_project_memberships[&request.candidate.cutex_session_id].revision,
+            state.current_project_memberships[request.candidate.cutex_session_id.as_ref().unwrap()]
+                .revision,
             2
         );
         assert_eq!(f.run(&request).unwrap(), receipt);
@@ -482,7 +560,9 @@ fn explicit_operator_detach_revokes_grant_and_task_guard_prevents_move() {
     assert!(!state
         .operator_grants
         .get(&ProjectId::new("alpha").unwrap())
-        .is_some_and(|grants| grants.contains_key(&request.candidate.cutex_session_id)));
+        .is_some_and(
+            |grants| grants.contains_key(request.candidate.cutex_session_id.as_ref().unwrap())
+        ));
 }
 
 #[test]

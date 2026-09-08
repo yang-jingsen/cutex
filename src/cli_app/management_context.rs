@@ -51,15 +51,17 @@ fn durable_agent_candidates(
     let mut candidates = management_agent_provider()?.durable_agent_candidates(principal, &path)?;
     let observer = ManagementProjectRuntimeObserver::load()?;
     for candidate in &mut candidates {
+        let Some(id) = candidate.cutex_session_id.as_ref() else {
+            continue;
+        };
         candidate.online = observer
             .sessions
             .sessions
-            .get(candidate.cutex_session_id.as_str())
+            .get(id.as_str())
             .is_some_and(|record| {
-                record.cutex_session_id == candidate.cutex_session_id.as_str()
+                record.cutex_session_id == id.as_str()
                     && observer.live_agents.iter().any(|agent| {
-                        agent.cutex_session_id.as_deref()
-                            == Some(candidate.cutex_session_id.as_str())
+                        agent.cutex_session_id.as_deref() == Some(id.as_str())
                             && record.current_runtime_agent_id.as_deref() == Some(agent.id.as_str())
                             && process_is_running(agent.pid)
                     })
@@ -99,25 +101,7 @@ fn list_management_projects(
     cutex::management::control_plane::HumanManagementProjectCollection,
     cutex::agent_management::AgentManagementError,
 > {
-    let mut collection =
-        management_agent_provider()?.list_cutex_projects_for_management(principal)?;
-    let sessions = load_cutex_session_store()
-        .map_err(|_| cutex::agent_management::AgentManagementError::PersistenceUnavailable)?;
-    for project in collection
-        .projects
-        .iter_mut()
-        .chain(&mut collection.archived_projects)
-    {
-        if let Some(name) = formal_name_for_id(&sessions, &project.director_cutex_session_id) {
-            project.director_name = Some(name.to_string());
-        }
-    }
-    for agent in &mut collection.available_agents {
-        if let Some(name) = formal_name_for_id(&sessions, &agent.cutex_session_id) {
-            agent.name = name.to_string();
-        }
-    }
-    Ok(collection)
+    management_agent_provider()?.list_cutex_projects_for_management(principal)
 }
 
 fn read_management_project(
@@ -128,38 +112,7 @@ fn read_management_project(
     cutex::agent_management::AgentManagementError,
 > {
     let observer = ManagementProjectRuntimeObserver::load()?;
-    let mut project = management_agent_provider()?
-        .read_cutex_project_for_management(principal, project_id, &observer)?;
-    let sessions = load_cutex_session_store()
-        .map_err(|_| cutex::agent_management::AgentManagementError::PersistenceUnavailable)?;
-    for member in project
-        .active_agents
-        .iter_mut()
-        .chain(&mut project.retired_agents)
-        .chain(project.director.member.iter_mut())
-        .chain(
-            project
-                .agent_operators
-                .iter_mut()
-                .map(|operator| &mut operator.member),
-        )
-    {
-        if let Some(name) = formal_name_for_id(&sessions, &member.agent.cutex_session_id) {
-            member.agent.spec.name = name.to_string();
-        }
-    }
-    Ok(project)
-}
-
-fn formal_name_for_id<'a>(
-    sessions: &'a cutex::session::model::CutexSessionStore,
-    id: &cutex::role_revision::CutexSessionId,
-) -> Option<&'a str> {
-    sessions
-        .sessions
-        .get(id.as_str())
-        .filter(|record| record.cutex_session_id == id.as_str())
-        .and_then(|record| record.formal_agent_name.as_deref())
+    management_agent_provider()?.read_cutex_project_for_management(principal, project_id, &observer)
 }
 
 fn update_management_project_presentation(

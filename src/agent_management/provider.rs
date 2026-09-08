@@ -216,6 +216,7 @@ impl AgentManagementPhaseObserver for NoopPhaseObserver {
 
 pub struct AgentManagementProvider {
     store: AgentManagementStore,
+    current_names_path: Option<std::path::PathBuf>,
     pub(super) director_seats: SeatOccupancyStore,
     phase_observer: Arc<dyn AgentManagementPhaseObserver>,
     #[cfg(test)]
@@ -234,6 +235,7 @@ impl AgentManagementProvider {
         let root = root.into();
         Ok(Self {
             store: AgentManagementStore::open(&root)?,
+            current_names_path: None,
             director_seats: SeatOccupancyStore::open(root.join("task-service-seat-authority-v1"))
                 .map_err(seat_authority_error)?,
             phase_observer: Arc::new(NoopPhaseObserver),
@@ -247,6 +249,7 @@ impl AgentManagementProvider {
     pub fn open_default() -> anyhow::Result<Self> {
         Ok(Self {
             store: AgentManagementStore::open_default()?,
+            current_names_path: Some(crate::session::store::cutex_sessions_path()?),
             director_seats: SeatOccupancyStore::open_default()?,
             phase_observer: Arc::new(NoopPhaseObserver),
             #[cfg(test)]
@@ -259,6 +262,46 @@ impl AgentManagementProvider {
     pub fn with_phase_observer(mut self, observer: Arc<dyn AgentManagementPhaseObserver>) -> Self {
         self.phase_observer = observer;
         self
+    }
+
+    /// Explicit durable observation source for current reads, never action replay.
+    /// Production open_default always configures this; isolated providers can
+    /// supply their own store without consulting global session state.
+    pub fn with_current_names_path(mut self, path: std::path::PathBuf) -> Self {
+        self.current_names_path = Some(path);
+        self
+    }
+
+    pub(super) fn current_name_snapshot(
+        &self,
+    ) -> Result<AgentManagementSnapshot, AgentManagementError> {
+        let mut snapshot = self.store.snapshot()?;
+        if let Some(path) = &self.current_names_path {
+            let sessions = crate::session::store::load_cutex_session_store_from_path(path)
+                .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
+            for agent in snapshot.agents.values_mut() {
+                let record = sessions
+                    .sessions
+                    .get(agent.cutex_session_id.as_str())
+                    .filter(|record| record.cutex_session_id == agent.cutex_session_id.as_str())
+                    .ok_or_else(|| {
+                        AgentManagementError::OwnerActionRequired(format!(
+                            "durable_name_observation_unavailable: {}",
+                            agent.cutex_session_id.as_str()
+                        ))
+                    })?;
+                if let Some(name) = &record.formal_agent_name {
+                    if name.trim().is_empty() || name.chars().any(char::is_control) {
+                        return Err(AgentManagementError::OwnerActionRequired(format!(
+                            "malformed_formal_agent_name: {}",
+                            agent.cutex_session_id.as_str()
+                        )));
+                    }
+                    agent.spec.name = name.clone();
+                }
+            }
+        }
+        Ok(snapshot)
     }
 
     #[cfg(test)]
@@ -1300,7 +1343,7 @@ impl AgentManagementProvider {
                 )
             }
             AgentOperation::QueryManaged => {
-                let snapshot = self.store.snapshot()?;
+                let snapshot = self.current_name_snapshot()?;
                 let authority = snapshot
                     .projects
                     .get(&request.project_id)
@@ -5937,6 +5980,159 @@ mod tests {
         assert!(provider.store().snapshot().unwrap().agents[&id]
             .retired_at
             .is_some());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn current_names_reach_all_fresh_readers_without_relabeling_receipts() {
+        use crate::management::control_plane::HumanManagementPrincipal;
+        use crate::session::{
+            model::{CutexSessionRecord, CutexSessionStore},
+            store::save_cutex_session_store_to_path,
+        };
+        let root = root("current-name-readers");
+        let provider = AgentManagementProvider::open(&root).unwrap();
+        bind(&provider, "bind", "cutex.director", None);
+        let lifecycle = FakeLifecycle::default();
+        for action_id in ["create-one", "create-two"] {
+            completed(provider.execute(
+                &invocation("cutex.director"),
+                &create_request(action_id, action_id, AgentStartMode::BootstrapOnly),
+                &lifecycle,
+            ));
+        }
+        let mut sessions = CutexSessionStore::default();
+        // This fixture binds authority separately from importing the Director.
+        provider
+            .store()
+            .with_state(true, |mut state| {
+                let mut director = state.agents.values().next().unwrap().clone();
+                director.cutex_session_id = session("cutex.director");
+                director.native_session_id = "native-director".into();
+                director.spec.name = "Original Director".into();
+                state
+                    .agents
+                    .insert(director.cutex_session_id.clone(), director);
+                Ok((state, (), true))
+            })
+            .unwrap();
+        let snapshot = provider.store().snapshot().unwrap();
+        for agent in snapshot.agents.values() {
+            let mut record = CutexSessionRecord::new(
+                agent.cutex_session_id.as_str().into(),
+                Some(agent.native_session_id.clone()),
+                crate::platform::host::current_host_name(),
+                agent.spec.cwd.clone(),
+                None,
+            )
+            .unwrap();
+            record.formal_agent_name = Some("Shared formal name".into());
+            record.thread_name = Some("NEVER A FORMAL NAME".into());
+            sessions
+                .sessions
+                .insert(agent.cutex_session_id.as_str().into(), record);
+        }
+        let path = root.join("sessions.json");
+        save_cutex_session_store_to_path(&path, &sessions).unwrap();
+        let provider = provider.with_current_names_path(path.clone());
+        let query = AgentManagementRequest {
+            schema: AgentManagementSchema::V1,
+            action_id: action("query-before"),
+            project_id: Some(project()),
+            operation: AgentOperation::QueryManaged,
+        };
+        let original =
+            completed(provider.execute(&invocation("cutex.director"), &query, &lifecycle));
+        for id in sessions.sessions.keys().cloned().collect::<Vec<_>>() {
+            crate::session::service::set_cutex_session_display_name_by_key(
+                &mut sessions,
+                &id,
+                &format!("Renamed {id}"),
+            )
+            .unwrap();
+        }
+        save_cutex_session_store_to_path(&path, &sessions).unwrap();
+        assert_eq!(
+            completed(provider.execute(&invocation("cutex.director"), &query, &lifecycle)),
+            original
+        );
+        let mut fresh = query.clone();
+        fresh.action_id = action("query-after");
+        let current =
+            completed(provider.execute(&invocation("cutex.director"), &fresh, &lifecycle));
+        let AgentManagementResult::QueryManaged { agents, .. } = current.result else {
+            panic!("query result")
+        };
+        assert!(agents.len() >= 2);
+        for agent in &agents {
+            assert_eq!(
+                agent.spec.name,
+                format!("Renamed {}", agent.cutex_session_id.as_str())
+            );
+        }
+        let principal = HumanManagementPrincipal::authenticated();
+        let expected = Some("Renamed cutex.director".to_string());
+        assert_eq!(
+            provider
+                .list_cutex_projects(&invocation("cutex.director"))
+                .unwrap()[0]
+                .director_name,
+            expected
+        );
+        let collection = provider
+            .list_cutex_projects_for_management(&principal)
+            .unwrap();
+        assert_eq!(collection.projects[0].director_name, expected);
+        for choice in collection.available_agents {
+            assert_eq!(
+                choice.name,
+                format!("Renamed {}", choice.cutex_session_id.as_str())
+            );
+        }
+        let observer = |_: &CutexSessionId| Err(AgentManagementError::PersistenceUnavailable);
+        for workspace in [
+            provider
+                .read_cutex_project(&invocation("cutex.director"), &project(), &observer)
+                .unwrap(),
+            provider
+                .read_cutex_project_for_management(&principal, &project(), &observer)
+                .unwrap(),
+        ] {
+            for member in workspace
+                .active_agents
+                .iter()
+                .chain(&workspace.retired_agents)
+                .chain(workspace.director.member.iter())
+                .chain(workspace.agent_operators.iter().map(|o| &o.member))
+            {
+                assert_eq!(
+                    member.agent.spec.name,
+                    format!("Renamed {}", member.agent.cutex_session_id.as_str())
+                );
+            }
+        }
+        // A legacy record without the dedicated field uses only historical spec.name.
+        for record in sessions.sessions.values_mut() {
+            record.formal_agent_name = None;
+        }
+        save_cutex_session_store_to_path(&path, &sessions).unwrap();
+        assert_eq!(
+            provider.current_name_snapshot().unwrap().agents,
+            snapshot.agents
+        );
+        sessions
+            .sessions
+            .get_mut("cutex.director")
+            .unwrap()
+            .cutex_session_id = "cutex.wrong".into();
+        save_cutex_session_store_to_path(&path, &sessions).unwrap();
+        assert!(provider
+            .list_cutex_projects_for_management(&principal)
+            .is_err());
+        assert_eq!(
+            completed(provider.execute(&invocation("cutex.director"), &query, &lifecycle)),
+            original
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

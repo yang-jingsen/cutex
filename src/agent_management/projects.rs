@@ -409,7 +409,7 @@ impl AgentManagementProvider {
         &self,
         invocation: &AgentManagementInvocation,
     ) -> Result<Vec<CutexProjectSummary>, AgentManagementError> {
-        let snapshot = self.store().snapshot()?;
+        let snapshot = self.current_name_snapshot()?;
         let seats = self
             .director_seats
             .query()
@@ -439,7 +439,7 @@ impl AgentManagementProvider {
         project_id: &ProjectId,
         observer: &dyn ProjectRuntimeObserver,
     ) -> Result<CutexProjectWorkspace, AgentManagementError> {
-        let snapshot = self.store().snapshot()?;
+        let snapshot = self.current_name_snapshot()?;
         let (authority, access_role) = authorized_project(&snapshot, invocation, project_id)?;
         let seats = self
             .director_seats
@@ -514,7 +514,7 @@ impl AgentManagementProvider {
         &self,
         _principal: &HumanManagementPrincipal,
     ) -> Result<HumanManagementProjectCollection, AgentManagementError> {
-        let snapshot = self.store().snapshot()?;
+        let snapshot = self.current_name_snapshot()?;
         let seats = self
             .director_seats
             .query()
@@ -577,7 +577,7 @@ impl AgentManagementProvider {
         project_id: &ProjectId,
         observer: &dyn ProjectRuntimeObserver,
     ) -> Result<CutexProjectWorkspace, AgentManagementError> {
-        let snapshot = self.store().snapshot()?;
+        let snapshot = self.current_name_snapshot()?;
         let authority = snapshot
             .projects
             .get(project_id)

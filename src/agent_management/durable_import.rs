@@ -15,7 +15,9 @@ use std::{collections::BTreeMap, path::Path};
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DurableAgentCandidate {
-    pub cutex_session_id: CutexSessionId,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub raw_store_key: String,
+    pub cutex_session_id: Option<CutexSessionId>,
     pub formal_name: Option<String>,
     pub durable_revision: u64,
     pub durable_sha256: Sha256,
@@ -77,7 +79,12 @@ fn append_audit(state: &mut AgentManagementSnapshot, receipt: &DurableImportRece
         .or_insert_with(|| DurableImportAuditEvent {
             action_id: receipt.action_id.clone(),
             request_sha256: receipt.request_sha256.clone(),
-            cutex_session_id: receipt.request.candidate.cutex_session_id.clone(),
+            cutex_session_id: receipt
+                .request
+                .candidate
+                .cutex_session_id
+                .clone()
+                .expect("validated import identity"),
             formal_name: receipt.request.confirmed_formal_name.clone(),
             stage: stage.into(),
             performed_by_human_management: true,
@@ -208,10 +215,12 @@ fn candidate(
     key: &str,
     record: &CutexSessionRecord,
 ) -> Result<DurableAgentCandidate, AgentManagementError> {
-    let id = CutexSessionId::new(key.to_string()).map_err(|_| conflict("malformed_durable_id"))?;
-    let agent = state.agents.get(&id);
-    let rejection = if state.agents.values().any(|other| {
-        other.cutex_session_id != id
+    let id = CutexSessionId::new(key.to_string()).ok();
+    let agent = id.as_ref().and_then(|id| state.agents.get(id));
+    let rejection = if id.is_none() {
+        Some("malformed_durable_id".to_string())
+    } else if state.agents.values().any(|other| {
+        Some(&other.cutex_session_id) != id.as_ref()
             && record.codex_session_id.as_deref() == Some(other.native_session_id.as_str())
     }) {
         Some("native_session_already_owned_by_other_durable_agent".to_string())
@@ -223,6 +232,7 @@ fn candidate(
             .map(|error| error.to_string())
     };
     Ok(DurableAgentCandidate {
+        raw_store_key: key.to_string(),
         cutex_session_id: id.clone(),
         formal_name: record
             .formal_agent_name
@@ -230,7 +240,10 @@ fn candidate(
             .or_else(|| agent.map(|a| a.spec.name.clone())),
         durable_revision: record.revision,
         durable_sha256: super::store::request_sha256(record)?,
-        roster_sha256: roster_digest(state, &id)?,
+        roster_sha256: match &id {
+            Some(id) => roster_digest(state, id)?,
+            None => super::store::request_sha256(&Option::<()>::None)?,
+        },
         agent_sha256: super::store::request_sha256(&agent)?,
         in_roster: agent.is_some(),
         current_project_id: agent.and_then(|a| super::projects::current_project_id(state, a)),
@@ -258,7 +271,18 @@ impl AgentManagementProvider {
                 .iter()
                 .map(|(key, record)| candidate(&state, key, record))
                 .collect::<Result<Vec<_>, _>>()?;
-            rows.sort_by(|a, b| a.cutex_session_id.cmp(&b.cutex_session_id));
+            for row in &mut rows {
+                let record = &sessions.sessions[&row.raw_store_key];
+                if record.codex_session_id.is_some()
+                    && sessions.sessions.iter().any(|(key, other)| {
+                        key != &row.raw_store_key
+                            && other.codex_session_id == record.codex_session_id
+                    })
+                {
+                    row.rejection = Some("ambiguous_durable_native_identity".into());
+                }
+            }
+            rows.sort_by(|a, b| a.raw_store_key.cmp(&b.raw_store_key));
             Ok(rows)
         })
         .map_err(import_error)
@@ -368,7 +392,16 @@ impl AgentManagementProvider {
         receipt: &mut DurableImportReceipt,
         tasks: &dyn ProjectTaskInspector,
     ) -> Result<(), AgentManagementError> {
-        let id = &request.candidate.cutex_session_id;
+        let id = request
+            .candidate
+            .cutex_session_id
+            .as_ref()
+            .ok_or(conflict("malformed_durable_id"))?;
+        if !request.candidate.raw_store_key.is_empty()
+            && request.candidate.raw_store_key != id.as_str()
+        {
+            return Err(conflict("malformed_durable_id"));
+        }
         let record = sessions
             .sessions
             .get(id.as_str())
@@ -381,6 +414,10 @@ impl AgentManagementProvider {
         eligibility(id.as_str(), record)?;
         let state = self.store().snapshot()?;
         let mut actual = candidate(&state, id.as_str(), record)?;
+        // Preserve the original wire shape/digest for pre-repair confirmations.
+        if request.candidate.raw_store_key.is_empty() {
+            actual.raw_store_key.clear();
+        }
         // Runtime liveness is informational, never import authorization or CAS.
         actual.online = request.candidate.online;
         if let Some(reason) = actual.rejection {
@@ -515,7 +552,16 @@ impl AgentManagementProvider {
         request: &DurableImportRequest,
         receipt: &DurableImportReceipt,
     ) -> Result<(), AgentManagementError> {
-        let id = &request.candidate.cutex_session_id;
+        let id = request
+            .candidate
+            .cutex_session_id
+            .as_ref()
+            .ok_or(conflict("malformed_durable_id"))?;
+        if !request.candidate.raw_store_key.is_empty()
+            && request.candidate.raw_store_key != id.as_str()
+        {
+            return Err(conflict("malformed_durable_id"));
+        }
         if let Some(imported) = &receipt.imported_agent {
             if state.agents.get(id) != Some(imported) {
                 return Err(conflict("imported_roster_record_changed"));
@@ -566,7 +612,15 @@ fn validate_request(request: &DurableImportRequest) -> Result<(), AgentManagemen
     if !valid_name(&request.confirmed_formal_name) {
         return Err(conflict("explicit_formal_name_required"));
     }
-    let id = &request.candidate.cutex_session_id;
+    let id = request
+        .candidate
+        .cutex_session_id
+        .as_ref()
+        .ok_or(conflict("malformed_durable_id"))?;
+    if !request.candidate.raw_store_key.is_empty() && request.candidate.raw_store_key != id.as_str()
+    {
+        return Err(conflict("malformed_durable_id"));
+    }
     if let Some(assignment) = &request.assignment {
         let target = match &assignment.operation {
             HumanManagementProjectMutationKind::Create {

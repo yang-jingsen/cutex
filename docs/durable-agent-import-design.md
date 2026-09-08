@@ -4,6 +4,43 @@ Assignment: `projects-durable-agent-import-r1-assignment`.
 Exact base: `fed5e05f65c0921551b4973bb7475908141347f5`.
 Status: implemented; independent acceptance review required before integration.
 
+## Bounded candidate-review repair
+
+Repair assignment: `projects-durable-import-repair-r1`, exact repair base
+`d60feac5a4ee3e454346c12676378f4a7d220db3` (tree
+`9c31521ad41e59daf58cd09c622bc593e1a0d0cc`). Original base remains unchanged.
+
+Candidate responses now carry `raw_store_key` and optional validated
+`cutex_session_id`. Malformed keys produce individually rejected rows without
+inventing an ID or suppressing valid rows. The picker excludes unvalidated IDs
+from selectable choices; Create also displays their raw-key rejection reasons.
+Typed rejected candidates cannot pass confirmation. Duplicate durable native
+identities are marked rejected during query as well as fenced at commit. Whole
+store read/parse failures remain errors. Pre-repair requests lacking raw_store_key
+retain their exact serialized shape and digest for receipt replay.
+
+All four provider project list/detail readers and fresh Agent QueryManaged now
+share `current_name_snapshot`. Production `open_default` binds the durable store;
+isolated providers use an explicit `with_current_names_path` adapter. It projects
+formal_agent_name by exact durable ID into a read-only roster snapshot, falling
+back only when the dedicated field is absent. Missing/key-mismatched durable
+records or malformed formal names report an observation error, never a title.
+The projection observes the roster snapshot as a whole, so unavailable durable
+evidence for any roster record can fail a current read. No historical receipt,
+digest or roster entry is rewritten. Replaying an original action returns its
+original name; a fresh query uses the current name. Human-only duplicate overlay
+code was removed. No cross-store rename transaction or authority changes added.
+
+Repair verification: Management library suite 113 passed; affected binary
+Management suite 55 passed (two previously disclosed user-systemd cases skipped);
+Projects HTTP/TUI suite 13 passed. New cases cover mixed/all-invalid candidates,
+duplicate native IDs, corrupt-store failure, root HTTP serialization/disabled
+malformed selection with working Create/Add, exact pre-repair wire replay, explicit
+rename across all provider readers, same-name/different-ID records, legacy formal
+fallback and failed observation without relabeling replay. Prior broad evidence
+is reused, not rerun solely for certainty. Temporary-state/simulated boundaries
+and the four original user-systemd omissions remain unchanged.
+
 ## Identity, naming and eligibility
 
 Identity is the exact validated durable store key and `cutex_session_id`.

@@ -413,14 +413,7 @@ fn load_model() -> anyhow::Result<CutexProjectsModel> {
     let archived_projects = collection.archived_projects;
     projects.extend(archived_projects.iter().cloned());
     let durable_candidates = client.durable_candidates()?;
-    let available_agents = durable_candidates
-        .iter()
-        .map(|agent| ProjectAgentChoice {
-            cutex_session_id: agent.cutex_session_id.clone(),
-            name: candidate_label(agent),
-            current_project_id: agent.current_project_id.clone(),
-        })
-        .collect();
+    let available_agents = candidate_choices(&durable_candidates);
     Ok(CutexProjectsModel {
         durable_candidates,
         import_request: None,
@@ -463,15 +456,7 @@ fn reload(model: &mut CutexProjectsModel, open_details: bool) -> anyhow::Result<
         .projects
         .extend(model.archived_projects.iter().cloned());
     model.durable_candidates = client.durable_candidates()?;
-    model.available_agents = model
-        .durable_candidates
-        .iter()
-        .map(|agent| ProjectAgentChoice {
-            cutex_session_id: agent.cutex_session_id.clone(),
-            name: candidate_label(agent),
-            current_project_id: agent.current_project_id.clone(),
-        })
-        .collect();
+    model.available_agents = candidate_choices(&model.durable_candidates);
     let visible = model.visible_indices();
     model.selected = selected_id
         .and_then(|id| {
@@ -567,6 +552,21 @@ fn save_project_create(model: &mut CutexProjectsModel) -> anyhow::Result<()> {
     begin_import_confirmation(model, request)
 }
 
+fn candidate_choices(
+    candidates: &[cutex::agent_management::DurableAgentCandidate],
+) -> Vec<ProjectAgentChoice> {
+    candidates
+        .iter()
+        .filter_map(|agent| {
+            Some(ProjectAgentChoice {
+                cutex_session_id: agent.cutex_session_id.clone()?,
+                name: candidate_label(agent),
+                current_project_id: agent.current_project_id.clone(),
+            })
+        })
+        .collect()
+}
+
 fn candidate_label(agent: &cutex::agent_management::DurableAgentCandidate) -> String {
     format!(
         "{} · {} · {} · {}{}",
@@ -608,7 +608,7 @@ fn begin_import_confirmation(
     let candidate = model
         .durable_candidates
         .iter()
-        .find(|c| &c.cutex_session_id == id)
+        .find(|c| c.cutex_session_id.as_ref() == Some(id))
         .cloned()
         .context("durable candidate unavailable; refresh")?;
     if let Some(reason) = &candidate.rejection {
@@ -1758,7 +1758,7 @@ fn render_import_confirmation(frame: &mut Frame<'_>, area: Rect, model: &CutexPr
         .unwrap_or_else(|| "Import only; remains unassigned".into());
     let source = request.detach.as_ref().map(|d| format!("Explicit Detach from {} first (revision {}, authority {}). Protected roles may require Director rotation or grant revocation before detachment.", d.project_id, d.expected_project_revision, d.expected_authority_epoch)).unwrap_or_else(|| "No source detachment".into());
     frame.render_widget(Paragraph::new(vec![
-        Line::from(format!("Durable Agent ID: {}", request.candidate.cutex_session_id.as_str())),
+        Line::from(format!("Durable Agent ID: {}", request.candidate.cutex_session_id.as_ref().map(|id| id.as_str()).unwrap_or("invalid — cannot confirm"))),
         Line::from(candidate_label(&request.candidate)),
         Line::from(format!("Formal Cutex Agent name: {}", model.import_name.value())),
         Line::from(if request.candidate.formal_name.is_none() { "Historical record: type a formal Agent name. No thread title is supplied." } else { "Existing authoritative formal name; name changes require a fresh review." }),
@@ -1778,7 +1778,7 @@ fn render_create_editor(frame: &mut Frame<'_>, area: Rect, model: &CutexProjects
         .available_agents
         .get(editor.director)
         .map(|agent| format!("{} ({})", agent.name, agent.cutex_session_id.as_str()))
-        .unwrap_or_else(|| "No unassigned Agent".to_string());
+        .unwrap_or_else(|| "No durable Agent with a validated identity".to_string());
     let field = |index, label: &str, value: String| {
         Line::from(vec![
             Span::styled(
@@ -1799,6 +1799,7 @@ fn render_create_editor(frame: &mut Frame<'_>, area: Rect, model: &CutexProjects
             field(2, "Badge (1-2 cells)", editor.badge_label.clone()),
             field(3, "Color", editor.color.clone()),
             field(4, "Initial Director", director),
+            Line::from(model.durable_candidates.iter().filter(|row| row.cutex_session_id.is_none()).map(|row| format!("Rejected store key {:?}: {}", row.raw_store_key, row.rejection.as_deref().unwrap_or("invalid identity"))).collect::<Vec<_>>().join("; ")),
             Line::from(""),
             Line::from(Span::styled(
                 "The final step commits Project, membership, authority, presentation, and the project Director seat.",
@@ -2057,6 +2058,9 @@ mod tests {
             record.display_name_hint = record.thread_name.clone();
             sessions.sessions.insert(id.into(), record);
         }
+        let mut malformed = sessions.sessions["cutex.worker"].clone();
+        malformed.codex_session_id = Some("bad-native".into());
+        sessions.sessions.insert("bad key".into(), malformed);
         save_cutex_session_store(&sessions).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -2104,15 +2108,14 @@ mod tests {
         model.failure = None;
         model.client = Some(client.clone());
         model.durable_candidates = client.durable_candidates().unwrap();
-        model.available_agents = model
+        model.available_agents = candidate_choices(&model.durable_candidates);
+        assert_eq!(model.available_agents.len(), 2);
+        assert!(model
             .durable_candidates
             .iter()
-            .map(|c| ProjectAgentChoice {
-                cutex_session_id: c.cutex_session_id.clone(),
-                name: candidate_label(c),
-                current_project_id: c.current_project_id.clone(),
-            })
-            .collect();
+            .any(|row| row.raw_store_key == "bad key"
+                && row.cutex_session_id.is_none()
+                && row.rejection.is_some()));
         let before = std::fs::read(cutex::session::store::cutex_sessions_path().unwrap()).unwrap();
         model.begin_create();
         let editor = model.create_editor.as_mut().unwrap();
@@ -2156,7 +2159,11 @@ mod tests {
         let worker = model
             .durable_candidates
             .iter()
-            .find(|c| c.cutex_session_id.as_str() == "cutex.worker")
+            .find(|c| {
+                c.cutex_session_id
+                    .as_ref()
+                    .is_some_and(|id| id.as_str() == "cutex.worker")
+            })
             .unwrap()
             .clone();
         let add = HumanManagementProjectMutationRequest {
@@ -2166,7 +2173,7 @@ mod tests {
             expected_authority_epoch: 1,
             expected_project_revision: 1,
             operation: HumanManagementProjectMutationKind::AddMember {
-                cutex_session_id: worker.cutex_session_id.clone(),
+                cutex_session_id: worker.cutex_session_id.clone().unwrap(),
             },
         };
         begin_import_confirmation(&mut model, add).unwrap();
