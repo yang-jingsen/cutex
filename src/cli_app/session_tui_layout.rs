@@ -67,8 +67,11 @@ pub(super) fn tabs(active: PrimaryPanel, width: u16) -> Line<'static> {
                 },
             ));
         }
-        if width >= 64 {
-            spans.push(Span::styled("  Settings [Alt+S]", Style::new().fg(FOCUS)));
+        if width >= 72 {
+            spans.push(Span::styled(
+                "  Global Settings [Alt+S]",
+                Style::new().fg(FOCUS),
+            ));
         }
     }
     Line::from(spans)

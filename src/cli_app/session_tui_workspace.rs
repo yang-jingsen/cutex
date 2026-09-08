@@ -154,6 +154,7 @@ impl<T: PartialEq> WorkspaceSelection<T> {
         self.transiently_visible = target;
     }
 
+    #[cfg(test)]
     pub(super) fn is_transiently_visible(&self, target: &T) -> bool {
         self.transiently_visible.as_ref() == Some(target)
     }

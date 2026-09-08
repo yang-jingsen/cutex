@@ -19,7 +19,6 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
     LeaveAlternateScreen,
 };
-use cutex::agent_bus::client::agent_bus_fetch_agents_if_healthy;
 use cutex::agent_bus::model::{AgentBusAgent, AgentGroupUpdateMode};
 use cutex::agent_management::{
     effective_presentation, AgentManagementSnapshot, AgentManagementStore, ProjectPaletteColor,
@@ -83,6 +82,7 @@ use super::session_tui_settings::{
     SessionSettingsField, SessionSettingsSnapshot, SessionTuiSettingCategory,
     SessionTuiSettingOption,
 };
+use super::session_tui_view::{self as views, AgentSessionView, ListKind, Observation, SubjectRef};
 use super::session_tui_workspace::{
     PrimaryPanel, PrimaryPanelOutcome, SessionTuiWorkspace, WorkspaceSelection,
 };
@@ -91,7 +91,6 @@ use super::session_tui_workspace_loading::{WorkspaceLoad, WorkspaceLoadPoll};
 use super::session_tui_workspace_render::{render_workspace, WorkspaceRenderer};
 
 const WIDE_LAYOUT_MIN_WIDTH: u16 = 96;
-const EXTRA_WIDE_LAYOUT_MIN_WIDTH: u16 = 136;
 const SETTINGS_TWO_PANE_MIN_WIDTH: u16 = 64;
 #[cfg(test)]
 const INSPECTOR_SPLIT_MIN_WIDTH: u16 = 115;
@@ -156,6 +155,7 @@ impl SelectorTarget {
         matches!(self, Self::Tasks)
     }
 
+    #[cfg(test)]
     fn is_retired_sessions(&self) -> bool {
         matches!(self, Self::RetiredSessions)
     }
@@ -164,6 +164,7 @@ impl SelectorTarget {
         matches!(self, Self::GlobalSettings)
     }
 
+    #[cfg(test)]
     fn is_system(&self) -> bool {
         matches!(
             self,
@@ -184,6 +185,7 @@ impl SelectorTarget {
 
 #[derive(Debug, Clone)]
 struct SelectorRow {
+    view: Option<AgentSessionView>,
     target: SelectorTarget,
     agent: String,
     /// Mutable native conversation title. It is presentation-only and never
@@ -757,6 +759,7 @@ impl AppContext {
 
 #[derive(Debug, Clone)]
 struct SelectorModel {
+    managed_scope: usize,
     managed_table: std::cell::RefCell<TableState>,
     recent_table: std::cell::RefCell<TableState>,
     context: AppContext,
@@ -772,6 +775,9 @@ struct SelectorModel {
     mode: SelectorMode,
     suspended_managed_mode: Option<SelectorMode>,
     inspector_overview_focused: bool,
+    recent_inspecting: bool,
+    settings_navigation: Option<Help>,
+    settings_return_panel: Option<PrimaryPanel>,
     confirmation_returns_to_list: bool,
     show_thread_titles: bool,
     enhanced_keyboard: bool,
@@ -798,6 +804,7 @@ impl SelectorModel {
         sort_rows(&mut rows);
         let context = AppContext::extract(&mut rows);
         let mut model = Self {
+            managed_scope: 0,
             managed_table: Default::default(),
             recent_table: Default::default(),
             context,
@@ -813,6 +820,9 @@ impl SelectorModel {
             mode: SelectorMode::Agents,
             suspended_managed_mode: None,
             inspector_overview_focused: false,
+            recent_inspecting: false,
+            settings_navigation: None,
+            settings_return_panel: None,
             confirmation_returns_to_list: false,
             show_thread_titles: false,
             enhanced_keyboard,
@@ -986,30 +996,18 @@ impl SelectorModel {
     }
 
     fn visible_indices(&self) -> Vec<usize> {
-        let query = self.query.value();
-        if query.is_empty() {
-            return self
-                .rows
-                .iter()
-                .enumerate()
-                .filter_map(|(index, row)| {
-                    (row.target.is_system()
-                        || row.lifecycle == Some(CutexSessionLifecycleState::Online)
-                        || row.attachable
-                        || row.pinned
-                        || self.workspace_selection.is_transiently_visible(&row.target))
-                    .then_some(index)
-                })
-                .collect();
-        }
-
-        let query = query.to_lowercase();
+        let query = self.query.value().to_lowercase();
         self.rows
             .iter()
             .enumerate()
             .filter_map(|(index, row)| {
-                (row.target.is_system() || (row.managed && selector_row_matches_query(row, &query)))
-                    .then_some(index)
+                (matches!(row.target, SelectorTarget::Agent(_))
+                    && (self.managed_scope == 0
+                        || (self.managed_scope == 1
+                            && row.lifecycle == Some(CutexSessionLifecycleState::Online))
+                        || (self.managed_scope == 2 && row.pinned))
+                    && (query.is_empty() || selector_row_matches_query(row, &query)))
+                .then_some(index)
             })
             .collect()
     }
@@ -1019,22 +1017,6 @@ impl SelectorModel {
             .into_iter()
             .map(|index| &self.rows[index])
             .collect()
-    }
-
-    fn hidden_searchable_agent_count(&self) -> usize {
-        if !self.query.value().is_empty() {
-            return 0;
-        }
-        self.rows
-            .iter()
-            .filter(|row| {
-                row.managed
-                    && row.lifecycle != Some(CutexSessionLifecycleState::Online)
-                    && !row.attachable
-                    && !row.pinned
-                    && !self.workspace_selection.is_transiently_visible(&row.target)
-            })
-            .count()
     }
 
     fn selected_visible_index(&self) -> Option<usize> {
@@ -1593,6 +1575,40 @@ impl SelectorModel {
                 let managed_names = managed_names_by_native_session_id();
                 self.recent
                     .receive_with_managed_names(reply, &store, &managed_names);
+                let mut archived: Vec<_> = store
+                    .sessions
+                    .iter()
+                    .filter(|(_, r)| r.is_retired() && cutex_session_is_managed(r))
+                    .map(|(key, record)| {
+                        let mut row = retired_selector_row(key, record, None);
+                        let mut view = selector_view(&row, None);
+                        view.native_thread = record.codex_session_id.clone();
+                        view.runtime =
+                            Observation::Unavailable("archived runtime not observed".into());
+                        row.view = Some(view);
+                        row
+                    })
+                    .collect();
+                enrich_provider_views(&mut archived, &store);
+                self.recent.enrich_views(
+                    &archived
+                        .iter()
+                        .filter_map(|r| r.view.clone())
+                        .collect::<Vec<_>>(),
+                );
+                if archived
+                    .iter()
+                    .any(|r| r.view.as_ref().is_some_and(|v| v.retirement_note.is_some()))
+                {
+                    self.warning = Some("Retirement mismatch in hidden archived Recent identities; Archive/provider reconciliation deferred to phase D".into());
+                }
+                self.recent.enrich_views(
+                    &self
+                        .rows
+                        .iter()
+                        .filter_map(|r| r.view.clone())
+                        .collect::<Vec<_>>(),
+                );
             }
             Err(error) => {
                 self.recent.reconciliation_failed(
@@ -3625,6 +3641,7 @@ impl SelectorModel {
     }
 
     fn replace_snapshot(&mut self, snapshot: SelectorSnapshot) {
+        let previous_index = self.selected_visible_index().unwrap_or(0);
         let stale_confirmation =
             if let SelectorMode::ConfirmRuntimeAction { agent_key, .. } = &self.mode {
                 let old = self
@@ -3704,7 +3721,21 @@ impl SelectorModel {
         self.refreshing = false;
         let warning = combine_warnings(snapshot.warning, settings_warning);
         self.warning = combine_warnings(warning, self.pending_startup_warning.take());
+        if self.selected_visible_index().is_none() {
+            let indices = self.visible_indices();
+            let target = indices
+                .get(previous_index.min(indices.len().saturating_sub(1)))
+                .map(|index| self.rows[*index].target.clone());
+            self.workspace_selection.select(target);
+        }
         self.ensure_selection();
+        self.recent.enrich_views(
+            &self
+                .rows
+                .iter()
+                .filter_map(|row| row.view.clone())
+                .collect::<Vec<_>>(),
+        );
         if let Some(target) = active_settings_target {
             self.reproject_settings(&target);
         }
@@ -3712,6 +3743,16 @@ impl SelectorModel {
     }
 
     fn mark_refresh_failed(&mut self, message: String) {
+        for row in &mut self.rows {
+            if let Some(view) = &mut row.view {
+                if let Some(value) = view.runtime.known().cloned() {
+                    view.runtime = Observation::Stale(value, message.clone());
+                }
+                if let Some(value) = view.project.known().cloned() {
+                    view.project = Observation::Stale(value, message.clone());
+                }
+            }
+        }
         self.refreshing = false;
         self.pending_settings_refresh_override = None;
         self.pending_global_settings_refresh_override = None;
@@ -4311,6 +4352,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
                 )?;
                 if std::mem::take(&mut model.open_settings_requested) {
                     selector_command(&mut selector_model, Command::Settings);
+                    selector_model.settings_return_panel = Some(PrimaryPanel::Projects);
                 }
                 projects_model = Some(model);
                 match outcome {
@@ -4394,7 +4436,7 @@ fn initial_selector_model(refreshing: bool) -> anyhow::Result<SelectorModel> {
     let (project_contexts, project_warning) = project_contexts_with_warning();
     let initial_warning = combine_warnings(
         combine_warnings(profile_warning, activity_warning),
-        project_warning,
+        project_warning.clone(),
     );
     let initial_rows = selector_rows_from_store(
         &store,
@@ -4406,6 +4448,15 @@ fn initial_selector_model(refreshing: bool) -> anyhow::Result<SelectorModel> {
         &project_contexts,
     );
     let mut model = SelectorModel::new(initial_rows, refreshing, false);
+    for row in &mut model.rows {
+        if let Some(view) = &mut row.view {
+            view.runtime = Observation::Unavailable("initial runtime snapshot pending".into());
+            row.lifecycle = None;
+            if let Some(error) = &project_warning {
+                view.project = Observation::Unavailable(error.clone());
+            }
+        }
+    }
     model.warning = initial_warning;
     Ok(model)
 }
@@ -4485,25 +4536,100 @@ fn load_live_snapshot() -> anyhow::Result<SelectorSnapshot> {
     let (activity_states, activity_warning) = activity_states_with_warning();
     let (project_contexts, project_warning) = project_contexts_with_warning();
     let config = load_codez_config();
-    let live_agents = agent_bus_fetch_agents_if_healthy(&config);
-    Ok(SelectorSnapshot {
-        rows: selector_rows_from_store(
-            &store,
-            &alden_sessions,
-            &live_agents,
-            &config,
-            &profile_names,
-            &activity_states,
-            &project_contexts,
+    let (live_agents, bus_warning) = match cutex::agent_bus::client::agent_bus_fetch_agents(&config)
+    {
+        Ok(agents) => (agents, None),
+        Err(error) => (
+            Vec::new(),
+            Some(format!("runtime bus unavailable: {error:#}")),
         ),
+    };
+    let mut rows = selector_rows_from_store(
+        &store,
+        &alden_sessions,
+        &live_agents,
+        &config,
+        &profile_names,
+        &activity_states,
+        &project_contexts,
+    );
+    for row in &mut rows {
+        if let Some(view) = row.view.as_mut() {
+            if let Some(error) = alden_warning.as_ref().or(bus_warning.as_ref()) {
+                view.runtime = Observation::Unavailable(error.clone());
+                row.lifecycle = None;
+            }
+            if let Some(error) = &project_warning {
+                view.project = Observation::Unavailable(error.clone());
+            }
+        }
+    }
+    enrich_provider_views(&mut rows, &store);
+    Ok(SelectorSnapshot {
+        rows,
         warning: combine_warnings(
             combine_warnings(
-                combine_warnings(alden_warning, profile_warning),
+                combine_warnings(
+                    combine_warnings(alden_warning, bus_warning),
+                    profile_warning,
+                ),
                 activity_warning,
             ),
-            project_warning,
+            project_warning.clone(),
         ),
     })
+}
+
+fn enrich_provider_views(rows: &mut [SelectorRow], durable: &CutexSessionStore) {
+    let provider =
+        AgentManagementStore::open_default().and_then(|s| s.snapshot().map_err(anyhow::Error::new));
+    apply_provider_views(rows, durable, &provider);
+}
+fn apply_provider_views(
+    rows: &mut [SelectorRow],
+    durable: &CutexSessionStore,
+    provider: &anyhow::Result<AgentManagementSnapshot>,
+) {
+    for row in rows {
+        let Some(view) = row.view.as_mut() else {
+            continue;
+        };
+        let SubjectRef::Managed(id) = &view.subject else {
+            continue;
+        };
+        match provider {
+            Err(error) => {
+                view.project =
+                    Observation::Unavailable(format!("Project provider unavailable: {error:#}"))
+            }
+            Ok(snapshot) => {
+                let agent = snapshot
+                    .agents
+                    .values()
+                    .find(|agent| agent.cutex_session_id.as_str() == id);
+                if let Some(agent) = agent {
+                    let record = durable
+                        .sessions
+                        .values()
+                        .find(|r| r.cutex_session_id == *id);
+                    view.name = record
+                        .and_then(|r| r.formal_agent_name.clone())
+                        .unwrap_or_else(|| agent.spec.name.clone());
+                    row.agent = view.name.clone();
+                    view.project = Observation::Known(
+                        cutex::agent_management::current_project_id(snapshot, agent)
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "unassigned".into()),
+                    );
+                    if record.is_some_and(|r| r.is_retired() != agent.retired_at.is_some()) {
+                        view.retirement_note = Some("Retirement mismatch: durable archive and provider retirement disagree; not reconciled by this UI".into());
+                    }
+                } else {
+                    view.project = Observation::Known("unassigned (not in roster)".into());
+                }
+            }
+        }
+    }
 }
 
 fn load_reconciled_session_store() -> anyhow::Result<CutexSessionStore> {
@@ -4733,7 +4859,7 @@ fn selector_rows_from_store(
     let mut rows = store
         .sessions
         .iter()
-        .filter(|(_, record)| record.is_active())
+        .filter(|(_, record)| record.is_active() && cutex_session_is_managed(record))
         .map(|(key, record)| {
             let mut row = selector_row(key, record, alden_sessions, live_agents, profile_names);
             row.activity = activity_states
@@ -4753,6 +4879,24 @@ fn selector_rows_from_store(
                     // projections. Legacy hints remain display-only fallback.
                     row.agent = managed_session_fallback_name(record);
                 }
+            }
+            row.view = Some(selector_view(&row, config.default_profile.as_deref()));
+            row.view.as_mut().unwrap().native_thread = record.codex_session_id.clone();
+            row.view.as_mut().unwrap().cwd = record
+                .managed_cwd
+                .clone()
+                .unwrap_or_else(|| "Unavailable".into());
+            let observations: Vec<_> = live_agents
+                .iter()
+                .filter(|agent| {
+                    agent.cutex_session_id.as_deref() == Some(record.cutex_session_id.as_str())
+                        && agent.session_id == record.codex_session_id
+                        && record.codex_session_id.is_some()
+                })
+                .collect();
+            if observations.len() == 1 {
+                row.view.as_mut().unwrap().effective_profile =
+                    Observation::Known(observations[0].profile.clone());
             }
             row
         })
@@ -4792,6 +4936,7 @@ fn retired_selector_row(
     context: Option<&SelectorProjectContext>,
 ) -> SelectorRow {
     SelectorRow {
+        view: None,
         target: SelectorTarget::RetiredAgent(key.to_string()),
         agent: record
             .formal_agent_name
@@ -4831,7 +4976,6 @@ fn managed_session_fallback_name(record: &CutexSessionRecord) -> String {
     record
         .formal_agent_name
         .as_deref()
-        .or(record.display_name_hint.as_deref())
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .map(str::to_string)
@@ -4857,8 +5001,13 @@ fn selector_row(
         });
     }
     SelectorRow {
+        view: None,
         target: SelectorTarget::Agent(key.to_string()),
-        agent: cutex_session_display_name(record),
+        agent: if cutex_session_is_managed(record) {
+            managed_session_fallback_name(record)
+        } else {
+            cutex_session_display_name(record)
+        },
         thread_title: cutex_session_is_managed(record)
             .then(|| record.thread_name.clone())
             .flatten(),
@@ -4892,6 +5041,7 @@ fn selector_row(
 
 fn retired_sessions_row(retired_count: usize) -> SelectorRow {
     SelectorRow {
+        view: None,
         target: SelectorTarget::RetiredSessions,
         agent: format!("Retired sessions ({retired_count})"),
         thread_title: None,
@@ -4917,6 +5067,7 @@ fn retired_sessions_row(retired_count: usize) -> SelectorRow {
 
 fn projects_row() -> SelectorRow {
     SelectorRow {
+        view: None,
         target: SelectorTarget::Projects,
         agent: "Workspaces".to_string(),
         thread_title: None,
@@ -4943,6 +5094,7 @@ fn projects_row() -> SelectorRow {
 #[cfg(test)]
 fn cutex_projects_row() -> SelectorRow {
     SelectorRow {
+        view: None,
         target: SelectorTarget::CutexProjects,
         agent: "Cutex Projects".to_string(),
         thread_title: None,
@@ -4969,6 +5121,7 @@ fn cutex_projects_row() -> SelectorRow {
 #[cfg(test)]
 fn recent_sessions_row() -> SelectorRow {
     SelectorRow {
+        view: None,
         target: SelectorTarget::RecentSessions,
         agent: "Recent sessions".to_string(),
         thread_title: None,
@@ -5024,6 +5177,7 @@ fn global_settings_row_with_profiles(
     let settings_snapshot =
         GlobalSettingsSnapshot::from_config_with_profiles(config, profile_names);
     SelectorRow {
+        view: None,
         target: SelectorTarget::GlobalSettings,
         agent: "Global settings".to_string(),
         thread_title: None,
@@ -5051,6 +5205,7 @@ fn profiles_row(config: &CodezConfig, profile_names: &[String]) -> SelectorRow {
     let settings_snapshot =
         GlobalSettingsSnapshot::from_config_with_profiles(config, profile_names);
     SelectorRow {
+        view: None,
         target: SelectorTarget::Profiles,
         agent: "Profiles".to_string(),
         thread_title: None,
@@ -5304,12 +5459,27 @@ fn selector_modal(model: &SelectorModel) -> bool {
             .as_ref()
             .is_some_and(|o| !matches!(o, ProfileOverlay::RenameInput { .. }))
 }
+fn settings_navigation_commands() -> Vec<(Command, Option<&'static str>)> {
+    [
+        Command::Settings,
+        Command::Profiles,
+        Command::Appearance,
+        Command::Workspaces,
+        Command::Archive,
+    ]
+    .into_iter()
+    .map(|command| (command, None))
+    .collect()
+}
 fn selector_commands(model: &SelectorModel) -> Vec<(Command, Option<&'static str>)> {
     input_policy::BINDINGS
         .iter()
         .map(|b| {
             let reason = match b.command {
                 Command::Archived => Some("Available on Projects"),
+                Command::Scope if !matches!(model.mode, SelectorMode::Agents) => {
+                    Some("Available on Managed")
+                }
                 Command::NewProject => {
                     Some("Available on Projects; native creation is not implemented here")
                 }
@@ -5403,11 +5573,20 @@ fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyR
             SelectorKeyRoute::Control(None)
         }
         Command::Page(panel) => {
+            model.settings_return_panel = None;
             model.filter_focused = false;
             model.recent.blur_filter();
             SelectorKeyRoute::Switch(panel)
         }
         Command::Settings => {
+            if model.settings_return_panel.is_none() {
+                model.settings_return_panel =
+                    Some(if matches!(model.mode, SelectorMode::RecentSessions) {
+                        PrimaryPanel::Recent
+                    } else {
+                        PrimaryPanel::Agents
+                    });
+            }
             model.activate_primary_panel(PrimaryPanel::Agents);
             let selected = model.workspace_selection.selected().cloned();
             model
@@ -5415,14 +5594,27 @@ fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyR
                 .select(Some(SelectorTarget::GlobalSettings));
             model.open_settings();
             model.workspace_selection.select(selected);
+            model.settings_navigation = Some(Help::default());
             SelectorKeyRoute::Control(None)
         }
         Command::Exit => SelectorKeyRoute::Control(Some(SelectorControl::Exit)),
         Command::Back => {
             model.leave_settings();
-            SelectorKeyRoute::Control(None)
+            model
+                .settings_return_panel
+                .take()
+                .map(SelectorKeyRoute::Switch)
+                .unwrap_or(SelectorKeyRoute::Control(None))
         }
         Command::Refresh => SelectorKeyRoute::Refresh,
+        Command::Scope => {
+            model.managed_scope = (model.managed_scope + 1) % 3;
+            if model.selected_visible_index().is_none() {
+                let target = model.visible_rows().first().map(|row| row.target.clone());
+                model.workspace_selection.select(target);
+            }
+            SelectorKeyRoute::Control(None)
+        }
         Command::LoadMore => {
             if matches!(model.mode, SelectorMode::RecentSessions)
                 && model.recent.next_cursor().is_some()
@@ -5446,6 +5638,9 @@ fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyR
             if matches!(model.mode, SelectorMode::Agents) {
                 model.inspector_overview_focused = model.selected_managed_agent().is_some();
                 SelectorKeyRoute::Control(None)
+            } else if matches!(model.mode, SelectorMode::RecentSessions) {
+                model.recent_inspecting = !model.recent.visible_rows().is_empty();
+                SelectorKeyRoute::Control(None)
             } else {
                 SelectorKeyRoute::Control(Some(model.handle(SelectorEvent::OpenActions)))
             }
@@ -5468,6 +5663,35 @@ fn route_selector_key(model: &mut SelectorModel, key: KeyEvent) -> SelectorKeyRo
     let text_input = selector_input(model).is_some();
     if !super::session_tui_workspace_events::accepts_key(key, text_input) {
         return SelectorKeyRoute::Control(None);
+    }
+    if let Some(mut navigation) = model.settings_navigation.take() {
+        match navigation.handle(key, &settings_navigation_commands()) {
+            Some(Some(Command::Settings)) => {}
+            Some(Some(command)) => return selector_command(model, command),
+            Some(None) => {
+                model.leave_settings();
+                return SelectorKeyRoute::Switch(
+                    model
+                        .settings_return_panel
+                        .take()
+                        .unwrap_or(PrimaryPanel::Agents),
+                );
+            }
+            None => model.settings_navigation = Some(navigation),
+        }
+        return SelectorKeyRoute::Control(None);
+    }
+    if key.code == KeyCode::Esc
+        && !text_input
+        && !selector_modal(model)
+        && !selector_dirty(model)
+        && model.help.is_none()
+        && model.leave_review.is_none()
+        && !matches!(model.mode, SelectorMode::ClosingRuntime { .. })
+        && model.settings_return_panel.is_some()
+    {
+        model.leave_settings();
+        return SelectorKeyRoute::Switch(model.settings_return_panel.take().unwrap());
     }
     if let Some(mut review) = model.leave_review.take() {
         match review.handle(key) {
@@ -5512,6 +5736,15 @@ fn route_selector_key(model: &mut SelectorModel, key: KeyEvent) -> SelectorKeyRo
         }
     }
     let recent = matches!(model.mode, SelectorMode::RecentSessions);
+    if recent && model.recent_inspecting {
+        if let Some(command) = input_policy::resolve(key) {
+            return selector_command(model, command);
+        }
+        if key.code == KeyCode::Esc {
+            model.recent_inspecting = false;
+        }
+        return SelectorKeyRoute::Control(None);
+    }
     let filter = (recent && model.recent.filter_focused())
         || (matches!(model.mode, SelectorMode::Agents) && model.filter_focused);
     if filter
@@ -6306,6 +6539,13 @@ fn selector_event_from_key(key: KeyEvent, enhanced_keyboard: bool) -> Option<Sel
 
 fn render_selector(frame: &mut Frame<'_>, model: &SelectorModel) {
     render_workspace(frame, model, &SelectorWorkspaceRenderer);
+    if let Some(navigation) = &model.settings_navigation {
+        navigation.render_titled(
+            frame,
+            &settings_navigation_commands(),
+            " Global Settings · General / Profiles / Appearance · Utilities · Esc returns ",
+        );
+    }
     if let Some(help) = &model.help {
         help.render(frame, &selector_commands(model));
     }
@@ -6472,13 +6712,13 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
         ));
     }
     if matches!(&model.mode, SelectorMode::Agents) {
-        let hidden = model.hidden_searchable_agent_count();
-        if hidden > 0 {
-            spans.push(Span::styled(
-                format!("  {hidden} offline searchable"),
-                Style::new().fg(Color::DarkGray),
-            ));
-        }
+        spans.push(Span::styled(
+            format!(
+                "  {} · Alt+O scope",
+                ["All", "Online", "Pinned"][model.managed_scope]
+            ),
+            Style::new().fg(Color::Cyan),
+        ));
         if model.show_thread_titles {
             spans.push(Span::styled(
                 "  thread titles expanded",
@@ -6649,10 +6889,20 @@ fn render_recent_context(frame: &mut Frame<'_>, area: Rect, model: &SelectorMode
 }
 
 fn render_recent_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
+    if model.recent_inspecting {
+        if let Some(row) = model
+            .recent
+            .visible_rows()
+            .get(model.recent.selected_visible())
+        {
+            views::render_inspector(frame, area, &row.view);
+        }
+        return;
+    }
     if let Some(row) = model.recent.review() {
         let lines = vec![
             Line::from(vec![
-                Span::styled("Name / preview: ", Style::new().fg(Color::DarkGray)),
+                Span::styled("Native title / preview (not Agent name): ", Style::new().fg(Color::DarkGray)),
                 Span::raw(row.title.clone()),
             ]),
             Line::from(vec![
@@ -6715,72 +6965,18 @@ fn render_recent_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorMo
         frame,
         filter_area,
         model.recent.filter_input(),
-        " Filter loaded rows: title / name / cwd / provider / project / state  [/] ",
+        " Filter loaded Recent rows ",
         model.recent.filter_focused(),
     );
-    match model.recent.load_state() {
-        RecentLoadState::Loading
-        | RecentLoadState::Empty
-        | RecentLoadState::ProviderIncompatible(_)
-        | RecentLoadState::Failed(_)
-            if model.recent.rows().is_empty() =>
-        {
-            frame.render_widget(
-                Paragraph::new("The catalog loads asynchronously. Press Enter to retry a failure.")
-                    .block(Block::bordered()),
-                table_area,
-            );
-        }
-        _ => {
-            let visible_rows = model.recent.visible_rows();
-            let rows = visible_rows.iter().map(|row| {
-                Row::new([
-                    Cell::from(row.primary_label().to_string()),
-                    Cell::from(
-                        row.cwd
-                            .as_deref()
-                            .map(truncate_recent_display)
-                            .unwrap_or_else(|| "-".to_string()),
-                    ),
-                    Cell::from(format!("{} / {}", row.provider, row.source)),
-                    Cell::from(row.project_id.clone().unwrap_or_else(|| "-".to_string())),
-                    Cell::from(row.state.label()),
-                ])
-            });
-            let table = Table::new(
-                rows,
-                [
-                    Constraint::Min(22),
-                    Constraint::Min(22),
-                    Constraint::Length(18),
-                    Constraint::Length(16),
-                    Constraint::Length(16),
-                ],
-            )
-            .header(
-                Row::new([
-                    "NAME / PREVIEW",
-                    "CWD",
-                    "PROVIDER / SOURCE",
-                    "PROJECT",
-                    "CUTEX STATE",
-                ])
-                .style(Style::new().fg(Color::Gray).add_modifier(Modifier::BOLD))
-                .bottom_margin(1),
-            )
-            .column_spacing(1)
-            .row_highlight_style(
-                Style::new()
-                    .fg(Color::White)
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("> ");
-            let mut state = model.recent_table.borrow_mut();
-            state.select((!visible_rows.is_empty()).then_some(model.recent.selected_visible()));
-            frame.render_stateful_widget(table, table_area, &mut state);
-        }
-    }
+    let rows: Vec<_> = model
+        .recent
+        .visible_rows()
+        .iter()
+        .map(|row| row.view.clone())
+        .collect();
+    let mut state = model.recent_table.borrow_mut();
+    state.select((!rows.is_empty()).then_some(model.recent.selected_visible()));
+    views::render_table(frame, table_area, &rows, ListKind::Recent, &mut state);
 }
 
 fn truncate_recent_display(value: &str) -> String {
@@ -7458,69 +7654,14 @@ fn render_inspector_overview(
     model: &SelectorModel,
     row: &SelectorRow,
 ) {
-    let profile = row
-        .configured_profile
-        .as_deref()
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            format!(
-                "~{}",
-                selector_default_profile_name(model).unwrap_or("unset")
-            )
-        });
-    let configured_model = row
-        .settings
-        .iter()
-        .flat_map(|category| category.options.iter())
-        .find(|option| option.label == "Model")
-        .map(|option| option.value.as_str())
-        .unwrap_or("default");
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("Cutex Project: ", Style::new().fg(Color::DarkGray)),
-            Span::raw(
-                row.project
-                    .as_ref()
-                    .map(|project| {
-                        format!(
-                            "[{}] {} ({})",
-                            project.badge_label, project.display_name, project.project_id
-                        )
-                    })
-                    .unwrap_or_else(|| "unassigned".to_string()),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Profile / model: ", Style::new().fg(Color::DarkGray)),
-            Span::raw(format!("{profile} / {configured_model}")),
-        ]),
-        Line::from(vec![
-            Span::styled("Managed path: ", Style::new().fg(Color::DarkGray)),
-            Span::raw(row.managed_path.as_str()),
-        ]),
-        Line::from(vec![
-            Span::styled("Activity: ", Style::new().fg(Color::DarkGray)),
-            Span::raw(format_selector_activity(row.activity.as_ref(), Utc::now())),
-        ]),
-    ];
-    if model.show_thread_titles {
-        if let Some(title) = row
-            .thread_title
-            .as_deref()
-            .filter(|title| !title.trim().is_empty() && *title != row.agent)
-        {
-            lines.push(Line::from(vec![
-                Span::styled("Thread title: ", Style::new().fg(Color::DarkGray)),
-                Span::styled(title, Style::new().fg(Color::Gray)),
-            ]));
-        }
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Read-only overview  ·  Alt+A Actions  ·  Alt+E Settings",
-        Style::new().fg(Color::DarkGray),
-    )));
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    let mut view = row
+        .view
+        .clone()
+        .unwrap_or_else(|| selector_view(row, selector_default_profile_name(model)));
+    view.name = row.agent.clone();
+    view.configured_profile = row.configured_profile.clone();
+    view.native_title = row.thread_title.clone();
+    views::render_inspector(frame, area, &view);
 }
 
 fn render_inspector_settings(
@@ -7562,94 +7703,61 @@ fn render_filter(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel, focus
     );
 }
 
+fn selector_view(row: &SelectorRow, _default_profile: Option<&str>) -> AgentSessionView {
+    AgentSessionView {
+        subject: SubjectRef::Managed(
+            row.activity_session_id
+                .clone()
+                .or_else(|| row.target.agent_key().map(str::to_owned))
+                .unwrap_or_default(),
+        ),
+        name: row.agent.clone(),
+        native_title: row.thread_title.clone(),
+        native_thread: None,
+        native_workspace: None,
+        runtime: row
+            .lifecycle
+            .map(|state| Observation::Known(format!("{state:?}")))
+            .unwrap_or_else(|| Observation::Unavailable("runtime not observed".into())),
+        project: Observation::Known(
+            row.project
+                .as_ref()
+                .map(|p| p.display_name.clone())
+                .unwrap_or_else(|| "unassigned".into()),
+        ),
+        configured_profile: row.configured_profile.clone(),
+        effective_profile: Observation::Unavailable("effective runtime profile not observed; configured/default profile is next-launch configuration".into()),
+        role: String::new(),
+        activity: format_selector_activity(row.activity.as_ref(), Utc::now()),
+        updated: "—".into(),
+        cwd: row.managed_path.clone(),
+        retirement_note: None,
+    }
+}
+
 fn render_table(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
-    let visible = model.visible_rows();
-    let wide = area.width >= WIDE_LAYOUT_MIN_WIDTH;
-    let extra_wide = area.width >= EXTRA_WIDE_LAYOUT_MIN_WIDTH;
-    let default_profile = selector_default_profile_name(model);
-    let rows = visible
+    let rows: Vec<_> = model
+        .visible_rows()
         .iter()
         .map(|row| {
-            selector_table_row(
-                row,
-                wide,
-                extra_wide,
-                default_profile,
-                model.show_thread_titles,
-            )
+            let mut view = row
+                .view
+                .clone()
+                .unwrap_or_else(|| selector_view(row, selector_default_profile_name(model)));
+            view.name = row.agent.clone();
+            view.configured_profile = row.configured_profile.clone();
+            view.activity = format_selector_activity(row.activity.as_ref(), Utc::now());
+            if model.show_thread_titles {
+                if let Some(title) = &row.thread_title {
+                    view.name.push_str(&format!(" · {title}"));
+                }
+            }
+            view
         })
-        .collect::<Vec<_>>();
-    let header_style = Style::new().fg(Color::Gray).add_modifier(Modifier::BOLD);
-    let header = if wide {
-        Row::new([
-            "AGENT",
-            "PROFILE",
-            "ST",
-            "ACTIVITY",
-            "MANAGED PATH",
-            "ACTION",
-        ])
-    } else {
-        Row::new(["AGENT", "PROFILE", "ST", "ACTION"])
-    }
-    .style(header_style)
-    .bottom_margin(1);
-    let widths = if extra_wide {
-        vec![
-            Constraint::Min(22),
-            Constraint::Length(20),
-            Constraint::Length(5),
-            Constraint::Length(11),
-            Constraint::Min(30),
-            Constraint::Length(10),
-        ]
-    } else if wide {
-        vec![
-            Constraint::Min(14),
-            Constraint::Length(18),
-            Constraint::Length(5),
-            Constraint::Length(11),
-            Constraint::Min(18),
-            Constraint::Length(10),
-        ]
-    } else {
-        vec![
-            Constraint::Min(14),
-            Constraint::Length(18),
-            Constraint::Length(5),
-            Constraint::Length(10),
-        ]
-    };
-    let table = Table::new(rows, widths)
-        .header(header)
-        .column_spacing(2)
-        .row_highlight_style(Style::new().fg(Color::White).add_modifier(Modifier::BOLD))
-        .highlight_symbol("> ");
+        .collect();
     let mut state = model.managed_table.borrow_mut();
     state.select(model.selected_visible_index());
-    frame.render_stateful_widget(table, area, &mut state);
-
-    if visible.is_empty() && area.height > 2 {
-        let message = if model.query.value().is_empty() {
-            "No live or pinned agents".to_string()
-        } else {
-            format!(
-                "No managed agents or Projects match {:?}",
-                model.query.value()
-            )
-        };
-        let empty_area = Rect {
-            y: area.y + 2,
-            height: area.height.saturating_sub(2),
-            ..area
-        };
-        frame.render_widget(
-            Paragraph::new(message)
-                .alignment(Alignment::Center)
-                .style(Style::new().fg(Color::DarkGray)),
-            empty_area,
-        );
-    }
+    views::render_table(frame, area, &rows, ListKind::Managed, &mut state);
 }
 
 fn render_action_table(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
@@ -8347,114 +8455,7 @@ fn render_runtime_close_progress(frame: &mut Frame<'_>, area: Rect, model: &Sele
     );
 }
 
-fn selector_table_row<'a>(
-    row: &'a SelectorRow,
-    wide: bool,
-    extra_wide: bool,
-    default_profile: Option<&str>,
-    show_thread_titles: bool,
-) -> Row<'a> {
-    let state = if let Some(lifecycle) = row.lifecycle {
-        let label = selector_state_label(row);
-        let style = if selector_row_is_detached(row) {
-            Style::new().fg(Color::Yellow)
-        } else {
-            lifecycle_style(lifecycle)
-        };
-        Cell::from(label).style(style)
-    } else if row.target.is_profiles() {
-        Cell::from("accounts").style(Style::new().fg(Color::Cyan))
-    } else if row.target.is_retired_sessions() {
-        Cell::from("archive").style(Style::new().fg(Color::Cyan))
-    } else if row.target.is_cutex_projects() {
-        Cell::from("permissions").style(Style::new().fg(Color::Cyan))
-    } else if row.target.is_projects() {
-        Cell::from("workspace").style(Style::new().fg(Color::Cyan))
-    } else if row.target.is_tasks() {
-        Cell::from("tasks").style(Style::new().fg(Color::Cyan))
-    } else {
-        Cell::from("global").style(Style::new().fg(Color::Cyan))
-    };
-    let primary_label = if row.target.is_retired_sessions() {
-        "browse"
-    } else if row.target.is_profiles() {
-        "manage"
-    } else if row.target.is_cutex_projects() || row.target.is_projects() || row.target.is_tasks() {
-        "open"
-    } else if row.target.is_global_settings() {
-        "settings"
-    } else {
-        row.actions
-            .iter()
-            .find(|item| item.primary)
-            .map(|item| homepage_action_label(item.action))
-            .unwrap_or("-")
-    };
-    let primary = Cell::from(primary_label).style(Style::new().fg(Color::Cyan));
-    let primary_agent_line = if let Some(project) = row.project.as_ref() {
-        Line::from(vec![
-            Span::styled(
-                project.badge_label.as_str(),
-                Style::new()
-                    .fg(Color::White)
-                    .bg(project_palette_color(project.color))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::raw(row.agent.as_str()),
-        ])
-    } else if row.target.is_system() {
-        Line::from(Span::styled(
-            row.agent.as_str(),
-            Style::new().fg(Color::Cyan),
-        ))
-    } else {
-        Line::from(row.agent.as_str())
-    };
-    let thread_title = show_thread_titles
-        .then_some(row.thread_title.as_deref())
-        .flatten()
-        .filter(|title| !title.trim().is_empty() && *title != row.agent);
-    let agent = if let Some(thread_title) = thread_title {
-        Cell::from(vec![
-            primary_agent_line,
-            Line::from(vec![
-                Span::styled("  thread: ", Style::new().fg(Color::DarkGray)),
-                Span::styled(thread_title, Style::new().fg(Color::Gray)),
-            ]),
-        ])
-    } else {
-        Cell::from(primary_agent_line)
-    };
-    let profile = if row.target.is_system() {
-        Cell::from("-").style(Style::new().fg(Color::DarkGray))
-    } else if let Some(profile) = row.configured_profile.as_deref() {
-        Cell::from(profile).style(Style::new().fg(Color::Magenta))
-    } else {
-        Cell::from(format!("~{}", default_profile.unwrap_or("unset")))
-            .style(Style::new().fg(Color::DarkGray))
-    };
-    let activity = Cell::from(format_selector_activity(row.activity.as_ref(), Utc::now()))
-        .style(Style::new().fg(Color::Gray));
-    let rendered = if extra_wide || wide {
-        Row::new([
-            agent,
-            profile,
-            state,
-            activity,
-            Cell::from(row.managed_path.as_str()),
-            primary,
-        ])
-    } else {
-        Row::new([agent, profile, state, primary])
-    };
-    if thread_title.is_some() {
-        rendered.height(2)
-    } else {
-        rendered
-    }
-}
-
+#[cfg(test)]
 fn homepage_action_label(action: SessionTuiAction) -> &'static str {
     match action {
         SessionTuiAction::ResumeAttach | SessionTuiAction::TakeoverExisting => "takeover",
@@ -8491,6 +8492,7 @@ fn format_selector_activity(value: Option<&SelectorActivity>, now: DateTime<Utc>
     format!("{}{failed} {age}", value.class.label())
 }
 
+#[cfg(test)]
 fn selector_state_label(row: &SelectorRow) -> &'static str {
     match row.lifecycle {
         Some(CutexSessionLifecycleState::Online) if selector_row_is_detached(row) => "DET",
@@ -8506,6 +8508,7 @@ fn selector_state_label(row: &SelectorRow) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn selector_row_is_detached(row: &SelectorRow) -> bool {
     row.lifecycle == Some(CutexSessionLifecycleState::Online)
         && row.backend == "alden"
@@ -9281,6 +9284,7 @@ mod tests {
             });
         }
         SelectorRow {
+            view: None,
             target: SelectorTarget::Agent(key.to_string()),
             agent: agent.to_string(),
             thread_title: None,
@@ -9555,6 +9559,7 @@ mod tests {
     fn select_global_setting(model: &mut SelectorModel, field: GlobalSettingsField) {
         if matches!(model.mode, SelectorMode::Agents) {
             selector_command(model, Command::Settings);
+            route_selector_key(model, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         }
         let (category, option) = model
             .active_row()
@@ -9594,6 +9599,7 @@ mod tests {
                 .and_then(|row| row.global_settings_snapshot.clone())
                 .expect("Global settings snapshot");
             model.context.settings.push(SelectorRow {
+                view: None,
                 target: SelectorTarget::Profiles,
                 agent: "Profiles".to_string(),
                 thread_title: None,
@@ -9653,6 +9659,218 @@ mod tests {
     fn cutex_tui_is_an_explicit_command() {
         let cli = Cli::try_parse_from(["cutex", "tui"]).expect("parse tui command");
         assert!(matches!(cli.command, Some(CommandKind::Tui)));
+    }
+
+    #[test]
+    fn ui_contract_c_d01_d02_d03_exact_member_union_and_unavailable() {
+        use cutex::agent_management::{
+            CutexProjectWorkspace, ProjectMemberLifecycle, ProjectMemberProjection,
+        };
+        let snapshot = project_snapshot("cutex.one", "alpha", None);
+        let agent = snapshot.agents.values().next().unwrap().clone();
+        let member = ProjectMemberProjection {
+            agent: agent.clone(),
+            lifecycle: ProjectMemberLifecycle::Unavailable,
+            runtime: None,
+            observation_error: Some("provider runtime unavailable".into()),
+        };
+        let mut other = member.clone();
+        other.agent.cutex_session_id = CutexSessionId::new("cutex.two").unwrap();
+        other.agent.native_session_id = "native-two".into();
+        let mut project: CutexProjectWorkspace = serde_json::from_value(serde_json::json!({
+            "project_id":"alpha", "authority_epoch":1, "director":{"cutex_session_id":"cutex.one", "member":member},
+            "access_role":"human_management", "operator_grant_revision":1,
+            "agent_operators":[{"member":member,"grant":{"project_id":"alpha","operator_cutex_session_id":"cutex.one","grant_revision":1,"granted_at":"2026-09-09T00:00:00Z","granted_by_primary_director_session":"cutex.one"}}],
+            "presentation":effective_presentation(&ProjectId::new("alpha").unwrap(),None),
+            "active_agents":[member,other],"retired_agents":[]
+        })).unwrap();
+        let rows = views::project_members(&project);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, rows[1].name);
+        assert_eq!(rows[0].cwd, rows[1].cwd);
+        assert_ne!(rows[0].subject, rows[1].subject);
+        assert_eq!(rows[0].role, "Director/Operator/Member");
+        assert!(matches!(rows[0].runtime, Observation::Unavailable(_)));
+        assert!(matches!(
+            rows[0].effective_profile,
+            Observation::Unavailable(_)
+        ));
+        project.director.member = None;
+        let rows = views::project_members(&project);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].role.starts_with("Director/"));
+        assert_eq!(rows[0].name, agent.spec.name);
+        project.director.member = Some(member.clone());
+        let operator = project.agent_operators[0].clone();
+        project.agent_operators = (1..=2)
+            .map(|i| {
+                let mut operator = operator.clone();
+                let id = CutexSessionId::new(format!("cutex.operator-{i}")).unwrap();
+                operator.member.agent.cutex_session_id = id.clone();
+                operator.grant.operator_cutex_session_id = id;
+                operator
+            })
+            .collect();
+        project.active_agents = (1..=3)
+            .map(|i| {
+                let mut member = member.clone();
+                member.agent.cutex_session_id =
+                    CutexSessionId::new(format!("cutex.member-{i}")).unwrap();
+                member
+            })
+            .collect();
+        let rows = views::project_members(&project);
+        assert_eq!(rows.len(), 6);
+        assert_eq!(rows.iter().filter(|r| r.role == "Director").count(), 1);
+        assert_eq!(rows.iter().filter(|r| r.role == "Operator").count(), 2);
+        assert_eq!(rows.iter().filter(|r| r.role == "Member").count(), 3);
+    }
+
+    #[test]
+    fn ui_contract_c_d05_v06_scope_query_and_thousand_row_selection() {
+        let rows = (0..1000)
+            .map(|i| {
+                row(
+                    &format!("id-{i:04}"),
+                    "duplicate name",
+                    if i % 2 == 0 {
+                        CutexSessionLifecycleState::Online
+                    } else {
+                        CutexSessionLifecycleState::Offline
+                    },
+                    i % 5 == 0,
+                    true,
+                )
+            })
+            .collect();
+        let mut model = SelectorModel::new(rows, false, false);
+        assert_eq!(model.visible_rows().len(), 1000);
+        route_selector_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::ALT),
+        );
+        assert_eq!(model.visible_rows().len(), 500);
+        route_selector_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::ALT),
+        );
+        assert_eq!(model.visible_rows().len(), 200);
+        model.query = Input::new("duplicate".into());
+        assert_eq!(model.visible_rows().len(), 200);
+        selector_command(&mut model, Command::Scope);
+        model.select_edge(true);
+        let selected = model.selected_target();
+        let mut rows = model.rows.clone();
+        rows.reverse();
+        model.replace_snapshot(SelectorSnapshot {
+            rows,
+            warning: None,
+        });
+        assert_eq!(model.selected_target(), selected);
+        let mut rows = model.rows.clone();
+        rows.retain(|r| Some(r.target.clone()) != selected);
+        model.replace_snapshot(SelectorSnapshot {
+            rows,
+            warning: None,
+        });
+        assert_eq!(model.selected_visible_index(), Some(998));
+    }
+
+    #[test]
+    fn ui_contract_c_global_settings_navigation_and_project_return() {
+        let mut model = SelectorModel::new(
+            vec![
+                row(
+                    "id",
+                    "formal",
+                    CutexSessionLifecycleState::Offline,
+                    false,
+                    true,
+                ),
+                global_row(),
+            ],
+            false,
+            false,
+        );
+        let selected = model.selected_target();
+        route_selector_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT),
+        );
+        model.settings_return_panel = Some(PrimaryPanel::Projects);
+        let text = rendered_text_at(100, 30, &model);
+        for label in [
+            "Global Settings",
+            "Profiles",
+            "Appearance",
+            "Workspaces",
+            "Archive",
+        ] {
+            assert!(text.contains(label), "{label}: {text}");
+        }
+        assert!(matches!(
+            route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            SelectorKeyRoute::Switch(PrimaryPanel::Projects)
+        ));
+        assert_eq!(model.selected_target(), selected);
+        route_selector_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT),
+        );
+        assert!(
+            matches!(model.mode,SelectorMode::Settings{target:SelectorTarget::Agent(ref id),..} if id=="id")
+        );
+        assert!(model.settings_navigation.is_none());
+    }
+
+    #[test]
+    fn ui_contract_c_d04_missing_provider_and_retirement_mismatch_are_not_reconciled() {
+        let mut agent = row(
+            "cutex.one",
+            "name",
+            CutexSessionLifecycleState::Offline,
+            false,
+            true,
+        );
+        agent.view = Some(selector_view(&agent, None));
+        let mut rows = vec![agent];
+        apply_provider_views(
+            &mut rows,
+            &CutexSessionStore::default(),
+            &Err(anyhow::anyhow!("fixture unavailable")),
+        );
+        assert!(matches!(
+            rows[0].view.as_ref().unwrap().project,
+            Observation::Unavailable(_)
+        ));
+        let mut durable = editable_record();
+        durable.cutex_session_id = "cutex.one".into();
+        durable.archive_state = cutex::session::model::CutexSessionArchiveState::Retired;
+        let store = CutexSessionStore {
+            sessions: HashMap::from([("cutex.one".into(), durable)]),
+            ..Default::default()
+        };
+        let before = serde_json::to_value(&store).unwrap();
+        apply_provider_views(
+            &mut rows,
+            &store,
+            &Ok(project_snapshot("cutex.one", "alpha", None)),
+        );
+        assert!(rows[0]
+            .view
+            .as_ref()
+            .unwrap()
+            .retirement_note
+            .as_ref()
+            .unwrap()
+            .contains("mismatch"));
+        assert_eq!(serde_json::to_value(&store).unwrap(), before);
+        let mut model = SelectorModel::new(rows, false, false);
+        model.mark_refresh_failed("refresh unavailable".into());
+        assert!(matches!(
+            model.rows[0].view.as_ref().unwrap().project,
+            Observation::Stale(_, _)
+        ));
     }
 
     #[test]
@@ -9748,7 +9966,7 @@ mod tests {
             exact.thread_title.as_deref(),
             Some("Generated conversation title")
         );
-        assert_eq!(decoy.agent, "decoy-worker");
+        assert_eq!(decoy.agent, "cutex.decoy-worker");
         assert_ne!(decoy.agent, "Decoy conversation title");
         assert!(decoy.project.is_none());
         assert!(rows
@@ -9798,49 +10016,26 @@ mod tests {
     }
 
     #[test]
-    fn homepage_badge_is_colored_before_agent_in_narrow_and_wide_layouts() {
-        let mut project_row = row(
+    fn homepage_project_name_is_secondary_to_formal_agent_name() {
+        let mut agent = row(
             "associated",
             "worker-zeta",
             CutexSessionLifecycleState::Online,
             false,
             true,
         );
-        project_row.project = Some(SelectorProjectContext {
-            agent_name: "worker-zeta".to_string(),
-            project_id: "project-8f31".to_string(),
-            display_name: "Nova Operations".to_string(),
-            badge_label: "NX".to_string(),
+        agent.project = Some(SelectorProjectContext {
+            agent_name: "worker-zeta".into(),
+            project_id: "project-8f31".into(),
+            display_name: "Nova Operations".into(),
+            badge_label: "NX".into(),
             color: ProjectPaletteColor::Green,
         });
-        let model = SelectorModel::new(vec![project_row], false, false);
-
-        for width in [72, WIDE_LAYOUT_MIN_WIDTH] {
-            let backend = TestBackend::new(width, 16);
-            let mut terminal = Terminal::new(backend).expect("test terminal");
-            terminal
-                .draw(|frame| render_selector(frame, &model))
-                .expect("render homepage");
-            let buffer = terminal.backend().buffer();
-            let (x, y) = (0..buffer.area.height)
-                .flat_map(|y| (0..buffer.area.width.saturating_sub(1)).map(move |x| (x, y)))
-                .find(|(x, y)| {
-                    buffer
-                        .cell((*x, *y))
-                        .is_some_and(|cell| cell.symbol() == "N")
-                        && buffer
-                            .cell((x.saturating_add(1), *y))
-                            .is_some_and(|cell| cell.symbol() == "X")
-                })
-                .expect("NX badge");
-            for badge_x in [x, x + 1] {
-                let cell = buffer.cell((badge_x, y)).expect("badge cell");
-                assert_eq!(cell.fg, Color::White, "width {width}");
-                assert_eq!(cell.bg, Color::LightGreen, "width {width}");
-            }
-            let text = rendered_text(width, &model);
-            assert!(text.contains("NX worker-zeta"), "width {width}");
-            assert!(text.contains("Filter agents / Projects"), "width {width}");
+        let model = SelectorModel::new(vec![agent], false, false);
+        for width in [72, 100, 160] {
+            let text = rendered_text_at(width, 30, &model);
+            assert!(text.contains("worker-zeta"));
+            assert!(text.contains("Nova Operations"), "{text}");
         }
     }
 
@@ -9900,7 +10095,7 @@ mod tests {
         ));
         let expanded = rendered_text_at(100, 18, &model);
         assert!(expanded.contains("Stable Managed Name"));
-        assert!(expanded.contains("thread: Generated"));
+        assert!(expanded.contains("Generated"));
         assert_eq!(
             model.selected_row().map(|row| row.agent.as_str()),
             Some("Stable Managed Name")
@@ -9916,7 +10111,7 @@ mod tests {
             .expect("render resized expanded selector");
         let resized = rendered_text_at(140, 24, &model);
         assert!(resized.contains("Stable Managed Name"));
-        assert!(resized.contains("Thread title: Generated conversation title"));
+        assert!(resized.contains("Native title: Generated"));
 
         assert!(toggle_managed_thread_titles_from_key(
             &mut model,
@@ -10176,24 +10371,7 @@ mod tests {
         terminal
             .draw(|frame| render_selector(frame, &model))
             .expect("render detached row");
-        let buffer = terminal.backend().buffer();
-        let det_cell = (0..buffer.area.height)
-            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
-            .find_map(|position| {
-                let (x, y) = position;
-                (buffer
-                    .cell(position)
-                    .is_some_and(|cell| cell.symbol() == "D")
-                    && buffer
-                        .cell((x.saturating_add(1), y))
-                        .is_some_and(|cell| cell.symbol() == "E")
-                    && buffer
-                        .cell((x.saturating_add(2), y))
-                        .is_some_and(|cell| cell.symbol() == "T"))
-                .then(|| buffer.cell(position).expect("DET cell"))
-            })
-            .expect("DET cell");
-        assert_eq!(det_cell.fg, Color::Yellow);
+        assert!(rendered_text_at(WIDE_LAYOUT_MIN_WIDTH, 12, &model).contains("Online"));
         assert_eq!(
             row.actions
                 .iter()
@@ -10256,7 +10434,7 @@ mod tests {
                 SelectorTarget::GlobalSettings => "global",
             })
             .collect::<Vec<_>>();
-        assert_eq!(initial, vec!["online", "pinned"]);
+        assert_eq!(initial, vec!["online", "pinned", "history", "managed"]);
 
         assert_eq!(
             model.handle(SelectorEvent::Insert('q')),
@@ -10276,7 +10454,7 @@ mod tests {
                 SelectorTarget::GlobalSettings => "global",
             })
             .collect::<Vec<_>>();
-        assert_eq!(filtered, vec!["managed"]);
+        assert_eq!(filtered, vec!["history", "managed"]);
         assert_eq!(model.query.value(), "q");
 
         for query in ['g', 'p'] {
@@ -10301,7 +10479,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_filter_reports_offline_managed_agents_as_searchable() {
+    fn empty_filter_includes_offline_rows_in_all_scope() {
         let mut model = SelectorModel::new(
             vec![
                 row(
@@ -10332,9 +10510,9 @@ mod tests {
             false,
         );
 
-        assert_eq!(model.hidden_searchable_agent_count(), 1);
+        assert_eq!(model.visible_rows().len(), 3);
         model.handle(SelectorEvent::Insert('b'));
-        assert_eq!(model.hidden_searchable_agent_count(), 0);
+        assert_eq!(model.visible_rows().len(), 1);
     }
 
     #[test]
@@ -11217,7 +11395,10 @@ mod tests {
         );
 
         model.handle(SelectorEvent::Escape);
-        assert_eq!(model.selected_target(), None);
+        assert_eq!(
+            model.selected_target(),
+            Some(SelectorTarget::Agent(EDITABLE_AGENT_KEY.into()))
+        );
     }
 
     #[test]
@@ -13329,6 +13510,7 @@ mod tests {
     #[test]
     fn retire_is_final_non_primary_action_and_defaults_to_cancel() {
         let mut record = editable_record();
+        record.formal_agent_name = Some("editable-agent".into());
         record.registration_class = AgentRegistrationClass::Persistent;
         record.profile = Some("alpha".to_string());
         record.managed_cwd = Some("/tmp/editable-managed".to_string());
@@ -13616,6 +13798,7 @@ mod tests {
     #[test]
     fn close_and_restart_confirms_and_keeps_the_selected_launch_profile() {
         let mut record = editable_record();
+        record.formal_agent_name = Some("editable-agent".into());
         record.profile = Some("alpha".to_string());
         record.registration_class = AgentRegistrationClass::Persistent;
         record.runtime_backend = CutexSessionRuntimeBackend::CuteAlden;
@@ -13913,66 +14096,40 @@ mod tests {
     }
 
     #[test]
-    fn responsive_layouts_keep_agent_first_and_show_managed_path() {
-        let mut activity_row = row(
-            "agent",
-            "cutex-dev-v5",
-            CutexSessionLifecycleState::Online,
+    fn ui_contract_c_v04_v05_responsive_name_status_and_inspectable_path() {
+        let model = SelectorModel::new(
+            vec![row(
+                "agent",
+                "Agent Unicode 界",
+                CutexSessionLifecycleState::Online,
+                false,
+                true,
+            )],
             false,
-            true,
+            false,
         );
-        activity_row.activity = Some(SelectorActivity {
-            class: SelectorActivityClass::Output,
-            updated_at: (Utc::now() - chrono::Duration::minutes(10)).to_rfc3339(),
-            failed: false,
-        });
-        let model = SelectorModel::new(vec![activity_row], false, false);
-
-        let wide_boundary = rendered_text_at(WIDE_LAYOUT_MIN_WIDTH, 9, &model);
-        assert!(wide_boundary.contains("AGENT") && wide_boundary.contains("MANAGED PATH"));
-        assert!(wide_boundary.contains("> cutex-dev-v5") && wide_boundary.contains("takeover"));
-        let last_unsplit = rendered_text_at(INSPECTOR_SPLIT_MIN_WIDTH - 1, 12, &model);
-        assert!(last_unsplit.contains("ACTIVITY"));
-        assert!(last_unsplit.contains("MANAGED PATH"));
-        assert!(!last_unsplit.contains("Overview | Actions [Alt+A]"));
-
-        let split = rendered_text_at(150, 18, &model);
-        assert!(split.contains("Inspector"));
-        assert!(split.contains("Overview"));
-        assert!(split.contains("Actions [Alt+A]"));
-        assert!(split.contains("Settings [Alt+E]"));
-        assert!(split.contains("cutex-dev-v5"));
-        assert!(split.contains("Managed path: ~/Projects/cutex"));
-        assert!(split.contains("Profile / model: aemeath / default"));
-        assert!(split.contains("Activity: OUT 10m"));
-        assert!(split.contains("takeover"));
-        assert!(!split.contains("HOST"));
-        assert!(!split.contains("BACKEND"));
-
-        let split_boundary = rendered_text_at(INSPECTOR_SPLIT_MIN_WIDTH, 18, &model);
-        assert!(split_boundary.contains("Inspector"));
-        assert!(split_boundary.contains("Managed path:"));
-
-        let minimum_wide = rendered_text(WIDE_LAYOUT_MIN_WIDTH, &model);
-        assert!(minimum_wide.contains("ACTIVITY"));
-        assert!(minimum_wide.contains("MANAGED PATH"));
-        assert!(minimum_wide.contains("ACTION"));
-        assert!(minimum_wide.contains("takeover"));
-
-        let narrow = rendered_text(72, &model);
-        let agent = narrow.find("AGENT").expect("agent heading");
-        let profile = narrow.find("PROFILE").expect("profile heading");
-        let state = narrow.find("ST").expect("state heading");
-        let primary = narrow.find("ACTION").expect("action heading");
-        assert!(agent < profile && profile < state && state < primary);
-        assert!(!narrow.contains("HOST"));
-        assert!(!narrow.contains("BACKEND"));
-        assert!(!narrow.contains("ACTIVITY"));
-        assert!(!narrow.contains("MANAGED PATH"));
-        assert!(!narrow.contains("~ global profile"));
-        assert!(narrow.contains("aemeath"));
-        assert!(narrow.contains("F1"));
-        assert!(narrow.contains("Commands"));
+        for (width, height) in [
+            (60, 18),
+            (80, 24),
+            (100, 30),
+            (120, 36),
+            (160, 48),
+            (240, 50),
+        ] {
+            let text = rendered_text_at(width, height, &model);
+            assert!(
+                text.contains("NAME") && text.contains("STATUS"),
+                "{width}: {text}"
+            );
+            assert!(text.contains("Agent Unicode"));
+            assert!(text.contains("F1"));
+        }
+        for width in 70..=120 {
+            assert!(rendered_text_at(width, 30, &model).contains("NAME"));
+        }
+        let mut inspected = model;
+        selector_command(&mut inspected, Command::Inspect);
+        assert!(rendered_text_at(80, 30, &inspected).contains("Path:"));
     }
 
     #[test]
@@ -14085,7 +14242,8 @@ mod tests {
 
     #[test]
     fn selector_rows_join_activity_by_durable_session_id() {
-        let record = editable_record();
+        let mut record = editable_record();
+        record.registration_class = AgentRegistrationClass::Persistent;
         let mut store = CutexSessionStore::default();
         store
             .sessions
@@ -14257,45 +14415,29 @@ mod tests {
     }
 
     #[test]
-    fn agent_profile_column_distinguishes_persistent_override_from_global_default() {
-        let mut explicit = row(
-            "deepseek",
-            "deepseek-agent",
+    fn agent_profile_column_distinguishes_configured_from_unobserved_effective() {
+        let mut agent = row(
+            "agent",
+            "agent",
             CutexSessionLifecycleState::Online,
             false,
             true,
         );
-        explicit.configured_profile = Some("deepseek".to_string());
-        let mut inherited = row(
-            "inherited",
-            "default-agent",
-            CutexSessionLifecycleState::Online,
-            false,
-            true,
+        agent.configured_profile = None;
+        let view = selector_view(&agent, Some("global-default"));
+        assert_eq!(view.configured_profile, None);
+        assert!(matches!(
+            view.effective_profile,
+            Observation::Unavailable(_)
+        ));
+        assert!(!format!("{view:?}").contains("Known(\"global-default\")"));
+        agent.configured_profile = Some("explicit".into());
+        assert_eq!(
+            selector_view(&agent, Some("other"))
+                .configured_profile
+                .as_deref(),
+            Some("explicit")
         );
-        inherited.configured_profile = None;
-        let config = CodezConfig {
-            default_profile: Some("colab".to_string()),
-            ..CodezConfig::default()
-        };
-        let mut model = SelectorModel::new(
-            vec![explicit, inherited, global_settings_row(&config)],
-            false,
-            false,
-        );
-
-        for width in [120, 72] {
-            let rendered = rendered_text(width, &model);
-            assert!(rendered.contains("deepseek"));
-            assert!(rendered.contains("~colab"));
-        }
-
-        let updated_config = CodezConfig {
-            default_profile: Some("deepseek".to_string()),
-            ..CodezConfig::default()
-        };
-        model.global_settings_apply_succeeded(&updated_config, &[], 1);
-        assert!(rendered_text(120, &model).contains("~deepseek"));
     }
 
     #[test]
@@ -14372,6 +14514,10 @@ mod tests {
 
         let mut global_model = SelectorModel::new(vec![global_row()], false, false);
         selector_command(&mut global_model, Command::Settings);
+        route_selector_key(
+            &mut global_model,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
         global_model.handle(SelectorEvent::Down);
         let medium = rendered_text(80, &global_model);
         assert!(medium.contains("view Expanded [Categories]"));
@@ -14404,6 +14550,10 @@ mod tests {
 
         let mut narrow_model = SelectorModel::new(vec![global_row()], false, false);
         selector_command(&mut narrow_model, Command::Settings);
+        route_selector_key(
+            &mut narrow_model,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
         let narrow_categories = rendered_text(50, &narrow_model);
         assert!(narrow_categories.contains("Categories"));
         assert!(narrow_categories.contains("Notifications  12"));
@@ -14420,6 +14570,10 @@ mod tests {
 
         let mut narrow_choice_model = SelectorModel::new(vec![global_row()], false, false);
         selector_command(&mut narrow_choice_model, Command::Settings);
+        route_selector_key(
+            &mut narrow_choice_model,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
         narrow_choice_model.handle(SelectorEvent::Insert('v'));
         narrow_choice_model.handle(SelectorEvent::Activate);
         let narrow_choice = rendered_text_at(50, 24, &narrow_choice_model);
@@ -14428,6 +14582,10 @@ mod tests {
 
         let mut global_tail_model = SelectorModel::new(vec![global_row()], false, false);
         selector_command(&mut global_tail_model, Command::Settings);
+        route_selector_key(
+            &mut global_tail_model,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
         global_tail_model.handle(SelectorEvent::Last);
         global_tail_model.handle(SelectorEvent::OpenActions);
         global_tail_model.handle(SelectorEvent::Last);
@@ -14509,6 +14667,27 @@ mod tests {
             &CutexSessionStore::default(),
         );
         model
+    }
+
+    #[test]
+    fn ui_contract_c_v06_recent_inspect_is_read_only_and_preserves_query() {
+        let mut model = contract_recent_model();
+        model.recent.push_filter('N');
+        let id = model.recent.visible_rows()[0].thread_id.clone();
+        assert!(matches!(
+            route_selector_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Char('i'), KeyModifiers::ALT)
+            ),
+            SelectorKeyRoute::Control(None)
+        ));
+        assert!(model.recent_inspecting);
+        assert!(model.recent.review().is_none());
+        assert!(rendered_text_at(80, 30, &model).contains("Inspector"));
+        route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!model.recent_inspecting);
+        assert_eq!(model.recent.query(), "N");
+        assert_eq!(model.recent.visible_rows()[0].thread_id, id);
     }
 
     fn contract_key(model: &mut SelectorModel, code: KeyCode) {

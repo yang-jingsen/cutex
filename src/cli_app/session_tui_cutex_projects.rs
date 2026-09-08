@@ -26,6 +26,7 @@ use uuid::Uuid;
 use super::management_control_plane::ManagementControlClient;
 use super::session_tui::footer_hints;
 use super::session_tui_input::{self as input_policy, Command, Gate, Help, LeaveReview};
+use super::session_tui_view::{self as views, AgentSessionView, ListKind, SubjectRef};
 use super::session_tui_workspace::{PrimaryPanel, PrimaryPanelOutcome};
 
 type ProjectTerminal = Terminal<CrosstermBackend<Stdout>>;
@@ -75,8 +76,8 @@ enum ProjectSection {
 
 impl ProjectSection {
     const ALL: [Self; 4] = [
-        Self::Overview,
         Self::Members,
+        Self::Overview,
         Self::Operators,
         Self::Appearance,
     ];
@@ -117,6 +118,10 @@ struct ProjectMutationTarget {
 
 #[derive(Debug)]
 pub(super) struct CutexProjectsModel {
+    member_selected: Option<SubjectRef>,
+    member_index: usize,
+    member_inspecting: bool,
+    member_table: std::cell::RefCell<TableState>,
     table_state: std::cell::RefCell<TableState>,
     help: Option<Help>,
     leave_review: Option<LeaveReview>,
@@ -151,6 +156,10 @@ pub(super) struct CutexProjectsModel {
 impl CutexProjectsModel {
     fn empty_with_failure(error: impl Into<String>) -> Self {
         Self {
+            member_selected: None,
+            member_index: 0,
+            member_inspecting: false,
+            member_table: Default::default(),
             table_state: Default::default(),
             help: None,
             leave_review: None,
@@ -168,7 +177,7 @@ impl CutexProjectsModel {
             filter_focused: false,
             show_archived: false,
             details: None,
-            section: ProjectSection::Overview,
+            section: ProjectSection::Members,
             operator_selected: 0,
             pending_operator: None,
             pending_project_mutation: None,
@@ -422,6 +431,10 @@ fn load_model() -> anyhow::Result<CutexProjectsModel> {
     let durable_candidates = client.durable_candidates()?;
     let available_agents = candidate_choices(&durable_candidates);
     Ok(CutexProjectsModel {
+        member_selected: None,
+        member_index: 0,
+        member_inspecting: false,
+        member_table: Default::default(),
         table_state: Default::default(),
         help: None,
         leave_review: None,
@@ -439,7 +452,7 @@ fn load_model() -> anyhow::Result<CutexProjectsModel> {
         filter_focused: false,
         show_archived: false,
         details: None,
-        section: ProjectSection::Overview,
+        section: ProjectSection::Members,
         operator_selected: 0,
         pending_operator: None,
         pending_project_mutation: None,
@@ -485,6 +498,29 @@ fn reload(model: &mut CutexProjectsModel, open_details: bool) -> anyhow::Result<
     Ok(())
 }
 
+fn selected_member(model: &CutexProjectsModel) -> Option<AgentSessionView> {
+    let rows = views::project_members(model.details.as_ref()?);
+    model
+        .member_selected
+        .as_ref()
+        .and_then(|id| rows.iter().find(|r| r.subject == *id))
+        .or_else(|| rows.get(model.member_index))
+        .cloned()
+}
+fn reconcile_member_selection(model: &mut CutexProjectsModel) {
+    let rows = model
+        .details
+        .as_ref()
+        .map(views::project_members)
+        .unwrap_or_default();
+    model.member_index = model
+        .member_selected
+        .as_ref()
+        .and_then(|id| rows.iter().position(|r| r.subject == *id))
+        .unwrap_or(model.member_index)
+        .min(rows.len().saturating_sub(1));
+    model.member_selected = rows.get(model.member_index).map(|r| r.subject.clone());
+}
 fn load_details(model: &mut CutexProjectsModel) -> anyhow::Result<()> {
     let project_id = model
         .selected_project()
@@ -494,7 +530,19 @@ fn load_details(model: &mut CutexProjectsModel) -> anyhow::Result<()> {
         .client
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Management control plane is unavailable"))?;
-    model.details = Some(client.project(&project_id)?);
+    let details = client.project(&project_id)?;
+    if model
+        .details
+        .as_ref()
+        .is_none_or(|old| old.project_id != project_id)
+    {
+        model.member_selected = None;
+        model.member_index = 0;
+        model.member_inspecting = false;
+        *model.member_table.borrow_mut() = TableState::default();
+    }
+    model.details = Some(details);
+    reconcile_member_selection(model);
     model.operator_selected = model
         .operator_selected
         .min(model.operator_targets().len().saturating_sub(1));
@@ -859,6 +907,7 @@ fn project_commands(model: &CutexProjectsModel) -> Vec<(Command, Option<&'static
         .iter()
         .map(|b| {
             let reason = match b.command {
+                Command::Actions | Command::Edit if model.view == ProjectView::Details && model.section == ProjectSection::Members => Some("Member actions deferred; Project list Actions/Edit retains project operations"),
                 Command::Profiles
                 | Command::Workspaces
                 | Command::Archive
@@ -873,7 +922,7 @@ fn project_commands(model: &CutexProjectsModel) -> Vec<(Command, Option<&'static
                 {
                     Some("Finish the current editor/review")
                 }
-                Command::LoadMore | Command::Titles => Some("Available on Recent / Managed"),
+                Command::LoadMore | Command::Titles | Command::Scope => Some("Available on Recent / Managed"),
                 Command::NewProject if model.available_agents.is_empty() => {
                     Some("No eligible persistent Director candidate")
                 }
@@ -937,13 +986,23 @@ fn project_command(
         }
         Command::Exit => Some(PrimaryPanelOutcome::Exit),
         Command::Back => {
-            model.view = ProjectView::List;
+            if model.member_inspecting {
+                model.member_inspecting = false;
+            } else {
+                model.view = ProjectView::List;
+            }
             None
         }
         Command::NewProject => {
             if model.view == ProjectView::List {
                 model.begin_create();
             }
+            None
+        }
+        Command::Inspect
+            if model.view == ProjectView::Details && model.section == ProjectSection::Members =>
+        {
+            model.member_inspecting = selected_member(model).is_some();
             None
         }
         Command::Actions | Command::Edit | Command::Inspect => {
@@ -975,7 +1034,7 @@ fn project_command(
                 load_details(model)
             };
             if let Err(e) = result {
-                model.failure = Some(format!("{e:#}"));
+                model.failure = Some(format!("Refresh failed; previous snapshot is stale: {e:#}"));
             }
             None
         }
@@ -1216,7 +1275,7 @@ fn handle_project_widget_key(
                     (model.selected + 1).min(model.visible_indices().len().saturating_sub(1));
             }
             KeyCode::Enter | KeyCode::Tab => {
-                model.section = ProjectSection::Overview;
+                model.section = ProjectSection::Members;
                 if let Err(error) = load_details(model) {
                     model.failure = Some(format!("{error:#}"));
                 }
@@ -1225,13 +1284,23 @@ fn handle_project_widget_key(
             _ => {}
         },
         ProjectView::Details => match key.code {
+            KeyCode::Esc if model.member_inspecting => model.member_inspecting = false,
             KeyCode::Esc => model.view = ProjectView::List,
-            KeyCode::Left => model.section = model.section.shifted(-1),
-            KeyCode::Right | KeyCode::Tab => model.section = model.section.shifted(1),
+            KeyCode::Left => {
+                model.member_inspecting = false;
+                model.section = model.section.shifted(-1);
+            }
+            KeyCode::Right | KeyCode::Tab => {
+                model.member_inspecting = false;
+                model.section = model.section.shifted(1);
+            }
             KeyCode::BackTab if model.section == ProjectSection::Overview => {
                 model.view = ProjectView::List
             }
-            KeyCode::BackTab => model.section = model.section.shifted(-1),
+            KeyCode::BackTab => {
+                model.member_inspecting = false;
+                model.section = model.section.shifted(-1);
+            }
             KeyCode::Up if model.section == ProjectSection::Operators => {
                 model.operator_selected = model.operator_selected.saturating_sub(1)
             }
@@ -1239,9 +1308,33 @@ fn handle_project_widget_key(
                 model.operator_selected = (model.operator_selected + 1)
                     .min(model.operator_targets().len().saturating_sub(1))
             }
+            KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End
+                if model.section == ProjectSection::Members =>
+            {
+                let len = model
+                    .details
+                    .as_ref()
+                    .map(views::project_members)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                model.member_index = match key.code {
+                    KeyCode::Up => model.member_index.saturating_sub(1),
+                    KeyCode::Down => (model.member_index + 1).min(len.saturating_sub(1)),
+                    KeyCode::Home => 0,
+                    _ => len.saturating_sub(1),
+                };
+                model.member_selected = model
+                    .details
+                    .as_ref()
+                    .map(views::project_members)
+                    .and_then(|m| m.get(model.member_index).map(|v| v.subject.clone()));
+            }
             KeyCode::Enter => match model.section {
                 ProjectSection::Operators => model.begin_operator_confirmation(),
-                ProjectSection::Overview | ProjectSection::Members | ProjectSection::Appearance => {
+                ProjectSection::Members => {
+                    model.member_inspecting = selected_member(model).is_some()
+                }
+                ProjectSection::Overview | ProjectSection::Appearance => {
                     model.notice = Some("This section has no mutating action.".to_string())
                 }
             },
@@ -1632,77 +1725,57 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel) {
         model.filter_focused,
     );
     let visible = model.visible_indices();
+    let width = chunks[1].width.saturating_sub(4);
+    let mut columns = if width >= 36 {
+        vec![("Name", width - 29), ("Director", 20), ("Members", 7)]
+    } else {
+        vec![("Name", width.max(1))]
+    };
+    if width >= 100 {
+        columns[0].1 = width - 65;
+        columns.push(("Project ID", 35));
+    }
     let rows = visible.iter().map(|index| {
         let project = &model.projects[*index];
-        Row::new([
-            Cell::from(project.presentation.badge_label.clone())
-                .style(project_badge_style(project.presentation.color)),
-            Cell::from(project.presentation.display_name.clone()),
-            Cell::from(project.project_id.to_string()),
-            Cell::from(
-                project
-                    .director_name
-                    .clone()
-                    .unwrap_or_else(|| project.director_cutex_session_id.as_str().to_string()),
-            ),
-            Cell::from(project.active_member_count.to_string()),
-            Cell::from(if project.retired_member_count == 0 {
-                "-".to_string()
-            } else {
-                project.retired_member_count.to_string()
-            }),
-            Cell::from(match project.access_role {
-                ProjectAccessRole::PrimaryDirector => "primary",
-                ProjectAccessRole::AgentOperator => "operator",
-                ProjectAccessRole::HumanManagement => "management",
-            }),
-        ])
+        Row::new(
+            columns
+                .iter()
+                .map(|(column, width)| {
+                    let value = match *column {
+                        "Name" => project.presentation.display_name.clone(),
+                        "Director" => project.director_name.clone().unwrap_or_else(|| {
+                            project.director_cutex_session_id.as_str().to_owned()
+                        }),
+                        "Members" => project.active_member_count.to_string(),
+                        _ => project.project_id.to_string(),
+                    };
+                    Cell::from(views::clipped(&value, usize::from(*width)))
+                })
+                .collect::<Vec<_>>(),
+        )
     });
-    let widths = if chunks[1].width >= 96 {
-        vec![
-            Constraint::Length(4),
-            Constraint::Length(22),
-            Constraint::Min(16),
-            Constraint::Length(20),
-            Constraint::Length(7),
-            Constraint::Length(7),
-            Constraint::Length(10),
-        ]
+    let table = Table::new(
+        rows,
+        columns
+            .iter()
+            .map(|(_, width)| Constraint::Length(*width))
+            .collect::<Vec<_>>(),
+    )
+    .header(Row::new(
+        columns.iter().map(|(label, _)| *label).collect::<Vec<_>>(),
+    ))
+    .block(Block::bordered().title(if model.show_archived {
+        " Cutex Projects + archived "
     } else {
-        vec![
-            Constraint::Length(4),
-            Constraint::Length(16),
-            Constraint::Min(12),
-            Constraint::Length(16),
-            Constraint::Length(7),
-            Constraint::Length(0),
-            Constraint::Length(0),
-        ]
-    };
-    let table = Table::new(rows, widths)
-        .header(
-            Row::new([
-                "BADGE",
-                "PROJECT",
-                "PROJECT ID",
-                "DIRECTOR",
-                "AGENTS",
-                "RETIRED",
-                "ROLE",
-            ])
-            .style(Style::new().fg(Color::Gray).add_modifier(Modifier::BOLD)),
-        )
-        .block(Block::bordered().title(if model.show_archived {
-            " Canonical Projects + archived "
-        } else {
-            " Canonical Projects "
-        }))
-        .row_highlight_style(
-            Style::new()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("> ");
+        " Cutex Projects "
+    }))
+    .row_highlight_style(
+        Style::new()
+            .bg(Color::Blue)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol("> ");
     let mut state = model.table_state.borrow_mut();
     state.select((!visible.is_empty()).then_some(model.selected));
     frame.render_stateful_widget(table, chunks[1], &mut state);
@@ -1767,7 +1840,18 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel)
     );
     match model.section {
         ProjectSection::Overview => render_overview(frame, chunks[1], project),
-        ProjectSection::Members => render_members(frame, chunks[1], project),
+        ProjectSection::Members => {
+            let members = views::project_members(project);
+            if model.member_inspecting {
+                if let Some(member) = selected_member(model) {
+                    views::render_inspector(frame, chunks[1], &member);
+                }
+            } else {
+                let mut state = model.member_table.borrow_mut();
+                state.select((!members.is_empty()).then_some(model.member_index));
+                views::render_table(frame, chunks[1], &members, ListKind::Members, &mut state);
+            }
+        }
         ProjectSection::Operators => render_operators(frame, chunks[1], model, project),
         ProjectSection::Appearance => render_appearance(frame, chunks[1], project),
     }
@@ -1801,50 +1885,6 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, project: &CutexProjectWork
         ])
         .wrap(Wrap { trim: true })
         .block(Block::bordered().title(" Overview ")),
-        area,
-    );
-}
-
-fn render_members(frame: &mut Frame<'_>, area: Rect, project: &CutexProjectWorkspace) {
-    let mut lines = vec![Line::from(Span::styled(
-        "Primary Director",
-        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-    ))];
-    lines.push(Line::from(format!(
-        "  {}",
-        project.director.cutex_session_id.as_str()
-    )));
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Ordinary members",
-        Style::new().add_modifier(Modifier::BOLD),
-    )));
-    lines.extend(project.active_agents.iter().map(|member| {
-        Line::from(format!(
-            "  {}  [{}]  {}",
-            member.agent.spec.name,
-            lifecycle_label(member.lifecycle),
-            member.agent.cutex_session_id.as_str()
-        ))
-    }));
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Retired members",
-        Style::new()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    )));
-    lines.extend(project.retired_agents.iter().map(|member| {
-        Line::from(format!(
-            "  {}  {}",
-            member.agent.spec.name,
-            member.agent.cutex_session_id.as_str()
-        ))
-    }));
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .block(Block::bordered().title(" Members ")),
         area,
     );
 }
@@ -2394,6 +2434,28 @@ mod tests {
             .project(&cutex::agent_management::ProjectId::new("alpha").unwrap())
             .unwrap();
         model.details = Some(project);
+        model.view = ProjectView::Details;
+        model.section = ProjectSection::Members;
+        reconcile_member_selection(&mut model);
+        let member_id = model.member_selected.clone();
+        assert!(member_id.is_some(), "Director alone must appear in Members");
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(model.member_inspecting);
+        assert!(rendered(&model, 80, 30).contains("Inspector"));
+        handle_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!model.member_inspecting);
+        assert_eq!(model.view, ProjectView::Details);
+        assert_eq!(model.member_selected, member_id);
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT),
+        );
+        assert_eq!(model.view, ProjectView::Details);
+        assert!(model.notice.as_deref().unwrap().contains("deferred"));
+        model.view = ProjectView::List;
         model.durable_candidates = client.durable_candidates().unwrap();
         let worker = model
             .durable_candidates
@@ -3012,7 +3074,7 @@ mod tests {
         let style = project_badge_style(ProjectPaletteColor::Magenta);
         assert_eq!(style.fg, Some(Color::White));
         assert_eq!(style.bg, Some(Color::LightMagenta));
-        assert!(rendered(&model_with_projects(), 90, 18).contains("CX"));
+        assert!(rendered(&model_with_projects(), 90, 18).contains("Render Lab"));
     }
 
     #[test]
@@ -3148,7 +3210,7 @@ mod tests {
         terminal.draw(|frame| render(frame, &model)).unwrap();
         terminal.backend_mut().resize(120, 24);
         terminal.draw(|frame| render(frame, &model)).unwrap();
-        assert!(format!("{:?}", terminal.backend().buffer()).contains("PROJECT ID"));
+        assert!(format!("{:?}", terminal.backend().buffer()).contains("Director"));
     }
 
     #[test]

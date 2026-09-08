@@ -125,6 +125,7 @@ pub(super) enum Command {
     Edit,
     NewProject,
     LoadMore,
+    Scope,
     Titles,
     Refresh,
     Exit,
@@ -197,6 +198,12 @@ pub(super) const BINDINGS: &[Binding] = &[
     alt(Command::Edit, 'e', "Edit object", "Alt+E"),
     alt(Command::NewProject, 'n', "New Project", "Alt+N"),
     alt(Command::LoadMore, 'l', "Load more recent rows", "Alt+L"),
+    alt(
+        Command::Scope,
+        'o',
+        "Managed scope: All / Online / Pinned",
+        "Alt+O",
+    ),
     alt(Command::Titles, 'v', "Toggle thread titles", "Alt+V"),
     Binding {
         command: Command::Refresh,
@@ -334,9 +341,17 @@ impl Help {
         }
     }
     pub fn render(&self, frame: &mut Frame<'_>, entries: &[(Command, Option<&'static str>)]) {
+        self.render_titled(frame, entries, " F1 commands · arrows / Enter · Esc ");
+    }
+    pub fn render_titled(
+        &self,
+        frame: &mut Frame<'_>,
+        entries: &[(Command, Option<&'static str>)],
+        title: &str,
+    ) {
         overlay(
             frame,
-            " F1 commands · arrows / Enter · Esc ",
+            title,
             entries
                 .iter()
                 .enumerate()

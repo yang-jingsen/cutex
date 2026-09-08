@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
+use super::session_tui_view::{AgentSessionView, Observation, SubjectRef};
 use cutex::catalog::{
     CatalogClient, CatalogError, CatalogThread, SortDirection, ThreadListParams, ThreadPage,
     ThreadSortKey,
@@ -25,6 +26,7 @@ pub(super) enum RecentThreadState {
     Managed,
     Retired,
     MissingCwd,
+    Ambiguous,
 }
 
 impl RecentThreadState {
@@ -34,6 +36,7 @@ impl RecentThreadState {
             Self::Managed => "managed",
             Self::Retired => "retired",
             Self::MissingCwd => "cwd unavailable",
+            Self::Ambiguous => "ambiguous mapping",
         }
     }
 
@@ -44,6 +47,7 @@ impl RecentThreadState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RecentThreadRow {
+    pub(super) view: AgentSessionView,
     /// The native `thread/list` id. This is the only identity used for
     /// adoption; `session_id` is intentionally not retained as an identity.
     pub(super) thread_id: String,
@@ -61,6 +65,7 @@ pub(super) struct RecentThreadRow {
 }
 
 impl RecentThreadRow {
+    #[cfg(test)]
     pub(super) fn primary_label(&self) -> &str {
         self.managed_name.as_deref().unwrap_or(&self.title)
     }
@@ -257,6 +262,21 @@ impl Default for RecentSessionsWorkspace {
 }
 
 impl RecentSessionsWorkspace {
+    pub(super) fn enrich_views(&mut self, managed: &[AgentSessionView]) {
+        for row in &mut self.rows {
+            if let Some(view) = managed.iter().find(|view| {
+                view.subject == row.view.subject
+                    && view.native_thread.as_deref() == Some(row.thread_id.as_str())
+            }) {
+                let mut current = view.clone();
+                current.native_title = Some(row.title.clone());
+                current.native_workspace = row.project_id.clone();
+                current.updated = row.view.updated.clone();
+                row.managed_name = Some(current.name.clone());
+                row.view = current;
+            }
+        }
+    }
     pub(super) fn rows(&self) -> &[RecentThreadRow] {
         &self.rows
     }
@@ -367,6 +387,8 @@ impl RecentSessionsWorkspace {
                         .cmp(&left.recency_at)
                         .then_with(|| left.thread_id.cmp(&right.thread_id))
                 });
+                let mut page_ids = HashSet::new();
+                incoming.retain(|row| page_ids.insert(row.thread_id.clone()));
                 if append {
                     let known = self
                         .rows
@@ -386,7 +408,7 @@ impl RecentSessionsWorkspace {
                     self.rows = incoming;
                     self.selected = selected_id
                         .and_then(|id| self.rows.iter().position(|row| row.thread_id == id))
-                        .unwrap_or(0);
+                        .unwrap_or(self.selected);
                 }
                 self.rows.sort_by(|left, right| {
                     right
@@ -436,6 +458,35 @@ impl RecentSessionsWorkspace {
                 store,
                 known_managed_name.as_deref(),
             );
+            if matches!(
+                row.state,
+                RecentThreadState::Managed | RecentThreadState::Retired
+            ) {
+                if let Some(record) = store
+                    .sessions
+                    .values()
+                    .find(|r| r.codex_session_id.as_deref() == Some(row.thread_id.as_str()))
+                {
+                    row.view.subject = SubjectRef::Managed(record.cutex_session_id.clone());
+                    row.view.configured_profile = record.profile.clone();
+                    row.view.name = record
+                        .formal_agent_name
+                        .clone()
+                        .or_else(|| row.managed_name.clone())
+                        .unwrap_or_else(|| record.cutex_session_id.clone());
+                }
+            } else {
+                row.view.subject = SubjectRef::Native {
+                    catalog: "paired-local-app-server".into(),
+                    thread: row.thread_id.clone(),
+                };
+                row.view.name = row.title.clone();
+                row.view.project =
+                    Observation::Unavailable("durable mapping absent or ambiguous".into());
+                row.view.effective_profile =
+                    Observation::Unavailable("effective profile not observed".into());
+                row.view.configured_profile = None;
+            }
         }
     }
 
@@ -519,6 +570,9 @@ impl RecentSessionsWorkspace {
             .iter()
             .enumerate()
             .filter_map(|(index, row)| {
+                if row.state == RecentThreadState::Retired {
+                    return None;
+                }
                 let matches = query.is_empty()
                     || row.title.to_lowercase().contains(&query)
                     || row
@@ -578,7 +632,51 @@ fn recent_row(
         store,
         managed_names.get(&thread.id).map(String::as_str),
     );
+    let records: Vec<_> = store
+        .sessions
+        .values()
+        .filter(|record| {
+            record.codex_session_id.as_deref() == Some(thread.id.as_str())
+                && cutex_session_is_managed(record)
+        })
+        .collect();
+    let view = AgentSessionView {
+        subject: if records.len() == 1 && state != RecentThreadState::Ambiguous {
+            SubjectRef::Managed(records[0].cutex_session_id.clone())
+        } else {
+            SubjectRef::Native {
+                catalog: "paired-local-app-server".into(),
+                thread: thread.id.clone(),
+            }
+        },
+        name: managed_name.clone().unwrap_or_else(|| bound(&title)),
+        native_title: Some(bound(&title)),
+        native_thread: Some(thread.id.clone()),
+        native_workspace: thread.project_id.clone(),
+        runtime: Observation::Unavailable("runtime not observed by native catalog".into()),
+        project: Observation::Unavailable(
+            "Cutex membership not observed; native workspace is not membership".into(),
+        ),
+        configured_profile: records
+            .first()
+            .filter(|_| records.len() == 1 && state != RecentThreadState::Ambiguous)
+            .and_then(|r| r.profile.clone()),
+        effective_profile: Observation::Unavailable("effective profile not observed".into()),
+        role: String::new(),
+        activity: String::new(),
+        updated: thread
+            .recency_at
+            .or(thread.updated_at)
+            .or(thread.created_at)
+            .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+            .map(|t| t.format("%m-%d %H:%M UTC").to_string())
+            .unwrap_or_else(|| "Unavailable".into()),
+        cwd: cwd.clone().unwrap_or_else(|| "Unavailable".into()),
+        retirement_note: (state == RecentThreadState::Ambiguous)
+            .then(|| "Ambiguous durable/native mapping; not joined".into()),
+    };
     RecentThreadRow {
+        view,
         thread_id: thread.id,
         title: bound(&title),
         managed_name,
@@ -610,8 +708,12 @@ fn managed_primary_label(
             .map(bound)
             .or_else(|| {
                 store.sessions.values().find_map(|record| {
-                    (record.codex_session_id.as_deref() == Some(thread_id))
-                        .then(|| record.cutex_session_id.clone())
+                    (record.codex_session_id.as_deref() == Some(thread_id)).then(|| {
+                        record
+                            .formal_agent_name
+                            .clone()
+                            .unwrap_or_else(|| record.cutex_session_id.clone())
+                    })
                 })
             })
             .unwrap_or_else(|| thread_id.to_string())
@@ -622,8 +724,17 @@ fn thread_state(thread_id: &str, has_cwd: bool, store: &CutexSessionStore) -> Re
     if store
         .sessions
         .values()
-        .any(|record| record.codex_session_id.as_deref() == Some(thread_id) && record.is_retired())
+        .filter(|r| r.codex_session_id.as_deref() == Some(thread_id))
+        .count()
+        > 1
     {
+        return RecentThreadState::Ambiguous;
+    }
+    if store.sessions.values().any(|record| {
+        record.codex_session_id.as_deref() == Some(thread_id)
+            && record.is_retired()
+            && cutex_session_is_managed(record)
+    }) {
         RecentThreadState::Retired
     } else if store.sessions.values().any(|record| {
         record.codex_session_id.as_deref() == Some(thread_id) && cutex_session_is_managed(record)
@@ -654,6 +765,64 @@ fn bound(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ui_contract_c_d03_v07_recent_exact_mapping_retirement_and_pagination() {
+        let mut store = store_with("mapped", true, false);
+        let record = store.sessions.values_mut().next().unwrap();
+        record.formal_agent_name = Some("Formal Agent".into());
+        record.thread_name = Some("never formal".into());
+        let mapped = recent_row(
+            thread("mapped", "irrelevant-session", 1),
+            &store,
+            &HashMap::new(),
+        );
+        assert_eq!(mapped.view.name, "Formal Agent");
+        assert_eq!(
+            mapped.view.subject,
+            SubjectRef::Managed("cutex-test".into())
+        );
+        assert!(matches!(mapped.view.project, Observation::Unavailable(_)));
+        assert_eq!(mapped.view.native_workspace.as_deref(), Some("project-a"));
+        let mut duplicate = store.sessions.values().next().unwrap().clone();
+        duplicate.cutex_session_id = "other-id".into();
+        store.sessions.insert("other-id".into(), duplicate);
+        let ambiguous = recent_row(thread("mapped", "other", 1), &store, &HashMap::new());
+        assert_eq!(ambiguous.state, RecentThreadState::Ambiguous);
+        assert!(!ambiguous.state.can_adopt());
+        assert!(matches!(ambiguous.view.subject, SubjectRef::Native { .. }));
+        let retired = store_with("retired", true, true);
+        let mut workspace = RecentSessionsWorkspace::default();
+        workspace.receive(
+            CatalogReply::Page {
+                cursor: None,
+                result: Ok(ThreadPage {
+                    data: vec![
+                        thread("retired", "x", 3),
+                        thread("same", "x", 2),
+                        thread("same", "x", 1),
+                    ],
+                    next_cursor: Some("next".into()),
+                    backwards_cursor: None,
+                }),
+            },
+            &retired,
+        );
+        assert_eq!(workspace.rows.len(), 2);
+        assert_eq!(workspace.visible_rows().len(), 1);
+        workspace.selected = workspace.visible_indices()[0];
+        workspace.receive(
+            CatalogReply::Page {
+                cursor: Some("next".into()),
+                result: Ok(ThreadPage {
+                    data: vec![thread("new", "x", 4)],
+                    next_cursor: None,
+                    backwards_cursor: None,
+                }),
+            },
+            &retired,
+        );
+        assert_eq!(workspace.rows[workspace.selected].thread_id, "same");
+    }
     #[test]
     fn ui_contract_b2_failed_pages_preserve_rows_cursor_and_selection() {
         let mut workspace = RecentSessionsWorkspace::default();
