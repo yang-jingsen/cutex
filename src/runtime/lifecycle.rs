@@ -88,6 +88,7 @@ pub fn session_online_base_codex_args(
     record: &CutexSessionRecord,
     account: &StoredAccount,
 ) -> anyhow::Result<Vec<String>> {
+    crate::agent_management::require_default_launch(record)?;
     let codex_args = session_runtime_base_codex_args(record, account)?;
     let codex_session_id = required_codex_session_id(record)?;
     if !codex_session_exists_in_home(codex_session_id)? {
@@ -100,6 +101,7 @@ pub fn live_remote_tui_attach_plan(
     record: &CutexSessionRecord,
     account: &StoredAccount,
 ) -> anyhow::Result<LiveRemoteTuiAttachPlan> {
+    crate::agent_management::require_default_launch(record)?;
     let mut codex_args = session_runtime_base_codex_args(record, account)?;
     let codex_session_id = required_codex_session_id(record)?;
     codex_args.push("resume".to_string());

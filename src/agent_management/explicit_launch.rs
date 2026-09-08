@@ -65,8 +65,20 @@ pub fn require_default_launch(record: &CutexSessionRecord) -> anyhow::Result<()>
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExplicitLaunchReview {
-    pub agent: AgentArchiveReview,
+    pub subject: ExplicitLaunchSubject,
     pub contract: ExplicitLaunchContract,
+    pub configuration: crate::launch::stock::StockConfiguration,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExplicitLaunchSubject {
+    pub cutex_session_id: CutexSessionId,
+    pub formal_name: String,
+    pub durable_sha256: Sha256,
+    pub authority_sha256: Sha256,
+    pub current_project_id: Option<ProjectId>,
+    pub revision: u64,
+    pub runtime_generation: u64,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -76,9 +88,23 @@ pub struct ExplicitLaunchReceipt {
     pub activated_revision: u64,
     pub committed_at: String,
 }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "receipt", rename_all = "snake_case")]
+pub enum ExplicitLaunchActionReceipt {
+    Activation(ExplicitLaunchReceipt),
+    Runtime(StockRuntimeReceipt),
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExplicitLaunchRequest {
+    ReviewRuntime {
+        cutex_session_id: CutexSessionId,
+        restart: bool,
+    },
+    Run {
+        action_id: AgentActionId,
+        review: StockRuntimeReview,
+    },
     Review {
         cutex_session_id: CutexSessionId,
         contract: ExplicitLaunchContract,
@@ -92,30 +118,72 @@ pub enum ExplicitLaunchRequest {
 impl AgentManagementProvider {
     pub fn explicit_launch_action(
         &self,
-        principal: &HumanManagementPrincipal,
+        _principal: &HumanManagementPrincipal,
         path: &Path,
         request: &ExplicitLaunchRequest,
         tasks: &crate::task_service::TaskServiceProvider,
     ) -> anyhow::Result<serde_json::Value> {
         match request {
+            ExplicitLaunchRequest::ReviewRuntime {
+                cutex_session_id,
+                restart,
+            } => self
+                .review_stock_runtime(path, cutex_session_id, *restart, tasks)
+                .and_then(|r| Ok(serde_json::to_value(r)?)),
+            ExplicitLaunchRequest::Run { .. } => {
+                anyhow::bail!("explicit stock runtime executor required")
+            }
             ExplicitLaunchRequest::Review {
                 cutex_session_id,
                 contract,
             } => {
-                contract.validate()?;
-                let agent = self.review_agent_archive(
-                    principal,
-                    path,
-                    cutex_session_id,
-                    AgentArchiveOperation::Archive,
-                )?;
-                let sessions = crate::session::store::load_cutex_session_store_from_path(path)?;
-                let record = &sessions.sessions[cutex_session_id.as_str()];
-                validate_activation(record, contract)?;
-                Ok(serde_json::to_value(ExplicitLaunchReview {
-                    agent,
-                    contract: contract.clone(),
-                })?)
+                let _mutation = self.store().lock_mutations()?;
+                tasks.with_archive_read_fence(|tasks| -> anyhow::Result<_> {
+                    let state = self.store().snapshot()?;
+                    let current_project_id = super::archive::guard(&state, cutex_session_id)
+                        .map_err(|e| {
+                            anyhow::anyhow!("explicit launch protected-role/project guard: {e}")
+                        })?;
+                    ensure_no_task(tasks, cutex_session_id)?;
+                    let sessions = crate::session::store::load_cutex_session_store_from_path(path)?;
+                    let record = sessions
+                        .sessions
+                        .get(cutex_session_id.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("explicit launch durable record missing"))?;
+                    validate_activation(record, contract)?;
+                    crate::launch::stock::StockBundle::load(contract)?;
+                    crate::launch::stock::validate_native(record, &sessions, contract)?;
+                    let configuration = crate::launch::stock::current_configuration(record)?;
+                    let formal_name = record
+                        .formal_agent_name
+                        .clone()
+                        .or_else(|| {
+                            state
+                                .agents
+                                .get(cutex_session_id)
+                                .map(|a| a.spec.name.clone())
+                        })
+                        .ok_or_else(|| anyhow::anyhow!("explicit formal Agent name required"))?;
+                    anyhow::ensure!(
+                        !formal_name.trim().is_empty()
+                            && !formal_name.chars().any(char::is_control),
+                        "malformed formal Agent name"
+                    );
+                    Ok(serde_json::to_value(ExplicitLaunchReview {
+                        subject: ExplicitLaunchSubject {
+                            cutex_session_id: cutex_session_id.clone(),
+                            formal_name,
+                            durable_sha256: super::store::request_sha256(record)?,
+                            authority_sha256: self
+                                .archive_authority_digest(&state, cutex_session_id)?,
+                            current_project_id,
+                            revision: record.revision,
+                            runtime_generation: record.runtime_generation,
+                        },
+                        contract: contract.clone(),
+                        configuration,
+                    })?)
+                })?
             }
             ExplicitLaunchRequest::Activate { action_id, review } => {
                 let _execution = super::provider::provider_execution_lock()
@@ -127,19 +195,22 @@ impl AgentManagementProvider {
                         if let Some(receipt) =
                             sessions.explicit_launch_receipts.get(action_id.as_str())
                         {
+                            let ExplicitLaunchActionReceipt::Activation(receipt) = receipt else {
+                                anyhow::bail!("explicit_launch_action_conflict")
+                            };
                             anyhow::ensure!(
                                 &receipt.review == review,
                                 "explicit_launch_action_conflict"
                             );
                             return Ok(serde_json::to_value(receipt)?);
                         }
-                        review.contract.validate()?;
+                        crate::launch::stock::StockBundle::load(&review.contract)?;
                         let state = self.store().snapshot()?;
-                        let id = &review.agent.cutex_session_id;
+                        let id = &review.subject.cutex_session_id;
                         super::archive::guard(&state, id)?;
                         anyhow::ensure!(
                             self.archive_authority_digest(&state, id)?
-                                == review.agent.authority_sha256,
+                                == review.subject.authority_sha256,
                             "explicit_launch_authority_stale"
                         );
                         anyhow::ensure!(
@@ -152,12 +223,22 @@ impl AgentManagementProvider {
                         );
                         let record = sessions
                             .sessions
+                            .get(id.as_str())
+                            .ok_or_else(|| anyhow::anyhow!("durable record missing"))?;
+                        crate::launch::stock::validate_native(record, sessions, &review.contract)?;
+                        anyhow::ensure!(
+                            crate::launch::stock::current_configuration(record)?
+                                == review.configuration,
+                            "explicit_launch_configuration_stale"
+                        );
+                        let record = sessions
+                            .sessions
                             .get_mut(id.as_str())
                             .ok_or_else(|| anyhow::anyhow!("durable record missing"))?;
                         anyhow::ensure!(
-                            super::store::request_sha256(record)? == review.agent.durable_sha256
-                                && record.revision == review.agent.revision
-                                && record.runtime_generation == review.agent.runtime_generation,
+                            super::store::request_sha256(record)? == review.subject.durable_sha256
+                                && record.revision == review.subject.revision
+                                && record.runtime_generation == review.subject.runtime_generation,
                             "explicit_launch_confirmation_stale"
                         );
                         validate_activation(record, &review.contract)?;
@@ -173,9 +254,10 @@ impl AgentManagementProvider {
                             activated_revision: record.revision,
                             committed_at: record.updated_at.clone(),
                         };
-                        sessions
-                            .explicit_launch_receipts
-                            .insert(action_id.to_string(), receipt.clone());
+                        sessions.explicit_launch_receipts.insert(
+                            action_id.to_string(),
+                            ExplicitLaunchActionReceipt::Activation(receipt.clone()),
+                        );
                         // Requirement and immutable action/audit receipt share the durable CAS write.
                         crate::session::store::save_locked_session_store(path, sessions)?;
                         Ok(serde_json::to_value(receipt)?)
@@ -184,6 +266,21 @@ impl AgentManagementProvider {
             }
         }
     }
+}
+
+fn ensure_no_task(
+    tasks: &crate::task_service::TaskServiceSnapshot,
+    id: &CutexSessionId,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !tasks
+            .assignments
+            .values()
+            .any(|a| &a.assignee_cutex_session == id
+                && a.state != crate::task_service::AssignmentState::Closed),
+        "explicit_launch_active_task"
+    );
+    Ok(())
 }
 
 fn validate_activation(

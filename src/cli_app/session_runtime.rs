@@ -220,7 +220,7 @@ pub(crate) fn cmd_session_close_and_restart_with_profile(
     let key =
         cutex_session_key_for_user_id(&store, id).ok_or_else(|| anyhow!("unknown session"))?;
     cutex::agent_management::require_default_launch(&store.sessions[&key])?;
-    cmd_session_close_and_wait(id)
+    cmd_session_close_and_wait_with_guard(id, LifecycleResponseOutput::Print, true)
         .context("Failed to close runtime before restart; restart was not attempted")?;
     cmd_session_online_with_profile(id, launch_profile, open_visible_terminal)
         .context("Runtime closed, but failed to restart")
@@ -238,12 +238,20 @@ fn cmd_session_close_and_wait_with_output(
     id: &str,
     output: LifecycleResponseOutput,
 ) -> anyhow::Result<serde_json::Value> {
+    cmd_session_close_and_wait_with_guard(id, output, false)
+}
+
+fn cmd_session_close_and_wait_with_guard(
+    id: &str,
+    output: LifecycleResponseOutput,
+    require_default_launch: bool,
+) -> anyhow::Result<serde_json::Value> {
     let started = Instant::now();
     loop {
         let close = cmd_session_lifecycle_action_with_payload_and_output(
             id,
             "session.close",
-            serde_json::json!({}),
+            serde_json::json!({"requireDefaultLaunch": require_default_launch}),
             output,
         )
         .context("Failed to close runtime")?;
@@ -311,6 +319,9 @@ fn cmd_session_lifecycle_action_with_payload_and_output(
         .sessions
         .get(&key)
         .ok_or_else(|| anyhow!("cutex session disappeared while preparing lifecycle request"))?;
+    if action_type == "session.online" {
+        cutex::agent_management::require_default_launch(record)?;
+    }
     let method = match action_type {
         "session.online" => "cutex/runtime/online",
         "session.offline" => "cutex/runtime/offline",
@@ -322,6 +333,14 @@ fn cmd_session_lifecycle_action_with_payload_and_output(
         "expectedRuntimeGeneration": record.runtime_generation,
         "reason": "cutex_cli",
     });
+    if payload
+        .get("requireDefaultLaunch")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        cutex::agent_management::require_default_launch(record)?;
+        params["requireDefaultLaunch"] = serde_json::json!(true);
+    }
     if method == "cutex/runtime/online" {
         let open_visible_terminal = payload
             .get("openVisibleTerminal")

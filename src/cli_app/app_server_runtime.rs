@@ -82,7 +82,11 @@ fn handle_runtime_native_event(
                 sha256: context.schema.sha256.clone(),
                 channel: AppServerSchemaChannel::Experimental,
                 capabilities: serde_json::json!({ "experimentalApi": true }),
-                extensions: vec!["cutex-inter-agent-v2".to_string()],
+                extensions: if context.schema.sha256 == cutex::launch::stock::STOCK_SCHEMA_SHA256 {
+                    Vec::new()
+                } else {
+                    vec!["cutex-inter-agent-v2".to_string()]
+                },
             },
         },
         event,
@@ -171,6 +175,7 @@ pub(crate) fn connect_runtime_with_model_provider(
     runtime_agent_id: &str,
     model_provider: Option<&str>,
 ) -> anyhow::Result<AppServerRuntimeConnectResult> {
+    cutex::agent_management::require_default_launch(record)?;
     if record.is_retired() {
         anyhow::bail!(
             "cannot connect a runtime for retired cutex session {}",
@@ -215,6 +220,7 @@ pub(crate) fn connect_new_thread_runtime(
     binding: &CutexAppServerRuntimeBinding,
     developer_instructions: Option<String>,
 ) -> anyhow::Result<AppServerRuntimeStartResult> {
+    cutex::agent_management::require_default_launch(record)?;
     if record.is_retired() {
         anyhow::bail!(
             "cannot connect a runtime for retired cutex session {}",
@@ -302,6 +308,7 @@ pub(crate) fn recover_persisted_runtime_for_lifecycle(
     config: &CodezConfig,
     expected: &CutexSessionRecord,
 ) -> anyhow::Result<ManagedRuntimeRecoveryOutcome> {
+    cutex::agent_management::require_default_launch(expected)?;
     match classify_local_persisted_runtime_recovery(expected, process_is_running) {
         PersistedRuntimeRecoveryAction::Launch => Ok(ManagedRuntimeRecoveryOutcome::NoClaim),
         PersistedRuntimeRecoveryAction::ClearStaleAndLaunch => {
@@ -388,7 +395,7 @@ fn verify_recovered_runtime_state(
     Ok(())
 }
 
-fn verify_exact_live_runtime_claim(
+pub(super) fn verify_exact_live_runtime_claim(
     record: &CutexSessionRecord,
     binding: &CutexAppServerRuntimeBinding,
 ) -> anyhow::Result<()> {
@@ -739,6 +746,7 @@ fn runtime_ownership_snapshot_matches(
     expected: &CutexSessionRecord,
 ) -> bool {
     current.host_id == expected.host_id
+        && current.explicit_launch == expected.explicit_launch
         && current.runtime_backend == expected.runtime_backend
         && current.profile == expected.profile
         && current.pending_launch_id == expected.pending_launch_id
@@ -801,6 +809,13 @@ pub(crate) fn adopt_persisted_runtimes(
         let Some(record) = store.sessions.get(&key).cloned() else {
             continue;
         };
+        if record.explicit_launch.is_some() {
+            summary.failures.push(format!(
+                "{}: explicit stock recovery required; owner unchanged",
+                record.cutex_session_id
+            ));
+            continue;
+        }
         match classify_persisted_runtime_adoption(&record, current_host, process_is_running) {
             PersistedRuntimeAdoptionAction::Retired | PersistedRuntimeAdoptionAction::Remote => {
                 summary.skipped = summary.skipped.saturating_add(1);
@@ -859,7 +874,7 @@ pub(crate) fn adopt_persisted_runtimes(
     Ok(summary)
 }
 
-fn runtime_agent_registration(
+pub(super) fn runtime_agent_registration(
     record: &CutexSessionRecord,
     binding: &CutexAppServerRuntimeBinding,
     runtime_agent_id: &str,
@@ -913,6 +928,33 @@ mod tests {
     use cutex::app_server::journal::AppServerSchemaIdentity;
     use cutex::app_server::protocol::RpcNotification;
     use cutex::session::model::CutexAppServerTransport;
+
+    #[test]
+    fn stock_generic_recovery_refuses_before_process_or_config_discovery() {
+        let mut record = CutexSessionRecord::new_at(
+            "cutex-1".into(),
+            None,
+            "foreign-host".into(),
+            "/missing".into(),
+            None,
+            "2026-08-07T00:00:00Z".into(),
+        )
+        .unwrap();
+        record.explicit_launch = Some(
+            serde_json::from_value(serde_json::json!({
+                "version":999,"native_id":"invalid","native_home":"/missing",
+                "bundle_manifest":"/missing","bundle_sha256":"a".repeat(64)
+            }))
+            .unwrap(),
+        );
+        let error = recover_persisted_runtime_for_lifecycle(&CodezConfig::default(), &record)
+            .err()
+            .expect("generic recovery must refuse even an unknown future marker");
+        assert!(error.to_string().contains("explicit_stock_launch_required"));
+        let mut changed = record.clone();
+        changed.explicit_launch = None;
+        assert!(!runtime_ownership_snapshot_matches(&changed, &record));
+    }
 
     fn event_context() -> AppServerRuntimeEventContext {
         AppServerRuntimeEventContext {
@@ -1078,8 +1120,8 @@ mod tests {
     #[test]
     fn unix_socket_claim_requires_the_claimed_process_to_own_the_live_inode() {
         let root = std::env::temp_dir().join(format!(
-            "cutex-runtime-ownership-{}",
-            uuid::Uuid::new_v4().simple()
+            "own-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
         ));
         fs::create_dir(&root).expect("runtime ownership fixture directory");
         let socket = root.join("app.sock");
@@ -1105,8 +1147,8 @@ mod tests {
     #[test]
     fn unix_socket_claim_tolerates_connected_rows_for_the_listener_path() {
         let root = std::env::temp_dir().join(format!(
-            "cutex-runtime-listener-ownership-{}",
-            uuid::Uuid::new_v4().simple()
+            "listen-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
         ));
         fs::create_dir(&root).expect("runtime listener fixture directory");
         let socket = root.join("app.sock");

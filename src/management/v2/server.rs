@@ -2609,7 +2609,7 @@ fn dispatch_runtime_mutation(
         .as_object()
         .ok_or_else(|| invalid_user_input_error("params must be an object"))?;
     let online = request.method == "cutex/runtime/online";
-    let max_fields = if online { 4 } else { 3 };
+    let max_fields = 4;
     if object.len() > max_fields
         || !object.contains_key("expectedRuntimeGeneration")
         || object.keys().any(|key| {
@@ -2617,12 +2617,20 @@ fn dispatch_runtime_mutation(
                 && !if online {
                     matches!(key.as_str(), "openVisibleTerminal" | "launchProfile")
                 } else {
-                    key == "force"
+                    matches!(key.as_str(), "force" | "requireDefaultLaunch")
                 }
         })
     {
         return Err(invalid_user_input_error(
             "runtime params contain a field outside the method's v2 schema",
+        ));
+    }
+    if object
+        .get("requireDefaultLaunch")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(invalid_user_input_error(
+            "requireDefaultLaunch must be boolean",
         ));
     }
     let expected_generation = required_safe_integer_param(object, "expectedRuntimeGeneration")?;

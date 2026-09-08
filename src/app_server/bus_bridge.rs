@@ -4493,6 +4493,60 @@ mod tests {
     }
 
     #[test]
+    fn stock_registration_only_refreshes_without_poll_submit_or_ack() {
+        struct RegistrationOnlyBus {
+            registered: mpsc::Sender<()>,
+            polls: AtomicUsize,
+            acks: AtomicUsize,
+        }
+        impl RuntimeAgentBus for RegistrationOnlyBus {
+            fn register(&self, _: &AgentBusRegisterRequest) -> anyhow::Result<()> {
+                self.registered.send(())?;
+                Ok(())
+            }
+            fn unregister(&self, _: &str) -> anyhow::Result<bool> {
+                Ok(true)
+            }
+            fn poll(&self, _: &str) -> anyhow::Result<Vec<AgentBusMessage>> {
+                self.polls.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("stock must not poll")
+            }
+            fn ack(&self, _: &str, _: &[String]) -> anyhow::Result<usize> {
+                self.acks.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("stock must not ack")
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        let bus = Arc::new(RegistrationOnlyBus {
+            registered: tx,
+            polls: AtomicUsize::new(0),
+            acks: AtomicUsize::new(0),
+        });
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let submitter = Arc::new(FakeSubmitter {
+            events: events.clone(),
+            result: Mutex::new(None),
+        });
+        let mut options = test_options();
+        options.registration_only = true;
+        options.registration_refresh_interval = Duration::from_millis(1);
+        options.poll_interval = Duration::from_millis(1);
+        let bridge = AppServerAgentBusBridge::spawn_with_liveness(
+            bus.clone(),
+            submitter,
+            options,
+            Arc::new(AtomicBool::new(true)),
+        )
+        .unwrap();
+        rx.recv_timeout(Duration::from_secs(2)).unwrap(); // initial public register
+        rx.recv_timeout(Duration::from_secs(2)).unwrap(); // worker refresh reached
+        bridge.shutdown().unwrap();
+        assert_eq!(bus.polls.load(Ordering::SeqCst), 0);
+        assert_eq!(bus.acks.load(Ordering::SeqCst), 0);
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn bridge_options_require_native_thread_identity_and_app_server_pid() {
         let mut options = test_options();
         assert!(options.validate().is_ok());

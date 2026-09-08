@@ -12,6 +12,7 @@ mod explicit_launch;
 mod model;
 mod projects;
 mod provider;
+mod stock_runtime;
 mod store;
 
 pub use archive::*;
@@ -21,6 +22,7 @@ pub use explicit_launch::*;
 pub use model::*;
 pub use projects::*;
 pub use provider::*;
+pub use stock_runtime::*;
 pub use store::*;
 
 pub const AGENT_MANAGEMENT_CONTRACT: &str = "cutex/agent-management/v1";

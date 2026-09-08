@@ -257,6 +257,15 @@ pub struct AppServerRuntimeManager {
 }
 
 impl AppServerRuntimeManager {
+    pub fn supports_cutex_ingress(&self, cutex_session_id: &str) -> anyhow::Result<bool> {
+        let runtimes = self
+            .runtimes
+            .lock()
+            .map_err(|_| anyhow::anyhow!("runtime lock unavailable"))?;
+        Ok(runtimes
+            .get(cutex_session_id)
+            .is_some_and(|runtime| runtime.supports_cutex_ingress))
+    }
     pub fn new(event_sink: Arc<dyn AppServerRuntimeEventSink>) -> Self {
         Self {
             runtimes: Arc::new(Mutex::new(HashMap::new())),
@@ -799,6 +808,7 @@ impl AppServerRuntimeManager {
             schema: schema.clone(),
         };
         let mut journal_options = DiagnosticJournalOptions::new(diagnostic_journal_path.into());
+        let supports_cutex_ingress = schema.sha256 != crate::launch::stock::STOCK_SCHEMA_SHA256;
         journal_options.schema = schema;
         let journal = DiagnosticJournal::new(journal_options)?;
         let (stop_tx, stop_rx) = mpsc::sync_channel(1);
@@ -818,6 +828,7 @@ impl AppServerRuntimeManager {
             )
         });
         let runtime = ManagedRuntime {
+            supports_cutex_ingress,
             endpoint,
             handle,
             status,
@@ -847,6 +858,7 @@ impl AppServerRuntimeManager {
 }
 
 struct ManagedRuntime {
+    supports_cutex_ingress: bool,
     endpoint: AppServerEndpoint,
     handle: AppServerHandle,
     status: Arc<Mutex<AppServerManagedRuntimeStatus>>,
@@ -1155,6 +1167,7 @@ mod tests {
             .insert(
                 "saturated-close".to_string(),
                 ManagedRuntime {
+                    supports_cutex_ingress: true,
                     endpoint: AppServerEndpoint::LoopbackWebSocket {
                         url: "ws://127.0.0.1:1".to_string(),
                         bearer_token: None,

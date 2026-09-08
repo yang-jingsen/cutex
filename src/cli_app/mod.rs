@@ -64,6 +64,7 @@ mod session_tui_workspace_loading;
 mod session_tui_workspace_render;
 mod session_wizard;
 mod settings;
+mod stock_lifecycle;
 #[cfg(test)]
 mod test_home;
 mod usage;

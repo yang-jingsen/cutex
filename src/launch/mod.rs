@@ -11,3 +11,4 @@ pub mod env;
 pub mod profile;
 pub mod program;
 pub mod runtime;
+pub mod stock;

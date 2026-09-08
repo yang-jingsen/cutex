@@ -188,7 +188,7 @@ pub fn parse_cutex_session_quick_action_mode(
 pub struct CutexSessionStore {
     #[serde(default)]
     pub explicit_launch_receipts:
-        std::collections::BTreeMap<String, crate::agent_management::ExplicitLaunchReceipt>,
+        std::collections::BTreeMap<String, crate::agent_management::ExplicitLaunchActionReceipt>,
     #[serde(default)]
     pub human_adoption_receipts:
         std::collections::BTreeMap<String, crate::agent_management::HumanAdoptReceipt>,

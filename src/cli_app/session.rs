@@ -9,6 +9,11 @@ use cutex::session::projection::CutexSessionListFilter;
 
 pub(crate) fn run_command(command: SessionCommand) -> anyhow::Result<()> {
     match command {
+        SessionCommand::Stock {
+            request,
+            management_url,
+        } => super::stock_lifecycle::request(&request, &management_url),
+        SessionCommand::StockAttach { id } => super::stock_lifecycle::attach(&id),
         SessionCommand::Wizard { list } => cmd_session_wizard(&list),
         SessionCommand::List { list } => cmd_session_list(&list),
         SessionCommand::Show { id } => cmd_session_show(&id),

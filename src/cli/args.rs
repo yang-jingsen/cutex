@@ -493,6 +493,16 @@ pub enum UsageResetWindowArg {
 
 #[derive(Subcommand, Debug)]
 pub enum SessionCommand {
+    /// Private Linux stock-U opt-in: submit an explicit root-Human review/action JSON file
+    Stock {
+        #[arg(long)]
+        request: std::path::PathBuf,
+        /// Existing local Management endpoint; never starts a service
+        #[arg(long)]
+        management_url: String,
+    },
+    /// Attach stock native CLI to the exact already-ready owner (no new writer)
+    StockAttach { id: String },
     /// Open the interactive session management wizard
     #[command(visible_alias = "edit")]
     Wizard {

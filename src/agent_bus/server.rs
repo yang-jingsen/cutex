@@ -3896,6 +3896,7 @@ fn validate_mcp_caller_fence(
         || record.current_runtime_agent_id.as_deref() != Some(sender.runtime_agent_id.as_str())
         || !record.agent_enabled
         || record.is_retired()
+        || (record.explicit_launch.is_some() && record.app_server_launch_claim_id.is_some())
         || record.registration_class != crate::agent_bus::model::AgentRegistrationClass::Persistent
         || roster.registration_class != crate::agent_bus::model::AgentRegistrationClass::Persistent
     {
