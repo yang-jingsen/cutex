@@ -2261,7 +2261,8 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn ui_contract_production_durable_import_http_tui_create_add_cancel_auth_and_rename() {
+    fn ui_contract_production_durable_import_http_tui_create_add_cancel_auth_and_rename_and_d1_archive_gap(
+    ) {
         use cutex::session::{
             model::{CutexSessionRecord, CutexSessionStore},
             store::{load_cutex_session_store, save_cutex_session_store},
@@ -2575,6 +2576,120 @@ mod tests {
             .iter()
             .any(|c| c.formal_name.as_deref() == Some("Renamed Worker")
                 && c.current_project_id.is_some()));
+
+        // D1 characterization only: current public archive adapter does not
+        // transition the Agent Management roster. This is NOT desired policy.
+        _isolated_bus.set_nonblocking(true).unwrap();
+        let bus_stop = Arc::new(AtomicBool::new(false));
+        let stopping = bus_stop.clone();
+        let bus = thread::spawn(move || {
+            use std::io::Write;
+            while !stopping.load(Ordering::SeqCst) {
+                match _isolated_bus.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = cutex::http::server::read_simple_http_request(&mut stream).unwrap();
+                        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]").unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2))
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+        });
+        let _bus = ServerGuard(bus_stop, Some(bus));
+        let provider = cutex::agent_management::AgentManagementProvider::open_default().unwrap();
+        let roster_before = serde_json::to_value(provider.store().snapshot().unwrap()).unwrap();
+        let mut durable_only = load_cutex_session_store().unwrap();
+        let mut ordinary = durable_only.sessions["cutex.worker"].clone();
+        ordinary.cutex_session_id = "cutex.durable-only".into();
+        ordinary.codex_session_id = Some("native-durable-only".into());
+        ordinary.formal_agent_name = Some("Durable Only".into());
+        durable_only
+            .sessions
+            .insert(ordinary.cutex_session_id.clone(), ordinary);
+        save_cutex_session_store(&durable_only).unwrap();
+        for id in ["cutex.durable-only", "cutex.worker", "cutex.director"] {
+            let before = load_cutex_session_store().unwrap().sessions[id].clone();
+            crate::cli_app::session::retire_session(id).unwrap();
+            let archived = load_cutex_session_store().unwrap().sessions[id].clone();
+            assert!(archived.is_retired());
+            let mut recent = crate::cli_app::session_tui_recent::RecentSessionsWorkspace::default();
+            recent.receive(
+                crate::cli_app::session_tui_recent::CatalogReply::Page {
+                    cursor: None,
+                    result: Ok(cutex::catalog::ThreadPage {
+                        data: vec![cutex::catalog::CatalogThread {
+                            id: archived.codex_session_id.clone().unwrap(),
+                            session_id: "not-identity".into(),
+                            project_id: Some("native-workspace".into()),
+                            parent_thread_id: None,
+                            preview: "not-formal-name".into(),
+                            model_provider: "fixture".into(),
+                            created_at: Some(1),
+                            updated_at: Some(1),
+                            recency_at: Some(1),
+                            cwd: Some(_home.root().into()),
+                            name: None,
+                            status: serde_json::json!({}),
+                            source: serde_json::json!("cli"),
+                            additional_fields: Default::default(),
+                        }],
+                        next_cursor: None,
+                        backwards_cursor: None,
+                    }),
+                },
+                &load_cutex_session_store().unwrap(),
+            );
+            assert!(recent.visible_rows().is_empty());
+            assert!(!recent.rows()[0].state.can_adopt());
+            assert!(crate::cli_app::session_archive::retired_sessions()
+                .unwrap()
+                .iter()
+                .any(|r| r.cutex_session_id == id));
+            assert_eq!(
+                serde_json::to_value(provider.store().snapshot().unwrap()).unwrap(),
+                roster_before,
+                "archive adapter does not write roster, authority or immutable receipts"
+            );
+            let project = client
+                .project(&cutex::agent_management::ProjectId::new("alpha").unwrap())
+                .unwrap();
+            if id == "cutex.worker" {
+                assert!(
+                    project
+                        .active_agents
+                        .iter()
+                        .any(|m| m.agent.cutex_session_id.as_str() == id),
+                    "F12 reproduced: durably retired worker remains an active Project member"
+                );
+            } else if id == "cutex.director" {
+                assert_eq!(
+                    project.director.cutex_session_id.as_str(),
+                    id,
+                    "durable Retire did not enforce Director protection or rotate its seat"
+                );
+            } else {
+                assert!(!project
+                    .active_agents
+                    .iter()
+                    .any(|m| m.agent.cutex_session_id.as_str() == id));
+            }
+            crate::cli_app::session::restore_session(id).unwrap();
+            let restored = load_cutex_session_store().unwrap().sessions[id].clone();
+            assert!(restored.is_active());
+            assert_eq!(restored.cutex_session_id, before.cutex_session_id);
+            assert_eq!(restored.codex_session_id, before.codex_session_id);
+            assert_eq!(restored.formal_agent_name, before.formal_agent_name);
+            assert_eq!(restored.profile, before.profile);
+            assert!(!cutex::session::archive::record_has_runtime_claim(
+                &restored
+            ));
+            assert_eq!(
+                serde_json::to_value(provider.store().snapshot().unwrap()).unwrap(),
+                roster_before
+            );
+        }
     }
     use ratatui::backend::TestBackend;
 
