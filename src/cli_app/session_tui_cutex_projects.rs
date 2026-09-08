@@ -138,6 +138,7 @@ pub(super) struct CutexProjectsModel {
     query: Input,
     filter_focused: bool,
     show_archived: bool,
+    show_archived_members: bool,
     details: Option<CutexProjectWorkspace>,
     section: ProjectSection,
     operator_selected: usize,
@@ -176,6 +177,7 @@ impl CutexProjectsModel {
             query: Input::default(),
             filter_focused: false,
             show_archived: false,
+            show_archived_members: false,
             details: None,
             section: ProjectSection::Members,
             operator_selected: 0,
@@ -451,6 +453,7 @@ fn load_model() -> anyhow::Result<CutexProjectsModel> {
         query: Input::default(),
         filter_focused: false,
         show_archived: false,
+        show_archived_members: false,
         details: None,
         section: ProjectSection::Members,
         operator_selected: 0,
@@ -499,7 +502,7 @@ fn reload(model: &mut CutexProjectsModel, open_details: bool) -> anyhow::Result<
 }
 
 fn selected_member(model: &CutexProjectsModel) -> Option<AgentSessionView> {
-    let rows = views::project_members(model.details.as_ref()?);
+    let rows = visible_members(model);
     model
         .member_selected
         .as_ref()
@@ -507,12 +510,24 @@ fn selected_member(model: &CutexProjectsModel) -> Option<AgentSessionView> {
         .or_else(|| rows.get(model.member_index))
         .cloned()
 }
+fn visible_members(model: &CutexProjectsModel) -> Vec<AgentSessionView> {
+    let Some(project) = &model.details else {
+        return Vec::new();
+    };
+    let mut rows = views::project_members(project);
+    if model.show_archived_members {
+        for member in &project.archived_agents {
+            let mut view =
+                views::member_view(member, project.project_id.as_str(), "Member (archived)");
+            view.retirement_note =
+                Some("Reversibly archived; membership retained; no runtime activation".into());
+            rows.push(view);
+        }
+    }
+    rows
+}
 fn reconcile_member_selection(model: &mut CutexProjectsModel) {
-    let rows = model
-        .details
-        .as_ref()
-        .map(views::project_members)
-        .unwrap_or_default();
+    let rows = visible_members(model);
     model.member_index = model
         .member_selected
         .as_ref()
@@ -969,6 +984,18 @@ fn project_command(
             if model.view == ProjectView::List {
                 model.show_archived = !model.show_archived;
                 model.retain_selection();
+            } else if model.view == ProjectView::Details && model.section == ProjectSection::Members
+            {
+                model.show_archived_members = !model.show_archived_members;
+                reconcile_member_selection(model);
+                model.notice = Some(
+                    if model.show_archived_members {
+                        "Members include archived; membership is retained"
+                    } else {
+                        "Archived members hidden (Ctrl+H to include)"
+                    }
+                    .into(),
+                );
             }
             None
         }
@@ -1311,23 +1338,16 @@ fn handle_project_widget_key(
             KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End
                 if model.section == ProjectSection::Members =>
             {
-                let len = model
-                    .details
-                    .as_ref()
-                    .map(views::project_members)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                let len = visible_members(model).len();
                 model.member_index = match key.code {
                     KeyCode::Up => model.member_index.saturating_sub(1),
                     KeyCode::Down => (model.member_index + 1).min(len.saturating_sub(1)),
                     KeyCode::Home => 0,
                     _ => len.saturating_sub(1),
                 };
-                model.member_selected = model
-                    .details
-                    .as_ref()
-                    .map(views::project_members)
-                    .and_then(|m| m.get(model.member_index).map(|v| v.subject.clone()));
+                model.member_selected = visible_members(model)
+                    .get(model.member_index)
+                    .map(|v| v.subject.clone());
             }
             KeyCode::Enter => match model.section {
                 ProjectSection::Operators => model.begin_operator_confirmation(),
@@ -1841,7 +1861,7 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel)
     match model.section {
         ProjectSection::Overview => render_overview(frame, chunks[1], project),
         ProjectSection::Members => {
-            let members = views::project_members(project);
+            let members = visible_members(model);
             if model.member_inspecting {
                 if let Some(member) = selected_member(model) {
                     views::render_inspector(frame, chunks[1], &member);
@@ -1873,8 +1893,9 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, project: &CutexProjectWork
             )),
             Line::from(format!("Access boundary: {role}")),
             Line::from(format!(
-                "Members: {} active, {} retired, {} operators",
-                project.active_agents.len(),
+                "Members: {} ordinary, {} archived, {} permanently retired, {} operators (Ctrl+H includes archived)",
+                views::project_members(project).len(),
+                project.archived_agents.len(),
                 project.retired_agents.len(),
                 project.agent_operators.len()
             )),
@@ -2353,6 +2374,13 @@ mod tests {
         for wrong in ["ordinary", "seat", "bus", ""] {
             let denied = ManagementControlClient::test_endpoint(base.clone(), wrong.into());
             assert!(denied.durable_candidates().is_err());
+            assert!(denied
+                .review_agent_archive(&cutex::agent_management::AgentArchiveReviewRequest {
+                    cutex_session_id: cutex::role_revision::CutexSessionId::new("cutex.worker")
+                        .unwrap(),
+                    operation: cutex::agent_management::AgentArchiveOperation::Archive,
+                })
+                .is_err());
         }
         let mut model = CutexProjectsModel::empty_with_failure("test");
         model.failure = None;
@@ -2577,8 +2605,8 @@ mod tests {
             .any(|c| c.formal_name.as_deref() == Some("Renamed Worker")
                 && c.current_project_id.is_some()));
 
-        // D1 characterization only: current public archive adapter does not
-        // transition the Agent Management roster. This is NOT desired policy.
+        // D1R2: approved reversible archive retains roster membership while
+        // the authoritative durable projection hides ordinary member rows.
         _isolated_bus.set_nonblocking(true).unwrap();
         let bus_stop = Arc::new(AtomicBool::new(false));
         let stopping = bus_stop.clone();
@@ -2609,9 +2637,88 @@ mod tests {
             .sessions
             .insert(ordinary.cutex_session_id.clone(), ordinary);
         save_cutex_session_store(&durable_only).unwrap();
-        for id in ["cutex.durable-only", "cutex.worker", "cutex.director"] {
+        // Real process boundary: unsupported online backend is rejected by the
+        // authenticated production adapter before either stop or persistence.
+        let mut owned = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let mut uncontained = load_cutex_session_store().unwrap();
+        let original = uncontained.sessions["cutex.durable-only"].clone();
+        let record = uncontained.sessions.get_mut("cutex.durable-only").unwrap();
+        record.runtime_backend = cutex::session::model::CutexSessionRuntimeBackend::HostForeground;
+        record.runtime_generation = 1;
+        record.runtime_pid = Some(owned.id());
+        save_cutex_session_store(&uncontained).unwrap();
+        let unsupported = cutex::agent_management::AgentArchiveRequest {
+            reason: None,
+            action_id: cutex::agent_management::AgentActionId::new("unsupported-real-process")
+                .unwrap(),
+            review: client
+                .review_agent_archive(&cutex::agent_management::AgentArchiveReviewRequest {
+                    cutex_session_id: cutex::role_revision::CutexSessionId::new(
+                        "cutex.durable-only",
+                    )
+                    .unwrap(),
+                    operation: cutex::agent_management::AgentArchiveOperation::Archive,
+                })
+                .unwrap(),
+        };
+        let before_rejection =
+            load_cutex_session_store().unwrap().sessions["cutex.durable-only"].clone();
+        assert!(client.execute_agent_archive(&unsupported).is_err());
+        assert!(owned.try_wait().unwrap().is_none());
+        assert_eq!(
+            load_cutex_session_store().unwrap().sessions["cutex.durable-only"],
+            before_rejection
+        );
+        owned.kill().unwrap();
+        owned.wait().unwrap();
+        let mut uncontained = load_cutex_session_store().unwrap();
+        uncontained
+            .sessions
+            .insert("cutex.durable-only".into(), original);
+        save_cutex_session_store(&uncontained).unwrap();
+        assert!(
+            client
+                .review_agent_archive(&cutex::agent_management::AgentArchiveReviewRequest {
+                    cutex_session_id: cutex::role_revision::CutexSessionId::new("cutex.director")
+                        .unwrap(),
+                    operation: cutex::agent_management::AgentArchiveOperation::Archive,
+                })
+                .is_err(),
+            "Director requires explicit rotation"
+        );
+        for id in ["cutex.durable-only", "cutex.worker"] {
             let before = load_cutex_session_store().unwrap().sessions[id].clone();
-            crate::cli_app::session::retire_session(id).unwrap();
+            let request = cutex::agent_management::AgentArchiveRequest {
+                reason: None,
+                action_id: cutex::agent_management::AgentActionId::new(format!("archive-{id}"))
+                    .unwrap(),
+                review: client
+                    .review_agent_archive(&cutex::agent_management::AgentArchiveReviewRequest {
+                        cutex_session_id: cutex::role_revision::CutexSessionId::new(id).unwrap(),
+                        operation: cutex::agent_management::AgentArchiveOperation::Archive,
+                    })
+                    .unwrap(),
+            };
+            let receipt = client.execute_agent_archive(&request).unwrap();
+            let cli_receipt =
+                crate::cli_app::session_archive::execute_confirmed_archive_with_client(
+                    &client, &request,
+                )
+                .unwrap();
+            assert_eq!(cli_receipt.cutex_session_id, id);
+            assert_eq!(cli_receipt.lifecycle, "archived");
+            assert_eq!(cli_receipt.retry_request.as_ref(), Some(&request));
+            assert!(
+                wrong.execute_agent_archive(&request).is_err(),
+                "ordinary token cannot replay root Archive"
+            );
+            assert_eq!(
+                receipt.stage,
+                cutex::agent_management::AgentArchiveStage::Committed
+            );
             let archived = load_cutex_session_store().unwrap().sessions[id].clone();
             assert!(archived.is_retired());
             let mut recent = crate::cli_app::session_tui_recent::RecentSessionsWorkspace::default();
@@ -2647,35 +2754,99 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|r| r.cutex_session_id == id));
-            assert_eq!(
-                serde_json::to_value(provider.store().snapshot().unwrap()).unwrap(),
-                roster_before,
-                "archive adapter does not write roster, authority or immutable receipts"
-            );
+            let current = serde_json::to_value(provider.store().snapshot().unwrap()).unwrap();
+            for key in [
+                "agents",
+                "projects",
+                "current_project_memberships",
+                "durable_import_actions",
+                "durable_import_audit",
+            ] {
+                assert_eq!(current[key], roster_before[key], "Archive preserves {key}");
+            }
             let project = client
                 .project(&cutex::agent_management::ProjectId::new("alpha").unwrap())
                 .unwrap();
             if id == "cutex.worker" {
                 assert!(
-                    project
+                    !project
                         .active_agents
                         .iter()
                         .any(|m| m.agent.cutex_session_id.as_str() == id),
-                    "F12 reproduced: durably retired worker remains an active Project member"
+                    "archived worker is hidden in default Project members"
                 );
-            } else if id == "cutex.director" {
-                assert_eq!(
-                    project.director.cutex_session_id.as_str(),
-                    id,
-                    "durable Retire did not enforce Director protection or rotate its seat"
-                );
+                assert!(project
+                    .archived_agents
+                    .iter()
+                    .any(|m| m.agent.cutex_session_id.as_str() == id));
+                model.details = Some(project.clone());
+                model.show_archived_members = false;
+                assert!(!visible_members(&model)
+                    .iter()
+                    .any(|m| m.subject == SubjectRef::Managed(id.into())));
+                model.show_archived_members = true;
+                assert!(visible_members(&model)
+                    .iter()
+                    .any(|m| m.subject == SubjectRef::Managed(id.into())));
             } else {
                 assert!(!project
                     .active_agents
                     .iter()
                     .any(|m| m.agent.cutex_session_id.as_str() == id));
             }
-            crate::cli_app::session::restore_session(id).unwrap();
+            if id == "cutex.worker" {
+                let archived_project = client
+                    .project_mutation(&HumanManagementProjectMutationRequest {
+                        schema: HumanManagementProjectMutationSchema::V1,
+                        action_id: cutex::agent_management::AgentActionId::new(
+                            "archive-project-d1r2",
+                        )
+                        .unwrap(),
+                        project_id: project.project_id.clone(),
+                        expected_authority_epoch: project.authority_epoch,
+                        expected_project_revision: project.project_revision,
+                        operation: HumanManagementProjectMutationKind::Archive,
+                    })
+                    .unwrap();
+                assert!(
+                    client
+                        .review_agent_archive(&cutex::agent_management::AgentArchiveReviewRequest {
+                            cutex_session_id: cutex::role_revision::CutexSessionId::new(id)
+                                .unwrap(),
+                            operation: cutex::agent_management::AgentArchiveOperation::Restore,
+                        })
+                        .is_err(),
+                    "restore must not silently detach from archived Project"
+                );
+                client
+                    .project_mutation(&HumanManagementProjectMutationRequest {
+                        schema: HumanManagementProjectMutationSchema::V1,
+                        action_id: cutex::agent_management::AgentActionId::new(
+                            "restore-project-d1r2",
+                        )
+                        .unwrap(),
+                        project_id: project.project_id.clone(),
+                        expected_authority_epoch: project.authority_epoch,
+                        expected_project_revision: archived_project.project_revision,
+                        operation: HumanManagementProjectMutationKind::Restore,
+                    })
+                    .unwrap();
+            }
+            let restore = cutex::agent_management::AgentArchiveRequest {
+                reason: None,
+                action_id: cutex::agent_management::AgentActionId::new(format!("restore-{id}"))
+                    .unwrap(),
+                review: client
+                    .review_agent_archive(&cutex::agent_management::AgentArchiveReviewRequest {
+                        cutex_session_id: cutex::role_revision::CutexSessionId::new(id).unwrap(),
+                        operation: cutex::agent_management::AgentArchiveOperation::Restore,
+                    })
+                    .unwrap(),
+            };
+            assert_eq!(
+                client.execute_agent_archive(&restore).unwrap().stage,
+                cutex::agent_management::AgentArchiveStage::Committed
+            );
             let restored = load_cutex_session_store().unwrap().sessions[id].clone();
             assert!(restored.is_active());
             assert_eq!(restored.cutex_session_id, before.cutex_session_id);
@@ -2686,8 +2857,9 @@ mod tests {
                 &restored
             ));
             assert_eq!(
-                serde_json::to_value(provider.store().snapshot().unwrap()).unwrap(),
-                roster_before
+                client.execute_agent_archive(&request).unwrap(),
+                receipt,
+                "historical replay unchanged after Restore"
             );
         }
     }

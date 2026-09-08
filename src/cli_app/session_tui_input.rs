@@ -159,7 +159,7 @@ pub(super) const BINDINGS: &[Binding] = &[
         command: Command::Archived,
         key: KeyCode::Char('h'),
         modifiers: KeyModifiers::CONTROL,
-        label: "Include archived Projects",
+        label: "Include archived Projects / members",
         hint: "Ctrl+H",
     },
     Binding {

@@ -367,6 +367,7 @@ type SelectorEvent = WorkspaceEvent;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SelectorControl {
+    ExecuteArchive(cutex::agent_management::AgentArchiveRequest),
     Continue,
     Exit,
     Selected(SessionTuiIntent),
@@ -779,6 +780,7 @@ struct SelectorModel {
     settings_navigation: Option<Help>,
     settings_return_panel: Option<PrimaryPanel>,
     confirmation_returns_to_list: bool,
+    archive_confirmation: Option<cutex::agent_management::AgentArchiveRequest>,
     show_thread_titles: bool,
     enhanced_keyboard: bool,
     refreshing: bool,
@@ -824,6 +826,7 @@ impl SelectorModel {
             settings_navigation: None,
             settings_return_panel: None,
             confirmation_returns_to_list: false,
+            archive_confirmation: None,
             show_thread_titles: false,
             enhanced_keyboard,
             refreshing,
@@ -3277,6 +3280,26 @@ impl SelectorModel {
                 next_confirmed = false;
             }
             SelectorEvent::Activate if next_confirmed => {
+                if matches!(
+                    action,
+                    SessionTuiAction::RetireSession | SessionTuiAction::RestoreSession
+                ) {
+                    let Some(request) = self.archive_confirmation.take() else {
+                        self.warning =
+                            Some("Archive review unavailable; no action submitted".into());
+                        return SelectorControl::Continue;
+                    };
+                    if request.review.cutex_session_id.as_str() != agent_key
+                        || (request.review.operation
+                            == cutex::agent_management::AgentArchiveOperation::Restore)
+                            != (action == SessionTuiAction::RestoreSession)
+                    {
+                        self.warning =
+                            Some("Archive confirmation target changed; review again".into());
+                        return SelectorControl::Continue;
+                    }
+                    return SelectorControl::ExecuteArchive(request);
+                }
                 return SelectorControl::Selected(SessionTuiIntent {
                     key: agent_key,
                     action,
@@ -3284,6 +3307,7 @@ impl SelectorModel {
                 });
             }
             SelectorEvent::Activate | SelectorEvent::Escape => {
+                self.archive_confirmation = None;
                 if self.confirmation_returns_to_list {
                     self.confirmation_returns_to_list = false;
                     self.inspector_overview_focused = false;
@@ -3556,7 +3580,7 @@ impl SelectorModel {
             SessionTuiAction::RepairInterruptedHistory => {
                 format!("Interrupted history checked and repaired if needed: {agent_name}")
             }
-            SessionTuiAction::RetireSession => format!("Retired session: {agent_name}"),
+            SessionTuiAction::RetireSession => format!("Archived Agent: {agent_name}"),
             SessionTuiAction::RestoreSession => format!("Restored offline: {agent_name}"),
             _ => unreachable!("only selector actions enter the operation worker"),
         });
@@ -4621,8 +4645,12 @@ fn apply_provider_views(
                             .map(|p| p.to_string())
                             .unwrap_or_else(|| "unassigned".into()),
                     );
-                    if record.is_some_and(|r| r.is_retired() != agent.retired_at.is_some()) {
-                        view.retirement_note = Some("Retirement mismatch: durable archive and provider retirement disagree; not reconciled by this UI".into());
+                    if agent.retired_at.is_some() {
+                        view.retirement_note =
+                            Some("Permanently retired roster history; not restorable".into());
+                    } else if record.is_some_and(|r| r.is_retired()) {
+                        view.retirement_note =
+                            Some("Reversibly archived; current Project membership retained".into());
                     }
                 } else {
                     view.project = Observation::Known("unassigned (not in roster)".into());
@@ -4652,11 +4680,18 @@ fn load_reconciled_session_store_with(
 
 fn load_retired_selector_rows() -> anyhow::Result<Vec<SelectorRow>> {
     let store = load_cutex_session_store()?;
-    let contexts = AgentManagementStore::open_default()
-        .and_then(|store| store.snapshot().map_err(anyhow::Error::new))
-        .map(|snapshot| selector_project_contexts(&snapshot))
-        .unwrap_or_default();
-    Ok(retired_selector_rows_from_store(&store, &contexts))
+    let snapshot = AgentManagementStore::open_default()?.snapshot()?;
+    let contexts = selector_project_contexts(&snapshot);
+    let mut rows = retired_selector_rows_from_store(&store, &contexts);
+    rows.retain(|row| {
+        row.target.agent_key().is_some_and(|id| {
+            !snapshot
+                .agents
+                .values()
+                .any(|agent| agent.cutex_session_id.as_str() == id && agent.retired_at.is_some())
+        })
+    });
+    Ok(rows)
 }
 
 fn profile_names_with_warning() -> (Vec<String>, Option<String>) {
@@ -5043,7 +5078,7 @@ fn retired_sessions_row(retired_count: usize) -> SelectorRow {
     SelectorRow {
         view: None,
         target: SelectorTarget::RetiredSessions,
-        agent: format!("Retired sessions ({retired_count})"),
+        agent: format!("Archived Agents ({retired_count})"),
         thread_title: None,
         project: None,
         configured_profile: None,
@@ -5896,6 +5931,49 @@ fn run_event_loop(
         if receive_runtime_close(model, &mut runtime_close) {
             terminal.clear()?;
         }
+        if let SelectorMode::ConfirmRuntimeAction {
+            agent_key, action, ..
+        } = &model.mode
+        {
+            if matches!(
+                action,
+                SessionTuiAction::RetireSession | SessionTuiAction::RestoreSession
+            ) && model.archive_confirmation.is_none()
+            {
+                let review = (|| -> anyhow::Result<_> {
+                    let client =
+                        super::management_control_plane::ManagementControlClient::connect()?;
+                    let request = cutex::agent_management::AgentArchiveReviewRequest {
+                        cutex_session_id: cutex::role_revision::CutexSessionId::new(
+                            agent_key.clone(),
+                        )
+                        .map_err(|_| anyhow::anyhow!("exact durable Agent ID required"))?,
+                        operation: if *action == SessionTuiAction::RestoreSession {
+                            cutex::agent_management::AgentArchiveOperation::Restore
+                        } else {
+                            cutex::agent_management::AgentArchiveOperation::Archive
+                        },
+                    };
+                    Ok(cutex::agent_management::AgentArchiveRequest {
+                        reason: None,
+                        action_id: cutex::agent_management::AgentActionId::new(format!(
+                            "tui-archive-{}",
+                            uuid::Uuid::new_v4()
+                        ))?,
+                        review: client.review_agent_archive(&request)?,
+                    })
+                })();
+                match review {
+                    Ok(request) => model.archive_confirmation = Some(request),
+                    Err(error) => {
+                        model.warning = Some(format!("Archive review failed: {error:#}"));
+                        model.mode = SelectorMode::Agents;
+                    }
+                }
+            }
+        } else if !matches!(model.mode, SelectorMode::ClosingRuntime { .. }) {
+            model.archive_confirmation = None;
+        }
         terminal.draw(|frame| render_selector(frame, model))?;
 
         let Some(event) = events.next()? else {
@@ -5938,6 +6016,41 @@ fn run_event_loop(
                 };
                 if let Some(control) = control {
                     match control {
+                        SelectorControl::ExecuteArchive(request) => {
+                            model.archive_confirmation = Some(request.clone());
+                            let intent = SessionTuiIntent {
+                                key: request.review.cutex_session_id.as_str().to_string(),
+                                action: if request.review.operation
+                                    == cutex::agent_management::AgentArchiveOperation::Restore
+                                {
+                                    SessionTuiAction::RestoreSession
+                                } else {
+                                    SessionTuiAction::RetireSession
+                                },
+                                launch_profile: None,
+                            };
+                            model.runtime_close_started(&intent);
+                            let (send, receive) = std::sync::mpsc::channel();
+                            std::thread::spawn(move || {
+                                let result =
+                                    super::session_archive::execute_confirmed_archive(&request)
+                                        .map_err(|error| {
+                                            RuntimeCloseWorkerResult::Failed(format!("{error:#}"))
+                                        })
+                                        .and_then(|_| {
+                                            load_live_snapshot()
+                                                .map(RuntimeCloseWorkerResult::Closed)
+                                                .map_err(|error| {
+                                                    RuntimeCloseWorkerResult::ClosedRefreshFailed(
+                                                        format!("{error:#}"),
+                                                    )
+                                                })
+                                        })
+                                        .unwrap_or_else(|error| error);
+                                let _ = send.send(result);
+                            });
+                            runtime_close = Some(receive);
+                        }
                         SelectorControl::Continue => {}
                         SelectorControl::Exit => return Ok(SessionTuiCycleOutcome::Exit),
                         SelectorControl::Selected(intent) if intent_runs_in_selector(&intent) => {
@@ -5955,7 +6068,7 @@ fn run_event_loop(
                                 Ok(rows) => model.open_retired_sessions(rows),
                                 Err(error) => {
                                     model.warning =
-                                        Some(format!("retired sessions unavailable: {error:#}"))
+                                        Some(format!("archived Agents unavailable: {error:#}"))
                                 }
                             }
                         }
@@ -6404,11 +6517,32 @@ fn receive_runtime_close(
     };
     *runtime_close = None;
     match result {
-        RuntimeCloseWorkerResult::Closed(snapshot) => model.runtime_close_succeeded(snapshot),
+        RuntimeCloseWorkerResult::Closed(snapshot) => {
+            model.archive_confirmation = None;
+            model.runtime_close_succeeded(snapshot);
+        }
         RuntimeCloseWorkerResult::ClosedRefreshFailed(message) => {
+            model.archive_confirmation = None;
             model.runtime_close_refresh_failed(message)
         }
-        RuntimeCloseWorkerResult::Failed(message) => model.runtime_close_failed(message),
+        RuntimeCloseWorkerResult::Failed(message) => {
+            model.runtime_close_failed(message);
+            if let Some(request) = &model.archive_confirmation {
+                model.mode = SelectorMode::ConfirmRuntimeAction {
+                    agent_key: request.review.cutex_session_id.as_str().into(),
+                    action: if request.review.operation
+                        == cutex::agent_management::AgentArchiveOperation::Restore
+                    {
+                        SessionTuiAction::RestoreSession
+                    } else {
+                        SessionTuiAction::RetireSession
+                    },
+                    launch_profile: None,
+                    confirmed: false,
+                };
+                model.notice = Some("Retry reuses the exact action/evidence. Cancel abandons the review, not any completed stop or write.".into());
+            }
+        }
     }
     true
 }
@@ -6670,7 +6804,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
     let (view, count) = match &model.mode {
         SelectorMode::Agents => ("managed", model.visible_indices().len()),
         SelectorMode::RecentSessions => ("recent sessions", model.recent.visible_rows().len()),
-        SelectorMode::RetiredSessions { .. } => ("retired sessions", model.retired_rows.len()),
+        SelectorMode::RetiredSessions { .. } => ("archived Agents", model.retired_rows.len()),
         SelectorMode::Actions { .. } => (
             "actions",
             model
@@ -6801,7 +6935,7 @@ fn render_item_context(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel)
     }
     let title = match &row.target {
         SelectorTarget::RecentSessions => " Recent sessions ",
-        SelectorTarget::RetiredSessions => " Retired sessions ",
+        SelectorTarget::RetiredSessions => " Archived Agents ",
         SelectorTarget::CutexProjects => " Cutex Projects ",
         SelectorTarget::Projects => " Workspaces ",
         SelectorTarget::Tasks => " Tasks ",
@@ -6827,13 +6961,10 @@ fn render_retired_context(frame: &mut Frame<'_>, area: Rect, model: &SelectorMod
             _ => 0,
         })
         .map(|row| row.agent.as_str())
-        .unwrap_or("No retired sessions");
+        .unwrap_or("No archived Agents");
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(
-                "Retired sessions",
-                Style::new().add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("Archived Agents", Style::new().add_modifier(Modifier::BOLD)),
             Span::styled(format!("  {selected}"), Style::new().fg(Color::DarkGray)),
         ]))
         .block(Block::bordered().title(" Archive ")),
@@ -8360,25 +8491,22 @@ fn render_runtime_action_confirmation(frame: &mut Frame<'_>, area: Rect, model: 
             "The Agent must be offline. Cutex backs up the rollout, then closes only orphaned turns left without a terminal event.".to_string(),
         ),
         SessionTuiAction::RetireSession => (
-            " Confirm retire ",
-            format!("Retire managed session {}?", row.agent),
-            "  Retire session  ",
+            " Confirm Archive ",
+            format!("Archive Agent {}?", model.archive_confirmation.as_ref().map(|r| r.review.formal_name.as_str()).unwrap_or(&row.agent)),
+            "  Archive Agent  ",
             format!(
-                "Profile: {}  Managed path: {}  Runtime: {}",
-                row.configured_profile.as_deref().unwrap_or("default"),
-                row.managed_path,
-                if row.lifecycle == Some(CutexSessionLifecycleState::Offline) {
-                    "already offline"
-                } else {
-                    "will be stopped and proven offline"
-                }
+                "ID: {}  Project: {} — retain membership/history; hide ordinary lists; require proven Offline",
+                model.archive_confirmation.as_ref().map(|r| r.review.cutex_session_id.as_str()).unwrap_or("review pending"),
+                model.archive_confirmation.as_ref().and_then(|r| r.review.current_project_id.as_ref()).map(|p| p.as_str()).unwrap_or("unassigned")
             ),
         ),
         SessionTuiAction::RestoreSession => (
             " Confirm restore ",
-            format!("Restore {} as active and offline?", row.agent),
+            format!("Restore {} as active and offline?", model.archive_confirmation.as_ref().map(|r| r.review.formal_name.as_str()).unwrap_or(&row.agent)),
             "  Restore session  ",
-            "No runtime will launch, resume, attach, or select a profile.".to_string(),
+            format!("ID: {}  Project: {} — retain current membership; no runtime launch or profile selection",
+                model.archive_confirmation.as_ref().map(|r| r.review.cutex_session_id.as_str()).unwrap_or("review pending"),
+                model.archive_confirmation.as_ref().and_then(|r| r.review.current_project_id.as_ref()).map(|p| p.as_str()).unwrap_or("unassigned")),
         ),
         _ => return,
     };
@@ -9385,6 +9513,9 @@ mod tests {
             retired_at: None,
         };
         AgentManagementSnapshot {
+            agent_archive_actions: BTreeMap::new(),
+            agent_archive_audit: BTreeMap::new(),
+            reversible_archive_projection: BTreeMap::new(),
             schema: AgentManagementStoreSchema::V1,
             store_revision: 1,
             durable_import_actions: BTreeMap::new(),
@@ -9824,7 +9955,7 @@ mod tests {
     }
 
     #[test]
-    fn ui_contract_c_d04_missing_provider_and_retirement_mismatch_are_not_reconciled() {
+    fn ui_contract_c_d04_missing_provider_and_reversible_archive_are_distinct() {
         let mut agent = row(
             "cutex.one",
             "name",
@@ -9863,7 +9994,7 @@ mod tests {
             .retirement_note
             .as_ref()
             .unwrap()
-            .contains("mismatch"));
+            .contains("Reversibly archived"));
         assert_eq!(serde_json::to_value(&store).unwrap(), before);
         let mut model = SelectorModel::new(rows, false, false);
         model.mark_refresh_failed("refresh unavailable".into());
@@ -13529,9 +13660,9 @@ mod tests {
             }
         ));
         let rendered = rendered_text_at(100, 20, &model);
-        assert!(rendered.contains("Retire managed session editable-agent?"));
-        assert!(rendered.contains("Profile: alpha"));
-        assert!(rendered.contains("Managed path: /tmp/editable-managed"));
+        assert!(rendered.contains("Archive Agent editable-agent?"));
+        assert!(rendered.contains("review pending"));
+        assert!(model.archive_confirmation.is_none());
 
         model.handle(SelectorEvent::Activate);
         assert!(matches!(model.mode, SelectorMode::Actions { .. }));
@@ -13553,8 +13684,8 @@ mod tests {
         for column in ["AGENT", "PROFILE", "MANAGED PATH", "RETIRED AT", "REVISION"] {
             assert!(rendered.contains(column));
         }
-        assert!(rendered_text_at(80, 24, &model).contains("Retired sessions"));
-        assert!(rendered_text_at(52, 16, &model).contains("Retired sessions"));
+        assert!(rendered_text_at(80, 24, &model).contains("Archived Agents"));
+        assert!(rendered_text_at(52, 16, &model).contains("Archived Agents"));
         model.handle(SelectorEvent::Activate);
         assert!(matches!(
             model.mode,
@@ -14809,6 +14940,11 @@ mod tests {
     #[test]
     fn ui_contract_k07_k08_retire_confirmation_and_busy_guard() {
         let mut model = SelectorModel::new(Vec::new(), false, false);
+        let request: cutex::agent_management::AgentArchiveRequest = serde_json::from_value(serde_json::json!({
+            "action_id": "confirmed-archive", "reason": null,
+            "review": { "cutex_session_id": "cutex.exact", "formal_name": "Exact Agent", "operation": "archive", "durable_sha256": "0".repeat(64), "authority_sha256": "1".repeat(64), "current_project_id": null, "revision": 3, "runtime_generation": 2 }
+        })).unwrap();
+        model.archive_confirmation = Some(request.clone());
         model.mode = SelectorMode::ConfirmRuntimeAction {
             agent_key: "cutex.exact".into(),
             action: SessionTuiAction::RetireSession,
@@ -14843,14 +14979,21 @@ mod tests {
                 SelectorKeyRoute::Control(None)
             ));
         }
-        let SelectorKeyRoute::Control(Some(SelectorControl::Selected(intent))) = route_selector_key(
-            &mut model,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        ) else {
-            panic!("expected retire intent")
+        let SelectorKeyRoute::Control(Some(SelectorControl::ExecuteArchive(actual))) =
+            route_selector_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            )
+        else {
+            panic!("expected exact reviewed Archive request")
         };
-        assert_eq!(intent.key, "cutex.exact");
-        assert_eq!(intent.action, SessionTuiAction::RetireSession);
+        assert_eq!(actual, request);
+        assert!(model.archive_confirmation.is_none());
+        let intent = SessionTuiIntent {
+            key: "cutex.exact".into(),
+            action: SessionTuiAction::RetireSession,
+            launch_profile: None,
+        };
         // Same guard used immediately by the production effect consumer.
         model.runtime_close_started(&intent);
         contract_key(&mut model, KeyCode::Enter);

@@ -158,7 +158,12 @@ pub(super) fn project_members(project: &CutexProjectWorkspace) -> Vec<AgentSessi
             })
             .or_insert(view);
     }
-    if project.director.member.is_none() {
+    if project.director.member.is_none()
+        && !project
+            .archived_agents
+            .iter()
+            .any(|m| m.agent.cutex_session_id == project.director.cutex_session_id)
+    {
         let id = project.director.cutex_session_id.as_str().to_owned();
         members
             .entry(SubjectRef::Managed(id.clone()))

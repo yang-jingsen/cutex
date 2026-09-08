@@ -94,6 +94,20 @@ pub enum ManagementNativeForwardError {
 
 #[derive(Clone, Copy)]
 pub struct ManagementRequestContext {
+    pub review_agent_archive: fn(
+        &crate::management::control_plane::HumanManagementPrincipal,
+        &crate::agent_management::AgentArchiveReviewRequest,
+    ) -> Result<
+        crate::agent_management::AgentArchiveReview,
+        crate::agent_management::AgentManagementError,
+    >,
+    pub execute_agent_archive: fn(
+        &crate::management::control_plane::HumanManagementPrincipal,
+        &crate::agent_management::AgentArchiveRequest,
+    ) -> Result<
+        crate::agent_management::AgentArchiveReceipt,
+        crate::agent_management::AgentManagementError,
+    >,
     pub durable_agent_candidates: fn(
         &crate::management::control_plane::HumanManagementPrincipal,
     ) -> Result<

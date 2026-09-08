@@ -512,16 +512,18 @@ pub enum SessionCommand {
         id: String,
     },
 
-    /// List retired durable cutex sessions
+    /// List reversibly archived durable Agents (not permanent Management retirement)
+    #[command(alias = "archived")]
     Retired {
         /// Print machine-readable JSON
         #[arg(long)]
         json: bool,
     },
 
-    /// Retire a managed session after its runtime is safely offline
+    /// Reversibly archive an Agent with guarded whole-runtime stop proof
+    #[command(alias = "archive")]
     Retire {
-        /// cutex_session_id or Codex session id
+        /// Exact durable cutex_session_id
         id: String,
         /// Optional audit reason
         #[arg(long)]
@@ -531,9 +533,9 @@ pub enum SessionCommand {
         json: bool,
     },
 
-    /// Restore a retired session as active and offline without launching it
+    /// Restore a reversibly archived Agent Offline, retaining current membership
     Restore {
-        /// cutex_session_id or Codex session id
+        /// Exact durable cutex_session_id
         id: String,
         /// Print machine-readable JSON
         #[arg(long)]
@@ -969,6 +971,8 @@ pub enum AgentManagementCliCommand {
         #[arg(long)]
         request_file: String,
     },
+    /// Permanently retire managed Agent ownership (not reversible Archive or runtime Stop)
+    #[command(alias = "permanent-retire")]
     Close {
         #[arg(long)]
         request_file: String,

@@ -1223,6 +1223,22 @@ impl TaskServiceProvider {
         self.query_cancellable(|| false)
     }
 
+    /// Application lifecycle guard. No Task protocol/state change; serializes
+    /// the exact task observation with existing assignment mutations.
+    pub(crate) fn with_archive_read_fence<T>(
+        &self,
+        operation: impl FnOnce(&TaskServiceSnapshot) -> T,
+    ) -> Result<T, ProviderError> {
+        let _process = self
+            .process_lock
+            .lock()
+            .map_err(|_| ProviderError::PersistenceUnavailable)?;
+        self.with_store_lock(true, |lock| {
+            let state = recover_checkpoint_locked(&self.root, lock)?;
+            Ok(operation(&state))
+        })
+    }
+
     /// Captures the atomic snapshot and authenticated journal tail under a
     /// bounded lock, then releases every provider lock before parsing and
     /// validation. Old or interrupted stores fall back to a bounded full-chain

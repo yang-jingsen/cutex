@@ -24,6 +24,27 @@ pub(super) struct ManagementControlClient {
 }
 
 impl ManagementControlClient {
+    pub(super) fn review_agent_archive(
+        &self,
+        request: &cutex::agent_management::AgentArchiveReviewRequest,
+    ) -> anyhow::Result<cutex::agent_management::AgentArchiveReview> {
+        self.request(
+            "POST",
+            "/v2/agent-management/archive-review",
+            Some(&serde_json::to_vec(request)?),
+        )
+    }
+
+    pub(super) fn execute_agent_archive(
+        &self,
+        request: &cutex::agent_management::AgentArchiveRequest,
+    ) -> anyhow::Result<cutex::agent_management::AgentArchiveReceipt> {
+        self.request(
+            "POST",
+            "/v2/agent-management/archive-actions",
+            Some(&serde_json::to_vec(request)?),
+        )
+    }
     #[cfg(test)]
     pub(super) fn test_endpoint(base_url: String, root_bearer: String) -> Self {
         Self {

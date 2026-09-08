@@ -272,6 +272,23 @@ impl AgentManagementProvider {
         self
     }
 
+    pub(super) fn require_not_reversibly_archived(
+        &self,
+        id: &CutexSessionId,
+    ) -> Result<(), AgentManagementError> {
+        if self
+            .current_name_snapshot()?
+            .reversible_archive_projection
+            .get(id)
+            == Some(&true)
+        {
+            return Err(AgentManagementError::Conflict(
+                "agent_archived_restore_required",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn current_name_snapshot(
         &self,
     ) -> Result<AgentManagementSnapshot, AgentManagementError> {
@@ -290,6 +307,9 @@ impl AgentManagementProvider {
                             agent.cutex_session_id.as_str()
                         ))
                     })?;
+                snapshot
+                    .reversible_archive_projection
+                    .insert(agent.cutex_session_id.clone(), record.is_retired());
                 if let Some(name) = &record.formal_agent_name {
                     if name.trim().is_empty() || name.chars().any(char::is_control) {
                         return Err(AgentManagementError::OwnerActionRequired(format!(
@@ -1356,6 +1376,11 @@ impl AgentManagementProvider {
                         super::projects::current_project_id(&snapshot, agent).as_ref()
                             == Some(&request.project_id)
                             && agent.retired_at.is_none()
+                            && !snapshot
+                                .reversible_archive_projection
+                                .get(&agent.cutex_session_id)
+                                .copied()
+                                .unwrap_or(false)
                     })
                     .cloned()
                     .collect();
@@ -1830,7 +1855,17 @@ impl AgentManagementProvider {
         project_id: &ProjectId,
         cutex_session_id: &CutexSessionId,
     ) -> Result<ManagedAgentRecord, AgentManagementError> {
-        let snapshot = self.store.snapshot()?;
+        let snapshot = self.current_name_snapshot()?;
+        if snapshot
+            .reversible_archive_projection
+            .get(cutex_session_id)
+            .copied()
+            .unwrap_or(false)
+        {
+            return Err(AgentManagementError::OwnerActionRequired(
+                "Agent is reversibly archived; explicitly Restore before ordinary lifecycle".into(),
+            ));
+        }
         let agent = snapshot
             .agents
             .get(cutex_session_id)

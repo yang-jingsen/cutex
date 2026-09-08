@@ -173,6 +173,8 @@ fn agent_management_admin_path(path: &str) -> bool {
         "/v2/agent-management/authority"
             | "/v2/agent-management/durable-candidates"
             | "/v2/agent-management/durable-import"
+            | "/v2/agent-management/archive-review"
+            | "/v2/agent-management/archive-actions"
             | "/v2/agent-management/legacy-director-ownership-import"
             | "/v2/agent-management/reservation-reconciliation"
             | "/v2/agent-management/projects"
@@ -258,6 +260,54 @@ fn handle_v2_request_with_repository(
             let principal =
                 crate::management::control_plane::HumanManagementPrincipal::authenticated();
             match (context.durable_agent_candidates)(&principal) {
+                Ok(response) => {
+                    write_json_response(stream, 200, "OK", &serde_json::to_value(response)?)
+                }
+                Err(error) => write_agent_management_control_error(stream, error),
+            }
+        }
+        ("POST", "/v2/agent-management/archive-review") => {
+            let payload = match serde_json::from_slice(&request.body) {
+                Ok(payload) => payload,
+                Err(_) => {
+                    return write_v2_error(
+                        stream,
+                        400,
+                        "Bad Request",
+                        "invalid_request",
+                        "strict Archive review required",
+                        false,
+                        json!({}),
+                    )
+                }
+            };
+            let principal =
+                crate::management::control_plane::HumanManagementPrincipal::authenticated();
+            match (context.review_agent_archive)(&principal, &payload) {
+                Ok(response) => {
+                    write_json_response(stream, 200, "OK", &serde_json::to_value(response)?)
+                }
+                Err(error) => write_agent_management_control_error(stream, error),
+            }
+        }
+        ("POST", "/v2/agent-management/archive-actions") => {
+            let payload = match serde_json::from_slice(&request.body) {
+                Ok(payload) => payload,
+                Err(_) => {
+                    return write_v2_error(
+                        stream,
+                        400,
+                        "Bad Request",
+                        "invalid_request",
+                        "strict confirmed Archive action required",
+                        false,
+                        json!({}),
+                    )
+                }
+            };
+            let principal =
+                crate::management::control_plane::HumanManagementPrincipal::authenticated();
+            match (context.execute_agent_archive)(&principal, &payload) {
                 Ok(response) => {
                     write_json_response(stream, 200, "OK", &serde_json::to_value(response)?)
                 }

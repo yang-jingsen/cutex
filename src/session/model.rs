@@ -21,6 +21,10 @@ fn default_durable_session_revision() -> u64 {
     1
 }
 
+fn runtime_history_unknown(value: &bool) -> bool {
+    !value
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CutexSessionArchiveState {
@@ -182,6 +186,10 @@ pub fn parse_cutex_session_quick_action_mode(
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct CutexSessionStore {
+    /// Archive transition receipt committed atomically with its durable state.
+    #[serde(default)]
+    pub agent_archive_receipts:
+        std::collections::BTreeMap<String, crate::agent_management::AgentArchiveReceipt>,
     /// Exact receipts for Human import naming; committed atomically with the name.
     #[serde(default)]
     pub formal_name_receipts: std::collections::BTreeMap<String, FormalAgentNameReceipt>,
@@ -276,6 +284,10 @@ pub struct CutexSessionRecord {
     pub current_runtime_agent_id: Option<String>,
     #[serde(default)]
     pub runtime_generation: u64,
+    /// Generation zero is evidence of no managed launch only for records
+    /// created with occurrence tracking; legacy default-zero is unknown.
+    #[serde(default, skip_serializing_if = "runtime_history_unknown")]
+    pub runtime_history_known: bool,
     #[serde(default)]
     pub last_runtime_agent_id: Option<String>,
     #[serde(default)]
@@ -353,6 +365,7 @@ impl CutexSessionRecord {
             app_server_runtime: None,
             current_runtime_agent_id: None,
             runtime_generation: 0,
+            runtime_history_known: true,
             last_runtime_agent_id: None,
             last_seen_at: None,
             last_user_selected_at: None,
