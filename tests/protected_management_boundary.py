@@ -9,6 +9,12 @@ builder=Path(__file__).with_name('management_bootstrap_boundary.py').read_text()
 ending="exec(compile(ast.fix_missing_locations(tree), 'S8a-private-bootstrap', 'exec'), globals())"
 assert ending in builder
 exec(compile(builder.replace(ending,''),'S8b-builder','exec'),globals())
+# Reuse the accepted S5b no-systemctl fixture. These direct stock owners have
+# no systemd scope; exercise the real SystemctlUnavailable fallback, never the
+# operator's user bus or a fabricated scope response.
+path_helper=next(n for n in ast.parse(Path(__file__).with_name('stock_management_mcp_boundary.py').read_text()).body if isinstance(n,ast.FunctionDef) and n.name=='private_executable_path')
+tree.body.insert(tree.body.index(probe),path_helper)
+setup.insert(0,ast.parse('private_executable_path()').body[0])
 prefix=campaign[:campaign.index('review_request=')]
 model=next(n for n in ast.parse(Path(__file__).with_name('stock_task_mcp_boundary.py').read_text()).body if isinstance(n,ast.ClassDef) and n.name=='Model')
 model_text=ast.unparse(model).replace('if Model.pending:',"if Model.pending and data.get('prompt_cache_key') == Model.target:")
@@ -157,4 +163,5 @@ probe.body=setup+ast.parse(campaign).body
 cleanup=ast.unparse(ast.Module(body=probe.finalbody,type_ignores=[]))
 cleanup=cleanup.replace("[RUN, RUN / 'new-agent']", "[RUN, RUN / 'new-agent', RUN / 'replacement', RUN / 'successor']")
 probe.finalbody=ast.parse(cleanup).body
+probe.finalbody.insert(0,ast.parse("(RUN/'model-requests.json').write_text(json.dumps(Model.requests))").body[0])
 exec(compile(ast.fix_missing_locations(tree),'S8b-private-protected-management','exec'),globals())

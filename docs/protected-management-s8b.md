@@ -1,7 +1,7 @@
 # S8b private protected lifecycle and completion MCP
 
-Base 7db389cfec3c8b3cc405ed74bf52ed8a5022f1f9. Work in progress;
-no deployment or real Agent operation is authorized by this candidate.
+Base 7db389cfec3c8b3cc405ed74bf52ed8a5022f1f9.
+No deployment or real Agent operation is authorized by this candidate.
 
 The existing root `explicit-launch` review/authorize route can freeze one
 complete Create, Replace or DirectorRotate request. Neutral Create retains
@@ -24,6 +24,14 @@ CAS. No replacement/rotation state machine is duplicated. Retained predecessor
 operator behavior is existing provider policy, not a new grant invented here.
 Original authenticated caller replay remains governed by existing historical
 receipt authorization after transfer. Generic marked restart still refuses.
+After creator death, a captured successor reconnects only through its original
+sealed bootstrap permit and Ready runtime receipt. Both sides of reconnect
+check the unchanged durable revision, binding/PID, generation, runtime ID,
+marker and reviewed configuration; the existing executor verifies the native
+process/bundle/endpoint. No spawn, stop, receipt relabel or new generation occurs
+in this step. Missing/changed ownership fails closed. Predecessor observation
+uses its exact original reviewed runtime groups when created by this path;
+legacy observations retain their existing group rules.
 
 Reserved Management start messages now use generic ingress as `service`
 source, with requested Director and explicit instructions. Native is still
