@@ -10069,6 +10069,7 @@ mod tests {
             retired_at: None,
         };
         AgentManagementSnapshot {
+            bootstrap_intents: BTreeMap::new(),
             agent_archive_actions: BTreeMap::new(),
             agent_archive_audit: BTreeMap::new(),
             reversible_archive_projection: BTreeMap::new(),
