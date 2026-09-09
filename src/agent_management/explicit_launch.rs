@@ -100,6 +100,8 @@ pub enum ExplicitLaunchRequest {
     ReviewRuntime {
         cutex_session_id: CutexSessionId,
         restart: bool,
+        #[serde(default)]
+        receiver_canonical_byte_limit: crate::launch::stock::CanonicalBytePolicy,
     },
     Run {
         action_id: AgentActionId,
@@ -127,9 +129,18 @@ impl AgentManagementProvider {
             ExplicitLaunchRequest::ReviewRuntime {
                 cutex_session_id,
                 restart,
+                receiver_canonical_byte_limit,
             } => self
                 .review_stock_runtime(path, cutex_session_id, *restart, tasks)
-                .and_then(|r| Ok(serde_json::to_value(r)?)),
+                .and_then(|mut r| {
+                    anyhow::ensure!(
+                        crate::launch::stock::StockBundle::load(&r.contract)?.common_ingress()
+                            || receiver_canonical_byte_limit.is_default(),
+                        "unchanged stock is registration-only; receiver ingress policy unsupported"
+                    );
+                    r.receiver_canonical_byte_limit = receiver_canonical_byte_limit.clone();
+                    Ok(serde_json::to_value(r)?)
+                }),
             ExplicitLaunchRequest::Run { .. } => {
                 anyhow::bail!("explicit stock runtime executor required")
             }

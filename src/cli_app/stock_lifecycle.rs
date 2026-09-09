@@ -3,7 +3,7 @@ use anyhow::{ensure, Context};
 use cutex::agent_management::{StockRuntimeExecutor, StockRuntimeReceipt};
 use cutex::app_server::runtime::AppServerRuntimeLayout;
 use cutex::launch::command::LaunchCommand;
-use cutex::launch::stock::{StockBundle, STOCK_SCHEMA_SHA256};
+use cutex::launch::stock::{ExternalInputBinding, StockBundle};
 use cutex::session::model::{
     CutexAppServerRuntimeBinding, CutexSessionRecord, LaunchProfileSource,
 };
@@ -212,8 +212,19 @@ impl StockRuntimeExecutor for StockExecutor {
             "code_mode.direct_only_tool_namespaces",
             vec!["mcp__cutex"],
         )?;
+        let mut args = layout.app_server_args();
+        if bundle.common_ingress() {
+            // The accepted artifact is the direct app-server, not the stock CLI.
+            args.remove(0);
+            let directory = std::path::PathBuf::from(layout.binding(0, String::new()).runtime_dir);
+            let path = ExternalInputBinding::from_review(receipt).stage(&directory)?;
+            args.extend([
+                "--external-input-binding-file".into(),
+                path.to_string_lossy().into_owned(),
+            ]);
+        }
         launch = launch
-            .args(layout.app_server_args())
+            .args(args)
             .env("CUTEX_AGENT_ID", &receipt.runtime_agent_id)
             .env(
                 "CUTEX_RUNTIME_GENERATION",
@@ -251,8 +262,13 @@ impl StockRuntimeExecutor for StockExecutor {
         } else {
             LaunchProfileSource::SessionConfigured
         });
-        binding.schema_version = "stock-0.153.4-app-server-v2".into();
-        binding.schema_sha256 = STOCK_SCHEMA_SHA256.into();
+        binding.schema_version = if bundle.common_ingress() {
+            "U-0.153.4+S6-c2aaceb4-external-input-v1"
+        } else {
+            "stock-0.153.4-app-server-v2"
+        }
+        .into();
+        binding.schema_sha256 = bundle.schema.sha256.as_str().to_string();
         Ok(binding)
     }
     fn connect(
@@ -261,6 +277,10 @@ impl StockRuntimeExecutor for StockExecutor {
         receipt: &StockRuntimeReceipt,
     ) -> anyhow::Result<()> {
         let binding = receipt.binding.as_ref().context("stock binding missing")?;
+        if StockBundle::load(&receipt.review.contract)?.common_ingress() {
+            ExternalInputBinding::from_review(receipt)
+                .verify(std::path::Path::new(&binding.runtime_dir))?;
+        }
         if let Some(child) = &mut self.child {
             child.release()?;
             self.publication.take();
@@ -404,7 +424,7 @@ fn verify_stock_process(
         .context("stock marker missing")?;
     let bundle = StockBundle::load(contract)?;
     ensure!(
-        binding.schema_sha256 == STOCK_SCHEMA_SHA256,
+        binding.schema_sha256 == bundle.schema.sha256.as_str(),
         "stock binding schema mismatch"
     );
     #[cfg(target_os = "linux")]
@@ -496,6 +516,8 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
         .as_ref()
         .context("stock activation missing")?;
     let bundle = StockBundle::load(contract)?;
+    ensure!(!bundle.common_ingress(),
+        "U+S6 bundle contains only app-server; this slice has no pinned compatible CLI attach artifact");
     verify_stock_process(record, binding)?;
     super::app_server_runtime::verify_exact_live_runtime_claim(record, binding)?;
     ensure!(
@@ -537,4 +559,83 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
         "stock CLI returned unsuccessfully; owner was not restarted"
     );
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod ingress_guard_tests {
+    #[test]
+    fn marked_generic_restart_stop_fence_preserves_real_owned_child() {
+        use cutex::session::model::{CutexSessionRecord, CutexSessionStore};
+        use std::io::BufRead;
+        let home = crate::cli_app::test_home::IsolatedTestHome::new("s6-stop").unwrap();
+        struct Owned(std::process::Child);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Owned(
+            std::process::Command::new("/usr/bin/python3")
+                .args([
+                    "-c",
+                    "import signal; print('READY', flush=True); signal.pause()",
+                ])
+                .env_clear()
+                .env("HOME", home.root())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut ready = String::new();
+        std::io::BufReader::new(child.0.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim(), "READY");
+        let native = uuid::Uuid::new_v4().to_string();
+        let id = format!("cutex.{native}");
+        let mut record = CutexSessionRecord::new(
+            id.clone(),
+            Some(native.clone()),
+            "private".into(),
+            home.root().display().to_string(),
+            None,
+        )
+        .unwrap();
+        record.runtime_pid = Some(child.0.id());
+        record.runtime_generation = 7;
+        // Missing referenced evidence is deliberately NOT permission to fall back.
+        record.explicit_launch = Some(cutex::agent_management::ExplicitLaunchContract {
+            version: 1,
+            native_id: native,
+            native_home: home.root().into(),
+            bundle_manifest: home.root().join("missing-bundle.json"),
+            bundle_sha256: cutex::role_revision::Sha256::new("a".repeat(64)).unwrap(),
+        });
+        let mut store = CutexSessionStore::default();
+        store.sessions.insert(id.clone(), record.clone());
+        cutex::session::store::save_cutex_session_store(&store).unwrap();
+        let entry = serde_json::from_value(serde_json::json!({"session_id":id,"display_name":"Formal private Agent",
+            "host_id":"private","cwd":home.root(),"profile":null,"groups":[],"registration_class":"persistent",
+            "visible":true,"created_at":"private","updated_at":"private"})).unwrap();
+        let error =
+            crate::cli_app::management_lifecycle::stop_cutex_session_runtime_for_entry_fenced(
+                &entry,
+                &[],
+                false,
+                Some((7, true)),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("explicit_stock_launch_required"),
+            "{error:#}"
+        );
+        assert!(child.0.try_wait().unwrap().is_none());
+        assert_eq!(
+            cutex::session::store::load_cutex_session_store()
+                .unwrap()
+                .sessions[&id],
+            record
+        );
+    }
 }

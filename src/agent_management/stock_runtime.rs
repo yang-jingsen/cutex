@@ -19,6 +19,11 @@ pub struct StockRuntimeReview {
     pub contract: ExplicitLaunchContract,
     pub configuration: StockConfiguration,
     pub restart: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::launch::stock::CanonicalBytePolicy::is_default"
+    )]
+    pub receiver_canonical_byte_limit: crate::launch::stock::CanonicalBytePolicy,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -130,6 +135,7 @@ impl AgentManagementProvider {
                 contract,
                 configuration,
                 restart,
+                receiver_canonical_byte_limit: Default::default(),
             })
         })?
     }
@@ -212,6 +218,8 @@ impl AgentManagementProvider {
                 "stock configuration changed; fresh review required"
             );
             let bundle = StockBundle::load(&review.contract)?;
+            anyhow::ensure!(bundle.common_ingress() || review.receiver_canonical_byte_limit.is_default(),
+                "unchanged stock is registration-only; receiver ingress policy unsupported");
             validate_native(record, &sessions, &review.contract)?;
             if receipt.stage == StockRuntimeStage::Spawned
                 && record.runtime_generation == review.subject.runtime_generation

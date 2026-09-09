@@ -748,6 +748,15 @@ impl AppServerRuntimeManager {
 
         let client = AppServerClient::connect(AppServerClientOptions::new(endpoint.clone()))?;
         let initialize_response = client.initialize_response().clone();
+        if schema.sha256 == crate::launch::stock::S6_SCHEMA_SHA256 {
+            anyhow::ensure!(
+                initialize_response
+                    .get("externalInputVersion")
+                    .and_then(Value::as_u64)
+                    == Some(1),
+                "reviewed U+S6 owner omitted ExternalInput v1 capability"
+            );
+        }
         let handle = client.handle();
         let commands = AppServerCommands::new(handle.clone());
         let (thread_response, expected_thread_id, settings_source) = match bootstrap {
@@ -808,7 +817,9 @@ impl AppServerRuntimeManager {
             schema: schema.clone(),
         };
         let mut journal_options = DiagnosticJournalOptions::new(diagnostic_journal_path.into());
-        let supports_cutex_ingress = schema.sha256 != crate::launch::stock::STOCK_SCHEMA_SHA256;
+        // Neither private stock nor U+S6 speaks the legacy K business ingress.
+        let supports_cutex_ingress =
+            !crate::launch::stock::is_private_native_schema(&schema.sha256);
         journal_options.schema = schema;
         let journal = DiagnosticJournal::new(journal_options)?;
         let (stop_tx, stop_rx) = mpsc::sync_channel(1);
