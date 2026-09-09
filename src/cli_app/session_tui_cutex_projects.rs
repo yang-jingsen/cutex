@@ -50,7 +50,7 @@ struct ProjectCreateEditor {
     display_name: String,
     badge_label: String,
     color: String,
-    director: usize,
+    director: Option<cutex::role_revision::CutexSessionId>,
     field: usize,
 }
 
@@ -61,6 +61,7 @@ enum ProjectView {
     Details,
     Editor,
     Create,
+    DirectorPicker,
     Actions,
     ConfirmProjectMutation,
     ConfirmOperator,
@@ -152,6 +153,8 @@ pub(super) struct CutexProjectsModel {
     confirm_selected: bool,
     editor: Option<PresentationEditor>,
     create_editor: Option<ProjectCreateEditor>,
+    director_query: Input,
+    director_picker_selected: Option<cutex::role_revision::CutexSessionId>,
     view: ProjectView,
     client: Option<ManagementControlClient>,
     pub(super) failure: Option<String>,
@@ -195,6 +198,8 @@ impl CutexProjectsModel {
             confirm_selected: false,
             editor: None,
             create_editor: None,
+            director_query: Input::default(),
+            director_picker_selected: None,
             view: ProjectView::List,
             client: None,
             failure: Some(error.into()),
@@ -312,10 +317,48 @@ impl CutexProjectsModel {
             display_name: String::new(),
             badge_label: "CX".to_string(),
             color: ProjectPaletteColor::Cyan.token(),
-            director: 0,
+            director: None,
             field: 0,
         });
         self.view = ProjectView::Create;
+        self.failure = None;
+    }
+
+    fn visible_director_indices(&self) -> Vec<usize> {
+        let query = self.director_query.value().trim().to_lowercase();
+        self.available_agents
+            .iter()
+            .enumerate()
+            .filter_map(|(index, agent)| {
+                let candidate = self
+                    .durable_candidates
+                    .iter()
+                    .find(|row| row.cutex_session_id.as_ref() == Some(&agent.cutex_session_id));
+                let matches = query.is_empty()
+                    || agent
+                        .cutex_session_id
+                        .as_str()
+                        .to_lowercase()
+                        .contains(&query)
+                    || candidate
+                        .and_then(|row| row.formal_name.as_deref())
+                        .is_some_and(|name| name.to_lowercase().contains(&query))
+                    || agent
+                        .current_project_id
+                        .as_ref()
+                        .is_some_and(|id| id.as_str().to_lowercase().contains(&query));
+                matches.then_some(index)
+            })
+            .collect()
+    }
+
+    fn begin_director_picker(&mut self) {
+        self.director_query.reset();
+        self.director_picker_selected = self
+            .create_editor
+            .as_ref()
+            .and_then(|editor| editor.director.clone());
+        self.view = ProjectView::DirectorPicker;
         self.failure = None;
     }
 
@@ -437,23 +480,16 @@ pub(super) fn run(
                 let selected = model
                     .create_editor
                     .as_ref()
-                    .and_then(|e| model.available_agents.get(e.director))
-                    .map(|a| a.cutex_session_id.clone());
+                    .and_then(|editor| editor.director.clone());
                 model.available_agents = candidate_choices(&candidates);
                 model.durable_candidates = candidates;
                 if let Some(editor) = model.create_editor.as_mut() {
-                    editor.director = selected
-                        .and_then(|id| {
-                            model
-                                .available_agents
-                                .iter()
-                                .position(|a| a.cutex_session_id == id)
-                        })
-                        .unwrap_or_else(|| {
-                            editor
-                                .director
-                                .min(model.available_agents.len().saturating_sub(1))
-                        });
+                    editor.director = selected.filter(|id| {
+                        model
+                            .available_agents
+                            .iter()
+                            .any(|agent| &agent.cutex_session_id == id)
+                    });
                 }
             }
             Err(error) => {
@@ -519,6 +555,8 @@ fn load_model() -> anyhow::Result<CutexProjectsModel> {
         confirm_selected: false,
         editor: None,
         create_editor: None,
+        director_query: Input::default(),
+        director_picker_selected: None,
         view: ProjectView::List,
         client: Some(client),
         failure: None,
@@ -553,6 +591,32 @@ fn reload(model: &mut CutexProjectsModel, open_details: bool) -> anyhow::Result<
         .min(visible.len().saturating_sub(1));
     if open_details {
         load_details(model)?;
+    }
+    Ok(())
+}
+
+fn reload_director_candidates(model: &mut CutexProjectsModel) -> anyhow::Result<()> {
+    let candidates = model
+        .client
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Management control plane is unavailable"))?
+        .durable_candidates()?;
+    model.durable_candidates = candidates;
+    model.available_agents = candidate_choices(&model.durable_candidates);
+    let intended = model.director_picker_selected.clone();
+    if intended.as_ref().is_some_and(|id| {
+        !model
+            .available_agents
+            .iter()
+            .any(|agent| &agent.cutex_session_id == id)
+    }) {
+        model.director_picker_selected = None;
+        model.failure = Some(
+            "Previously highlighted Director is no longer available; explicitly select again."
+                .into(),
+        );
+    } else {
+        retain_director_picker_selection(model);
     }
     Ok(())
 }
@@ -680,9 +744,15 @@ fn save_project_create(model: &mut CutexProjectsModel) -> anyhow::Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("project create wizard is unavailable"))?;
     let project_id = cutex::agent_management::ProjectId::new(editor.project_id.clone())?;
-    let director = model
-        .available_agents
-        .get(editor.director)
+    let director = editor
+        .director
+        .as_ref()
+        .and_then(|id| {
+            model
+                .available_agents
+                .iter()
+                .find(|agent| &agent.cutex_session_id == id)
+        })
         .ok_or_else(|| anyhow::anyhow!("initial Director selection is unavailable"))?;
     let request = HumanManagementProjectMutationRequest {
         schema: HumanManagementProjectMutationSchema::V1,
@@ -741,6 +811,43 @@ fn candidate_label(agent: &cutex::agent_management::DurableAgentCandidate) -> St
             .map(|r| format!(" · Unavailable: {r}"))
             .unwrap_or_default()
     )
+}
+
+fn retain_director_picker_selection(model: &mut CutexProjectsModel) {
+    let visible = model.visible_director_indices();
+    if model.director_picker_selected.as_ref().is_some_and(|id| {
+        visible
+            .iter()
+            .any(|index| model.available_agents[*index].cutex_session_id == *id)
+    }) {
+        return;
+    }
+    model.director_picker_selected = visible
+        .first()
+        .map(|index| model.available_agents[*index].cutex_session_id.clone());
+}
+
+fn shift_director_picker(model: &mut CutexProjectsModel, delta: isize) {
+    let visible = model.visible_director_indices();
+    if visible.is_empty() {
+        model.director_picker_selected = None;
+        return;
+    }
+    let current = model
+        .director_picker_selected
+        .as_ref()
+        .and_then(|id| {
+            visible
+                .iter()
+                .position(|index| model.available_agents[*index].cutex_session_id == *id)
+        })
+        .unwrap_or(0) as isize;
+    let next = (current + delta).clamp(0, visible.len().saturating_sub(1) as isize) as usize;
+    model.director_picker_selected = Some(
+        model.available_agents[visible[next]]
+            .cutex_session_id
+            .clone(),
+    );
 }
 
 fn begin_import_confirmation(
@@ -977,6 +1084,9 @@ fn handle_paste(model: &mut CutexProjectsModel, text: &str) {
     if model.view == ProjectView::List && model.filter_focused {
         input_policy::paste(&mut model.query, text);
         model.retain_selection();
+    } else if model.view == ProjectView::DirectorPicker {
+        input_policy::paste(&mut model.director_query, text);
+        retain_director_picker_selection(model);
     } else if model.view == ProjectView::ConfirmImport && model.import_name_focused {
         input_policy::paste(&mut model.import_name, text);
     } else if let Some((value, cursor)) = project_text_field(model) {
@@ -989,6 +1099,7 @@ fn project_modal(model: &CutexProjectsModel) -> bool {
         ProjectView::ConfirmImport
             | ProjectView::ConfirmOperator
             | ProjectView::ConfirmProjectMutation
+            | ProjectView::DirectorPicker
     )
 }
 fn project_dirty(model: &CutexProjectsModel) -> bool {
@@ -1176,6 +1287,7 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
     }
     let text = (model.view == ProjectView::List && model.filter_focused)
         || (model.view == ProjectView::ConfirmImport && model.import_name_focused)
+        || model.view == ProjectView::DirectorPicker
         || matches!(model.view, ProjectView::Editor | ProjectView::Create);
     if !super::session_tui_workspace_events::accepts_key(key, text) {
         return None;
@@ -1257,6 +1369,67 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
             }
             return None;
         }
+    }
+    if model.view == ProjectView::DirectorPicker {
+        match key.code {
+            KeyCode::Esc => {
+                model.director_query.reset();
+                model.director_picker_selected = None;
+                model.view = ProjectView::Create;
+            }
+            KeyCode::Enter => {
+                if let Some(id) = model.director_picker_selected.clone() {
+                    if model
+                        .available_agents
+                        .iter()
+                        .any(|agent| agent.cutex_session_id == id)
+                    {
+                        if let Some(editor) = model.create_editor.as_mut() {
+                            editor.director = Some(id);
+                        }
+                        model.director_query.reset();
+                        model.director_picker_selected = None;
+                        model.view = ProjectView::Create;
+                        model.notice = Some(
+                            "Initial Director selected; review the draft, then press Enter again to create."
+                                .into(),
+                        );
+                    }
+                } else {
+                    model.notice =
+                        Some("No matching Director candidate; change the filter.".into());
+                }
+            }
+            KeyCode::Up => shift_director_picker(model, -1),
+            KeyCode::Down => shift_director_picker(model, 1),
+            KeyCode::PageUp => shift_director_picker(model, -10),
+            KeyCode::PageDown => shift_director_picker(model, 10),
+            KeyCode::Home => {
+                model.director_picker_selected = model
+                    .visible_director_indices()
+                    .first()
+                    .map(|index| model.available_agents[*index].cutex_session_id.clone());
+            }
+            KeyCode::End => {
+                model.director_picker_selected = model
+                    .visible_director_indices()
+                    .last()
+                    .map(|index| model.available_agents[*index].cutex_session_id.clone());
+            }
+            _ if input_policy::resolve(key) == Some(Command::Refresh) => {
+                if let Err(error) = reload_director_candidates(model) {
+                    model.failure = Some(format!(
+                        "Candidate refresh failed; draft retained: {error:#}"
+                    ));
+                }
+            }
+            _ => {
+                if input_policy::edit(&mut model.director_query, key) {
+                    retain_director_picker_selection(model);
+                }
+            }
+        }
+        return None;
     }
     if model.view == ProjectView::Details
         && model.member_inspecting
@@ -1361,6 +1534,7 @@ fn handle_project_widget_key(
 ) -> Option<PrimaryPanelOutcome> {
     model.notice = None;
     match model.view {
+        ProjectView::DirectorPicker => {}
         ProjectView::ConfirmImport => match key.code {
             KeyCode::Esc => {
                 model.import_request = None;
@@ -1522,22 +1696,6 @@ fn handle_project_widget_key(
                     editor.field = editor.field.saturating_sub(1);
                 }
             }
-            KeyCode::Left | KeyCode::Right => {
-                if let Some(editor) = model
-                    .create_editor
-                    .as_mut()
-                    .filter(|editor| editor.field == 4)
-                {
-                    let len = model.available_agents.len();
-                    if len > 0 {
-                        editor.director = if key.code == KeyCode::Left {
-                            (editor.director + len - 1) % len
-                        } else {
-                            (editor.director + 1) % len
-                        };
-                    }
-                }
-            }
             KeyCode::Char(' ') if model.create_editor.as_ref().is_some_and(|e| e.field == 3) => {
                 if let Some(editor) = model
                     .create_editor
@@ -1562,6 +1720,12 @@ fn handle_project_widget_key(
                 } else if model.available_agents.is_empty() {
                     model.notice = Some("Draft kept. Select/Adopt an existing saved session in Recent, then Alt+P returns here. New Agent is unavailable until native persistence is verified.".into());
                     return Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Recent));
+                } else if model
+                    .create_editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.director.is_none())
+                {
+                    model.begin_director_picker();
                 } else {
                     match save_project_create(model) {
                         Ok(()) => model.failure = None,
@@ -1687,6 +1851,7 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
             render_editor(frame, areas[2], model.editor.as_ref());
         }
         ProjectView::Create => render_create_editor(frame, areas[2], model),
+        ProjectView::DirectorPicker => render_director_picker(frame, areas[2], model),
         ProjectView::Actions => {
             render_details(frame, areas[2], model);
             render_project_actions(frame, areas[2], model);
@@ -1740,9 +1905,14 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
             ProjectView::Create => footer_hints(&[
                 ("Enter/Tab", "next"),
                 ("↑/↓", "step"),
-                ("←/→", "Director"),
+                ("Enter", "choose Director/create"),
                 ("Space", "palette"),
-                ("Enter", "create on final step"),
+                ("Esc", "cancel"),
+            ]),
+            ProjectView::DirectorPicker => footer_hints(&[
+                ("Type", "filter"),
+                ("↑/↓ PgUp/Dn", "select"),
+                ("Enter", "choose only"),
                 ("Esc", "cancel"),
             ]),
             ProjectView::Actions => {
@@ -2256,12 +2426,23 @@ fn render_create_editor(frame: &mut Frame<'_>, area: Rect, model: &CutexProjects
     let Some(editor) = model.create_editor.as_ref() else {
         return;
     };
-    let director = model
-        .available_agents
-        .get(editor.director)
+    let director = editor
+        .director
+        .as_ref()
+        .and_then(|id| {
+            model
+                .available_agents
+                .iter()
+                .find(|agent| &agent.cutex_session_id == id)
+        })
         .map(|agent| format!("{} ({})", agent.name, agent.cutex_session_id.as_str()))
         .unwrap_or_else(|| {
-            "None — Enter: saved Recent; New Agent unavailable (persistence unverified)".to_string()
+            if model.available_agents.is_empty() {
+                "None — Enter: saved Recent; New Agent unavailable (persistence unverified)"
+                    .to_string()
+            } else {
+                "Choose… Enter opens searchable candidates".to_string()
+            }
         });
     let field = |index, label: &str, value: String| {
         Line::from(vec![
@@ -2293,6 +2474,99 @@ fn render_create_editor(frame: &mut Frame<'_>, area: Rect, model: &CutexProjects
         .wrap(Wrap { trim: true })
         .block(Block::bordered().border_style(Style::new().fg(Color::Cyan)).title(" Create Cutex Project ")),
         area,
+    );
+}
+
+fn render_director_picker(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel) {
+    let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(3)]).split(area);
+    input_policy::render_input(
+        frame,
+        chunks[0],
+        &model.director_query,
+        " Search Initial Director · formal name / durable ID / project ID ",
+        true,
+    );
+    let visible = model.visible_director_indices();
+    let narrow = chunks[1].width < 90;
+    let rows = visible.iter().map(|index| {
+        let agent = &model.available_agents[*index];
+        let candidate = model
+            .durable_candidates
+            .iter()
+            .find(|row| row.cutex_session_id.as_ref() == Some(&agent.cutex_session_id));
+        let selected = model.director_picker_selected.as_ref() == Some(&agent.cutex_session_id);
+        let style = if selected {
+            Style::new()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new()
+        };
+        let mut cells = vec![
+            Cell::from(
+                candidate
+                    .and_then(|row| row.formal_name.as_deref())
+                    .unwrap_or("<formal name required>"),
+            ),
+            Cell::from(
+                agent
+                    .current_project_id
+                    .as_ref()
+                    .map(|id| id.as_str())
+                    .unwrap_or("-"),
+            ),
+            Cell::from(if candidate.is_some_and(|row| row.online) {
+                "Online"
+            } else {
+                "Offline"
+            }),
+            Cell::from(if candidate.is_some_and(|row| row.in_roster) {
+                "roster"
+            } else {
+                "durable"
+            }),
+            Cell::from(agent.cutex_session_id.as_str()),
+        ];
+        if narrow {
+            cells.remove(3);
+        }
+        Row::new(cells).style(style)
+    });
+    let title = if model.available_agents.is_empty() {
+        " No eligible durable candidates · Recent saved sessions remains available "
+    } else if visible.is_empty() {
+        " No candidates match this filter "
+    } else {
+        " Initial Director candidates · Offline remains eligible "
+    };
+    let widths = if narrow {
+        vec![
+            Constraint::Percentage(34),
+            Constraint::Percentage(22),
+            Constraint::Length(8),
+            Constraint::Percentage(44),
+        ]
+    } else {
+        vec![
+            Constraint::Percentage(24),
+            Constraint::Percentage(18),
+            Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Percentage(50),
+        ]
+    };
+    let header = if narrow {
+        Row::new(["FORMAL NAME", "PROJECT", "STATE", "DURABLE ID"])
+    } else {
+        Row::new(["FORMAL NAME", "PROJECT", "STATE", "SOURCE", "DURABLE ID"])
+    };
+    let rows = rows.collect::<Vec<_>>();
+    frame.render_widget(
+        Table::new(rows, widths)
+            .header(header.style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
+            .column_spacing(1)
+            .block(Block::bordered().title(title)),
+        chunks[1],
     );
 }
 
@@ -2707,9 +2981,11 @@ mod tests {
                 && row.rejection.is_some()));
         let before = std::fs::read(cutex::session::store::cutex_sessions_path().unwrap()).unwrap();
         model.begin_create();
+        let initial_director = model.available_agents[0].cutex_session_id.clone();
         let editor = model.create_editor.as_mut().unwrap();
         editor.project_id = "alpha".into();
         editor.display_name = "Alpha".into();
+        editor.director = Some(initial_director);
         save_project_create(&mut model).unwrap();
         assert_eq!(model.view, ProjectView::ConfirmImport);
         assert!(!model.confirm_selected);
@@ -3253,6 +3529,162 @@ mod tests {
         model
     }
 
+    fn add_director_candidate(
+        model: &mut CutexProjectsModel,
+        id: &str,
+        name: Option<&str>,
+        project_id: Option<&str>,
+        online: bool,
+        in_roster: bool,
+    ) {
+        let id = cutex::role_revision::CutexSessionId::new(id).unwrap();
+        let project_id = project_id.map(|id| cutex::agent_management::ProjectId::new(id).unwrap());
+        model
+            .durable_candidates
+            .push(cutex::agent_management::DurableAgentCandidate {
+                raw_store_key: id.as_str().to_string(),
+                cutex_session_id: Some(id.clone()),
+                formal_name: name.map(str::to_string),
+                durable_revision: 1,
+                durable_sha256: cutex::role_revision::Sha256::new("1".repeat(64)).unwrap(),
+                roster_sha256: cutex::role_revision::Sha256::new("2".repeat(64)).unwrap(),
+                agent_sha256: cutex::role_revision::Sha256::new("3".repeat(64)).unwrap(),
+                in_roster,
+                current_project_id: project_id.clone(),
+                online,
+                rejection: None,
+            });
+        model.available_agents.push(ProjectAgentChoice {
+            cutex_session_id: id,
+            name: name.unwrap_or("Formal name required").to_string(),
+            current_project_id: project_id,
+        });
+    }
+
+    #[test]
+    fn create_director_picker_filters_selects_by_id_and_never_falls_through_to_create() {
+        let mut model = model_with_projects();
+        add_director_candidate(
+            &mut model,
+            "cutex.alpha-durable",
+            Some("Alpha Director"),
+            Some("source-project"),
+            false,
+            true,
+        );
+        add_director_candidate(
+            &mut model,
+            "cutex.beta-durable",
+            Some("贝塔 Director"),
+            None,
+            true,
+            false,
+        );
+        model.begin_create();
+        {
+            let editor = model.create_editor.as_mut().unwrap();
+            editor.project_id = "new-project".into();
+            editor.display_name = "New Project".into();
+            editor.field = 4;
+        }
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(model.view, ProjectView::DirectorPicker);
+        assert!(model.create_editor.as_ref().unwrap().director.is_none());
+        assert!(model.import_request.is_none());
+
+        handle_paste(&mut model, "贝塔");
+        assert_eq!(model.visible_director_indices(), vec![1]);
+        assert_eq!(
+            model
+                .director_picker_selected
+                .as_ref()
+                .map(|id| id.as_str()),
+            Some("cutex.beta-durable")
+        );
+        let frame = rendered_buffer(&model, 120, 30);
+        assert!(format!("{frame:?}").contains("贝塔 Director"));
+        if let Ok(path) = std::env::var("CUTEX_DIRECTOR_PICKER_FRAME_CAPTURE") {
+            let mut text = String::new();
+            for y in 0..frame.area.height {
+                for x in 0..frame.area.width {
+                    text.push_str(frame[(x, y)].symbol());
+                }
+                text.push('\n');
+            }
+            std::fs::write(path, text).unwrap();
+        }
+        handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(model.view, ProjectView::Create);
+        assert_eq!(
+            model
+                .create_editor
+                .as_ref()
+                .and_then(|editor| editor.director.as_ref())
+                .map(|id| id.as_str()),
+            Some("cutex.beta-durable")
+        );
+        assert!(model.import_request.is_none(), "picker Enter only chooses");
+    }
+
+    #[test]
+    fn director_picker_cancel_retains_draft_and_identity_survives_reorder() {
+        let mut model = model_with_projects();
+        add_director_candidate(&mut model, "cutex.first", Some("First"), None, false, true);
+        add_director_candidate(&mut model, "cutex.second", None, None, false, false);
+        model.begin_create();
+        let editor = model.create_editor.as_mut().unwrap();
+        editor.project_id = "draft-id".into();
+        editor.display_name = "草稿项目".into();
+        editor.director = Some(cutex::role_revision::CutexSessionId::new("cutex.second").unwrap());
+        editor.field = 4;
+        model.begin_director_picker();
+        model.available_agents.reverse();
+        assert_eq!(
+            model
+                .director_picker_selected
+                .as_ref()
+                .map(|id| id.as_str()),
+            Some("cutex.second")
+        );
+        assert!(rendered(&model, 140, 18).contains("<formal name required>"));
+        handle_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let editor = model.create_editor.as_ref().unwrap();
+        assert_eq!(editor.project_id, "draft-id");
+        assert_eq!(editor.display_name, "草稿项目");
+        assert_eq!(
+            editor.director.as_ref().map(|id| id.as_str()),
+            Some("cutex.second")
+        );
+        assert!(model.import_request.is_none());
+    }
+
+    #[test]
+    fn director_picker_distinguishes_no_candidates_from_no_filter_matches() {
+        let mut model = model_with_projects();
+        model.begin_create();
+        model.begin_director_picker();
+        assert!(rendered(&model, 100, 24).contains("No eligible durable candidates"));
+        add_director_candidate(
+            &mut model,
+            "cutex.offline",
+            Some("Offline Candidate"),
+            None,
+            false,
+            true,
+        );
+        model.director_query = Input::new("no-such-id".into());
+        retain_director_picker_selection(&mut model);
+        let screen = rendered(&model, 100, 24);
+        assert!(screen.contains("No candidates match this filter"));
+        assert!(!screen.contains("cutex.offline"));
+    }
+
     fn rendered(model: &CutexProjectsModel, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| render(frame, model)).unwrap();
@@ -3306,7 +3738,7 @@ mod tests {
                     display_name: String::new(),
                     badge_label: String::new(),
                     color: "green".into(),
-                    director: 0,
+                    director: None,
                     field,
                 });
                 let mut pasted = model_with_projects();
