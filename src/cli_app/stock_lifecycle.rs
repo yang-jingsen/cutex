@@ -135,7 +135,7 @@ pub(super) fn bootstrap_native(
     permit: &cutex::agent_management::BootstrapExecutionPermit<'_>,
     existing: Option<&str>,
 ) -> Result<String, cutex::agent_management::LifecycleFailure> {
-    use cutex::agent_management::{AgentOperation, LifecycleFailure};
+    use cutex::agent_management::LifecycleFailure;
     use cutex::app_server::client::{AppServerClient, AppServerClientOptions, AppServerEndpoint};
     let review = permit.review();
     let mut known = existing.map(str::to_owned);
@@ -159,9 +159,11 @@ pub(super) fn bootstrap_native(
             bundle.version == 3 && bundle.soon_ingress(),
             "bootstrap bundle mismatch"
         );
-        let AgentOperation::Create { spec, .. } = &review.request.operation else {
-            anyhow::bail!("bootstrap create required")
-        };
+        let spec = review
+            .request
+            .operation
+            .bootstrap_spec()
+            .context("bootstrap operation required")?;
         ensure!(
             cutex::launch::stock::bootstrap_configuration(spec)? == review.configuration,
             "bootstrap config changed before spawn"

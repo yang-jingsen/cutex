@@ -290,6 +290,8 @@ pub enum AgentOperation {
         cutex_session_id: CutexSessionId,
     },
     Replace {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap_intent: Option<AgentActionId>,
         predecessor_cutex_session_id: CutexSessionId,
         policy: AgentReplacePolicy,
         successor: ManagedAgentSpec,
@@ -306,6 +308,8 @@ pub enum AgentOperation {
         expected_grant_revision: u64,
     },
     DirectorRotate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap_intent: Option<AgentActionId>,
         expected_predecessor_cutex_session: CutexSessionId,
         expected_authority_epoch: u64,
         mode: DirectorRotateMode,
@@ -316,6 +320,30 @@ pub enum AgentOperation {
 }
 
 impl AgentOperation {
+    pub fn bootstrap_intent(&self) -> Option<&AgentActionId> {
+        match self {
+            Self::Create {
+                bootstrap_intent, ..
+            }
+            | Self::Replace {
+                bootstrap_intent, ..
+            }
+            | Self::DirectorRotate {
+                bootstrap_intent, ..
+            } => bootstrap_intent.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn bootstrap_spec(&self) -> Option<&ManagedAgentSpec> {
+        match self {
+            Self::Create { spec, .. } => Some(spec),
+            Self::Replace { successor, .. } | Self::DirectorRotate { successor, .. } => {
+                Some(successor)
+            }
+            _ => None,
+        }
+    }
     pub fn kind(&self) -> AgentOperationKind {
         match self {
             Self::Create { .. } => AgentOperationKind::Create,
@@ -387,6 +415,7 @@ impl<'de> Deserialize<'de> for AgentManagementRequest {
             "query_managed" => &[],
             "online" | "offline" | "restart" | "close" => &["cutex_session_id"],
             "replace" => &[
+                "bootstrap_intent",
                 "predecessor_cutex_session_id",
                 "policy",
                 "successor",
@@ -397,6 +426,7 @@ impl<'de> Deserialize<'de> for AgentManagementRequest {
                 &["operator_cutex_session_id", "expected_grant_revision"]
             }
             "director_rotate" => &[
+                "bootstrap_intent",
                 "expected_predecessor_cutex_session",
                 "expected_authority_epoch",
                 "mode",
@@ -433,21 +463,22 @@ impl<'de> Deserialize<'de> for AgentManagementRequest {
 
 impl AgentManagementRequest {
     pub fn validate(&self) -> Result<(), AgentManagementError> {
+        if self
+            .operation
+            .bootstrap_intent()
+            .is_some_and(|id| id != &self.action_id)
+        {
+            return Err(AgentManagementError::InvalidRequest(
+                "bootstrap_intent_requires_exact_action",
+            ));
+        }
         match &self.operation {
             AgentOperation::Create {
                 spec,
-                bootstrap_intent,
                 start_mode,
                 frozen_message,
+                ..
             } => {
-                if bootstrap_intent
-                    .as_ref()
-                    .is_some_and(|id| id != &self.action_id)
-                {
-                    return Err(AgentManagementError::InvalidRequest(
-                        "bootstrap_intent_requires_exact_action",
-                    ));
-                }
                 spec.validate()?;
                 validate_start(*start_mode, frozen_message.as_deref())
             }

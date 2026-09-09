@@ -1392,12 +1392,9 @@ fn job_service_inter_agent_params(
     })
 }
 
-fn agent_management_inter_agent_params(
-    thread_id: &str,
-    recipient_label: &str,
-    recipient_metadata: Option<ParticipantPresentationMetadata>,
+fn agent_management_metadata(
     message: &AgentBusMessage,
-) -> anyhow::Result<ThreadInterAgentMessageParams> {
+) -> anyhow::Result<AgentManagementMessageMetadata> {
     if message.from != AGENT_MANAGEMENT_SYSTEM_SENDER {
         anyhow::bail!(
             "Agent Management agent-bus message {} has a noncanonical sender",
@@ -1453,6 +1450,16 @@ fn agent_management_inter_agent_params(
                 message.id
             )
         })?;
+    Ok(metadata)
+}
+
+fn agent_management_inter_agent_params(
+    thread_id: &str,
+    recipient_label: &str,
+    recipient_metadata: Option<ParticipantPresentationMetadata>,
+    message: &AgentBusMessage,
+) -> anyhow::Result<ThreadInterAgentMessageParams> {
+    let metadata = agent_management_metadata(message)?;
     Ok(ThreadInterAgentMessageParams {
         thread_id: thread_id.to_string(),
         message_id: model_visible_message_id(&message.id),

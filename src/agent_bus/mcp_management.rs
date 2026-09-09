@@ -38,6 +38,8 @@ struct ManagedAgentSpec {
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 enum Operation {
     Create {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap_intent: Option<String>,
         spec: ManagedAgentSpec,
         start_mode: String,
         #[serde(default)]
@@ -57,6 +59,8 @@ enum Operation {
         cutex_session_id: String,
     },
     Replace {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap_intent: Option<String>,
         predecessor_cutex_session_id: String,
         policy: String,
         successor: ManagedAgentSpec,
@@ -65,6 +69,8 @@ enum Operation {
         frozen_message: Option<String>,
     },
     DirectorRotate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap_intent: Option<String>,
         expected_predecessor_cutex_session: String,
         expected_authority_epoch: u64,
         mode: String,
@@ -120,10 +126,11 @@ fn parse_input(arguments: &str) -> Result<ToolInput, ()> {
     let object = value.as_object().ok_or(())?;
     let operation = object.get("operation").and_then(Value::as_str).ok_or(())?;
     let operation_fields: &[&str] = match operation {
-        "create" => &["spec", "start_mode", "frozen_message"],
+        "create" => &["spec", "start_mode", "frozen_message", "bootstrap_intent"],
         "query_managed" => &[],
         "online" | "offline" | "restart" | "close" => &["cutex_session_id"],
         "replace" => &[
+            "bootstrap_intent",
             "predecessor_cutex_session_id",
             "policy",
             "successor",
@@ -131,6 +138,7 @@ fn parse_input(arguments: &str) -> Result<ToolInput, ()> {
             "frozen_message",
         ],
         "director_rotate" => &[
+            "bootstrap_intent",
             "expected_predecessor_cutex_session",
             "expected_authority_epoch",
             "mode",
@@ -490,11 +498,13 @@ pub(super) fn tool() -> Value {
         "predecessor_cutex_session_id",
         "expected_predecessor_cutex_session",
         "frozen_message",
+        "bootstrap_intent",
     ] {
         properties[field] = json!({"type":"string"});
     }
     properties["cutex_session_id"]["description"]=json!("Required for online/offline/restart/close; exact durable identity, not native thread/name/profile.");
-    json!({"name":"cutex_agent_management","description":"Typed provider-authorized Management action. create requires spec/start_mode; replace requires predecessor_cutex_session_id/policy/successor/start_mode; director_rotate requires expected_predecessor_cutex_session/expected_authority_epoch/mode/successor. close permanently retires, not reversible archive. Stock generic lifecycle/creation remains unsupported where provider rejects. Caller authority never comes from arguments. Reuse action_id only for exact replay.","inputSchema":{"type":"object","properties":properties,"required":["operation","action_id"],"additionalProperties":false}})
+    properties["bootstrap_intent"]["description"]=json!("Optional exact action_id reference to a previously Human-reviewed private bundle intent for create/replace/director_rotate. Does not mint an intent or grant authority.");
+    json!({"name":"cutex_agent_management","description":"Typed provider-authorized Management action. create requires spec/start_mode; replace requires predecessor_cutex_session_id/policy/successor/start_mode; director_rotate requires expected_predecessor_cutex_session/expected_authority_epoch/mode/successor. Private lightweight bootstrap requires a previously Human-reviewed exact bootstrap_intent reference. Generic marked online/restart still refuses default fallback. close permanently retires, not reversible archive. Caller authority never comes from arguments. Reuse action_id only for exact replay.","inputSchema":{"type":"object","properties":properties,"required":["operation","action_id"],"additionalProperties":false}})
 }
 
 #[cfg(test)]
@@ -610,6 +620,44 @@ mod tests {
             )["outcome"]["code"],
             "invalid_arguments"
         );
+    }
+
+    #[test]
+    fn reviewed_references_preserve_exact_semantics_without_minting_authority() {
+        for (operation, fields) in [
+            (
+                "create",
+                json!({"spec":spec(),"start_mode":"bootstrap_only"}),
+            ),
+            (
+                "replace",
+                json!({"predecessor_cutex_session_id":"cutex.old","policy":"keep_old","successor":spec(),"start_mode":"bootstrap_only"}),
+            ),
+            (
+                "director_rotate",
+                json!({"expected_predecessor_cutex_session":"cutex.old","expected_authority_epoch":1,"mode":"retain_predecessor_bootstrap_only","successor":spec()}),
+            ),
+        ] {
+            let mut args = json!({"operation":operation,"action_id":"reviewed","project_id":"private","bootstrap_intent":"reviewed"});
+            args.as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let result = invoke(args.clone(), |body| {
+                assert_eq!(body["bootstrap_intent"], "reviewed");
+                assert_eq!(body["operation"], operation);
+                Ok(
+                    json!({"schema":CONTRACT,"action_id":"reviewed","outcome":{"status":"no_write","code":"bootstrap_intent_missing","detail":"no Human intent"}}),
+                )
+            });
+            assert_eq!(result["outcome"]["code"], "bootstrap_intent_missing");
+            args["bootstrap_intent"] = json!("different");
+            // Provider validation is also mandatory, before any lifecycle effect.
+            let mut request = args.clone();
+            request["schema"] = json!(CONTRACT);
+            let request: crate::agent_management::AgentManagementRequest =
+                serde_json::from_value(request).unwrap();
+            assert!(request.validate().is_err());
+        }
     }
 
     #[test]

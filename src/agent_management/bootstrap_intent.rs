@@ -221,17 +221,32 @@ pub struct BootstrapIntentReview {
 
 impl BootstrapIntentReview {
     pub(crate) fn spec(&self) -> anyhow::Result<&ManagedAgentSpec> {
-        anyhow::ensure!(self.version == 1, "unsupported bootstrap intent version");
+        anyhow::ensure!(
+            matches!(self.version, 1 | 2),
+            "unsupported bootstrap intent version"
+        );
         self.request.validate()?;
-        let AgentOperation::Create {
-            spec,
-            start_mode: AgentStartMode::BootstrapOnly,
-            frozen_message: None,
-            bootstrap_intent: Some(intent),
-        } = &self.request.operation
-        else {
-            anyhow::bail!("reviewed bootstrap supports create/bootstrap_only without a message")
-        };
+        if self.version == 1 {
+            anyhow::ensure!(
+                matches!(
+                    &self.request.operation,
+                    AgentOperation::Create {
+                        start_mode: AgentStartMode::BootstrapOnly,
+                        frozen_message: None,
+                        ..
+                    }
+                ),
+                "version1 supports neutral Create only"
+            );
+        }
+        let spec = self.request.operation.bootstrap_spec().ok_or_else(|| {
+            anyhow::anyhow!("reviewed bootstrap requires create/replace/director_rotate")
+        })?;
+        let intent = self
+            .request
+            .operation
+            .bootstrap_intent()
+            .ok_or_else(|| anyhow::anyhow!("reviewed bootstrap intent reference missing"))?;
         anyhow::ensure!(
             intent == &self.request.action_id,
             "bootstrap requires exact intent reference"

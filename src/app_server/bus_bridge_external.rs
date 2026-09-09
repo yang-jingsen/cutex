@@ -71,6 +71,33 @@ pub(super) fn validate_target(
         message.to_cutex_session_id.as_deref() == Some(owner),
         "external input recipient conflict"
     );
+    if message.from == AGENT_MANAGEMENT_SYSTEM_SENDER {
+        let metadata = agent_management_metadata(message)?;
+        let mut actions = roster
+            .actions
+            .values()
+            .filter(|a| a.external_message_id.as_ref() == message.external_message_id.as_ref());
+        let action = actions.next().context("Management start action absent")?;
+        ensure!(
+            actions.next().is_none(),
+            "ambiguous Management start action"
+        );
+        let intent = roster
+            .bootstrap_intents
+            .get(&action.action_id)
+            .context("reviewed Management start intent absent")?;
+        ensure!(
+            action
+                .known_successor_cutex_session
+                .as_ref()
+                .map(|s| s.as_str())
+                == Some(owner)
+                && metadata.requested_by_director == intent.director
+                && metadata.requested_by_operator.is_none()
+                && action.caller_cutex_session == intent.director,
+            "Management start recipient/source conflict"
+        );
+    }
     if let Some(metadata) = task_service_completion_metadata(message)? {
         let snapshot = task_provider()?.query()?;
         let n = snapshot
@@ -301,6 +328,14 @@ fn envelope(
         ),
     };
     let (source, event_type, text) = match message.sender_kind {
+        AgentMessageKind::Agent if message.from == AGENT_MANAGEMENT_SYSTEM_SENDER => {
+            // Reuse the reserved in-process Management provenance validator;
+            // ordinary send cannot manufacture this control record.
+            let metadata = agent_management_metadata(message)?;
+            (Source { kind: SourceKind::Service, id: AGENT_MANAGEMENT_SYSTEM_SENDER.into() },
+             "management_start",
+             format!("Requested by Director: {}\nAction: follow the explicit start instructions.\nInstructions:\n{}", metadata.requested_by_director.as_str(), message.content))
+        }
         AgentMessageKind::Agent => {
             ensure!(
                 message.control_type.is_none() && message.from != AGENT_MANAGEMENT_SYSTEM_SENDER,

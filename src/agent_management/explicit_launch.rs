@@ -179,11 +179,22 @@ impl AgentManagementProvider {
                     .projects
                     .get(project)
                     .ok_or_else(|| anyhow::anyhow!("bootstrap project missing"))?;
-                let AgentOperation::Create { spec, .. } = &request.operation else {
-                    anyhow::bail!("bootstrap intent requires create")
-                };
+                let spec = request.operation.bootstrap_spec().ok_or_else(|| {
+                    anyhow::anyhow!("bootstrap intent requires create/replace/director_rotate")
+                })?;
                 let review = BootstrapIntentReview {
-                    version: 1,
+                    version: if matches!(
+                        &request.operation,
+                        AgentOperation::Create {
+                            start_mode: AgentStartMode::BootstrapOnly,
+                            frozen_message: None,
+                            ..
+                        }
+                    ) {
+                        1
+                    } else {
+                        2
+                    },
                     request: request.clone(),
                     director: authority.authorized_director_session.clone(),
                     authority_sha256: super::store::request_sha256(authority)?,

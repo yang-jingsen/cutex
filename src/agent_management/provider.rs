@@ -922,6 +922,18 @@ impl AgentManagementProvider {
                     .get(&request.action_id)
                     .is_none_or(|a| a.response.is_none())
                 {
+                    if state
+                        .actions
+                        .get(&request.action_id)
+                        .is_none_or(|a| a.phase == AgentActionPhase::Prepared)
+                        && intent.expires_at_unix <= chrono::Utc::now().timestamp()
+                    {
+                        return no_write(
+                            &request.action_id,
+                            "bootstrap_intent_expired",
+                            "review expired before lifecycle effects",
+                        );
+                    }
                     if let Err(error) = intent
                         .validate_authority(&state)
                         .and_then(|_| intent.validate_evidence())
@@ -935,15 +947,7 @@ impl AgentManagementProvider {
                 }
             }
             Err(error) => return error_response(&request.action_id, error),
-            Ok(_)
-                if matches!(
-                    &request.operation,
-                    AgentOperation::Create {
-                        bootstrap_intent: Some(_),
-                        ..
-                    }
-                ) =>
-            {
+            Ok(_) if request.operation.bootstrap_intent().is_some() => {
                 return no_write(
                     &request.action_id,
                     "bootstrap_intent_missing",
@@ -1579,6 +1583,7 @@ impl AgentManagementProvider {
                 successor,
                 start_mode,
                 frozen_message,
+                ..
             } => {
                 let mut action = action;
                 if action.phase == AgentActionPhase::Prepared {
@@ -1676,6 +1681,7 @@ impl AgentManagementProvider {
                 mode,
                 successor,
                 frozen_message,
+                ..
             } => {
                 if &invocation.caller_cutex_session != expected_predecessor_cutex_session {
                     return Err(AgentManagementError::Conflict("stale_director_predecessor"));
@@ -2005,7 +2011,16 @@ impl AgentManagementProvider {
             .ok_or(AgentManagementError::InvalidStore)?;
         let agent = self.active_agent(&request.project_id, successor)?;
         let observation = lifecycle.observe(successor).map_err(lifecycle_error)?;
-        validate_ready(&agent, &observation)?;
+        if let Some(intent) = self
+            .store
+            .snapshot()?
+            .bootstrap_intents
+            .get(&request.action_id)
+        {
+            validate_ready_with_groups(&agent, &observation, &intent.runtime_groups)?;
+        } else {
+            validate_ready(&agent, &observation)?;
+        }
         Ok(CreatedAgent {
             agent,
             observation,
@@ -2938,6 +2953,10 @@ impl AgentManagementProvider {
         self.director_seats
             .transfer_director(&seat_transfer)
             .map_err(seat_authority_error)?;
+        #[cfg(feature = "stock-launch-test-hook")]
+        if bootstrap_test_fault("CUTEX_BOOTSTRAP_TEST_TRANSFER_ACTION", &request.action_id) {
+            std::process::exit(86);
+        }
         if let Some(response) = self.inject_process_loss_after_director_seat_transfer(request) {
             return Ok(response);
         }
@@ -4988,6 +5007,7 @@ mod tests {
             action_id: action(action_id),
             project_id: Some(project()),
             operation: AgentOperation::DirectorRotate {
+                bootstrap_intent: None,
                 expected_predecessor_cutex_session: session("cutex.director"),
                 expected_authority_epoch: 1,
                 mode: DirectorRotateMode::RetainPredecessorWithMessage,
@@ -5441,6 +5461,7 @@ mod tests {
                 action_id: action("rotate-after-import"),
                 project_id: Some(project()),
                 operation: AgentOperation::DirectorRotate {
+                    bootstrap_intent: None,
                     expected_predecessor_cutex_session: session("cutex.director"),
                     expected_authority_epoch: 1,
                     mode: DirectorRotateMode::RetainPredecessorBootstrapOnly,
@@ -7066,6 +7087,7 @@ mod tests {
             action_id: action("replace"),
             project_id: Some(project()),
             operation: AgentOperation::Replace {
+                bootstrap_intent: None,
                 predecessor_cutex_session_id: predecessor.cutex_session_id.clone(),
                 policy: AgentReplacePolicy::CloseBeforeCreate,
                 successor: spec("worker-new"),
@@ -7129,6 +7151,7 @@ mod tests {
                 action_id: action("replace-crash"),
                 project_id: Some(project()),
                 operation: AgentOperation::Replace {
+                    bootstrap_intent: None,
                     predecessor_cutex_session_id: predecessor.cutex_session_id.clone(),
                     policy,
                     successor: spec("worker-new"),
@@ -7237,6 +7260,7 @@ mod tests {
             action_id: action("rotate-crash"),
             project_id: Some(project()),
             operation: AgentOperation::DirectorRotate {
+                bootstrap_intent: None,
                 expected_predecessor_cutex_session: predecessor.cutex_session_id.clone(),
                 expected_authority_epoch: 2,
                 mode: DirectorRotateMode::ClosePredecessorThenCreateWithMessage,
@@ -7336,6 +7360,7 @@ mod tests {
             action_id: action("replace-mismatch"),
             project_id: Some(project()),
             operation: AgentOperation::Replace {
+                bootstrap_intent: None,
                 predecessor_cutex_session_id: predecessor.cutex_session_id.clone(),
                 policy: AgentReplacePolicy::CloseBeforeCreate,
                 successor: spec("worker-new"),
@@ -7386,6 +7411,7 @@ mod tests {
             action_id: action("rotate-authority-change"),
             project_id: Some(project()),
             operation: AgentOperation::DirectorRotate {
+                bootstrap_intent: None,
                 expected_predecessor_cutex_session: director.cutex_session_id.clone(),
                 expected_authority_epoch: 2,
                 mode: DirectorRotateMode::ClosePredecessorThenCreateWithMessage,
@@ -7456,6 +7482,7 @@ mod tests {
             action_id: action("rotate"),
             project_id: Some(project()),
             operation: AgentOperation::DirectorRotate {
+                bootstrap_intent: None,
                 expected_predecessor_cutex_session: director.cutex_session_id.clone(),
                 expected_authority_epoch: 2,
                 mode: DirectorRotateMode::ClosePredecessorThenCreateWithMessage,
@@ -7661,6 +7688,7 @@ mod tests {
                 action_id: action("rotate-preflight"),
                 project_id: Some(project()),
                 operation: AgentOperation::DirectorRotate {
+                    bootstrap_intent: None,
                     expected_predecessor_cutex_session: predecessor.cutex_session_id.clone(),
                     expected_authority_epoch: 2,
                     mode: DirectorRotateMode::ClosePredecessorThenCreateWithMessage,
@@ -7718,6 +7746,7 @@ mod tests {
             action_id: action("rotate-boundary-loss"),
             project_id: Some(project()),
             operation: AgentOperation::DirectorRotate {
+                bootstrap_intent: None,
                 expected_predecessor_cutex_session: predecessor.cutex_session_id.clone(),
                 expected_authority_epoch: 2,
                 mode: DirectorRotateMode::RetainPredecessorBootstrapOnly,
@@ -7824,6 +7853,7 @@ mod tests {
             action_id: action("rotate-then-diverge"),
             project_id: Some(project()),
             operation: AgentOperation::DirectorRotate {
+                bootstrap_intent: None,
                 expected_predecessor_cutex_session: predecessor.cutex_session_id.clone(),
                 expected_authority_epoch: 2,
                 mode: DirectorRotateMode::RetainPredecessorBootstrapOnly,
@@ -7913,6 +7943,7 @@ mod tests {
                 action_id: action("rotate"),
                 project_id: Some(project()),
                 operation: AgentOperation::DirectorRotate {
+                    bootstrap_intent: None,
                     expected_predecessor_cutex_session: predecessor.cutex_session_id.clone(),
                     expected_authority_epoch: 2,
                     mode,
@@ -8005,6 +8036,7 @@ mod tests {
             action_id: action("stale-rotate"),
             project_id: Some(project()),
             operation: AgentOperation::DirectorRotate {
+                bootstrap_intent: None,
                 expected_predecessor_cutex_session: session("cutex.mistyped-director"),
                 expected_authority_epoch: 2,
                 mode: DirectorRotateMode::RetainPredecessorBootstrapOnly,
@@ -8059,6 +8091,7 @@ mod tests {
             action_id: action("corrected-rotate"),
             project_id: Some(project()),
             operation: AgentOperation::DirectorRotate {
+                bootstrap_intent: None,
                 expected_predecessor_cutex_session: director.cutex_session_id.clone(),
                 expected_authority_epoch: 2,
                 mode: DirectorRotateMode::RetainPredecessorBootstrapOnly,
@@ -9451,6 +9484,7 @@ mod tests {
                 action_id: action("operator-replace"),
                 project_id: Some(project()),
                 operation: AgentOperation::Replace {
+                    bootstrap_intent: None,
                     predecessor_cutex_session_id: replace_target.cutex_session_id,
                     policy: AgentReplacePolicy::CloseBeforeCreate,
                     successor: spec("replacement"),
@@ -9506,6 +9540,7 @@ mod tests {
             (
                 "operator-rotate",
                 AgentOperation::DirectorRotate {
+                    bootstrap_intent: None,
                     expected_predecessor_cutex_session: session("cutex.director"),
                     expected_authority_epoch: 1,
                     mode: DirectorRotateMode::RetainPredecessorBootstrapOnly,

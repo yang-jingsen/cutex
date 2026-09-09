@@ -1313,6 +1313,106 @@ impl TaskWorkerActionHost {
         response
     }
 
+    fn execute_terminal_semantic(
+        &self,
+        sender: TaskWorkerRosterSender,
+        command: crate::task_service::TerminalAuthorityRequest,
+    ) -> TaskServiceActionResponse {
+        use crate::task_service::TerminalAuthorityRequest as T;
+        let body = match &command {
+            T::AcceptResult(b) | T::RequestChanges(b) | T::FailResult(b) => b,
+            T::Cancel(b) => {
+                return task_service_v2_no_write(
+                    b.action_id.clone(),
+                    "unsupported_operation",
+                    "semantic completion route excludes cancel",
+                )
+            }
+        };
+        let action_id = body.action_id.clone();
+        let stable =
+            match crate::task_delivery::provider_adapter::authenticate_worker_principal(&sender) {
+                Ok(s) => s,
+                Err(_) => {
+                    return task_service_v2_no_write(
+                        action_id,
+                        "unauthorized",
+                        "current runtime required",
+                    )
+                }
+            };
+        let session = match stable.authenticated_session_id() {
+            Ok(s) => s,
+            Err(_) => {
+                return task_service_v2_no_write(
+                    action_id,
+                    "unauthorized",
+                    "durable caller required",
+                )
+            }
+        };
+        let _execution = match self.execution.lock() {
+            Ok(l) => l,
+            Err(_) => {
+                return task_service_v2_no_write(
+                    action_id,
+                    "persistence_unavailable",
+                    "execution unavailable",
+                )
+            }
+        };
+        let Some(provider) = &self.provider else {
+            return task_service_v2_no_write(
+                action_id,
+                "persistence_unavailable",
+                "provider unavailable",
+            );
+        };
+        let snapshot = match provider.query() {
+            Ok(s) => s,
+            Err(_) => {
+                return task_service_v2_no_write(
+                    action_id,
+                    "persistence_unavailable",
+                    "snapshot unavailable",
+                )
+            }
+        };
+        let Some(assignment) = snapshot.assignments.get(&body.assignment_id) else {
+            return task_service_v2_no_write(action_id, "not_found", "assignment unavailable");
+        };
+        let context = worker_mechanical_context(&snapshot, assignment);
+        let known = snapshot.receipts.contains_key(&action_id);
+        let envelope = crate::task_service::TerminalActionEnvelope {
+            schema: crate::task_service::TerminalRequestSchema::V2,
+            command,
+            context,
+        };
+        match self.with_current_seated_session(session, |principal| {
+            provider_result_response(
+                action_id.clone(),
+                provider.execute_terminal_action(principal, &envelope),
+            )
+        }) {
+            Ok(response) => {
+                if let TaskServiceActionOutcome::Committed(receipt) = &response.outcome {
+                    self.append_task_transition_if_new(
+                        known,
+                        terminal_transition_kind(&envelope.command),
+                        receipt,
+                        None,
+                    );
+                }
+                response
+            }
+            Err(_) => task_service_v2_no_write(
+                action_id,
+                "unauthorized",
+                "current completion seat required",
+            ),
+        }
+    }
+
     fn execute_terminal_v2(
         &self,
         sender: TaskWorkerRosterSender,
@@ -3549,6 +3649,39 @@ pub fn handle_agent_bus_request(
                 }
             };
             let response = task_actions.execute_coordinator_v2(sender, state, payload);
+            task_actions.dispatch_completion_notifications_after_transition(state, &response);
+            write_json_response(stream, 200, "OK", &serde_json::to_value(response)?)
+        }
+        ("POST", "/api/task/v2/terminal-semantic") => {
+            require_task_worker_bridge_token(&request, token)?;
+            let invalid = || crate::task_service::ActionId::new("invalid-body").expect("fixed ID");
+            if request.body.len() > TASK_WORKER_ACTION_MAX_BODY_BYTES {
+                return write_json_response(
+                    stream,
+                    200,
+                    "OK",
+                    &serde_json::to_value(task_service_v2_no_write(
+                        invalid(),
+                        "body_too_large",
+                        "request exceeds route limit",
+                    ))?,
+                );
+            }
+            let response = match (
+                serde_json::from_slice::<crate::task_service::TerminalAuthorityRequest>(
+                    &request.body,
+                ),
+                task_worker_sender(&request, state),
+            ) {
+                (Ok(command), Ok(sender)) => {
+                    task_actions.execute_terminal_semantic(sender, command)
+                }
+                _ => task_service_v2_no_write(
+                    invalid(),
+                    "unauthorized_or_invalid",
+                    "strict semantic request/current caller required",
+                ),
+            };
             task_actions.dispatch_completion_notifications_after_transition(state, &response);
             write_json_response(stream, 200, "OK", &serde_json::to_value(response)?)
         }

@@ -454,6 +454,7 @@ pub fn submit_mcp_control(
             | "/api/task/v2/worker-prepare"
             | "/api/task/v2/actions"
             | "/api/task/v2/director-action"
+            | "/api/task/v2/terminal-semantic"
             | "/api/agents?all_groups=false&all_hosts=false"
     ) {
         anyhow::bail!("unsupported MCP route");
