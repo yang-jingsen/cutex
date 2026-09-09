@@ -454,6 +454,7 @@ pub fn submit_mcp_control(
             | "/api/task/v2/worker-prepare"
             | "/api/task/v2/actions"
             | "/api/task/v2/director-action"
+            | "/api/agents?all_groups=false&all_hosts=false"
     ) {
         anyhow::bail!("unsupported MCP route");
     }
@@ -470,6 +471,10 @@ pub fn submit_mcp_control(
         "MCP",
         if path.starts_with("/api/task/v2/") {
             Duration::from_secs(5)
+        } else if path == "/api/agent-management/v1/actions" {
+            // Fixed native Management wrapper budget; timeout is uncertain,
+            // never permission to issue a replacement action identity.
+            Duration::from_secs(30)
         } else {
             AGENT_MANAGEMENT_ACTION_TIMEOUT
         },
@@ -507,18 +512,26 @@ fn submit_authenticated_agent_control_with_fence(
         .with_context(|| format!("Failed to connect local cutex agent bus {label} route"))?;
     stream.set_write_timeout(Some(AGENT_BUS_HTTP_TIMEOUT)).ok();
     stream.set_read_timeout(Some(response_timeout)).ok();
+    let method = if fence.is_some() && path == "/api/agents?all_groups=false&all_hosts=false" {
+        "GET"
+    } else {
+        "POST"
+    };
     let headers = format!(
-        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nAuthorization: Bearer {route_token}\r\n{extra}X-Cutex-Agent-Id: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nAuthorization: Bearer {route_token}\r\n{extra}X-Cutex-Agent-Id: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         sender.as_str(),
         body.len()
     );
     stream.write_all(headers.as_bytes())?;
     stream.write_all(&body)?;
     let mut response = Vec::new();
-    let task_mcp = fence.is_some() && path.starts_with("/api/task/v2/");
-    // Native Task adapter limit: 1 MiB body. Bound framing too before allocating
+    let bounded_mcp = fence.is_some()
+        && (path.starts_with("/api/task/v2/")
+            || path == "/api/agent-management/v1/actions"
+            || path == "/api/agents?all_groups=false&all_hosts=false");
+    // Native Task/Management adapter limit: 1 MiB body. Bound framing too before allocating
     // an unbounded response; other existing callers retain their limits.
-    let limit = if task_mcp {
+    let limit = if bounded_mcp {
         1024 * 1024 + 65536 + 1
     } else {
         u64::MAX
@@ -532,7 +545,7 @@ fn submit_authenticated_agent_control_with_fence(
         .position(|window| window == b"\r\n\r\n")
         .with_context(|| format!("Cutex {label} response has no HTTP header boundary"))?;
     let header = String::from_utf8_lossy(&response[..split]);
-    if task_mcp && (split > 65536 || response.len() - split - 4 > 1024 * 1024) {
+    if bounded_mcp && (split > 65536 || response.len() - split - 4 > 1024 * 1024) {
         return Ok(b"{\"mcp_transport_invalid_response\":true}".to_vec());
     }
     if !header.starts_with("HTTP/1.1 2") {

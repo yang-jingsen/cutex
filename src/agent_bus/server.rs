@@ -2808,6 +2808,25 @@ pub fn handle_agent_bus_request(
         ("GET", "/") => write_http_response(stream, 200, "OK", "text/plain", b"ok"),
         ("GET", "/api/agents") => {
             require_service_bridge_token(&request, token, "Agent Bus")?;
+            if let Some(invocation) = validate_mcp_caller_fence(&request, state)? {
+                if request.path != "/api/agents?all_groups=false&all_hosts=false" {
+                    anyhow::bail!("unsupported MCP list scope");
+                }
+                let sessions = load_cutex_session_store()?;
+                let state = state.lock().map_err(|_| anyhow!("Bus unavailable"))?;
+                let mut agents = visible_agents_for_request(
+                    &state,
+                    Some(&invocation.caller_runtime_agent_id),
+                    false,
+                );
+                agents.retain(|a| agent_is_local_to_bus(a, &current_host_name()));
+                let result = crate::agent_bus::mcp::list::project(
+                    &invocation.caller_runtime_agent_id,
+                    agents,
+                    &sessions,
+                );
+                return write_json_response(stream, 200, "OK", &result);
+            }
             if prune_stale_agents(state)? {
                 persist_agent_bus_registry(state)?;
             }
@@ -3161,6 +3180,13 @@ pub fn handle_agent_bus_request(
                     if !matches!(
                         payload.operation,
                         crate::agent_management::AgentOperation::QueryManaged
+                            | crate::agent_management::AgentOperation::Create { .. }
+                            | crate::agent_management::AgentOperation::Online { .. }
+                            | crate::agent_management::AgentOperation::Offline { .. }
+                            | crate::agent_management::AgentOperation::Restart { .. }
+                            | crate::agent_management::AgentOperation::Close { .. }
+                            | crate::agent_management::AgentOperation::Replace { .. }
+                            | crate::agent_management::AgentOperation::DirectorRotate { .. }
                     ) {
                         return write_json_response(
                             stream,

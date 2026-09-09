@@ -4,6 +4,10 @@ use anyhow::{bail, Context};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+#[path = "mcp_list.rs"]
+pub(crate) mod list;
+#[path = "mcp_management.rs"]
+mod management;
 #[path = "mcp_tasks.rs"]
 mod tasks;
 
@@ -41,6 +45,10 @@ pub fn tools() -> Value {
         .as_array_mut()
         .unwrap()
         .extend(tasks::tools());
+    result["tools"]
+        .as_array_mut()
+        .unwrap()
+        .extend([management::tool(), list::tool()]);
     result
 }
 
@@ -181,6 +189,38 @@ pub fn run() -> anyhow::Result<()> {
                             fence: &fence,
                         },
                     )
+                } else if name == "cutex_agent_management" {
+                    management::invoke(args, |body| {
+                        crate::agent_bus::client::submit_mcp_control(
+                            port,
+                            &token,
+                            &runtime,
+                            &fence,
+                            "/api/agent-management/v1/actions",
+                            body,
+                        )
+                    })
+                } else if name == "cutex_agent_list" {
+                    if list::validate_args(args).is_err() {
+                        json!({"ok":false,"code":"unsupported_scope_or_arguments","detail":"Only optional all_groups=false and all_hosts=false are supported; caller identity is not an argument."})
+                    } else {
+                        let value = crate::agent_bus::client::submit_mcp_control(
+                            port,
+                            &token,
+                            &runtime,
+                            &fence,
+                            "/api/agents?all_groups=false&all_hosts=false",
+                            &json!({}),
+                        )?;
+                        if value["ok"] == true
+                            && value["scope"] == "local_group_visible"
+                            && value["agents"].is_array()
+                        {
+                            value
+                        } else {
+                            json!({"ok":false,"code":"provider_observation_unavailable","detail":"Authenticated local Agent list unavailable; no empty or successful observation inferred."})
+                        }
+                    }
                 } else {
                     let (path, body) = request(name, args, &runtime)?;
                     crate::agent_bus::client::submit_mcp_control(
@@ -189,6 +229,7 @@ pub fn run() -> anyhow::Result<()> {
                 };
                 let failed = result.get("http_status").is_some()
                     || result["outcome"]["status"] == "no_write"
+                    || result["outcome"]["status"] == "owner_action_required"
                     || matches!(
                         result["status"].as_str(),
                         Some("no_write" | "conflict" | "response_uncertain")
