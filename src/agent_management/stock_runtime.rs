@@ -92,6 +92,7 @@ impl AgentManagementProvider {
         self.review_stock_runtime_locked(path, id, restart, tasks)
     }
 
+    /// Caller holds the provider mutation lock; this acquires the Task fence.
     pub(crate) fn review_stock_runtime_locked(
         &self,
         path: &Path,
@@ -166,6 +167,8 @@ impl AgentManagementProvider {
         self.execute_stock_runtime_locked(path, action_id, review, tasks, runtime)
     }
 
+    /// Caller holds execution then mutation locks. Only the root wrapper and
+    /// sealed, provider-authorized bootstrap permit may enter this helper.
     pub(crate) fn execute_stock_runtime_locked(
         &self,
         path: &Path,

@@ -130,6 +130,7 @@ fn receiver_profile(sandbox: &str) -> anyhow::Result<&'static str> {
 
 /// A neutral, model-free owner. Never retries thread/start after an uncertain
 /// response; the provider journals the known ID before adoption and online.
+#[cfg(unix)]
 pub(super) fn bootstrap_native(
     permit: &cutex::agent_management::BootstrapExecutionPermit<'_>,
     existing: Option<&str>,
@@ -285,6 +286,17 @@ pub(super) fn bootstrap_native(
         outcome_unknown: spawned || known.is_some(),
         known_native_session_id: known,
     })
+}
+
+#[cfg(not(unix))]
+pub(super) fn bootstrap_native(
+    _permit: &cutex::agent_management::BootstrapExecutionPermit<'_>,
+    _existing: Option<&str>,
+) -> Result<String, cutex::agent_management::LifecycleFailure> {
+    Err(cutex::agent_management::LifecycleFailure::definite(
+        "unsupported_bootstrap_platform",
+        "private bootstrap requires Linux",
+    ))
 }
 
 impl StockRuntimeExecutor for StockExecutor {

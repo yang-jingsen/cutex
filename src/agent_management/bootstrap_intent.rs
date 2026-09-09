@@ -48,6 +48,14 @@ impl BootstrapExecutionPermit<'_> {
         let spec = self.intent.spec()?;
         let digest = super::store::request_sha256(self.intent)?;
         let key = format!("bootstrap-adopt:{}", digest.as_str());
+        let contract = ExplicitLaunchContract {
+            version: 2,
+            native_id: native.to_owned(),
+            native_home: self.intent.native_home.clone(),
+            bundle_manifest: self.intent.bundle_manifest.clone(),
+            bundle_sha256: self.intent.bundle_sha256.clone(),
+        };
+        contract.validate()?;
         with_locked_session_store(path, |sessions| {
             if let Some(prior) = sessions.explicit_launch_receipts.get(&key) {
                 let ExplicitLaunchActionReceipt::Bootstrap(prior) = prior else {
@@ -63,7 +71,11 @@ impl BootstrapExecutionPermit<'_> {
                     .ok_or_else(|| anyhow::anyhow!("bootstrap adopted identity missing"))?;
                 anyhow::ensure!(
                     record.codex_session_id.as_deref() == Some(native)
-                        && record.explicit_launch.is_some(),
+                        && record.explicit_launch.as_ref() == Some(&contract)
+                        && !record.is_retired()
+                        && record.agent_enabled
+                        && record.formal_agent_name.as_ref() == Some(&spec.name)
+                        && record.profile == spec.profile,
                     "bootstrap adopted binding changed"
                 );
                 return Ok(prior.cutex_session_id.clone());
@@ -75,14 +87,6 @@ impl BootstrapExecutionPermit<'_> {
                     .any(|s| s.codex_session_id.as_deref() == Some(native)),
                 "bootstrap native identity already mapped without same-action receipt"
             );
-            let contract = ExplicitLaunchContract {
-                version: 2,
-                native_id: native.to_owned(),
-                native_home: self.intent.native_home.clone(),
-                bundle_manifest: self.intent.bundle_manifest.clone(),
-                bundle_sha256: self.intent.bundle_sha256.clone(),
-            };
-            contract.validate()?;
             let adopted = adopt_cutex_session(
                 sessions,
                 native,
@@ -151,6 +155,31 @@ impl BootstrapExecutionPermit<'_> {
             super::store::request_sha256(self.intent)?.as_str()
         ))?;
         let sessions = crate::session::store::load_cutex_session_store_from_path(path)?;
+        let intent_digest = super::store::request_sha256(self.intent)?;
+        let Some(ExplicitLaunchActionReceipt::Bootstrap(adopted)) = sessions
+            .explicit_launch_receipts
+            .get(&format!("bootstrap-adopt:{}", intent_digest.as_str()))
+        else {
+            anyhow::bail!("bootstrap adoption receipt missing; no launch permitted")
+        };
+        let record = sessions
+            .sessions
+            .get(id.as_str())
+            .ok_or_else(|| anyhow::anyhow!("bootstrap adopted record missing"))?;
+        anyhow::ensure!(
+            adopted.intent_sha256 == intent_digest
+                && &adopted.cutex_session_id == id
+                && record.codex_session_id.as_deref() == Some(adopted.native_id.as_str())
+                && record
+                    .explicit_launch
+                    .as_ref()
+                    .is_some_and(|contract| contract.native_id == adopted.native_id
+                        && contract.version == 2
+                        && contract.native_home == self.intent.native_home
+                        && contract.bundle_manifest == self.intent.bundle_manifest
+                        && contract.bundle_sha256 == self.intent.bundle_sha256),
+            "bootstrap adoption/intent binding changed; no launch permitted"
+        );
         let review = match sessions.explicit_launch_receipts.get(action.as_str()) {
             Some(ExplicitLaunchActionReceipt::Runtime(prior)) => {
                 anyhow::ensure!(
