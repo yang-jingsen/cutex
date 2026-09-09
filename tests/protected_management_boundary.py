@@ -73,8 +73,11 @@ def settle(request,value):
     if value['outcome'].get('code')=='response_uncertain':
         deadline=time.monotonic()+600
         while True:
-            action_record=roster()['actions'].get(request['action_id'])
+            snapshot=roster()
+            action_record=snapshot['actions'].get(request['action_id'])
             if action_record and action_record.get('response') is not None:break
+            failure=snapshot['failure_events'].get('agent-management:'+request['action_id']+':failure')
+            if failure:raise AssertionError(failure)
             assert time.monotonic()<deadline,action_record
             threading.Event().wait(.05)
         value=management('director',request)
@@ -151,4 +154,7 @@ assert management('director',rotation)==json.loads((RUN/'s8b-rotate-receipt.json
 (RUN/'result.json').write_text(json.dumps({'authority':authority,'successor':successor,'old_director':durable,'worker':actors['worker']['durable'],'release':legacy,'operations':len(facts),'same_action_replay':True,'default_bytes':sha(CUTEX)}))
 '''
 probe.body=setup+ast.parse(campaign).body
+cleanup=ast.unparse(ast.Module(body=probe.finalbody,type_ignores=[]))
+cleanup=cleanup.replace("[RUN, RUN / 'new-agent']", "[RUN, RUN / 'new-agent', RUN / 'replacement', RUN / 'successor']")
+probe.finalbody=ast.parse(cleanup).body
 exec(compile(ast.fix_missing_locations(tree),'S8b-private-protected-management','exec'),globals())

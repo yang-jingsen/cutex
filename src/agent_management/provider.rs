@@ -2010,13 +2010,25 @@ impl AgentManagementProvider {
             .as_ref()
             .ok_or(AgentManagementError::InvalidStore)?;
         let agent = self.active_agent(&request.project_id, successor)?;
+        let state = self.store.snapshot()?;
+        let intent = state.bootstrap_intents.get(&request.action_id);
+        if let Some(intent) = intent {
+            // A creator restart loses its in-process connection, not the
+            // captured successor. Reconcile the original runtime receipt and
+            // owned occurrence through the same sealed launch permit. This
+            // never enters generic online or creates another native thread.
+            lifecycle
+                .online_reviewed(
+                    &BootstrapExecutionPermit {
+                        provider: self,
+                        intent,
+                    },
+                    successor,
+                )
+                .map_err(lifecycle_error)?;
+        }
         let observation = lifecycle.observe(successor).map_err(lifecycle_error)?;
-        if let Some(intent) = self
-            .store
-            .snapshot()?
-            .bootstrap_intents
-            .get(&request.action_id)
-        {
+        if let Some(intent) = intent {
             validate_ready_with_groups(&agent, &observation, &intent.runtime_groups)?;
         } else {
             validate_ready(&agent, &observation)?;
@@ -2228,7 +2240,7 @@ impl AgentManagementProvider {
         let observation = lifecycle
             .observe(cutex_session_id)
             .map_err(lifecycle_error)?;
-        validate_managed_observation_identity(&expected, &observation)?;
+        self.validate_current_managed_observation(&expected, &observation)?;
         let externally_closed = !observation.active
             && !observation.app_server_runtime
             && observation.runtime_agent_ids.is_empty()
@@ -2259,7 +2271,7 @@ impl AgentManagementProvider {
         let after = lifecycle
             .observe(cutex_session_id)
             .map_err(lifecycle_error)?;
-        validate_managed_observation_identity(&agent, &after)?;
+        self.validate_current_managed_observation(&agent, &after)?;
         if after.active
             || after.app_server_runtime
             || !after.runtime_agent_ids.is_empty()
@@ -2274,6 +2286,27 @@ impl AgentManagementProvider {
         }
         self.mark_expected_predecessor_retired(request, &expected)?;
         Ok(None)
+    }
+
+    fn validate_current_managed_observation(
+        &self,
+        agent: &ManagedAgentRecord,
+        observation: &AgentRuntimeObservation,
+    ) -> Result<(), AgentManagementError> {
+        let state = self.store.snapshot()?;
+        let mut intents = state.actions.values().filter_map(|action| {
+            (action.known_successor_cutex_session.as_ref() == Some(&agent.cutex_session_id))
+                .then(|| state.bootstrap_intents.get(&action.action_id))
+                .flatten()
+        });
+        if let Some(intent) = intents.next() {
+            if intents.next().is_some() {
+                return Err(AgentManagementError::InvalidStore);
+            }
+            validate_managed_observation_groups(agent, observation, &intent.runtime_groups)
+        } else {
+            validate_managed_observation_identity(agent, observation)
+        }
     }
 
     fn mark_expected_predecessor_retired(
@@ -4014,9 +4047,20 @@ fn validate_managed_observation_identity(
     agent: &ManagedAgentRecord,
     observation: &AgentRuntimeObservation,
 ) -> Result<(), AgentManagementError> {
-    let spec = &agent.spec;
-    let groups_match = observation.groups == spec.groups
-        || observation.groups == expected_runtime_groups(&spec.cwd, &spec.groups);
+    validate_managed_observation_groups(
+        agent,
+        observation,
+        &expected_runtime_groups(&agent.spec.cwd, &agent.spec.groups),
+    )
+}
+
+fn validate_managed_observation_groups(
+    agent: &ManagedAgentRecord,
+    observation: &AgentRuntimeObservation,
+    expected_groups: &[String],
+) -> Result<(), AgentManagementError> {
+    let groups_match =
+        observation.groups == agent.spec.groups || observation.groups == expected_groups;
     if let Some(field) = managed_spec_mismatch(agent, observation, groups_match) {
         return Err(managed_observation_mismatch(
             "managed Agent observation",
