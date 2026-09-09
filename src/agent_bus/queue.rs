@@ -360,6 +360,7 @@ pub(crate) fn enqueue_task_service_system_message_once(
     metadata: &TaskServiceAssignmentMetadata,
     external_action_id: &str,
     external_message_id: &str,
+    native_target: Option<&str>,
     now: u64,
 ) -> anyhow::Result<AgentBusSendOutcome> {
     if !principal.authenticate() {
@@ -369,7 +370,7 @@ pub(crate) fn enqueue_task_service_system_message_once(
     }
     let contract = metadata.require_valid_contract()?;
     validate_task_service_assignment_summary(content, contract)?;
-    enqueue_agent_bus_message_once_with_participants(
+    enqueue_agent_bus_message_once_with_id(
         state,
         "cutex-task-service",
         target_id,
@@ -385,7 +386,8 @@ pub(crate) fn enqueue_task_service_system_message_once(
         Some(external_action_id.to_string()),
         Some(external_message_id.to_string()),
         None,
-        None,
+        native_target.map(str::to_string),
+        native_target.map(|owner| native_task_message_id("tsa", external_message_id, owner)),
         now,
     )
 }
@@ -401,6 +403,7 @@ pub(crate) fn enqueue_task_service_completion_message_once(
     delivery_mode: AgentDeliveryMode,
     external_action_id: &str,
     external_message_id: &str,
+    native_target: Option<&str>,
     now: u64,
 ) -> anyhow::Result<AgentBusSendOutcome> {
     if !principal.authenticate() {
@@ -408,6 +411,9 @@ pub(crate) fn enqueue_task_service_completion_message_once(
             "Task Service system principal authentication failed"
         ));
     }
+    let message_id = native_target
+        .map(|owner| native_completion_message_id(metadata.notification_id.as_str(), owner))
+        .unwrap_or_else(|| format!("tsc_{}", metadata.notification_id.as_str()));
     enqueue_agent_bus_message_once_with_id(
         state,
         "cutex-task-service",
@@ -424,10 +430,72 @@ pub(crate) fn enqueue_task_service_completion_message_once(
         Some(external_action_id.to_string()),
         Some(external_message_id.to_string()),
         None,
-        None,
-        Some(format!("tsc_{}", metadata.notification_id.as_str())),
+        native_target.map(str::to_string),
+        Some(message_id),
         now,
     )
+}
+
+/// A seat change creates a distinct recipient context obligation, never mutates
+/// the already frozen envelope/receipt for its predecessor. Runtime restart
+/// retains the same durable recipient and therefore the same message identity.
+pub(crate) fn native_completion_message_id(notification: &str, owner: &str) -> String {
+    native_task_message_id("tsc", notification, owner)
+}
+
+pub(crate) fn native_task_message_id(family: &str, notification: &str, owner: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "{family}_{notification}_{:x}",
+        Sha256::digest(owner.as_bytes())
+    )
+}
+
+/// Trusted dispatch observation only. The bridge revalidates occurrence and
+/// recipient authority before RPC and again at business commit.
+pub(crate) fn native_task_target(runtime: &str) -> anyhow::Result<Option<String>> {
+    let store = crate::session::store::load_cutex_session_store()?;
+    let mut matching = store
+        .sessions
+        .values()
+        .filter(|r| r.current_runtime_agent_id.as_deref() == Some(runtime));
+    let Some(record) = matching.next() else {
+        return Ok(None);
+    };
+    anyhow::ensure!(matching.next().is_none(), "ambiguous Task runtime mapping");
+    Ok((record.explicit_launch.is_some()
+        && record.app_server_runtime.as_ref().is_some_and(|r| {
+            matches!(
+                r.schema_sha256.as_str(),
+                crate::launch::stock::S6_SCHEMA_SHA256 | crate::launch::stock::S6E_SCHEMA_SHA256
+            )
+        }))
+    .then(|| record.cutex_session_id.clone()))
+}
+
+#[cfg(test)]
+#[test]
+fn native_completion_identity_is_recipient_scoped_not_runtime_scoped() {
+    let owner = "cutex.11111111-1111-4111-8111-111111111111";
+    let successor = "cutex.22222222-2222-4222-8222-222222222222";
+    let first = native_completion_message_id("tsn-notification", owner);
+    assert_eq!(
+        first,
+        native_completion_message_id("tsn-notification", owner)
+    );
+    assert_ne!(
+        first,
+        native_completion_message_id("tsn-notification", successor)
+    );
+    assert_ne!(first, native_completion_message_id("tsn-other", owner));
+    assert!(first.len() < 256);
+    for family in ["tsa", "tsf", "tsw"] {
+        let key = native_task_message_id(family, "event-1", owner);
+        assert_eq!(key, native_task_message_id(family, "event-1", owner));
+        assert_ne!(key, native_task_message_id(family, "event-1", successor));
+        assert_ne!(key, native_task_message_id("tsc", "event-1", owner));
+        assert_ne!(key, native_task_message_id(family, "event-2", owner));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -440,6 +508,7 @@ pub(crate) fn enqueue_task_service_worker_followup_message_once(
     metadata: &TaskServiceWorkerFollowupMetadata,
     external_action_id: &str,
     external_message_id: &str,
+    native_target: Option<&str>,
     now: u64,
 ) -> anyhow::Result<AgentBusSendOutcome> {
     if !principal.authenticate() {
@@ -466,8 +535,14 @@ pub(crate) fn enqueue_task_service_worker_followup_message_once(
         Some(external_action_id.to_string()),
         Some(external_message_id.to_string()),
         None,
-        None,
-        Some(format!("tsf_{}", metadata.notification_id.as_str())),
+        native_target.map(str::to_string),
+        Some(
+            native_target
+                .map(|owner| {
+                    native_task_message_id("tsf", metadata.notification_id.as_str(), owner)
+                })
+                .unwrap_or_else(|| format!("tsf_{}", metadata.notification_id.as_str())),
+        ),
         now,
     )
 }
@@ -482,6 +557,7 @@ pub(crate) fn enqueue_task_service_watchdog_message_once(
     metadata: &crate::task_service::TaskWatchdogMessageMetadata,
     delivery_mode: AgentDeliveryMode,
     external_message_id: &str,
+    native_target: Option<&str>,
     now: u64,
 ) -> anyhow::Result<AgentBusSendOutcome> {
     if !principal.authenticate() {
@@ -511,8 +587,12 @@ pub(crate) fn enqueue_task_service_watchdog_message_once(
         Some(metadata.notification_id.clone()),
         Some(external_message_id.to_string()),
         None,
-        None,
-        Some(format!("tsw_{}", metadata.notification_id)),
+        native_target.map(str::to_string),
+        Some(
+            native_target
+                .map(|owner| native_task_message_id("tsw", &metadata.notification_id, owner))
+                .unwrap_or_else(|| format!("tsw_{}", metadata.notification_id)),
+        ),
         now,
     )
 }
@@ -583,6 +663,7 @@ mod tests {
             &metadata,
             "assign-action",
             "message-1",
+            None,
             42,
         )
         .unwrap();
@@ -619,6 +700,7 @@ mod tests {
             &missing,
             "assign-action-missing",
             "message-missing",
+            None,
             43,
         )
         .is_err());
@@ -634,6 +716,7 @@ mod tests {
             &tampered,
             "assign-action-tampered",
             "message-tampered",
+            None,
             44,
         )
         .is_err());
@@ -653,6 +736,7 @@ mod tests {
             &duplicate_metadata,
             "assign-action-duplicate",
             "message-duplicate",
+            None,
             45,
         )
         .is_err());
@@ -852,6 +936,7 @@ mod tests {
             AgentDeliveryMode::Soon,
             "block-1",
             "notification-1",
+            None,
             1,
         )
         .unwrap();
@@ -865,6 +950,7 @@ mod tests {
             AgentDeliveryMode::Soon,
             "block-1",
             "notification-1",
+            None,
             100,
         )
         .unwrap();

@@ -91,6 +91,7 @@ pub(crate) fn ensure_managed_tui_peer_with_profile(
     if record.is_retired() {
         anyhow::bail!("cutex session is retired: {key}");
     }
+    cutex::agent_management::require_default_launch(&record)?;
     if record.runtime_backend != CutexSessionRuntimeBackend::CuteAlden {
         return Ok(false);
     }
@@ -283,6 +284,7 @@ fn start_cutex_session_online_with_profile_inner(
     if let Some(validate) = validate_occurrence {
         validate(&record)?;
     }
+    cutex::agent_management::require_default_launch(&record)?;
     ensure_runtime_claim_is_clear(&record)?;
     let next_runtime_generation = record
         .runtime_generation
@@ -886,7 +888,7 @@ fn app_server_new_thread_launch_command(
     ))
 }
 
-fn spawn_detached_child_reaper(mut child: Child, label: String) {
+pub(super) fn spawn_detached_child_reaper(mut child: Child, label: String) {
     let thread_name = format!("cutex-child-reaper-{}", child.id());
     let _ = std::thread::Builder::new()
         .name(thread_name)
@@ -1000,7 +1002,7 @@ fn strip_tui_runtime_env(
     launch
 }
 
-fn wait_for_app_server_endpoint(
+pub(super) fn wait_for_app_server_endpoint(
     layout: &AppServerRuntimeLayout,
     child: &mut Child,
     log_path: &std::path::Path,
@@ -1202,6 +1204,7 @@ fn runtime_claim_belongs_to_failed_start(
     failed_app_server_launch_claim_id: &str,
 ) -> bool {
     let stable_runtime_spec_matches = current.host_id == before.host_id
+        && current.explicit_launch == before.explicit_launch
         && current.runtime_backend == before.runtime_backend
         && current.profile == before.profile
         && current.codex_session_id == before.codex_session_id;
@@ -1491,6 +1494,15 @@ pub(crate) fn stop_cutex_session_runtime_for_entry(
     live_agents: &[AgentBusAgent],
     force: bool,
 ) -> anyhow::Result<SessionRuntimeStopResult> {
+    stop_cutex_session_runtime_for_entry_fenced(entry, live_agents, force, None)
+}
+
+pub(crate) fn stop_cutex_session_runtime_for_entry_fenced(
+    entry: &CodingSessionRegistration,
+    live_agents: &[AgentBusAgent],
+    force: bool,
+    fence: Option<(u64, bool)>,
+) -> anyhow::Result<SessionRuntimeStopResult> {
     let mut store = load_cutex_session_store()?;
     let Some(key) = cutex_session_key_for_user_id(&store, &entry.session_id) else {
         if let Some(agent) = live_agents.first() {
@@ -1515,6 +1527,15 @@ pub(crate) fn stop_cutex_session_runtime_for_entry(
         .get(&key)
         .cloned()
         .ok_or_else(|| anyhow!("cutex session disappeared while stopping: {key}"))?;
+    if let Some((generation, require_default)) = fence {
+        anyhow::ensure!(
+            record.runtime_generation == generation,
+            "runtime changed before stop; owner unchanged"
+        );
+        if require_default {
+            cutex::agent_management::require_default_launch(&record)?;
+        }
+    }
     ensure_cutex_session_runtime_host_is_local(&record)?;
     let alden_session = record
         .alden_session_name

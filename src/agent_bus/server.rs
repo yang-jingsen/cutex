@@ -696,6 +696,7 @@ impl TaskWorkerActionHost {
                 &metadata,
                 delivery_mode,
                 &notification.external_message_id,
+                crate::agent_bus::queue::native_task_target(&target_id)?.as_deref(),
                 crate::platform::now_epoch_secs(),
             ) {
                 Ok(queued) => watchdog.record_delivery_fact(
@@ -1310,6 +1311,106 @@ impl TaskWorkerActionHost {
             self.append_task_transition_if_new(was_known, transition, receipt, None);
         }
         response
+    }
+
+    fn execute_terminal_semantic(
+        &self,
+        sender: TaskWorkerRosterSender,
+        command: crate::task_service::TerminalAuthorityRequest,
+    ) -> TaskServiceActionResponse {
+        use crate::task_service::TerminalAuthorityRequest as T;
+        let body = match &command {
+            T::AcceptResult(b) | T::RequestChanges(b) | T::FailResult(b) => b,
+            T::Cancel(b) => {
+                return task_service_v2_no_write(
+                    b.action_id.clone(),
+                    "unsupported_operation",
+                    "semantic completion route excludes cancel",
+                )
+            }
+        };
+        let action_id = body.action_id.clone();
+        let stable =
+            match crate::task_delivery::provider_adapter::authenticate_worker_principal(&sender) {
+                Ok(s) => s,
+                Err(_) => {
+                    return task_service_v2_no_write(
+                        action_id,
+                        "unauthorized",
+                        "current runtime required",
+                    )
+                }
+            };
+        let session = match stable.authenticated_session_id() {
+            Ok(s) => s,
+            Err(_) => {
+                return task_service_v2_no_write(
+                    action_id,
+                    "unauthorized",
+                    "durable caller required",
+                )
+            }
+        };
+        let _execution = match self.execution.lock() {
+            Ok(l) => l,
+            Err(_) => {
+                return task_service_v2_no_write(
+                    action_id,
+                    "persistence_unavailable",
+                    "execution unavailable",
+                )
+            }
+        };
+        let Some(provider) = &self.provider else {
+            return task_service_v2_no_write(
+                action_id,
+                "persistence_unavailable",
+                "provider unavailable",
+            );
+        };
+        let snapshot = match provider.query() {
+            Ok(s) => s,
+            Err(_) => {
+                return task_service_v2_no_write(
+                    action_id,
+                    "persistence_unavailable",
+                    "snapshot unavailable",
+                )
+            }
+        };
+        let Some(assignment) = snapshot.assignments.get(&body.assignment_id) else {
+            return task_service_v2_no_write(action_id, "not_found", "assignment unavailable");
+        };
+        let context = worker_mechanical_context(&snapshot, assignment);
+        let known = snapshot.receipts.contains_key(&action_id);
+        let envelope = crate::task_service::TerminalActionEnvelope {
+            schema: crate::task_service::TerminalRequestSchema::V2,
+            command,
+            context,
+        };
+        match self.with_current_seated_session(session, |principal| {
+            provider_result_response(
+                action_id.clone(),
+                provider.execute_terminal_action(principal, &envelope),
+            )
+        }) {
+            Ok(response) => {
+                if let TaskServiceActionOutcome::Committed(receipt) = &response.outcome {
+                    self.append_task_transition_if_new(
+                        known,
+                        terminal_transition_kind(&envelope.command),
+                        receipt,
+                        None,
+                    );
+                }
+                response
+            }
+            Err(_) => task_service_v2_no_write(
+                action_id,
+                "unauthorized",
+                "current completion seat required",
+            ),
+        }
     }
 
     fn execute_terminal_v2(
@@ -2808,6 +2909,25 @@ pub fn handle_agent_bus_request(
         ("GET", "/") => write_http_response(stream, 200, "OK", "text/plain", b"ok"),
         ("GET", "/api/agents") => {
             require_service_bridge_token(&request, token, "Agent Bus")?;
+            if let Some(invocation) = validate_mcp_caller_fence(&request, state)? {
+                if request.path != "/api/agents?all_groups=false&all_hosts=false" {
+                    anyhow::bail!("unsupported MCP list scope");
+                }
+                let sessions = load_cutex_session_store()?;
+                let state = state.lock().map_err(|_| anyhow!("Bus unavailable"))?;
+                let mut agents = visible_agents_for_request(
+                    &state,
+                    Some(&invocation.caller_runtime_agent_id),
+                    false,
+                );
+                agents.retain(|a| agent_is_local_to_bus(a, &current_host_name()));
+                let result = crate::agent_bus::mcp::list::project(
+                    &invocation.caller_runtime_agent_id,
+                    agents,
+                    &sessions,
+                );
+                return write_json_response(stream, 200, "OK", &result);
+            }
             if prune_stale_agents(state)? {
                 persist_agent_bus_registry(state)?;
             }
@@ -2961,8 +3081,31 @@ pub fn handle_agent_bus_request(
             if prune_stale_agents(state)? {
                 persist_agent_bus_registry(state)?;
             }
-            let payload: AgentBusSendRequest = serde_json::from_slice(&request.body)
+            let mut payload: AgentBusSendRequest = serde_json::from_slice(&request.body)
                 .context("Failed to parse agent message JSON")?;
+            if let Some(invocation) = validate_mcp_caller_fence(&request, state)? {
+                if payload.from_agent_id.as_ref() != request.headers.get("x-cutex-agent-id")
+                    || payload.from.is_some()
+                    || payload.from_session_id.is_some()
+                    || payload.to_session_id.is_some()
+                    || payload
+                        .sender_kind
+                        .as_ref()
+                        .is_some_and(|kind| !kind.is_agent())
+                    || payload.control_type.is_some()
+                    || payload.control_payload.is_some()
+                    || payload.submit_mode.is_some()
+                    || payload.display_source.is_some()
+                    || payload.external_action_id.is_some()
+                    || payload.kind != crate::agent_bus::model::AgentBusEnvelopeKind::Message
+                {
+                    anyhow::bail!("unauthorized MCP sender or operation");
+                }
+                // Reuse the existing identity-bound send validation. A runtime
+                // rebind cannot reinterpret this Core caller as another Agent.
+                payload.from_session_id =
+                    Some(invocation.caller_cutex_session.as_str().to_string());
+            }
             let response = match (handlers.send_payload_response)(state, payload, true) {
                 Ok(response) => response,
                 Err(error) => {
@@ -3132,6 +3275,47 @@ pub fn handle_agent_bus_request(
                     "Agent Management requires authenticated Agent Bus access",
                 );
                 return write_json_response(stream, 200, "OK", &serde_json::to_value(response)?);
+            }
+            match validate_mcp_caller_fence(&request, state) {
+                Ok(Some(invocation)) => {
+                    if !matches!(
+                        payload.operation,
+                        crate::agent_management::AgentOperation::QueryManaged
+                            | crate::agent_management::AgentOperation::Create { .. }
+                            | crate::agent_management::AgentOperation::Online { .. }
+                            | crate::agent_management::AgentOperation::Offline { .. }
+                            | crate::agent_management::AgentOperation::Restart { .. }
+                            | crate::agent_management::AgentOperation::Close { .. }
+                            | crate::agent_management::AgentOperation::Replace { .. }
+                            | crate::agent_management::AgentOperation::DirectorRotate { .. }
+                    ) {
+                        return write_json_response(
+                            stream,
+                            200,
+                            "OK",
+                            &serde_json::to_value(agent_management_no_write(
+                                payload.action_id.clone(),
+                                "unauthorized",
+                                "MCP operation is not enabled",
+                            ))?,
+                        );
+                    }
+                    let response = (handlers.agent_management)(state, invocation, payload)?;
+                    return write_json_response(stream, 200, "OK", &response);
+                }
+                Err(_) => {
+                    return write_json_response(
+                        stream,
+                        200,
+                        "OK",
+                        &serde_json::to_value(agent_management_no_write(
+                            payload.action_id.clone(),
+                            "unauthorized",
+                            "MCP current runtime binding rejected",
+                        ))?,
+                    )
+                }
+                _ => {}
             }
             let sender = match agent_management_sender(&request, state) {
                 Ok(sender) => sender,
@@ -3468,6 +3652,39 @@ pub fn handle_agent_bus_request(
             task_actions.dispatch_completion_notifications_after_transition(state, &response);
             write_json_response(stream, 200, "OK", &serde_json::to_value(response)?)
         }
+        ("POST", "/api/task/v2/terminal-semantic") => {
+            require_task_worker_bridge_token(&request, token)?;
+            let invalid = || crate::task_service::ActionId::new("invalid-body").expect("fixed ID");
+            if request.body.len() > TASK_WORKER_ACTION_MAX_BODY_BYTES {
+                return write_json_response(
+                    stream,
+                    200,
+                    "OK",
+                    &serde_json::to_value(task_service_v2_no_write(
+                        invalid(),
+                        "body_too_large",
+                        "request exceeds route limit",
+                    ))?,
+                );
+            }
+            let response = match (
+                serde_json::from_slice::<crate::task_service::TerminalAuthorityRequest>(
+                    &request.body,
+                ),
+                task_worker_sender(&request, state),
+            ) {
+                (Ok(command), Ok(sender)) => {
+                    task_actions.execute_terminal_semantic(sender, command)
+                }
+                _ => task_service_v2_no_write(
+                    invalid(),
+                    "unauthorized_or_invalid",
+                    "strict semantic request/current caller required",
+                ),
+            };
+            task_actions.dispatch_completion_notifications_after_transition(state, &response);
+            write_json_response(stream, 200, "OK", &serde_json::to_value(response)?)
+        }
         ("POST", "/api/task/v2/terminal") => {
             if request.body.len() > TASK_WORKER_ACTION_MAX_BODY_BYTES {
                 return write_json_response(
@@ -3789,6 +4006,66 @@ fn require_agent_management_bridge_token(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("Agent Management requires a configured Agent Bus token"))?;
     require_service_bridge_token(request, Some(route_token), "Agent Bus")
+}
+
+/// Additional fail-closed occurrence fence for the opt-in MCP adapter. Native
+/// routes retain their existing contract; this grants no new principal/role.
+fn validate_mcp_caller_fence(
+    request: &crate::http::server::SimpleHttpRequest,
+    state: &Arc<Mutex<AgentBusState>>,
+) -> anyhow::Result<Option<AgentManagementInvocation>> {
+    use crate::agent_bus::mcp::{GENERATION_HEADER, THREAD_HEADER};
+    if !request.headers.contains_key(THREAD_HEADER)
+        && !request.headers.contains_key(GENERATION_HEADER)
+    {
+        return Ok(None);
+    }
+    let thread = request
+        .headers
+        .get(THREAD_HEADER)
+        .context("MCP thread missing")?;
+    let generation: u64 = request
+        .headers
+        .get(GENERATION_HEADER)
+        .context("MCP generation missing")?
+        .parse()?;
+    let sender = agent_management_sender(request, state)?;
+    let roster = state
+        .lock()
+        .map_err(|_| anyhow!("Bus unavailable"))?
+        .agents
+        .get(sender.runtime_agent_id.as_str())
+        .cloned()
+        .context("MCP occurrence missing")?;
+    let sessions = load_cutex_session_store()?;
+    let matches: Vec<_> = sessions
+        .sessions
+        .iter()
+        .filter(|(_, r)| r.codex_session_id.as_ref() == Some(thread))
+        .collect();
+    let [(key, record)] = matches.as_slice() else {
+        anyhow::bail!("MCP native mapping absent or ambiguous");
+    };
+    let caller_cutex_session =
+        crate::role_revision::CutexSessionId::new(record.cutex_session_id.clone())
+            .map_err(|_| anyhow!("invalid durable identity"))?;
+    if *key != &record.cutex_session_id
+        || sender.roster_session_id != *thread
+        || generation == 0
+        || record.runtime_generation != generation
+        || record.current_runtime_agent_id.as_deref() != Some(sender.runtime_agent_id.as_str())
+        || !record.agent_enabled
+        || record.is_retired()
+        || (record.explicit_launch.is_some() && record.app_server_launch_claim_id.is_some())
+        || record.registration_class != crate::agent_bus::model::AgentRegistrationClass::Persistent
+        || roster.registration_class != crate::agent_bus::model::AgentRegistrationClass::Persistent
+    {
+        anyhow::bail!("MCP occurrence is not the current persistent runtime");
+    }
+    Ok(Some(AgentManagementInvocation {
+        caller_cutex_session,
+        caller_runtime_agent_id: sender.runtime_agent_id.as_str().to_string(),
+    }))
 }
 
 fn agent_management_sender(
@@ -4513,6 +4790,10 @@ fn task_worker_sender(
     request: &crate::http::server::SimpleHttpRequest,
     state: &Arc<Mutex<AgentBusState>>,
 ) -> Result<TaskWorkerRosterSender, TaskWorkerActionNoWrite> {
+    // MCP adds an occurrence fence; provider Task roles/assignment checks below
+    // remain authoritative. Native callers without these headers are unchanged.
+    validate_mcp_caller_fence(request, state)
+        .map_err(|_| TaskWorkerActionNoWrite::SenderNotRegistered)?;
     let sender_id = request
         .headers
         .get("x-cutex-agent-id")
@@ -8376,6 +8657,7 @@ mod tests {
             AgentDeliveryMode::AfterTurn,
             notification.transition_action_id.as_str(),
             &notification.external_message_id,
+            None,
             now_epoch_secs(),
         )
         .unwrap();

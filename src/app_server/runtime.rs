@@ -50,14 +50,31 @@ impl AppServerRuntimeLayout {
         Self::prepare_under(&runtime_dir()?, cutex_session_id)
     }
 
+    /// Same private managed root, compact Unix path for explicit stock owners.
+    pub fn prepare_stock(cutex_session_id: &str) -> anyhow::Result<Self> {
+        Self::prepare_layout(&runtime_dir()?, cutex_session_id, true)
+    }
+
     fn prepare_under(runtime_root: &Path, cutex_session_id: &str) -> anyhow::Result<Self> {
+        Self::prepare_layout(runtime_root, cutex_session_id, false)
+    }
+
+    fn prepare_layout(
+        runtime_root: &Path,
+        cutex_session_id: &str,
+        compact: bool,
+    ) -> anyhow::Result<Self> {
         let session_key = runtime_session_key(cutex_session_id);
         let launch_key = Uuid::new_v4().simple().to_string();
         let launch_key = &launch_key[..8];
         let endpoint_key = fnv1a_hex(cutex_session_id);
         let runtime_dir = runtime_root
             .join(APP_SERVER_RUNTIME_DIR_NAME)
-            .join(format!("{}-{launch_key}", &endpoint_key[..10]));
+            .join(if compact {
+                Uuid::new_v4().simple().to_string()[..12].to_string()
+            } else {
+                format!("{}-{launch_key}", &endpoint_key[..10])
+            });
         create_private_dir(&runtime_dir)?;
         let journal_dir = runtime_root.join(APP_SERVER_JOURNAL_DIR_NAME);
         create_private_dir(&journal_dir)?;
@@ -67,7 +84,7 @@ impl AppServerRuntimeLayout {
         {
             use std::os::unix::ffi::OsStrExt;
 
-            let socket_path = runtime_dir.join("app.sock");
+            let socket_path = runtime_dir.join(if compact { "s" } else { "app.sock" });
             if socket_path.as_os_str().as_bytes().len() > MAX_UNIX_SOCKET_PATH_BYTES {
                 let _ = fs::remove_dir(&runtime_dir);
                 anyhow::bail!(

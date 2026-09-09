@@ -335,6 +335,36 @@ impl TaskServiceAgentBusDispatcher {
                     crate::agent_bus::delivery::AgentDeliveryMode::Soon
                 }
             };
+            let sessions = match load_cutex_session_store() {
+                Ok(sessions) => sessions,
+                Err(_) => {
+                    record_notification_uncertain_once(
+                        provider,
+                        notification,
+                        "recipient_session_snapshot_unavailable",
+                    )?;
+                    summary.uncertain += 1;
+                    continue;
+                }
+            };
+            let native_target = (|| {
+                let owner = target_session?;
+                sessions
+                    .sessions
+                    .get(owner)
+                    .filter(|r| {
+                        r.current_runtime_agent_id.as_deref() == Some(&target_id)
+                            && r.explicit_launch.is_some()
+                            && r.app_server_runtime.as_ref().is_some_and(|runtime| {
+                                matches!(
+                                    runtime.schema_sha256.as_str(),
+                                    crate::launch::stock::S6_SCHEMA_SHA256
+                                        | crate::launch::stock::S6E_SCHEMA_SHA256
+                                )
+                            })
+                    })
+                    .map(|_| owner.to_string())
+            })();
             let outcome = enqueue_task_service_completion_message_once(
                 state,
                 &task_service_system_principal(),
@@ -345,6 +375,7 @@ impl TaskServiceAgentBusDispatcher {
                 mode,
                 notification.transition_action_id.as_str(),
                 &notification.external_message_id,
+                native_target.as_deref(),
                 now_epoch_secs,
             );
             match outcome {
@@ -421,6 +452,9 @@ impl TaskServiceAgentBusDispatcher {
                 &metadata,
                 notification.transition_action_id.as_str(),
                 &notification.external_message_id,
+                crate::agent_bus::queue::native_task_target(&target_id)
+                    .map_err(|_| ProviderError::PersistenceUnavailable)?
+                    .as_deref(),
                 now_epoch_secs,
             ) {
                 Ok(outcome) => {
@@ -544,6 +578,9 @@ impl TaskServiceAgentBusDispatcher {
             &metadata,
             request.action_id.as_str(),
             &send_attempt.external_message_id,
+            crate::agent_bus::queue::native_task_target(&target_id)
+                .map_err(|_| AssignmentDispatchError::AgentBusUnavailable)?
+                .as_deref(),
             now_epoch_secs,
         )
         .map_err(|_| AssignmentDispatchError::AgentBusUnavailable)?;
@@ -673,6 +710,9 @@ impl TaskServiceAgentBusDispatcher {
             &metadata,
             request.action_id.as_str(),
             &send_attempt.external_message_id,
+            crate::agent_bus::queue::native_task_target(&target_id)
+                .map_err(|_| AssignmentDispatchError::AgentBusUnavailable)?
+                .as_deref(),
             now_epoch_secs,
         )
         .map_err(|_| AssignmentDispatchError::AgentBusUnavailable)?;
@@ -798,6 +838,9 @@ impl TaskServiceAgentBusDispatcher {
             &metadata,
             request.action_id.as_str(),
             &send_attempt.external_message_id,
+            crate::agent_bus::queue::native_task_target(&target_id)
+                .map_err(|_| AssignmentDispatchError::AgentBusUnavailable)?
+                .as_deref(),
             now_epoch_secs,
         )
         .map_err(|_| AssignmentDispatchError::AgentBusUnavailable)?;

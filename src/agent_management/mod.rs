@@ -6,19 +6,25 @@
 //! without creating real Agents.
 
 mod archive;
+mod bootstrap_intent;
 mod durable_adoption;
 mod durable_import;
+mod explicit_launch;
 mod model;
 mod projects;
 mod provider;
+mod stock_runtime;
 mod store;
 
 pub use archive::*;
+pub use bootstrap_intent::*;
 pub use durable_adoption::*;
 pub use durable_import::*;
+pub use explicit_launch::*;
 pub use model::*;
 pub use projects::*;
 pub use provider::*;
+pub use stock_runtime::*;
 pub use store::*;
 
 pub const AGENT_MANAGEMENT_CONTRACT: &str = "cutex/agent-management/v1";

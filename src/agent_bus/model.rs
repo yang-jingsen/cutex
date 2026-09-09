@@ -155,7 +155,7 @@ pub struct JobServiceCompletionReceipt {
     pub disposition: JobServiceCompletionDisposition,
     pub deduplicated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub a4_receipt: Option<crate::app_server::commands::InterAgentContextPersistedReceipt>,
+    pub a4_receipt: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
 }

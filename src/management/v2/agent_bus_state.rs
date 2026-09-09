@@ -47,6 +47,15 @@ pub struct AgentBusMessageSnapshot {
     pub a2_submission_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub a4_receipt: Option<InterAgentContextPersistedReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_input: Option<crate::app_server::external_input::Envelope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_input_receipt: Option<crate::app_server::external_input::Receipt>,
+    /// Observation only, not a task result or an automatic retry permission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_input_last_observed: Option<crate::app_server::external_input::Status>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_input_commit_generation: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<Value>,
 }
@@ -67,6 +76,9 @@ struct StoredAgentBusMessage {
 #[serde(rename_all = "camelCase")]
 struct AgentBusMessageStore {
     version: u8,
+    #[serde(default)]
+    external_recovery_actions:
+        BTreeMap<String, crate::app_server::external_recovery::RecoveryReceipt>,
     #[serde(default)]
     messages: BTreeMap<String, StoredAgentBusMessage>,
 }
@@ -138,6 +150,34 @@ fn validate_private_test_home(home: &str, private: &str) -> anyhow::Result<()> {
 }
 
 impl AgentBusMessageRepository {
+    pub(crate) fn recovery_action(
+        &self,
+        action: &str,
+    ) -> anyhow::Result<Option<crate::app_server::external_recovery::RecoveryReceipt>> {
+        self.read(|s| Ok(s.external_recovery_actions.get(action).cloned()))
+    }
+
+    pub(crate) fn save_recovery_action(
+        &self,
+        receipt: &crate::app_server::external_recovery::RecoveryReceipt,
+    ) -> anyhow::Result<()> {
+        self.mutate(|s| {
+            if let Some(old) = s.external_recovery_actions.get(&receipt.action_id) {
+                anyhow::ensure!(
+                    old.review == receipt.review && old.retry_id == receipt.retry_id,
+                    "recovery action semantic conflict"
+                );
+                anyhow::ensure!(
+                    old.result.is_none() || old.result == receipt.result,
+                    "recovery receipt conflict"
+                );
+            }
+            s.external_recovery_actions
+                .insert(receipt.action_id.clone(), receipt.clone());
+            s.version = 4;
+            Ok(())
+        })
+    }
     pub fn open(root: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let root = root.into();
         fs::create_dir_all(&root)?;
@@ -234,6 +274,10 @@ impl AgentBusMessageRepository {
                         semantic_sha256: Some(message.semantic_sha256),
                         a2_submission_id: None,
                         a4_receipt: None,
+                        external_input: None,
+                        external_input_receipt: None,
+                        external_input_last_observed: None,
+                        external_input_commit_generation: None,
                         error: None,
                     },
                     updated_at: message.queued_at.to_rfc3339(),
@@ -241,6 +285,153 @@ impl AgentBusMessageRepository {
             );
             write_private_pretty_json_atomic(path, &store, "management v2 agent-bus state")?;
             Ok(true)
+        })
+    }
+
+    /// Freeze from the authenticated, persisted canonical record, never a poll
+    /// payload. V3 prevents older writers from dropping native receipt fields.
+    pub(crate) fn freeze_external_input(
+        &self,
+        owner: &str,
+        message_id: &str,
+        make: impl FnOnce(
+            &AgentBusMessage,
+        ) -> anyhow::Result<crate::app_server::external_input::Envelope>,
+    ) -> anyhow::Result<crate::app_server::external_input::Envelope> {
+        self.mutate(|store| {
+            let stored = store
+                .messages
+                .get_mut(message_id)
+                .context("canonical message absent; explicit review required")?;
+            anyhow::ensure!(
+                stored.snapshot.to_cutex_session_id == owner,
+                "canonical recipient changed"
+            );
+            if let Some(envelope) = &stored.snapshot.external_input {
+                envelope.validate()?;
+                return Ok(envelope.clone());
+            }
+            anyhow::ensure!(
+                stored.snapshot.state == "pending"
+                    && stored.snapshot.a2_submission_id.is_none()
+                    && stored.snapshot.a4_receipt.is_none(),
+                "legacy native submission ambiguous; explicit review required"
+            );
+            let canonical = stored
+                .canonical_envelope
+                .as_ref()
+                .context("legacy canonical envelope absent; explicit review required")?;
+            let envelope = make(canonical)?;
+            envelope.validate()?;
+            anyhow::ensure!(
+                envelope.owner_id == owner
+                    && envelope.message.id == canonical.id
+                    && canonical.id == message_id,
+                "native envelope recipient/message mismatch"
+            );
+            stored.snapshot.external_input = Some(envelope.clone());
+            store.version = store.version.max(
+                if envelope.message.delivery == crate::app_server::external_input::Delivery::Soon {
+                    4
+                } else {
+                    3
+                },
+            );
+            Ok(envelope)
+        })
+    }
+
+    /// Caller holds current lifecycle/occurrence fences. The frozen envelope
+    /// and original receipt are compared again under this repository's lock.
+    pub(crate) fn record_external_input_delivered(
+        &self,
+        owner: &str,
+        message_id: &str,
+        envelope: &crate::app_server::external_input::Envelope,
+        receipt: &crate::app_server::external_input::Receipt,
+        generation: u64,
+    ) -> anyhow::Result<()> {
+        self.mutate(|store| {
+            let stored = store
+                .messages
+                .get_mut(message_id)
+                .context("canonical message disappeared")?;
+            anyhow::ensure!(
+                stored.snapshot.to_cutex_session_id == owner
+                    && stored.snapshot.external_input.as_ref() == Some(envelope),
+                "native business commit CAS conflict"
+            );
+            anyhow::ensure!(
+                stored.snapshot.state == "pending" || stored.snapshot.state == "delivered",
+                "native business state conflict"
+            );
+            anyhow::ensure!(
+                stored
+                    .snapshot
+                    .external_input_receipt
+                    .as_ref()
+                    .is_none_or(|r| r == receipt),
+                "native receipt replay conflict"
+            );
+            receipt.validate(
+                &crate::launch::stock::ExternalInputBinding {
+                    version: 1,
+                    owner_id: envelope.owner_id.clone(),
+                    thread_id: envelope.thread_id.clone(),
+                    runtime_generation: envelope.runtime_generation,
+                    canonical_byte_limit: Default::default(),
+                },
+                &envelope.key(),
+            )?;
+            stored.snapshot.external_input_receipt = Some(receipt.clone());
+            stored
+                .snapshot
+                .external_input_commit_generation
+                .get_or_insert(generation);
+            stored.snapshot.state = "delivered".into();
+            stored.snapshot.error = None;
+            stored.updated_at = Utc::now().to_rfc3339();
+            Ok(())
+        })
+    }
+
+    pub(crate) fn record_external_input_error(
+        &self,
+        message_id: &str,
+        error: &str,
+    ) -> anyhow::Result<()> {
+        self.mutate(|store| {
+            let stored = store
+                .messages
+                .get_mut(message_id)
+                .context("canonical message absent")?;
+            if stored.snapshot.state == "pending" {
+                stored.snapshot.error =
+                    Some(json!({"code":"external_input_pending", "message":error}));
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn observe_external_input(
+        &self,
+        message_id: &str,
+        frozen: &crate::app_server::external_input::Envelope,
+        observed: &crate::app_server::external_input::Status,
+    ) -> anyhow::Result<()> {
+        self.mutate(|store| {
+            let stored = store
+                .messages
+                .get_mut(message_id)
+                .context("native business record absent")?;
+            anyhow::ensure!(
+                stored.snapshot.external_input.as_ref() == Some(frozen)
+                    && observed.message_id == frozen.message.id
+                    && observed.semantic_sha256 == frozen.semantic_sha256,
+                "native observation CAS conflict"
+            );
+            stored.snapshot.external_input_last_observed = Some(observed.clone());
+            Ok(())
         })
     }
 
@@ -375,6 +566,12 @@ impl AgentBusMessageRepository {
         Ok(self
             .get(message_id)?
             .and_then(|stored| stored.snapshot.semantic_sha256))
+    }
+
+    pub(crate) fn canonical_message(&self, message_id: &str) -> anyhow::Result<AgentBusMessage> {
+        self.get(message_id)?
+            .and_then(|stored| stored.canonical_envelope)
+            .context("canonical business message unavailable; explicit review required")
     }
 
     pub fn snapshot_by_message_id(
@@ -528,7 +725,7 @@ fn validate_session_identity(value: &str) -> anyhow::Result<()> {
 
 fn load_store(path: &Path) -> anyhow::Result<AgentBusMessageStore> {
     let store = load_store_unchecked(path)?;
-    if store.version != 2 {
+    if !matches!(store.version, 2 | 3 | 4) {
         anyhow::bail!("unsupported management v2 agent-bus state version");
     }
     Ok(store)
@@ -541,6 +738,7 @@ fn load_store_unchecked(path: &Path) -> anyhow::Result<AgentBusMessageStore> {
             Ok(store)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(AgentBusMessageStore {
+            external_recovery_actions: BTreeMap::new(),
             version: 2,
             messages: BTreeMap::new(),
         }),
@@ -607,6 +805,160 @@ fn secure_file(_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_bus_freeze_replay_cas_and_native_receipt_survive_reopen() {
+        use crate::app_server::external_input::*;
+        let root =
+            std::env::temp_dir().join(format!("cutex-external-store-{}", uuid::Uuid::new_v4()));
+        let repository = AgentBusMessageRepository::open(&root).unwrap();
+        let queued = system_queued_message("original");
+        let owner = queued.to_cutex_session_id.clone();
+        repository.record_queued_isolated(queued).unwrap();
+        let frozen = repository
+            .freeze_external_input(&owner, "jsc_stable", |m| {
+                let mut e = Envelope {
+                    version: 1,
+                    owner_id: owner.clone(),
+                    thread_id: "native-test".into(),
+                    runtime_generation: 1,
+                    message: Message {
+                        id: m.id.clone(),
+                        source: Source {
+                            kind: SourceKind::Service,
+                            id: "cutex-job-service".into(),
+                        },
+                        event_type: "job_completion".into(),
+                        delivery: Delivery::AfterTurn,
+                        text: m.content.clone(),
+                    },
+                    semantic_sha256: String::new(),
+                };
+                e.semantic_sha256 = e.digest();
+                Ok(e)
+            })
+            .unwrap();
+        let reopened = AgentBusMessageRepository::open(&root).unwrap();
+        let mut permission = crate::app_server::external_recovery::RecoveryReceipt {
+            action_id: "private-recovery".into(),
+            retry_id: "private-retry".into(),
+            review: crate::app_server::external_recovery::RecoveryReview {
+                envelope: frozen.clone(),
+                binding: crate::launch::stock::ExternalInputBinding {
+                    version: 1,
+                    owner_id: owner.clone(),
+                    thread_id: frozen.thread_id.clone(),
+                    runtime_generation: 1,
+                    canonical_byte_limit: Default::default(),
+                },
+                status: Status {
+                    message_id: frozen.message.id.clone(),
+                    semantic_sha256: frozen.semantic_sha256.clone(),
+                    delivery_state: DeliveryState::Unknown,
+                    receipt: None,
+                    processing: ProcessingStatus {
+                        state: ProcessingState::Held,
+                        attempt_id: None,
+                        reason: Some(HoldReason::NoOutput),
+                    },
+                },
+                durable_sha256: "private-spec".into(),
+                authority_sha256: "private-authority".into(),
+                warning: crate::app_server::external_recovery::REPEAT_WARNING.into(),
+            },
+            result: None,
+        };
+        reopened.save_recovery_action(&permission).unwrap();
+        reopened.save_recovery_action(&permission).unwrap();
+        assert_eq!(
+            reopened.recovery_action("private-recovery").unwrap(),
+            Some(permission.clone())
+        );
+        let mut conflict = permission.clone();
+        conflict.retry_id = "different".into();
+        assert!(reopened.save_recovery_action(&conflict).is_err());
+        permission.result = Some(RetryResponse {
+            version: 1,
+            owner_id: owner.clone(),
+            thread_id: frozen.thread_id.clone(),
+            runtime_generation: 1,
+            message_id: frozen.message.id.clone(),
+            semantic_sha256: frozen.semantic_sha256.clone(),
+            expected_attempt_id: None,
+            retry_id: permission.retry_id.clone(),
+            disposition: RetryDisposition::Released,
+        });
+        reopened.save_recovery_action(&permission).unwrap();
+        reopened.save_recovery_action(&permission).unwrap();
+        conflict = permission.clone();
+        conflict.result = None;
+        assert!(reopened.save_recovery_action(&conflict).is_err());
+        reopened
+            .mutate(|s| {
+                assert_eq!(s.version, 4);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            reopened
+                .freeze_external_input(&owner, "jsc_stable", |_| panic!(
+                    "must not reformat frozen record"
+                ))
+                .unwrap(),
+            frozen
+        );
+        let mut receipt = Receipt {
+            schema: "codex.external-input-receipt.v1".into(),
+            receipt_id: String::new(),
+            owner_id: owner.clone(),
+            thread_id: frozen.thread_id.clone(),
+            message_id: frozen.message.id.clone(),
+            semantic_sha256: frozen.semantic_sha256.clone(),
+            response_item_id: frozen.message.id.clone(),
+            turn_id: "turn-test".into(),
+            ordinal: 1,
+        };
+        receipt.receipt_id = receipt.digest_id();
+        let mut changed = frozen.clone();
+        changed.message.text = "changed".into();
+        changed.semantic_sha256 = changed.digest();
+        assert!(reopened
+            .record_external_input_delivered(&owner, "jsc_stable", &changed, &receipt, 2)
+            .is_err());
+        assert!(reopened
+            .record_external_input_delivered("foreign", "jsc_stable", &frozen, &receipt, 2)
+            .is_err());
+        reopened
+            .record_external_input_delivered(&owner, "jsc_stable", &frozen, &receipt, 2)
+            .unwrap();
+        reopened
+            .record_external_input_delivered(&owner, "jsc_stable", &frozen, &receipt, 3)
+            .unwrap();
+        let snapshot = reopened
+            .snapshot_by_message_id("jsc_stable")
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.external_input_receipt, Some(receipt.clone()));
+        assert!(snapshot.a4_receipt.is_none());
+        assert_eq!(snapshot.state, "delivered");
+        assert_eq!(snapshot.external_input_commit_generation, Some(2));
+        receipt.ordinal = 2;
+        receipt.receipt_id = receipt.digest_id();
+        assert!(reopened
+            .record_external_input_delivered(&owner, "jsc_stable", &frozen, &receipt, 3)
+            .is_err());
+        let raw: Value =
+            serde_json::from_slice(&fs::read(root.join(AGENT_BUS_STATE_FILE)).unwrap()).unwrap();
+        assert_eq!(raw["version"], 4);
+        assert_eq!(
+            AgentBusMessageRepository::open(&root)
+                .unwrap()
+                .recovery_action("private-recovery")
+                .unwrap(),
+            Some(permission)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn system_queued_message(content: &str) -> AgentBusQueuedMessage {
         let target = "cutex.11111111-1111-4111-8111-111111111111".to_string();
@@ -690,6 +1042,10 @@ mod tests {
                             semantic_sha256: None,
                             a2_submission_id: None,
                             a4_receipt: None,
+                            external_input: None,
+                            external_input_receipt: None,
+                            external_input_last_observed: None,
+                            external_input_commit_generation: None,
                             error: None,
                         },
                         updated_at: Utc::now().to_rfc3339(),

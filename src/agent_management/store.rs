@@ -30,6 +30,8 @@ const MUTATION_LOCK_FILE: &str = "agent-management-mutation-v1.lock";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentManagementSnapshot {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bootstrap_intents: BTreeMap<AgentActionId, super::BootstrapIntentReview>,
     /// Read-only durable projection, never persisted into roster history.
     #[serde(skip)]
     pub reversible_archive_projection: BTreeMap<crate::role_revision::CutexSessionId, bool>,
@@ -105,6 +107,7 @@ pub struct AgentManagementSnapshot {
 impl AgentManagementSnapshot {
     fn empty() -> Self {
         Self {
+            bootstrap_intents: BTreeMap::new(),
             reversible_archive_projection: BTreeMap::new(),
             agent_archive_actions: BTreeMap::new(),
             agent_archive_audit: BTreeMap::new(),
@@ -178,6 +181,22 @@ impl AgentManagementStore {
             .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
         FileExt::lock_exclusive(&lock).map_err(|_| AgentManagementError::PersistenceUnavailable)?;
         Ok(lock)
+    }
+
+    /// Delivery must not wait behind a lifecycle action which is joining its
+    /// bridge worker. Return pending instead; the next occurrence reconciles.
+    pub(crate) fn try_lock_delivery_mutations(&self) -> Result<Option<File>, AgentManagementError> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        set_private_open_options(&mut options);
+        let lock = options
+            .open(self.root.join(MUTATION_LOCK_FILE))
+            .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
+        match FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => Ok(Some(lock)),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(_) => Err(AgentManagementError::PersistenceUnavailable),
+        }
     }
 
     pub(crate) fn with_state<T>(
@@ -260,7 +279,20 @@ fn prepare_private_root(root: &Path) -> Result<(), AgentManagementError> {
 fn read_snapshot(root: &Path) -> Result<AgentManagementSnapshot, AgentManagementError> {
     let path = root.join(STORE_FILE);
     match fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| AgentManagementError::InvalidStore),
+        Ok(bytes) => {
+            let state: AgentManagementSnapshot =
+                serde_json::from_slice(&bytes).map_err(|_| AgentManagementError::InvalidStore)?;
+            if !state.bootstrap_intents.is_empty() && state.schema != AgentManagementStoreSchema::V2
+            {
+                return Err(AgentManagementError::InvalidStore);
+            }
+            for (action, intent) in &state.bootstrap_intents {
+                if &intent.request.action_id != action || intent.spec().is_err() {
+                    return Err(AgentManagementError::InvalidStore);
+                }
+            }
+            Ok(state)
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             Ok(AgentManagementSnapshot::empty())
         }

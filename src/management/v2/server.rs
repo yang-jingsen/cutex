@@ -171,6 +171,8 @@ fn agent_management_admin_path(path: &str) -> bool {
     matches!(
         path,
         "/v2/agent-management/authority"
+            | "/v2/agent-management/explicit-launch"
+            | "/v2/agent-management/native-recovery"
             | "/v2/agent-management/durable-candidates"
             | "/v2/agent-management/durable-import"
             | "/v2/agent-management/archive-review"
@@ -256,6 +258,62 @@ fn handle_v2_request_with_repository(
         }
         ("GET", "/v2/agent-management/projects") => {
             handle_management_project_collection(stream, context)
+        }
+        ("POST", "/v2/agent-management/native-recovery") => {
+            let payload: crate::app_server::external_recovery::RecoveryRequest =
+                match serde_json::from_slice(&request.body) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return write_v2_error(
+                            stream,
+                            400,
+                            "Bad Request",
+                            "invalid_request",
+                            "strict native recovery request required",
+                            false,
+                            json!({}),
+                        )
+                    }
+                };
+            match crate::app_server::external_recovery::handle(
+                &crate::management::control_plane::HumanManagementPrincipal::authenticated(),
+                &payload,
+            ) {
+                Ok(value) => write_json_response(stream, 200, "OK", &value),
+                Err(error) => write_v2_error(
+                    stream,
+                    409,
+                    "Conflict",
+                    "native_recovery_not_committed",
+                    &error.to_string(),
+                    false,
+                    json!({"recovery":"inspect status and reconcile the exact action; never infer rollback or choose a new retry ID"}),
+                ),
+            }
+        }
+        ("POST", "/v2/agent-management/explicit-launch") => {
+            let payload: crate::agent_management::ExplicitLaunchRequest =
+                match serde_json::from_slice(&request.body) {
+                    Ok(payload) => payload,
+                    Err(_) => {
+                        return write_v2_error(
+                            stream,
+                            400,
+                            "Bad Request",
+                            "invalid_request",
+                            "strict explicit launch request required",
+                            false,
+                            json!({}),
+                        )
+                    }
+                };
+            match (context.explicit_launch_action)(
+                &crate::management::control_plane::HumanManagementPrincipal::authenticated(),
+                &payload,
+            ) {
+                Ok(response) => write_json_response(stream, 200, "OK", &response),
+                Err(error) => write_agent_management_control_error(stream, error),
+            }
         }
         ("GET", "/v2/agent-management/durable-candidates") => {
             let principal =
@@ -2584,7 +2642,7 @@ fn dispatch_runtime_mutation(
         .as_object()
         .ok_or_else(|| invalid_user_input_error("params must be an object"))?;
     let online = request.method == "cutex/runtime/online";
-    let max_fields = if online { 4 } else { 3 };
+    let max_fields = 4;
     if object.len() > max_fields
         || !object.contains_key("expectedRuntimeGeneration")
         || object.keys().any(|key| {
@@ -2592,12 +2650,20 @@ fn dispatch_runtime_mutation(
                 && !if online {
                     matches!(key.as_str(), "openVisibleTerminal" | "launchProfile")
                 } else {
-                    key == "force"
+                    matches!(key.as_str(), "force" | "requireDefaultLaunch")
                 }
         })
     {
         return Err(invalid_user_input_error(
             "runtime params contain a field outside the method's v2 schema",
+        ));
+    }
+    if object
+        .get("requireDefaultLaunch")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(invalid_user_input_error(
+            "requireDefaultLaunch must be boolean",
         ));
     }
     let expected_generation = required_safe_integer_param(object, "expectedRuntimeGeneration")?;
@@ -4207,6 +4273,7 @@ mod tests {
     #[test]
     fn human_management_projects_tasks_and_writes_require_the_dedicated_root_credential() {
         for path in [
+            "/v2/agent-management/native-recovery",
             "/v2/agent-management/durable-candidates",
             "/v2/agent-management/durable-import",
             "/v2/agent-management/projects",

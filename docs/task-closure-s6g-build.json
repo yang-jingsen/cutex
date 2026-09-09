@@ -1,0 +1,22 @@
+{
+  "schema": "cutex-private-s6g-default-evidence/v1",
+  "source_base": "94a3f2b34e04c70eaa4faf88c1a4772f4872d30a",
+  "source_scope": "S6g adds tests and documentation only; production behavior unchanged",
+  "build": "cargo build --bins",
+  "features": "default; no stock-launch-test-hook",
+  "frozen_owned_directory": "/mnt/mambo/PersonaProjects/cutex-mcp-facade-r1/artifacts/s6g-default",
+  "cutex_sha256": "8a3cd61e2d9c4b41fbd991c33af9ebf0bfe133db67ab074f4553bb487bdd5f5e",
+  "facade_sha256": "e2a3e6b6a2a61a0ff0023f4063e089a4193fa1b0ef4585d7c6caea05270f7621",
+  "native_commit": "a83dbb47ba6aa775f5d4b679fafc532c4db74c7f",
+  "native_tree": "3d4f5d0510d5b1b3800689fd09bef8e91b409953",
+  "native_manifest_sha256": "1b7e828279b1f3e152045ce94c31cf21acede34ddb0cc0eade727e4ae8056727",
+  "native_cli_sha256": "f360100339560e6a57eb08dea38ed740450904ce7bd72ea7b8a37238fff97bd6",
+  "native_server_sha256": "4638b86221593dd4bab1f66b504641836ac1adb864e946cbe42cb5cbf9f05a74",
+  "official_host_sha256": "3e85d67471825f73d02ff5f7e047ca1f6ca8caa3f59e4c6e8d9ca6ca7302cb45",
+  "schema_sha256": "459861225d5bfb73bb4c3896edb489169637424be410be346f955a39596da7e9",
+  "bundle_version": 3,
+  "explicit_launch_contract_version": 2,
+  "containment": "private user/network namespace, fake Responses; Cutex probe endpoint tripwire; no hostile same-UID claim",
+  "compatibility": "candidate-only stores; no old Soon enum parser, mixed writer downgrade or history rewrite",
+  "intended_use": "private candidate only, not deployed or release-approved"
+}

@@ -8,6 +8,8 @@ pub mod activity_bridge;
 pub mod bus_bridge;
 pub mod client;
 pub mod commands;
+pub mod external_input;
+pub mod external_recovery;
 pub mod journal;
 pub mod manager;
 pub mod participants;

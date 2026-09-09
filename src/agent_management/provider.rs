@@ -94,6 +94,45 @@ pub enum HistoricalRuntimeOccurrenceReconciliation {
 }
 
 pub trait AgentLifecycle: Send + Sync {
+    fn bootstrap_reviewed(
+        &self,
+        _permit: &BootstrapExecutionPermit<'_>,
+    ) -> Result<String, LifecycleFailure> {
+        Err(LifecycleFailure::definite(
+            "reviewed_bootstrap_adapter_required",
+            "no default launch is permitted",
+        ))
+    }
+    fn confirm_reviewed_bootstrap(
+        &self,
+        _permit: &BootstrapExecutionPermit<'_>,
+        _native: &str,
+    ) -> Result<(), LifecycleFailure> {
+        Err(LifecycleFailure::outcome_unknown(
+            "reviewed_bootstrap_ack_required",
+            "exact native persistence acknowledgement required",
+        ))
+    }
+    fn adopt_reviewed(
+        &self,
+        _permit: &BootstrapExecutionPermit<'_>,
+        _native: &str,
+    ) -> Result<CutexSessionId, LifecycleFailure> {
+        Err(LifecycleFailure::outcome_unknown(
+            "reviewed_bootstrap_adapter_required",
+            "atomic adoption and launch marker required",
+        ))
+    }
+    fn online_reviewed(
+        &self,
+        _permit: &BootstrapExecutionPermit<'_>,
+        _id: &CutexSessionId,
+    ) -> Result<(), LifecycleFailure> {
+        Err(LifecycleFailure::outcome_unknown(
+            "reviewed_bootstrap_adapter_required",
+            "no default launch is permitted",
+        ))
+    }
     fn prepare_private_cwd(&self, spec: &ManagedAgentSpec) -> Result<(), LifecycleFailure>;
     fn bootstrap_native(&self, spec: &ManagedAgentSpec) -> Result<String, LifecycleFailure>;
     fn reconcile_pre_sid_bootstrap(
@@ -866,6 +905,57 @@ impl AgentManagementProvider {
             Ok(request) => request,
             Err(error) => return error_response(&request.action_id, error),
         };
+        match self.store.snapshot() {
+            Ok(state) if state.bootstrap_intents.contains_key(&request.action_id) => {
+                let intent = &state.bootstrap_intents[&request.action_id];
+                if intent.request != *request.request
+                    || intent.director != invocation.caller_cutex_session
+                {
+                    return no_write(
+                        &request.action_id,
+                        "bootstrap_intent_conflict",
+                        "exact reviewed action and Director required",
+                    );
+                }
+                if state
+                    .actions
+                    .get(&request.action_id)
+                    .is_none_or(|a| a.response.is_none())
+                {
+                    if state
+                        .actions
+                        .get(&request.action_id)
+                        .is_none_or(|a| a.phase == AgentActionPhase::Prepared)
+                        && intent.expires_at_unix <= chrono::Utc::now().timestamp()
+                    {
+                        return no_write(
+                            &request.action_id,
+                            "bootstrap_intent_expired",
+                            "review expired before lifecycle effects",
+                        );
+                    }
+                    if let Err(error) = intent
+                        .validate_authority(&state)
+                        .and_then(|_| intent.validate_evidence())
+                    {
+                        return no_write(
+                            &request.action_id,
+                            "bootstrap_intent_stale",
+                            &error.to_string(),
+                        );
+                    }
+                }
+            }
+            Err(error) => return error_response(&request.action_id, error),
+            Ok(_) if request.operation.bootstrap_intent().is_some() => {
+                return no_write(
+                    &request.action_id,
+                    "bootstrap_intent_missing",
+                    "Human-reviewed intent is absent; no default launch permitted",
+                );
+            }
+            _ => {}
+        }
         let historical_continuation =
             match self.authorize_historical_bootstrap_continuation(&request, lifecycle) {
                 Ok(continuation) => continuation,
@@ -907,6 +997,9 @@ impl AgentManagementProvider {
             .store
             .snapshot()
             .map_err(|error| error_response(&request.action_id, error))?;
+        if snapshot.bootstrap_intents.contains_key(&request.action_id) {
+            return Ok(HistoricalBootstrapContinuation::None);
+        }
         let Some(action) = snapshot.actions.get(&request.action_id) else {
             return Ok(HistoricalBootstrapContinuation::None);
         };
@@ -1342,6 +1435,7 @@ impl AgentManagementProvider {
                 spec,
                 start_mode,
                 frozen_message,
+                ..
             } => {
                 let created = self.create_steps(
                     invocation,
@@ -1418,6 +1512,20 @@ impl AgentManagementProvider {
                 )
             }
             AgentOperation::Restart { cutex_session_id } => {
+                if let Some(path) = &self.current_names_path {
+                    let sessions = crate::session::store::load_cutex_session_store_from_path(path)
+                        .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
+                    let record = sessions
+                        .sessions
+                        .get(cutex_session_id.as_str())
+                        .ok_or_else(|| {
+                            AgentManagementError::OwnerActionRequired(
+                                "durable record unavailable".into(),
+                            )
+                        })?;
+                    super::explicit_launch::require_default_launch(record)
+                        .map_err(|e| AgentManagementError::OwnerActionRequired(e.to_string()))?;
+                }
                 let agent = self.active_agent(&request.project_id, cutex_session_id)?;
                 let (before, after) = match action.historical_runtime_occurrence_fence.as_ref() {
                     Some(fence) => lifecycle
@@ -1475,6 +1583,7 @@ impl AgentManagementProvider {
                 successor,
                 start_mode,
                 frozen_message,
+                ..
             } => {
                 let mut action = action;
                 if action.phase == AgentActionPhase::Prepared {
@@ -1572,6 +1681,7 @@ impl AgentManagementProvider {
                 mode,
                 successor,
                 frozen_message,
+                ..
             } => {
                 if &invocation.caller_cutex_session != expected_predecessor_cutex_session {
                     return Err(AgentManagementError::Conflict("stale_director_predecessor"));
@@ -1680,6 +1790,17 @@ impl AgentManagementProvider {
         message: Option<&str>,
         lifecycle: &dyn AgentLifecycle,
     ) -> Result<CreatedAgent, AgentManagementError> {
+        let bootstrap_state = self.store.snapshot()?;
+        let permit = bootstrap_state
+            .bootstrap_intents
+            .get(&request.action_id)
+            .map(|intent| BootstrapExecutionPermit {
+                provider: self,
+                intent,
+            });
+        // Only this invocation's positive native ACK skips the recovery read.
+        // A journaled known ID alone (including an uncertain failure) cannot.
+        let mut bootstrap_acknowledged = false;
         if action.known_successor_cutex_session.is_none()
             && action.known_native_session_id.is_none()
             && matches!(
@@ -1706,9 +1827,33 @@ impl AgentManagementProvider {
             } else {
                 self.consume_native_bootstrap_retry(request)?;
             }
-            match lifecycle.bootstrap_native(spec) {
+            if permit
+                .as_ref()
+                .is_some_and(|p| p.intent.expires_at_unix <= chrono::Utc::now().timestamp())
+            {
+                return Err(AgentManagementError::OwnerActionRequired(
+                    "bootstrap intent expired; no native create attempted".into(),
+                ));
+            }
+            match if let Some(permit) = &permit {
+                lifecycle.bootstrap_reviewed(permit)
+            } else {
+                lifecycle.bootstrap_native(spec)
+            } {
                 Ok(native_session_id) => {
                     action = self.capture_native_session(request, &native_session_id)?;
+                    bootstrap_acknowledged = permit.is_some();
+                    #[cfg(feature = "stock-launch-test-hook")]
+                    if permit.is_some()
+                        && bootstrap_test_fault(
+                            "CUTEX_BOOTSTRAP_TEST_POST_ID_ACTION",
+                            &request.action_id,
+                        )
+                    {
+                        // Abrupt creator exit: no Rust destructors and no
+                        // host coredump service or large core artifact.
+                        std::process::exit(86);
+                    }
                 }
                 Err(error) => {
                     if let Some(native_session_id) = error.known_native_session_id.as_deref() {
@@ -1732,9 +1877,17 @@ impl AgentManagementProvider {
             )
         })?;
         if action.known_successor_cutex_session.is_none() {
-            let cutex_session_id = lifecycle
-                .adopt_native(&native_session_id, spec)
-                .map_err(lifecycle_error)?;
+            let cutex_session_id = if let Some(permit) = &permit {
+                if !bootstrap_acknowledged {
+                    lifecycle
+                        .confirm_reviewed_bootstrap(permit, &native_session_id)
+                        .map_err(lifecycle_error)?;
+                }
+                lifecycle.adopt_reviewed(permit, &native_session_id)
+            } else {
+                lifecycle.adopt_native(&native_session_id, spec)
+            }
+            .map_err(lifecycle_error)?;
             action = self.capture_adopted_agent(
                 invocation,
                 request,
@@ -1748,30 +1901,48 @@ impl AgentManagementProvider {
             .clone()
             .ok_or(AgentManagementError::InvalidStore)?;
         if matches!(action.phase, AgentActionPhase::Adopted) {
-            lifecycle
-                .configure(&cutex_session_id, &native_session_id, spec)
-                .map_err(lifecycle_error)?;
+            if permit.is_none() {
+                lifecycle
+                    .configure(&cutex_session_id, &native_session_id, spec)
+                    .map_err(lifecycle_error)?;
+            }
             action = self.set_phase(request, AgentActionPhase::Configured)?;
         }
         if matches!(action.phase, AgentActionPhase::Configured) {
-            let agent = self.active_agent(&request.project_id, &cutex_session_id)?;
-            recover_runtime_for_agent(&agent, lifecycle)?;
-            lifecycle
-                .online(&cutex_session_id)
-                .map_err(lifecycle_error)?;
+            if let Some(permit) = &permit {
+                lifecycle
+                    .online_reviewed(permit, &cutex_session_id)
+                    .map_err(lifecycle_error)?;
+            } else {
+                let agent = self.active_agent(&request.project_id, &cutex_session_id)?;
+                recover_runtime_for_agent(&agent, lifecycle)?;
+                lifecycle
+                    .online(&cutex_session_id)
+                    .map_err(lifecycle_error)?;
+            }
             action = self.set_phase(request, AgentActionPhase::Online)?;
         } else if matches!(action.phase, AgentActionPhase::Online) {
-            let agent = self.active_agent(&request.project_id, &cutex_session_id)?;
-            recover_runtime_for_agent(&agent, lifecycle)?;
-            lifecycle
-                .online(&cutex_session_id)
-                .map_err(lifecycle_error)?;
+            if let Some(permit) = &permit {
+                lifecycle
+                    .online_reviewed(permit, &cutex_session_id)
+                    .map_err(lifecycle_error)?;
+            } else {
+                let agent = self.active_agent(&request.project_id, &cutex_session_id)?;
+                recover_runtime_for_agent(&agent, lifecycle)?;
+                lifecycle
+                    .online(&cutex_session_id)
+                    .map_err(lifecycle_error)?;
+            }
         }
         let observation = lifecycle
             .observe(&cutex_session_id)
             .map_err(lifecycle_error)?;
         let agent = self.active_agent(&request.project_id, &cutex_session_id)?;
-        validate_ready(&agent, &observation)?;
+        if let Some(permit) = &permit {
+            validate_ready_with_groups(&agent, &observation, &permit.intent.runtime_groups)?;
+        } else {
+            validate_ready(&agent, &observation)?;
+        }
         if matches!(action.phase, AgentActionPhase::Online) {
             action = self.set_phase(request, AgentActionPhase::Ready)?;
         }
@@ -1839,8 +2010,29 @@ impl AgentManagementProvider {
             .as_ref()
             .ok_or(AgentManagementError::InvalidStore)?;
         let agent = self.active_agent(&request.project_id, successor)?;
+        let state = self.store.snapshot()?;
+        let intent = state.bootstrap_intents.get(&request.action_id);
+        if let Some(intent) = intent {
+            // A creator restart loses its in-process connection, not the
+            // captured successor. Reconcile the original runtime receipt and
+            // owned occurrence through the same sealed launch permit. This
+            // never enters generic online or creates another native thread.
+            lifecycle
+                .online_reviewed(
+                    &BootstrapExecutionPermit {
+                        provider: self,
+                        intent,
+                    },
+                    successor,
+                )
+                .map_err(lifecycle_error)?;
+        }
         let observation = lifecycle.observe(successor).map_err(lifecycle_error)?;
-        validate_ready(&agent, &observation)?;
+        if let Some(intent) = intent {
+            validate_ready_with_groups(&agent, &observation, &intent.runtime_groups)?;
+        } else {
+            validate_ready(&agent, &observation)?;
+        }
         Ok(CreatedAgent {
             agent,
             observation,
@@ -2048,7 +2240,7 @@ impl AgentManagementProvider {
         let observation = lifecycle
             .observe(cutex_session_id)
             .map_err(lifecycle_error)?;
-        validate_managed_observation_identity(&expected, &observation)?;
+        self.validate_current_managed_observation(&expected, &observation)?;
         let externally_closed = !observation.active
             && !observation.app_server_runtime
             && observation.runtime_agent_ids.is_empty()
@@ -2079,7 +2271,7 @@ impl AgentManagementProvider {
         let after = lifecycle
             .observe(cutex_session_id)
             .map_err(lifecycle_error)?;
-        validate_managed_observation_identity(&agent, &after)?;
+        self.validate_current_managed_observation(&agent, &after)?;
         if after.active
             || after.app_server_runtime
             || !after.runtime_agent_ids.is_empty()
@@ -2094,6 +2286,27 @@ impl AgentManagementProvider {
         }
         self.mark_expected_predecessor_retired(request, &expected)?;
         Ok(None)
+    }
+
+    fn validate_current_managed_observation(
+        &self,
+        agent: &ManagedAgentRecord,
+        observation: &AgentRuntimeObservation,
+    ) -> Result<(), AgentManagementError> {
+        let state = self.store.snapshot()?;
+        let mut intents = state.actions.values().filter_map(|action| {
+            (action.known_successor_cutex_session.as_ref() == Some(&agent.cutex_session_id))
+                .then(|| state.bootstrap_intents.get(&action.action_id))
+                .flatten()
+        });
+        if let Some(intent) = intents.next() {
+            if intents.next().is_some() {
+                return Err(AgentManagementError::InvalidStore);
+            }
+            validate_managed_observation_groups(agent, observation, &intent.runtime_groups)
+        } else {
+            validate_managed_observation_identity(agent, observation)
+        }
     }
 
     fn mark_expected_predecessor_retired(
@@ -2773,6 +2986,10 @@ impl AgentManagementProvider {
         self.director_seats
             .transfer_director(&seat_transfer)
             .map_err(seat_authority_error)?;
+        #[cfg(feature = "stock-launch-test-hook")]
+        if bootstrap_test_fault("CUTEX_BOOTSTRAP_TEST_TRANSFER_ACTION", &request.action_id) {
+            std::process::exit(86);
+        }
         if let Some(response) = self.inject_process_loss_after_director_seat_transfer(request) {
             return Ok(response);
         }
@@ -3830,9 +4047,20 @@ fn validate_managed_observation_identity(
     agent: &ManagedAgentRecord,
     observation: &AgentRuntimeObservation,
 ) -> Result<(), AgentManagementError> {
-    let spec = &agent.spec;
-    let groups_match = observation.groups == spec.groups
-        || observation.groups == expected_runtime_groups(&spec.cwd, &spec.groups);
+    validate_managed_observation_groups(
+        agent,
+        observation,
+        &expected_runtime_groups(&agent.spec.cwd, &agent.spec.groups),
+    )
+}
+
+fn validate_managed_observation_groups(
+    agent: &ManagedAgentRecord,
+    observation: &AgentRuntimeObservation,
+    expected_groups: &[String],
+) -> Result<(), AgentManagementError> {
+    let groups_match =
+        observation.groups == agent.spec.groups || observation.groups == expected_groups;
     if let Some(field) = managed_spec_mismatch(agent, observation, groups_match) {
         return Err(managed_observation_mismatch(
             "managed Agent observation",
@@ -3852,11 +4080,22 @@ fn validate_ready(
     agent: &ManagedAgentRecord,
     observation: &AgentRuntimeObservation,
 ) -> Result<(), AgentManagementError> {
-    let spec = &agent.spec;
+    validate_ready_with_groups(
+        agent,
+        observation,
+        &expected_runtime_groups(&agent.spec.cwd, &agent.spec.groups),
+    )
+}
+
+fn validate_ready_with_groups(
+    agent: &ManagedAgentRecord,
+    observation: &AgentRuntimeObservation,
+    expected_groups: &[String],
+) -> Result<(), AgentManagementError> {
     if !observation.active {
         return Err(managed_observation_mismatch("Agent readiness", "active"));
     }
-    let groups_match = observation.groups == expected_runtime_groups(&spec.cwd, &spec.groups);
+    let groups_match = observation.groups == expected_groups;
     if let Some(field) = managed_spec_mismatch(agent, observation, groups_match) {
         return Err(managed_observation_mismatch("Agent readiness", field));
     }
@@ -4798,6 +5037,7 @@ mod tests {
             project_id: None,
             operation: AgentOperation::Create {
                 spec: spec(name),
+                bootstrap_intent: None,
                 start_mode,
                 frozen_message: (start_mode == AgentStartMode::CustomMessage)
                     .then(|| "Frozen assignment.".to_string()),
@@ -4811,6 +5051,7 @@ mod tests {
             action_id: action(action_id),
             project_id: Some(project()),
             operation: AgentOperation::DirectorRotate {
+                bootstrap_intent: None,
                 expected_predecessor_cutex_session: session("cutex.director"),
                 expected_authority_epoch: 1,
                 mode: DirectorRotateMode::RetainPredecessorWithMessage,
@@ -5264,6 +5505,7 @@ mod tests {
                 action_id: action("rotate-after-import"),
                 project_id: Some(project()),
                 operation: AgentOperation::DirectorRotate {
+                    bootstrap_intent: None,
                     expected_predecessor_cutex_session: session("cutex.director"),
                     expected_authority_epoch: 1,
                     mode: DirectorRotateMode::RetainPredecessorBootstrapOnly,
@@ -5597,6 +5839,42 @@ mod tests {
         assert_eq!(lifecycle.bootstrap_count(), 1);
         assert_eq!(lifecycle.message_count(), 1);
         assert_eq!(lifecycle.launch_count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reviewed_bootstrap_missing_or_wrong_reference_never_uses_legacy_lifecycle() {
+        let root = root("bootstrap-intent-refusal");
+        let provider = AgentManagementProvider::open(&root).unwrap();
+        bind(&provider, "bind", "cutex.director", None);
+        let lifecycle = FakeLifecycle::default();
+        let mut request =
+            create_request("explicit-create", "worker", AgentStartMode::BootstrapOnly);
+        let original = serde_json::to_value(&request).unwrap();
+        assert!(
+            original.get("bootstrap_intent").is_none(),
+            "legacy semantic digest must not change"
+        );
+        if let AgentOperation::Create {
+            bootstrap_intent, ..
+        } = &mut request.operation
+        {
+            *bootstrap_intent = Some(action("explicit-create"));
+        }
+        let response = provider.execute(&invocation("cutex.director"), &request, &lifecycle);
+        assert!(
+            matches!(response.outcome, AgentManagementOutcome::NoWrite { ref code, .. } if code == "bootstrap_intent_missing")
+        );
+        assert_eq!(lifecycle.bootstrap_count(), 0);
+        assert!(provider.store.snapshot().unwrap().actions.is_empty());
+        request.action_id = action("different-action");
+        assert!(request.validate().is_err());
+        let response = provider.execute(&invocation("cutex.director"), &request, &lifecycle);
+        assert!(matches!(
+            response.outcome,
+            AgentManagementOutcome::NoWrite { .. }
+        ));
+        assert_eq!(lifecycle.bootstrap_count(), 0);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -6853,6 +7131,7 @@ mod tests {
             action_id: action("replace"),
             project_id: Some(project()),
             operation: AgentOperation::Replace {
+                bootstrap_intent: None,
                 predecessor_cutex_session_id: predecessor.cutex_session_id.clone(),
                 policy: AgentReplacePolicy::CloseBeforeCreate,
                 successor: spec("worker-new"),
@@ -6916,6 +7195,7 @@ mod tests {
                 action_id: action("replace-crash"),
                 project_id: Some(project()),
                 operation: AgentOperation::Replace {
+                    bootstrap_intent: None,
                     predecessor_cutex_session_id: predecessor.cutex_session_id.clone(),
                     policy,
                     successor: spec("worker-new"),
@@ -7024,6 +7304,7 @@ mod tests {
             action_id: action("rotate-crash"),
             project_id: Some(project()),
             operation: AgentOperation::DirectorRotate {
+                bootstrap_intent: None,
                 expected_predecessor_cutex_session: predecessor.cutex_session_id.clone(),
                 expected_authority_epoch: 2,
                 mode: DirectorRotateMode::ClosePredecessorThenCreateWithMessage,
@@ -7123,6 +7404,7 @@ mod tests {
             action_id: action("replace-mismatch"),
             project_id: Some(project()),
             operation: AgentOperation::Replace {
+                bootstrap_intent: None,
                 predecessor_cutex_session_id: predecessor.cutex_session_id.clone(),
                 policy: AgentReplacePolicy::CloseBeforeCreate,
                 successor: spec("worker-new"),
@@ -7173,6 +7455,7 @@ mod tests {
             action_id: action("rotate-authority-change"),
             project_id: Some(project()),
             operation: AgentOperation::DirectorRotate {
+                bootstrap_intent: None,
                 expected_predecessor_cutex_session: director.cutex_session_id.clone(),
                 expected_authority_epoch: 2,
                 mode: DirectorRotateMode::ClosePredecessorThenCreateWithMessage,
@@ -7243,6 +7526,7 @@ mod tests {
             action_id: action("rotate"),
             project_id: Some(project()),
             operation: AgentOperation::DirectorRotate {
+                bootstrap_intent: None,
                 expected_predecessor_cutex_session: director.cutex_session_id.clone(),
                 expected_authority_epoch: 2,
                 mode: DirectorRotateMode::ClosePredecessorThenCreateWithMessage,
@@ -7448,6 +7732,7 @@ mod tests {
                 action_id: action("rotate-preflight"),
                 project_id: Some(project()),
                 operation: AgentOperation::DirectorRotate {
+                    bootstrap_intent: None,
                     expected_predecessor_cutex_session: predecessor.cutex_session_id.clone(),
                     expected_authority_epoch: 2,
                     mode: DirectorRotateMode::ClosePredecessorThenCreateWithMessage,
@@ -7505,6 +7790,7 @@ mod tests {
             action_id: action("rotate-boundary-loss"),
             project_id: Some(project()),
             operation: AgentOperation::DirectorRotate {
+                bootstrap_intent: None,
                 expected_predecessor_cutex_session: predecessor.cutex_session_id.clone(),
                 expected_authority_epoch: 2,
                 mode: DirectorRotateMode::RetainPredecessorBootstrapOnly,
@@ -7611,6 +7897,7 @@ mod tests {
             action_id: action("rotate-then-diverge"),
             project_id: Some(project()),
             operation: AgentOperation::DirectorRotate {
+                bootstrap_intent: None,
                 expected_predecessor_cutex_session: predecessor.cutex_session_id.clone(),
                 expected_authority_epoch: 2,
                 mode: DirectorRotateMode::RetainPredecessorBootstrapOnly,
@@ -7700,6 +7987,7 @@ mod tests {
                 action_id: action("rotate"),
                 project_id: Some(project()),
                 operation: AgentOperation::DirectorRotate {
+                    bootstrap_intent: None,
                     expected_predecessor_cutex_session: predecessor.cutex_session_id.clone(),
                     expected_authority_epoch: 2,
                     mode,
@@ -7792,6 +8080,7 @@ mod tests {
             action_id: action("stale-rotate"),
             project_id: Some(project()),
             operation: AgentOperation::DirectorRotate {
+                bootstrap_intent: None,
                 expected_predecessor_cutex_session: session("cutex.mistyped-director"),
                 expected_authority_epoch: 2,
                 mode: DirectorRotateMode::RetainPredecessorBootstrapOnly,
@@ -7846,6 +8135,7 @@ mod tests {
             action_id: action("corrected-rotate"),
             project_id: Some(project()),
             operation: AgentOperation::DirectorRotate {
+                bootstrap_intent: None,
                 expected_predecessor_cutex_session: director.cutex_session_id.clone(),
                 expected_authority_epoch: 2,
                 mode: DirectorRotateMode::RetainPredecessorBootstrapOnly,
@@ -9238,6 +9528,7 @@ mod tests {
                 action_id: action("operator-replace"),
                 project_id: Some(project()),
                 operation: AgentOperation::Replace {
+                    bootstrap_intent: None,
                     predecessor_cutex_session_id: replace_target.cutex_session_id,
                     policy: AgentReplacePolicy::CloseBeforeCreate,
                     successor: spec("replacement"),
@@ -9293,6 +9584,7 @@ mod tests {
             (
                 "operator-rotate",
                 AgentOperation::DirectorRotate {
+                    bootstrap_intent: None,
                     expected_predecessor_cutex_session: session("cutex.director"),
                     expected_authority_epoch: 1,
                     mode: DirectorRotateMode::RetainPredecessorBootstrapOnly,

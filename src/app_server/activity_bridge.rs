@@ -147,6 +147,10 @@ impl ActivitySubmitter for AppServerRuntimeManager {
         delivery: CutexUiActivityDelivery,
         activity: CutexUiActivity,
     ) -> anyhow::Result<CutexUiActivityIngestionDisposition> {
+        anyhow::ensure!(
+            self.supports_cutex_ingress(owner_cutex_session_id)?,
+            "stock runtime does not support Cutex activity ingress"
+        );
         let status = self
             .status(owner_cutex_session_id)?
             .with_context(|| format!("owner runtime is offline: {owner_cutex_session_id}"))?;

@@ -470,7 +470,16 @@ fn completion_receipt(
         message_id,
         disposition,
         deduplicated,
-        a4_receipt: snapshot.and_then(|value| value.a4_receipt),
+        a4_receipt: snapshot.and_then(|value| {
+            value
+                .external_input_receipt
+                .map(|r| serde_json::to_value(r).expect("typed native receipt"))
+                .or_else(|| {
+                    value
+                        .a4_receipt
+                        .map(|r| serde_json::to_value(r).expect("typed legacy receipt"))
+                })
+        }),
         error_code,
     }
 }

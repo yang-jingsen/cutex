@@ -647,6 +647,50 @@ impl CutexAgentLifecycle {
 }
 
 impl AgentLifecycle for CutexAgentLifecycle {
+    fn bootstrap_reviewed(
+        &self,
+        permit: &cutex::agent_management::BootstrapExecutionPermit<'_>,
+    ) -> Result<String, LifecycleFailure> {
+        super::stock_lifecycle::bootstrap_native(permit, None)
+    }
+    fn confirm_reviewed_bootstrap(
+        &self,
+        permit: &cutex::agent_management::BootstrapExecutionPermit<'_>,
+        native: &str,
+    ) -> Result<(), LifecycleFailure> {
+        super::stock_lifecycle::bootstrap_native(permit, Some(native)).map(|_| ())
+    }
+    fn adopt_reviewed(
+        &self,
+        permit: &cutex::agent_management::BootstrapExecutionPermit<'_>,
+        native: &str,
+    ) -> Result<CutexSessionId, LifecycleFailure> {
+        let path = cutex::session::store::cutex_sessions_path()
+            .map_err(definite("session_store_unavailable"))?;
+        permit
+            .adopt(&path, native)
+            .map_err(unknown("bootstrap_adoption_uncertain"))
+    }
+    fn online_reviewed(
+        &self,
+        permit: &cutex::agent_management::BootstrapExecutionPermit<'_>,
+        id: &CutexSessionId,
+    ) -> Result<(), LifecycleFailure> {
+        let operation = || -> anyhow::Result<()> {
+            let path = cutex::session::store::cutex_sessions_path()?;
+            let tasks = cutex::task_service::TaskServiceProvider::open(
+                cutex::task_delivery::provider_adapter::default_task_service_provider_root()?,
+            )?;
+            let mut runtime = super::stock_lifecycle::StockExecutor::default();
+            let receipt = permit.online(&path, id, &tasks, &mut runtime)?;
+            anyhow::ensure!(
+                receipt.stage == cutex::agent_management::StockRuntimeStage::Ready,
+                "bootstrap runtime not ready"
+            );
+            Ok(())
+        };
+        operation().map_err(unknown("bootstrap_runtime_uncertain"))
+    }
     fn prepare_private_cwd(&self, spec: &ManagedAgentSpec) -> Result<(), LifecycleFailure> {
         prepare_private_managed_cwd(Path::new(&spec.cwd)).map_err(definite("private_cwd_failed"))
     }

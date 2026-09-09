@@ -352,6 +352,48 @@ mod tests {
     }
 
     #[test]
+    fn stock_reconciliation_preserves_launch_requirement_and_formal_identity() {
+        let mut store = CutexSessionStore::default();
+        let mut record = CutexSessionRecord::new_at(
+            "cutex.stock-reconcile".into(),
+            Some("stock-reconcile".into()),
+            "host".into(),
+            "/tmp".into(),
+            Some("mutable-profile".into()),
+            "2026-09-09T00:00:00Z".into(),
+        )
+        .unwrap();
+        record.registration_class = AgentRegistrationClass::Persistent;
+        record.formal_agent_name = Some("Exact formal Agent".into());
+        record.explicit_launch = Some(crate::agent_management::ExplicitLaunchContract {
+            version: 999,
+            native_id: "stock-reconcile".into(),
+            native_home: "/unavailable".into(),
+            bundle_manifest: "/unavailable/bundle".into(),
+            bundle_sha256: crate::role_revision::Sha256::new("a".repeat(64)).unwrap(),
+        });
+        let requirement = record.explicit_launch.clone();
+        store
+            .sessions
+            .insert(record.cutex_session_id.clone(), record);
+        reconcile_cutex_session_store_from_agent(
+            &mut store,
+            &live_agent("stock-reconcile", "Not a formal name"),
+            "host",
+            "2026-09-09T00:01:00Z",
+        )
+        .unwrap();
+        let current = &store.sessions["cutex.stock-reconcile"];
+        assert_eq!(current.explicit_launch, requirement);
+        assert_eq!(
+            current.formal_agent_name.as_deref(),
+            Some("Exact formal Agent")
+        );
+        assert_eq!(current.profile.as_deref(), Some("mutable-profile"));
+        assert!(crate::agent_management::require_default_launch(current).is_err());
+    }
+
+    #[test]
     fn persistent_session_keeps_managed_display_name_when_runtime_title_changes() {
         let mut store = CutexSessionStore::default();
         let mut record = CutexSessionRecord::new_at(

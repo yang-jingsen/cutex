@@ -1,0 +1,24 @@
+{
+  "schema": "cutex-private-s6f-evidence/v1",
+  "source_base": "2af181a87b54a193e8b8bf1a2ad78cd544475beb",
+  "scope": "private integration evidence, not installed or release-approved",
+  "build": "cargo build --bins --features stock-launch-test-hook",
+  "test_feature": "fixed approved private native connect guard; not a public network policy API",
+  "frozen_owned_directory": "/mnt/mambo/PersonaProjects/cutex-mcp-facade-r1/artifacts/s6f-final",
+  "cutex_sha256": "3503054fcdcd42adc15706f8429ff6c1ec1d837344c295c5155c974e59f8e87c",
+  "facade_sha256": "baa440a92e2ea8f3f84984763a14d70203272faa016993b7803477c3db9ddd94",
+  "native_commit": "a83dbb47ba6aa775f5d4b679fafc532c4db74c7f",
+  "native_tree": "3d4f5d0510d5b1b3800689fd09bef8e91b409953",
+  "native_manifest_sha256": "1b7e828279b1f3e152045ce94c31cf21acede34ddb0cc0eade727e4ae8056727",
+  "native_cli_sha256": "f360100339560e6a57eb08dea38ed740450904ce7bd72ea7b8a37238fff97bd6",
+  "native_server_sha256": "4638b86221593dd4bab1f66b504641836ac1adb864e946cbe42cb5cbf9f05a74",
+  "official_host_sha256": "3e85d67471825f73d02ff5f7e047ca1f6ca8caa3f59e4c6e8d9ca6ca7302cb45",
+  "schema_sha256": "459861225d5bfb73bb4c3896edb489169637424be410be346f955a39596da7e9",
+  "bundle_version": 3,
+  "explicit_launch_contract_version": 2,
+  "required_capabilities": {
+    "externalInputVersion": 1,
+    "externalInputDeliveries_contains": "soon"
+  },
+  "compatibility": "candidate-only stores; no old enum parser or mixed writer downgrade"
+}

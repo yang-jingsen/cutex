@@ -641,7 +641,7 @@ fn authority_digest(
     ))
 }
 
-fn guard(
+pub(super) fn guard(
     state: &AgentManagementSnapshot,
     id: &CutexSessionId,
 ) -> Result<Option<ProjectId>, AgentManagementError> {
@@ -677,7 +677,7 @@ fn guard(
 }
 
 impl AgentManagementProvider {
-    fn archive_authority_digest(
+    pub(super) fn archive_authority_digest(
         &self,
         state: &AgentManagementSnapshot,
         id: &CutexSessionId,

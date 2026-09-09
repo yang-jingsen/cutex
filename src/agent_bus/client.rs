@@ -427,19 +427,118 @@ fn submit_authenticated_agent_control_request(
     label: &str,
     response_timeout: Duration,
 ) -> anyhow::Result<Vec<u8>> {
+    submit_authenticated_agent_control_with_fence(
+        port,
+        route_token,
+        sender,
+        path,
+        body,
+        label,
+        response_timeout,
+        None,
+    )
+}
+
+pub fn submit_mcp_control(
+    port: u16,
+    token: &str,
+    sender: &RuntimeAgentId,
+    fence: &crate::agent_bus::mcp::CallerFence,
+    path: &str,
+    body: &Value,
+) -> anyhow::Result<Value> {
+    if !matches!(
+        path,
+        "/api/agent-management/v1/actions"
+            | "/api/messages/send"
+            | "/api/task/v2/worker-prepare"
+            | "/api/task/v2/actions"
+            | "/api/task/v2/director-action"
+            | "/api/task/v2/terminal-semantic"
+            | "/api/agents?all_groups=false&all_hosts=false"
+    ) {
+        anyhow::bail!("unsupported MCP route");
+    }
+    let body = serde_json::to_vec(body)?;
+    if body.len() > 262144 || token.trim().is_empty() || token.contains(['\r', '\n']) {
+        anyhow::bail!("invalid MCP request configuration");
+    }
+    let response = submit_authenticated_agent_control_with_fence(
+        port,
+        token,
+        sender,
+        path,
+        &body,
+        "MCP",
+        if path.starts_with("/api/task/v2/") {
+            Duration::from_secs(5)
+        } else if path == "/api/agent-management/v1/actions" {
+            // Fixed native Management wrapper budget; timeout is uncertain,
+            // never permission to issue a replacement action identity.
+            Duration::from_secs(30)
+        } else {
+            AGENT_MANAGEMENT_ACTION_TIMEOUT
+        },
+        Some(fence),
+    )?;
+    if path.starts_with("/api/task/v2/") {
+        Ok(serde_json::from_slice(&response)
+            .unwrap_or_else(|_| serde_json::json!({"mcp_transport_invalid_response":true})))
+    } else {
+        Ok(serde_json::from_slice(&response)?)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_authenticated_agent_control_with_fence(
+    port: u16,
+    route_token: &str,
+    sender: &RuntimeAgentId,
+    path: &str,
+    body: &[u8],
+    label: &str,
+    response_timeout: Duration,
+    fence: Option<&crate::agent_bus::mcp::CallerFence>,
+) -> anyhow::Result<Vec<u8>> {
+    let extra = if let Some(fence) = fence {
+        let thread = crate::session::identity::normalize_codex_session_id(&fence.thread_id)?;
+        format!(
+            "X-Cutex-Mcp-Thread-Id: {thread}\r\nX-Cutex-Mcp-Generation: {}\r\n",
+            fence.generation
+        )
+    } else {
+        String::new()
+    };
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .with_context(|| format!("Failed to connect local cutex agent bus {label} route"))?;
     stream.set_write_timeout(Some(AGENT_BUS_HTTP_TIMEOUT)).ok();
     stream.set_read_timeout(Some(response_timeout)).ok();
+    let method = if fence.is_some() && path == "/api/agents?all_groups=false&all_hosts=false" {
+        "GET"
+    } else {
+        "POST"
+    };
     let headers = format!(
-        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nAuthorization: Bearer {route_token}\r\nX-Cutex-Agent-Id: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nAuthorization: Bearer {route_token}\r\n{extra}X-Cutex-Agent-Id: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         sender.as_str(),
         body.len()
     );
     stream.write_all(headers.as_bytes())?;
     stream.write_all(&body)?;
     let mut response = Vec::new();
-    stream
+    let bounded_mcp = fence.is_some()
+        && (path.starts_with("/api/task/v2/")
+            || path == "/api/agent-management/v1/actions"
+            || path == "/api/agents?all_groups=false&all_hosts=false");
+    // Native Task/Management adapter limit: 1 MiB body. Bound framing too before allocating
+    // an unbounded response; other existing callers retain their limits.
+    let limit = if bounded_mcp {
+        1024 * 1024 + 65536 + 1
+    } else {
+        u64::MAX
+    };
+    Read::by_ref(&mut stream)
+        .take(limit)
         .read_to_end(&mut response)
         .with_context(|| format!("Failed to read Cutex {label} response"))?;
     let split = response
@@ -447,8 +546,23 @@ fn submit_authenticated_agent_control_request(
         .position(|window| window == b"\r\n\r\n")
         .with_context(|| format!("Cutex {label} response has no HTTP header boundary"))?;
     let header = String::from_utf8_lossy(&response[..split]);
+    if bounded_mcp && (split > 65536 || response.len() - split - 4 > 1024 * 1024) {
+        return Ok(b"{\"mcp_transport_invalid_response\":true}".to_vec());
+    }
     if !header.starts_with("HTTP/1.1 2") {
         let body = String::from_utf8_lossy(&response[split + 4..]);
+        if fence.is_some() {
+            let status = header
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<u16>().ok())
+                .unwrap_or(500);
+            let error = serde_json::from_str::<Value>(&body)
+                .unwrap_or_else(|_| serde_json::json!({"message":body.trim()}));
+            return Ok(serde_json::to_vec(
+                &serde_json::json!({"http_status":status,"error":error}),
+            )?);
+        }
         anyhow::bail!("Cutex {label} route returned non-success: {header}\n{body}");
     }
     Ok(response[split + 4..].to_vec())

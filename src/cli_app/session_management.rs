@@ -218,11 +218,18 @@ pub(crate) fn cmd_session_profile(command: SessionProfileCommand) -> anyhow::Res
             record.cutex_session_id
         );
     }
-    let profile = requested_profile
-        .as_deref()
-        .map(super::launch::resolve_launch_profile_override)
-        .transpose()?
-        .map(|resolved| resolved.account.name);
+    let profile = if record.explicit_launch.is_some() {
+        let mut candidate = record.clone();
+        candidate.profile = requested_profile.clone();
+        cutex::launch::stock::current_configuration(&candidate)?;
+        requested_profile
+    } else {
+        requested_profile
+            .as_deref()
+            .map(super::launch::resolve_launch_profile_override)
+            .transpose()?
+            .map(|resolved| resolved.account.name)
+    };
     let outcome = set_cutex_session_profile_by_key(&mut store, &key, profile.clone())?;
     persist_cutex_session_store_and_im_record(&store, &key)?;
     match profile {

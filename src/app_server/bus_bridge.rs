@@ -58,6 +58,18 @@ const MODEL_VISIBLE_MESSAGE_ID_HASH_DOMAIN: &str = "cutex:model-visible-inter-ag
 const INTER_AGENT_SEMANTIC_HASH_DOMAIN: &[u8] = b"cutex:inter-agent-message-semantic:v1\0";
 const INTER_AGENT_STATUS_SCHEMA: &str = "cutex/inter-agent-delivery-status/v1";
 
+#[path = "bus_bridge_external.rs"]
+mod external;
+
+pub(crate) fn validate_external_recovery_target(
+    message: &AgentBusMessage,
+    owner: &str,
+    seats: &crate::seat::SeatOccupancySnapshot,
+    roster: &crate::agent_management::AgentManagementSnapshot,
+) -> anyhow::Result<()> {
+    external::validate_target(message, owner, seats, roster)
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct DeliverySweepOutcome {
     had_messages: bool,
@@ -416,6 +428,10 @@ impl InterAgentMessageSubmitter for AppServerCommands {
 
 #[derive(Debug, Clone)]
 pub struct AppServerAgentBusBridgeOptions {
+    /// Stock outbound-only prototype: maintain registration, never poll/ack.
+    pub registration_only: bool,
+    /// Trusted launcher only; client still proves exact pinned occurrence.
+    pub external_input_generation: Option<u64>,
     pub registration: AgentBusRegisterRequest,
     pub cutex_session_id: String,
     pub thread_id: String,
@@ -428,6 +444,8 @@ impl AppServerAgentBusBridgeOptions {
     pub fn new(registration: AgentBusRegisterRequest, thread_id: impl Into<String>) -> Self {
         let thread_id = thread_id.into();
         Self {
+            registration_only: false,
+            external_input_generation: None,
             registration,
             cutex_session_id: default_cutex_session_id_for_codex_session(&thread_id),
             thread_id,
@@ -621,6 +639,7 @@ fn run_bridge_worker(
     .to_string();
     let mut next_registration = Instant::now() + options.registration_refresh_interval;
     let mut pending_poll_backoff = PendingPollBackoff::default();
+    let mut external_client = None;
     loop {
         if !runtime_alive.load(Ordering::Acquire) {
             mark_error(&status, "app-server runtime disconnected".to_string());
@@ -659,22 +678,40 @@ fn run_bridge_worker(
             next_registration = Instant::now() + options.registration_refresh_interval;
         }
 
+        if options.registration_only {
+            if stop_requested(&stop_rx, options.poll_interval) {
+                break;
+            }
+            continue;
+        }
         let poll_started = Instant::now();
         match bus.poll(&options.registration.id) {
             Ok(messages) => {
                 mark_poll(&status);
-                let outcome = match deliver_polled_messages(
-                    bus.as_ref(),
-                    submitter.as_ref(),
-                    &DurableTaskServiceContextRecorder,
-                    &options.registration.id,
-                    &recipient_label,
-                    &options.cutex_session_id,
-                    &options.thread_id,
-                    messages,
-                    &mut pending_acks,
-                    &status,
-                ) {
+                let delivery = if let Some(generation) = options.external_input_generation {
+                    external::deliver(
+                        bus.as_ref(),
+                        &options,
+                        generation,
+                        messages,
+                        &status,
+                        &mut external_client,
+                    )
+                } else {
+                    deliver_polled_messages(
+                        bus.as_ref(),
+                        submitter.as_ref(),
+                        &DurableTaskServiceContextRecorder,
+                        &options.registration.id,
+                        &recipient_label,
+                        &options.cutex_session_id,
+                        &options.thread_id,
+                        messages,
+                        &mut pending_acks,
+                        &status,
+                    )
+                };
+                let outcome = match delivery {
                     Ok(outcome) => outcome,
                     Err(error) => {
                         mark_error(&status, error.to_string());
@@ -1355,12 +1392,9 @@ fn job_service_inter_agent_params(
     })
 }
 
-fn agent_management_inter_agent_params(
-    thread_id: &str,
-    recipient_label: &str,
-    recipient_metadata: Option<ParticipantPresentationMetadata>,
+fn agent_management_metadata(
     message: &AgentBusMessage,
-) -> anyhow::Result<ThreadInterAgentMessageParams> {
+) -> anyhow::Result<AgentManagementMessageMetadata> {
     if message.from != AGENT_MANAGEMENT_SYSTEM_SENDER {
         anyhow::bail!(
             "Agent Management agent-bus message {} has a noncanonical sender",
@@ -1416,6 +1450,16 @@ fn agent_management_inter_agent_params(
                 message.id
             )
         })?;
+    Ok(metadata)
+}
+
+fn agent_management_inter_agent_params(
+    thread_id: &str,
+    recipient_label: &str,
+    recipient_metadata: Option<ParticipantPresentationMetadata>,
+    message: &AgentBusMessage,
+) -> anyhow::Result<ThreadInterAgentMessageParams> {
+    let metadata = agent_management_metadata(message)?;
     Ok(ThreadInterAgentMessageParams {
         thread_id: thread_id.to_string(),
         message_id: model_visible_message_id(&message.id),
@@ -4481,6 +4525,60 @@ mod tests {
             },
             "thread-1",
         )
+    }
+
+    #[test]
+    fn stock_registration_only_refreshes_without_poll_submit_or_ack() {
+        struct RegistrationOnlyBus {
+            registered: mpsc::Sender<()>,
+            polls: AtomicUsize,
+            acks: AtomicUsize,
+        }
+        impl RuntimeAgentBus for RegistrationOnlyBus {
+            fn register(&self, _: &AgentBusRegisterRequest) -> anyhow::Result<()> {
+                self.registered.send(())?;
+                Ok(())
+            }
+            fn unregister(&self, _: &str) -> anyhow::Result<bool> {
+                Ok(true)
+            }
+            fn poll(&self, _: &str) -> anyhow::Result<Vec<AgentBusMessage>> {
+                self.polls.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("stock must not poll")
+            }
+            fn ack(&self, _: &str, _: &[String]) -> anyhow::Result<usize> {
+                self.acks.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("stock must not ack")
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        let bus = Arc::new(RegistrationOnlyBus {
+            registered: tx,
+            polls: AtomicUsize::new(0),
+            acks: AtomicUsize::new(0),
+        });
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let submitter = Arc::new(FakeSubmitter {
+            events: events.clone(),
+            result: Mutex::new(None),
+        });
+        let mut options = test_options();
+        options.registration_only = true;
+        options.registration_refresh_interval = Duration::from_millis(1);
+        options.poll_interval = Duration::from_millis(1);
+        let bridge = AppServerAgentBusBridge::spawn_with_liveness(
+            bus.clone(),
+            submitter,
+            options,
+            Arc::new(AtomicBool::new(true)),
+        )
+        .unwrap();
+        rx.recv_timeout(Duration::from_secs(2)).unwrap(); // initial public register
+        rx.recv_timeout(Duration::from_secs(2)).unwrap(); // worker refresh reached
+        bridge.shutdown().unwrap();
+        assert_eq!(bus.polls.load(Ordering::SeqCst), 0);
+        assert_eq!(bus.acks.load(Ordering::SeqCst), 0);
+        assert!(events.lock().unwrap().is_empty());
     }
 
     #[test]

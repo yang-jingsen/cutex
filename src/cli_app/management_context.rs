@@ -16,6 +16,7 @@ pub(crate) fn load_management_v2_registry() -> anyhow::Result<ImRegistry> {
 
 pub(crate) fn management_request_context() -> ManagementRequestContext {
     ManagementRequestContext {
+        explicit_launch_action,
         adopt_saved_native,
         review_agent_archive,
         execute_agent_archive,
@@ -41,6 +42,39 @@ pub(crate) fn management_request_context() -> ManagementRequestContext {
         execute_management_project_mutation,
         query_management_tasks,
     }
+}
+
+fn explicit_launch_action(
+    principal: &cutex::management::control_plane::HumanManagementPrincipal,
+    request: &cutex::agent_management::ExplicitLaunchRequest,
+) -> Result<serde_json::Value, cutex::agent_management::AgentManagementError> {
+    let operation = || -> anyhow::Result<_> {
+        let tasks = cutex::task_service::TaskServiceProvider::open(
+            cutex::task_delivery::provider_adapter::default_task_service_provider_root()?,
+        )?;
+        if let cutex::agent_management::ExplicitLaunchRequest::Run { action_id, review } = request {
+            let mut runtime = super::stock_lifecycle::StockExecutor::default();
+            return Ok(serde_json::to_value(
+                management_agent_provider()?.execute_stock_runtime(
+                    principal,
+                    &cutex::session::store::cutex_sessions_path()?,
+                    action_id,
+                    review,
+                    &tasks,
+                    &mut runtime,
+                )?,
+            )?);
+        }
+        management_agent_provider()?.explicit_launch_action(
+            principal,
+            &cutex::session::store::cutex_sessions_path()?,
+            request,
+            &tasks,
+        )
+    };
+    operation().map_err(|e| {
+        cutex::agent_management::AgentManagementError::OwnerActionRequired(format!("{e:#}"))
+    })
 }
 
 fn adopt_saved_native(
@@ -418,12 +452,20 @@ fn mutate_management_v2_session(
                     .ok_or_else(|| {
                         session_mutation_invalid("profile must be a non-empty string")
                     })?;
-                Some(
-                    super::launch::resolve_launch_profile_override(requested)
-                        .map_err(session_mutation_invalid_error)?
-                        .account
-                        .name,
-                )
+                if target.explicit_launch.is_some() {
+                    let mut candidate = target.clone();
+                    candidate.profile = Some(requested.to_string());
+                    cutex::launch::stock::current_configuration(&candidate)
+                        .map_err(session_mutation_invalid_error)?;
+                    Some(requested.to_string())
+                } else {
+                    Some(
+                        super::launch::resolve_launch_profile_override(requested)
+                            .map_err(session_mutation_invalid_error)?
+                            .account
+                            .name,
+                    )
+                }
             }
             "cutex/session/profile/clear" => None,
             _ => unreachable!(),
@@ -598,6 +640,14 @@ fn mutate_management_v2_runtime(
         .get(&key)
         .cloned()
         .ok_or_else(|| session_mutation_invalid("cutex session disappeared during mutation"))?;
+    if method == "cutex/runtime/online"
+        || params
+            .get("requireDefaultLaunch")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    {
+        cutex::agent_management::require_default_launch(&record).map_err(runtime_mutation_error)?;
+    }
     if record.runtime_generation != expected_generation {
         return Err(UserInputExecutionError {
             stage: "route".to_string(),
@@ -877,10 +927,17 @@ fn mutate_management_v2_runtime(
             );
             let live_agents =
                 super::management_lifecycle::live_agents_for_management_entry(&config, &entry);
-            let stop = super::management_lifecycle::stop_cutex_session_runtime_for_entry(
+            let stop = super::management_lifecycle::stop_cutex_session_runtime_for_entry_fenced(
                 &entry,
                 &live_agents,
                 force,
+                Some((
+                    expected_generation,
+                    params
+                        .get("requireDefaultLaunch")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true),
+                )),
             )
             .map_err(runtime_mutation_error)?;
             if !stop.stopped {
