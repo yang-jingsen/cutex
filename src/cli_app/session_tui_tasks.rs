@@ -42,10 +42,9 @@ use uuid::Uuid;
 
 use super::management_control_plane::ManagementControlClient;
 use super::session_tui::footer_hints;
+use super::session_tui_input::{self as input_policy, Command};
 use super::session_tui_view::{self as views, DetailScroll};
-use super::session_tui_workspace::{
-    primary_panel_shortcut, primary_panel_tabs, PrimaryPanel, PrimaryPanelOutcome,
-};
+use super::session_tui_workspace::{primary_panel_shortcut, PrimaryPanel, PrimaryPanelOutcome};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -348,6 +347,7 @@ pub(super) struct TaskModel {
     loading: bool,
     warning: Option<String>,
     refreshed_at: Option<Instant>,
+    pub(super) open_settings_requested: bool,
 }
 
 impl Default for TaskModel {
@@ -363,6 +363,7 @@ impl Default for TaskModel {
             loading: true,
             warning: None,
             refreshed_at: None,
+            open_settings_requested: false,
         }
     }
 }
@@ -598,6 +599,10 @@ fn handle_key(
     {
         return Some(PrimaryPanelOutcome::Exit);
     }
+    if input_policy::resolve(key) == Some(Command::Settings) {
+        model.open_settings_requested = true;
+        return Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Agents));
+    }
     if let Some(panel) = primary_panel_shortcut(key) {
         return (panel != PrimaryPanel::Tasks).then_some(PrimaryPanelOutcome::Switch(panel));
     }
@@ -702,7 +707,10 @@ fn render(frame: &mut Frame<'_>, model: &TaskModel) {
         "active"
     };
     frame.render_widget(
-        Paragraph::new(primary_panel_tabs(PrimaryPanel::Tasks)),
+        Paragraph::new(super::session_tui_layout::tabs(
+            PrimaryPanel::Tasks,
+            area.width,
+        )),
         chunks[0],
     );
     frame.render_widget(
@@ -789,7 +797,7 @@ fn render_filter(frame: &mut Frame<'_>, area: Rect, model: &TaskModel) {
 
 fn render_table(frame: &mut Frame<'_>, area: Rect, model: &TaskModel) {
     let visible = model.visible_indices();
-    let columns = task_columns(area.width);
+    let columns = task_columns(area.width.saturating_sub(2));
     let selected = model.selected_visible_index();
     let rows = visible
         .iter()
@@ -810,13 +818,18 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, model: &TaskModel) {
         columns.iter().map(|(_, width)| Constraint::Length(*width)),
     )
     .header(header)
+    .block(Block::bordered().title(if model.show_closed {
+        " Cutex Tasks + history "
+    } else {
+        " Cutex Tasks "
+    }))
     .column_spacing(1)
     .highlight_symbol("> ")
     // Row styles carry selection so semantic status and badge colors survive.
     .row_highlight_style(Style::new());
     let mut state = TableState::default().with_selected(model.selected_visible_index());
     frame.render_stateful_widget(table, area, &mut state);
-    if visible.is_empty() && area.height > 2 {
+    if visible.is_empty() && area.height > 3 {
         let message = if model.warning.is_some() {
             "Task data is unavailable; press F5 to retry."
         } else if model.query.value().is_empty() {
@@ -828,7 +841,7 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, model: &TaskModel) {
             Paragraph::new(message).style(Style::new().fg(Color::DarkGray)),
             Rect {
                 x: area.x + 2,
-                y: area.y + 2,
+                y: area.y + 3,
                 width: area.width.saturating_sub(4),
                 height: 1,
             },
@@ -1294,14 +1307,110 @@ mod tests {
                 output.contains('任') && output.contains('务'),
                 "width={width}\n{output}"
             );
-            // Header y=5, margin y=6, selected row y=7; badge begins after "> ".
-            assert_eq!(buffer[(3, 7)].bg, Color::LightMagenta);
-            assert_eq!(buffer[(3, 7)].fg, Color::Black);
+            // Border y=5, header y=6, margin y=7, selected row y=8; badge
+            // begins after the bordered table's "> " selection marker.
+            assert_eq!(buffer[(3, 8)].bg, Color::LightMagenta);
+            assert_eq!(buffer[(3, 8)].fg, Color::Black);
             assert_eq!(
-                buffer[(12, 7)].bg,
+                buffer[(12, 8)].bg,
                 super::super::session_tui_layout::SELECTION
             );
         }
+    }
+
+    #[test]
+    fn full_frame_reuses_global_shell_and_frames_filter_and_task_list() {
+        let mut blocked = row("shell-blocked", TaskState::Blocked, "2026-09-09T00:58:03Z");
+        blocked.activity = "Awaiting explicit Human decision".to_string();
+        let mut review = row(
+            "shell-review",
+            TaskState::ReviewReady,
+            "2026-09-09T00:42:03Z",
+        );
+        review.activity = "Review evidence prepared".to_string();
+        let model = TaskModel {
+            rows: vec![
+                row("shell", TaskState::Running, "2026-09-09T01:02:03Z"),
+                blocked,
+                review,
+            ],
+            selected_assignment_id: Some("shell".to_string()),
+            loading: false,
+            ..Default::default()
+        };
+        for width in [72, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 18)).unwrap();
+            terminal.draw(|frame| render(frame, &model)).unwrap();
+            let output = buffer_text(terminal.backend().buffer());
+            assert!(output.contains("CUTEX"), "width={width}\n{output}");
+            assert!(output.contains("Managed"), "width={width}\n{output}");
+            assert!(output.contains("Recent"), "width={width}\n{output}");
+            assert!(output.contains("Projects"), "width={width}\n{output}");
+            assert!(output.contains("Tasks"), "width={width}\n{output}");
+            assert!(
+                output.contains("Global Settings [Alt+S]"),
+                "width={width}\n{output}"
+            );
+            assert!(
+                output.contains("Filter tasks (active"),
+                "width={width}\n{output}"
+            );
+            assert!(output.contains("Cutex Tasks"), "width={width}\n{output}");
+            assert!(
+                output.contains('┌') && output.contains('└'),
+                "width={width}\n{output}"
+            );
+            if width == 120 {
+                if let Some(path) = std::env::var_os("CUTEX_TASKS_FRAME_CAPTURE") {
+                    std::fs::write(path, output.trim_end()).expect("write full-frame evidence");
+                }
+            }
+        }
+
+        let mut narrow = Terminal::new(TestBackend::new(38, 14)).unwrap();
+        narrow.draw(|frame| render(frame, &model)).unwrap();
+        let narrow_output = buffer_text(narrow.backend().buffer());
+        assert!(narrow_output.contains("CUTEX"));
+        assert!(narrow_output.contains("Tasks"));
+        assert!(!narrow_output.contains("Global Settings"));
+        assert!(narrow_output.contains('┌') && narrow_output.contains('└'));
+    }
+
+    #[test]
+    fn filter_and_detail_modes_preserve_the_shared_shell() {
+        let mut model = TaskModel {
+            rows: vec![row("modes", TaskState::Running, "2026-09-09T01:02:03Z")],
+            selected_assignment_id: Some("modes".to_string()),
+            loading: false,
+            filter_focused: true,
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 22)).unwrap();
+        terminal.draw(|frame| render(frame, &model)).unwrap();
+        let filter = buffer_text(terminal.backend().buffer());
+        assert!(filter.contains("CUTEX"));
+        assert!(filter.contains("Global Settings [Alt+S]"));
+        assert!(filter.contains("Filter tasks (active"));
+
+        model.filter_focused = false;
+        model.detail = true;
+        terminal.draw(|frame| render(frame, &model)).unwrap();
+        let detail = buffer_text(terminal.backend().buffer());
+        assert!(detail.contains("CUTEX"));
+        assert!(detail.contains("Global Settings [Alt+S]"));
+        assert!(detail.contains("Task details"));
+
+        handle_key(
+            &mut model,
+            &mut RefreshCadence::new(Instant::now()),
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(!model.detail);
+        terminal.draw(|frame| render(frame, &model)).unwrap();
+        let list = buffer_text(terminal.backend().buffer());
+        assert!(list.contains("CUTEX"));
+        assert!(list.contains("Global Settings [Alt+S]"));
+        assert!(list.contains("Cutex Tasks"));
     }
 
     #[test]
@@ -1464,6 +1573,21 @@ mod tests {
         assert_eq!(model.selected_assignment_id.as_deref(), Some("one"));
         assert_eq!(model.query.value(), "running");
         assert!(model.detail);
+    }
+
+    #[test]
+    fn global_settings_shortcut_uses_the_real_parent_workspace_route() {
+        let mut model = TaskModel::default();
+        let outcome = handle_key(
+            &mut model,
+            &mut RefreshCadence::new(Instant::now()),
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT),
+        );
+        assert_eq!(
+            outcome,
+            Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Agents))
+        );
+        assert!(model.open_settings_requested);
     }
 
     #[test]

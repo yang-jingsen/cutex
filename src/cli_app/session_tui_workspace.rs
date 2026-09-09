@@ -38,15 +38,6 @@ impl PrimaryPanel {
         }
     }
 
-    pub(super) fn shortcut(self) -> &'static str {
-        match self {
-            Self::Agents => "Alt+M",
-            Self::Projects => "Alt+P",
-            Self::Tasks => "Alt+T",
-            Self::Recent => "Alt+R",
-        }
-    }
-
     pub(super) fn adjacent(self, forward: bool) -> Option<Self> {
         let index = Self::ALL.iter().position(|panel| *panel == self)?;
         let next = if forward {
@@ -62,31 +53,6 @@ impl PrimaryPanel {
 pub(super) enum PrimaryPanelOutcome {
     Exit,
     Switch(PrimaryPanel),
-}
-
-pub(super) fn primary_panel_tabs(active: PrimaryPanel) -> ratatui::text::Line<'static> {
-    use ratatui::style::{Color, Modifier, Style};
-    use ratatui::text::{Line, Span};
-
-    let mut spans = Vec::new();
-    for (index, panel) in PrimaryPanel::ALL.into_iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::styled(" | ", Style::new().fg(Color::DarkGray)));
-        }
-        let style = if panel == active {
-            Style::new()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::new().fg(Color::Gray)
-        };
-        spans.push(Span::styled(
-            format!(" {} {} ", panel.label(), panel.shortcut()),
-            style,
-        ));
-    }
-    Line::from(spans)
 }
 
 /// Resolve only the frozen top-level workspace shortcuts. These shortcuts are

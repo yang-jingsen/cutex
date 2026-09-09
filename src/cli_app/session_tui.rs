@@ -4524,8 +4524,12 @@ pub(crate) fn run() -> anyhow::Result<()> {
                 }
             }
             PrimaryPanel::Tasks => {
-                let (outcome, model) =
+                let (outcome, mut model) =
                     shell.handoff(|| super::session_tui_tasks::run(tasks_model.take()))??;
+                if std::mem::take(&mut model.open_settings_requested) {
+                    selector_command(&mut selector_model, Command::Settings);
+                    selector_model.settings_return_panel = Some(PrimaryPanel::Tasks);
+                }
                 tasks_model = Some(model);
                 match outcome {
                     PrimaryPanelOutcome::Exit => return Ok(()),
@@ -10435,7 +10439,7 @@ mod tests {
     }
 
     #[test]
-    fn ui_contract_c_global_settings_navigation_and_project_return() {
+    fn ui_contract_c_global_settings_navigation_and_project_and_tasks_return() {
         let mut model = SelectorModel::new(
             vec![
                 row(
@@ -10469,6 +10473,17 @@ mod tests {
         assert!(matches!(
             route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             SelectorKeyRoute::Switch(PrimaryPanel::Projects)
+        ));
+        assert_eq!(model.selected_target(), selected);
+        route_selector_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT),
+        );
+        model.settings_return_panel = Some(PrimaryPanel::Tasks);
+        assert!(rendered_text_at(100, 30, &model).contains("Global Settings"));
+        assert!(matches!(
+            route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            SelectorKeyRoute::Switch(PrimaryPanel::Tasks)
         ));
         assert_eq!(model.selected_target(), selected);
         route_selector_key(
