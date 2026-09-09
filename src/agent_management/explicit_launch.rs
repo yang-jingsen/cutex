@@ -19,7 +19,7 @@ pub struct ExplicitLaunchContract {
 impl ExplicitLaunchContract {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.version == 1,
+            matches!(self.version, 1 | 2),
             "unsupported explicit launch contract version"
         );
         anyhow::ensure!(
@@ -60,6 +60,31 @@ pub fn file_sha256(path: &Path) -> anyhow::Result<Sha256> {
 pub fn require_default_launch(record: &CutexSessionRecord) -> anyhow::Result<()> {
     anyhow::ensure!(record.explicit_launch.is_none(), "explicit_stock_launch_required: generic launch/restart/attach is disabled; owner is unchanged");
     Ok(())
+}
+
+#[test]
+fn explicit_launch_versions_require_unchanged_manifest_evidence() {
+    let root = std::env::temp_dir().join(format!("s6f-contract-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let manifest = root.join("bundle.json");
+    std::fs::write(&manifest, b"private evidence").unwrap();
+    let mut contract = ExplicitLaunchContract {
+        version: 1,
+        native_id: uuid::Uuid::new_v4().to_string(),
+        native_home: root.clone(),
+        bundle_manifest: manifest.clone(),
+        bundle_sha256: file_sha256(&manifest).unwrap(),
+    };
+    contract.validate().unwrap();
+    contract.version = 2;
+    contract.validate().unwrap();
+    contract.version = 3;
+    assert!(contract.validate().is_err());
+    contract.version = 2;
+    std::fs::write(&manifest, b"changed evidence").unwrap();
+    assert!(contract.validate().is_err());
+    std::fs::remove_file(manifest).unwrap();
+    std::fs::remove_dir(root).unwrap();
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

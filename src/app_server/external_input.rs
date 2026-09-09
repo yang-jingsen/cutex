@@ -28,6 +28,7 @@ pub struct Source {
 pub enum Delivery {
     AfterTurn,
     Passive,
+    Soon,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -99,6 +100,7 @@ impl Envelope {
                     match self.message.delivery {
                         Delivery::AfterTurn => "after_turn",
                         Delivery::Passive => "passive",
+                        Delivery::Soon => "soon",
                     },
                     &self.message.text
                 ]
@@ -359,6 +361,7 @@ impl PinnedArtifacts {
                 &bundle.shared_config.path,
             ]
             .into_iter()
+            .chain(bundle.cli.as_ref().map(|c| &c.path))
             .map(|path| {
                 ensure!(
                     path.canonicalize()? == *path,
@@ -520,6 +523,10 @@ impl ExternalInputClient {
             _ => anyhow::bail!("ingress requires private Unix endpoint"),
         }
         let client = AppServerClient::connect(AppServerClientOptions::new(endpoint))?;
+        crate::launch::stock::validate_ingress_capability(
+            artifacts.bundle.schema.sha256.as_str(),
+            client.initialize_response(),
+        )?;
         ensure!(
             client
                 .initialize_response()
@@ -622,6 +629,7 @@ impl ExternalInputClient {
     }
     pub fn submit(&self, envelope: &Envelope) -> anyhow::Result<Response> {
         envelope.validate()?;
+        self.require_delivery(&envelope.message.delivery)?;
         ensure!(
             envelope.owner_id == self.binding.owner_id
                 && envelope.thread_id == self.binding.thread_id
@@ -634,6 +642,13 @@ impl ExternalInputClient {
         )?)?;
         response.validate(&self.binding, &[envelope.key()])?;
         Ok(response)
+    }
+    pub(crate) fn require_delivery(&self, delivery: &Delivery) -> anyhow::Result<()> {
+        ensure!(
+            *delivery != Delivery::Soon || self.artifacts.bundle.soon_ingress(),
+            "native ingress does not support soon; explicit compatible activation required"
+        );
+        Ok(())
     }
     pub fn status(&self, keys: &[MessageKey]) -> anyhow::Result<Response> {
         ensure!(

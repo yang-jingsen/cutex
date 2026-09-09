@@ -82,7 +82,11 @@ fn handle_runtime_native_event(
                 sha256: context.schema.sha256.clone(),
                 channel: AppServerSchemaChannel::Experimental,
                 capabilities: serde_json::json!({ "experimentalApi": true }),
-                extensions: if context.schema.sha256 == cutex::launch::stock::S6_SCHEMA_SHA256 {
+                extensions: if matches!(
+                    context.schema.sha256.as_str(),
+                    cutex::launch::stock::S6_SCHEMA_SHA256
+                        | cutex::launch::stock::S6E_SCHEMA_SHA256
+                ) {
                     vec!["external-input-v1".to_string()]
                 } else if context.schema.sha256 == cutex::launch::stock::STOCK_SCHEMA_SHA256 {
                     Vec::new()

@@ -12,6 +12,12 @@ fn task_provider() -> anyhow::Result<crate::task_service::TaskServiceProvider> {
         crate::task_delivery::provider_adapter::default_task_service_provider_root()?,
     )?)
 }
+fn watchdog() -> anyhow::Result<crate::task_service::TaskStaleWatchdog> {
+    crate::task_service::TaskStaleWatchdog::open(
+        crate::task_service::default_task_watchdog_root()?,
+        crate::task_service::TaskWatchdogConfig::from_env()?,
+    )
+}
 
 #[cfg(all(unix, feature = "stock-launch-test-hook"))]
 fn before_commit_test_gate(message: &AgentBusMessage, stage: &str) -> anyhow::Result<()> {
@@ -115,6 +121,165 @@ pub(super) fn validate_target(
     if let Some(metadata) = task_service_worker_followup_metadata(message)? {
         DurableTaskServiceContextRecorder.validate_worker_followup(&metadata, owner)?;
     }
+    if let Some(metadata) = task_service_watchdog_metadata(message)? {
+        let n = watchdog()?
+            .notification(&metadata.notification_id)?
+            .context("watchdog absent")?;
+        ensure!(
+            crate::task_service::TaskWatchdogMessageMetadata::from(&n) == metadata,
+            "watchdog metadata conflict"
+        );
+        let snapshot = task_provider()?.query()?;
+        let assignment = snapshot
+            .assignments
+            .values()
+            .find(|a| a.assignment_id.as_str() == metadata.assignment_id)
+            .context("watchdog assignment absent")?;
+        ensure!(
+            assignment.project_id == metadata.project_id
+                && assignment.state != crate::task_service::AssignmentState::Closed
+                && assignment
+                    .active_attempt
+                    .is_some_and(|a| a.get() == metadata.attempt_number),
+            "watchdog assignment/attempt no longer current"
+        );
+        match &n.target {
+            crate::task_service::TaskWatchdogTarget::AssigneeSession(id) => ensure!(
+                id == owner && assignment.assignee_cutex_session.as_str() == owner,
+                "watchdog assignee conflict"
+            ),
+            crate::task_service::TaskWatchdogTarget::AuthoritySeat(id) => {
+                let seat = crate::task_service::SeatId::new(id.clone())
+                    .map_err(|_| anyhow::anyhow!("invalid watchdog seat"))?;
+                let target = crate::seat::task_seat_occupancy(seats, n.project_id.as_ref(), &seat)
+                    .context("watchdog seat missing/fenced")?;
+                ensure!(
+                    target.occupant_cutex_session.as_str() == owner,
+                    "watchdog recipient rotated"
+                );
+                if id == "cutex-director" {
+                    if let Some(project) = &n.project_id {
+                        ensure!(
+                            roster
+                                .projects
+                                .get(project)
+                                .context("watchdog project missing")?
+                                .authorized_director_session
+                                .as_str()
+                                == owner,
+                            "watchdog project authority/seat mismatch"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate the authoritative outbox projection before freezing native bytes.
+/// Existing historical envelopes are not synthesized from a new display name.
+fn fresh_task_projection(
+    message: &AgentBusMessage,
+    owner: &str,
+    activated_at: &str,
+) -> anyhow::Result<()> {
+    use crate::agent_bus::delivery::AgentDeliveryMode as Mode;
+    ensure!(
+        message.from == TASK_SERVICE_SYSTEM_SENDER && message.from_cutex_session_id.is_none(),
+        "Task source conflict"
+    );
+    let snapshot = task_provider()?.query()?;
+    let (family, external, created) = if let Some(m) = task_service_completion_metadata(message)? {
+        let n = snapshot
+            .completion_notifications
+            .get(&m.notification_id)
+            .context("completion absent")?;
+        let mode = match n.delivery_mode {
+            crate::task_service::CompletionNotificationDeliveryMode::AfterTurn => Mode::AfterTurn,
+            crate::task_service::CompletionNotificationDeliveryMode::Soon => Mode::Soon,
+        };
+        ensure!(
+            !n.is_delivered()
+                && message.content == n.human_readable_content
+                && message.delivery_mode == mode,
+            "completion projection conflict"
+        );
+        (
+            "tsc",
+            n.notification_id.as_str().to_string(),
+            n.created_at.as_str().to_string(),
+        )
+    } else if let Some(m) = task_service_metadata(message)? {
+        let a = snapshot
+            .assignments
+            .get(&m.assignment_id)
+            .context("assignment absent")?;
+        let send = snapshot
+            .send_attempts
+            .get(&m.send_attempt_id)
+            .context("send attempt absent")?;
+        ensure!(
+            message.delivery_mode == Mode::Soon
+                && message.external_message_id.as_deref() == Some(&send.external_message_id),
+            "assignment mode/message conflict"
+        );
+        crate::agent_bus::model::validate_task_service_assignment_summary(
+            &message.content,
+            m.require_valid_contract()?,
+        )?;
+        (
+            "tsa",
+            send.external_message_id.clone(),
+            a.created_at.as_str().to_string(),
+        )
+    } else if let Some(m) = task_service_worker_followup_metadata(message)? {
+        let n = snapshot
+            .worker_followup_notifications
+            .get(&m.notification_id)
+            .context("follow-up absent")?;
+        ensure!(
+            !n.is_delivered()
+                && message.content == n.decision_reference
+                && message.delivery_mode == Mode::Soon,
+            "follow-up projection conflict"
+        );
+        (
+            "tsf",
+            n.notification_id.as_str().to_string(),
+            n.created_at.as_str().to_string(),
+        )
+    } else if let Some(m) = task_service_watchdog_metadata(message)? {
+        let n = watchdog()?
+            .notification(&m.notification_id)?
+            .context("watchdog absent")?;
+        let mode = match n.delivery_mode {
+            crate::task_service::TaskWatchdogDeliveryMode::Soon => Mode::Soon,
+            crate::task_service::TaskWatchdogDeliveryMode::AfterTurn => Mode::AfterTurn,
+        };
+        ensure!(
+            !n.is_delivered() && message.content == n.content && message.delivery_mode == mode,
+            "watchdog projection conflict"
+        );
+        let created = n
+            .facts
+            .first()
+            .context("watchdog provenance absent")?
+            .recorded_at
+            .to_string();
+        ("tsw", n.notification_id, created)
+    } else {
+        anyhow::bail!("unsupported Task canonical projection");
+    };
+    ensure!(
+        chrono::DateTime::parse_from_rfc3339(&created)?
+            >= chrono::DateTime::parse_from_rfc3339(activated_at)?,
+        "pre-activation Task projection requires explicit review"
+    );
+    ensure!(
+        message.id == crate::agent_bus::queue::native_task_message_id(family, &external, owner),
+        "Task outbox message identity conflict"
+    );
     Ok(())
 }
 
@@ -130,8 +295,9 @@ fn envelope(
     let delivery = match message.delivery_mode {
         crate::agent_bus::delivery::AgentDeliveryMode::AfterTurn => Delivery::AfterTurn,
         crate::agent_bus::delivery::AgentDeliveryMode::Passive => Delivery::Passive,
+        crate::agent_bus::delivery::AgentDeliveryMode::Soon => Delivery::Soon,
         _ => anyhow::bail!(
-            "native ingress does not support soon/interrupt; explicit sender decision required"
+            "native ingress does not support interrupt; explicit sender decision required"
         ),
     };
     let (source, event_type, text) = match message.sender_kind {
@@ -173,6 +339,11 @@ fn envelope(
                 format!("Assignment ID: {}\nTask: {} revision {}\nAction: perform the assigned work using Task Service tools.\nContract:\n{}", metadata.assignment_id.as_str(), metadata.task_id.as_str(), metadata.task_revision.get(), metadata.require_valid_contract()?)
             } else if let Some(metadata) = task_service_worker_followup_metadata(message)? {
                 format!("Assignment ID: {}\nTask: {} revision {}\nAction: address requested changes.\nDecision:\n{}", metadata.assignment_id.as_str(), metadata.task_id.as_str(), metadata.task_revision.get(), metadata.decision_reference)
+            } else if let Some(metadata) = task_service_watchdog_metadata(message)? {
+                watchdog()?
+                    .notification(&metadata.notification_id)?
+                    .context("watchdog absent")?
+                    .content
             } else {
                 anyhow::bail!("unsupported Task control ingress; retain pending");
             };
@@ -277,34 +448,58 @@ pub(super) fn deliver(
                 // materialize its fresh authenticated projection into the existing
                 // Bus repository; old/ambiguous K-era notifications require review.
                 seats.with_notification_snapshot(|s| -> anyhow::Result<()> {
-                    let metadata = task_service_completion_metadata(&polled)?.context("Task ingress requires persisted canonical envelope")?;
-                    let snapshot = task_provider()?.query()?;
-                    let n = snapshot.completion_notifications.get(&metadata.notification_id).context("completion absent")?;
                     let store = crate::session::store::load_cutex_session_store_from_path(&path)?;
-                    let r = store.sessions.get(&options.cutex_session_id).context("recipient absent")?;
+                    let r = store
+                        .sessions
+                        .get(&options.cutex_session_id)
+                        .context("recipient absent")?;
                     r.app_server_runtime.as_ref().context("recipient offline")?;
-                    let activation = store.explicit_launch_receipts.values().filter_map(|receipt| {
-                        match receipt {
+                    let activation = store
+                        .explicit_launch_receipts
+                        .values()
+                        .filter_map(|receipt| match receipt {
                             crate::agent_management::ExplicitLaunchActionReceipt::Activation(a)
-                                if a.review.subject.cutex_session_id.as_str() == options.cutex_session_id
-                                    && r.explicit_launch.as_ref() == Some(&a.review.contract) => Some(a),
+                                if a.review.subject.cutex_session_id.as_str()
+                                    == options.cutex_session_id
+                                    && r.explicit_launch.as_ref() == Some(&a.review.contract) =>
+                            {
+                                Some(a)
+                            }
                             _ => None,
-                        }
-                    }).min_by_key(|a| &a.committed_at).context("native activation provenance absent")?;
+                        })
+                        .min_by_key(|a| &a.committed_at)
+                        .context("native activation provenance absent")?;
                     // The explicit activation, not the latest runtime start,
                     // establishes this private lineage across owned restarts.
-                    ensure!(!n.is_delivered() && chrono::DateTime::parse_from_rfc3339(n.created_at.as_str())? >= chrono::DateTime::parse_from_rfc3339(&activation.committed_at)?, "pre-activation completion without native envelope requires explicit review");
-                    ensure!(polled.from == TASK_SERVICE_SYSTEM_SENDER && polled.from_cutex_session_id.is_none() && polled.content == n.human_readable_content && polled.id == crate::agent_bus::queue::native_completion_message_id(n.notification_id.as_str(), &options.cutex_session_id), "Task outbox projection conflict");
+                    fresh_task_projection(
+                        &polled,
+                        &options.cutex_session_id,
+                        &activation.committed_at,
+                    )?;
                     let mut canonical = polled.clone();
                     canonical.to_cutex_session_id = Some(options.cutex_session_id.clone());
                     validate_target(&canonical, &options.cutex_session_id, s, &before)?;
-                    let params = inter_agent_params(&options.thread_id, &options.cutex_session_id, &options.cutex_session_id, &canonical)?;
-                    repository.record_queued(crate::management::v2::agent_bus_state::AgentBusQueuedMessage {
-                        owner_cutex_session_id: options.cutex_session_id.clone(), message_id: canonical.id.clone(), from_cutex_session_id: None,
-                        to_cutex_session_id: options.cutex_session_id.clone(), from_runtime_agent_id: None, to_runtime_agent_id: Some(options.registration.id.clone()),
-                        delivery_mode: canonical.delivery_mode.event_label().into(), content: canonical.content.clone(), queued_at: Utc::now(),
-                        semantic_sha256: inter_agent_semantic_sha256(&params), canonical_envelope: canonical,
-                    })?;
+                    let params = inter_agent_params(
+                        &options.thread_id,
+                        &options.cutex_session_id,
+                        &options.cutex_session_id,
+                        &canonical,
+                    )?;
+                    repository.record_queued(
+                        crate::management::v2::agent_bus_state::AgentBusQueuedMessage {
+                            owner_cutex_session_id: options.cutex_session_id.clone(),
+                            message_id: canonical.id.clone(),
+                            from_cutex_session_id: None,
+                            to_cutex_session_id: options.cutex_session_id.clone(),
+                            from_runtime_agent_id: None,
+                            to_runtime_agent_id: Some(options.registration.id.clone()),
+                            delivery_mode: canonical.delivery_mode.event_label().into(),
+                            content: canonical.content.clone(),
+                            queued_at: Utc::now(),
+                            semantic_sha256: inter_agent_semantic_sha256(&params),
+                            canonical_envelope: canonical,
+                        },
+                    )?;
                     Ok(())
                 })??;
             }
@@ -324,7 +519,9 @@ pub(super) fn deliver(
             })??;
             let frozen =
                 repository.freeze_external_input(&options.cutex_session_id, &message.id, |m| {
-                    envelope(m, client.binding())
+                    let e = envelope(m, client.binding())?;
+                    client.require_delivery(&e.message.delivery)?;
+                    Ok(e)
                 })?;
             ensure!(
                 frozen.owner_id == options.cutex_session_id
@@ -398,6 +595,19 @@ pub(super) fn deliver(
                             &receipt.receipt_id,
                         )?;
                     }
+                    if let Some(m) = task_service_watchdog_metadata(&message)? {
+                        DurableTaskServiceContextRecorder.record_watchdog_context_inserted(
+                            &m,
+                            &message.id,
+                            &receipt.receipt_id,
+                        )?;
+                        DurableTaskServiceContextRecorder.record_watchdog_turn_binding(
+                            &m,
+                            &options.cutex_session_id,
+                            &options.thread_id,
+                            &receipt.turn_id,
+                        )?;
+                    }
                     repository.record_external_input_delivered(
                         &options.cutex_session_id,
                         &message.id,
@@ -460,10 +670,14 @@ mod tests {
     }
     #[test]
     fn external_bus_unsupported_modes_roles_and_missing_identity_fail_closed() {
-        for mode in [
-            crate::agent_bus::delivery::AgentDeliveryMode::Soon,
-            crate::agent_bus::delivery::AgentDeliveryMode::Interrupt,
-        ] {
+        let mut soon = message();
+        let after = envelope(&soon, &binding()).unwrap();
+        soon.delivery_mode = crate::agent_bus::delivery::AgentDeliveryMode::Soon;
+        let immediate = envelope(&soon, &binding()).unwrap();
+        assert_eq!(after.message.text, immediate.message.text);
+        assert_eq!(immediate.message.delivery, Delivery::Soon);
+        assert_ne!(after.semantic_sha256, immediate.semantic_sha256);
+        for mode in [crate::agent_bus::delivery::AgentDeliveryMode::Interrupt] {
             let mut m = message();
             m.delivery_mode = mode;
             assert!(envelope(&m, &binding()).is_err());

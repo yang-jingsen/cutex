@@ -330,7 +330,13 @@ impl AgentBusMessageRepository {
                 "native envelope recipient/message mismatch"
             );
             stored.snapshot.external_input = Some(envelope.clone());
-            store.version = store.version.max(3);
+            store.version = store.version.max(
+                if envelope.message.delivery == crate::app_server::external_input::Delivery::Soon {
+                    4
+                } else {
+                    3
+                },
+            );
             Ok(envelope)
         })
     }

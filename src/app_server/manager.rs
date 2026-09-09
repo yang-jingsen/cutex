@@ -748,15 +748,7 @@ impl AppServerRuntimeManager {
 
         let client = AppServerClient::connect(AppServerClientOptions::new(endpoint.clone()))?;
         let initialize_response = client.initialize_response().clone();
-        if schema.sha256 == crate::launch::stock::S6_SCHEMA_SHA256 {
-            anyhow::ensure!(
-                initialize_response
-                    .get("externalInputVersion")
-                    .and_then(Value::as_u64)
-                    == Some(1),
-                "reviewed U+S6 owner omitted ExternalInput v1 capability"
-            );
-        }
+        crate::launch::stock::validate_ingress_capability(&schema.sha256, &initialize_response)?;
         let handle = client.handle();
         let commands = AppServerCommands::new(handle.clone());
         let (thread_response, expected_thread_id, settings_source) = match bootstrap {

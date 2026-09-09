@@ -356,7 +356,11 @@ impl TaskServiceAgentBusDispatcher {
                         r.current_runtime_agent_id.as_deref() == Some(&target_id)
                             && r.explicit_launch.is_some()
                             && r.app_server_runtime.as_ref().is_some_and(|runtime| {
-                                runtime.schema_sha256 == crate::launch::stock::S6_SCHEMA_SHA256
+                                matches!(
+                                    runtime.schema_sha256.as_str(),
+                                    crate::launch::stock::S6_SCHEMA_SHA256
+                                        | crate::launch::stock::S6E_SCHEMA_SHA256
+                                )
                             })
                     })
                     .map(|_| owner.to_string())
@@ -448,6 +452,9 @@ impl TaskServiceAgentBusDispatcher {
                 &metadata,
                 notification.transition_action_id.as_str(),
                 &notification.external_message_id,
+                crate::agent_bus::queue::native_task_target(&target_id)
+                    .map_err(|_| ProviderError::PersistenceUnavailable)?
+                    .as_deref(),
                 now_epoch_secs,
             ) {
                 Ok(outcome) => {
@@ -571,6 +578,9 @@ impl TaskServiceAgentBusDispatcher {
             &metadata,
             request.action_id.as_str(),
             &send_attempt.external_message_id,
+            crate::agent_bus::queue::native_task_target(&target_id)
+                .map_err(|_| AssignmentDispatchError::AgentBusUnavailable)?
+                .as_deref(),
             now_epoch_secs,
         )
         .map_err(|_| AssignmentDispatchError::AgentBusUnavailable)?;
@@ -700,6 +710,9 @@ impl TaskServiceAgentBusDispatcher {
             &metadata,
             request.action_id.as_str(),
             &send_attempt.external_message_id,
+            crate::agent_bus::queue::native_task_target(&target_id)
+                .map_err(|_| AssignmentDispatchError::AgentBusUnavailable)?
+                .as_deref(),
             now_epoch_secs,
         )
         .map_err(|_| AssignmentDispatchError::AgentBusUnavailable)?;
@@ -825,6 +838,9 @@ impl TaskServiceAgentBusDispatcher {
             &metadata,
             request.action_id.as_str(),
             &send_attempt.external_message_id,
+            crate::agent_bus::queue::native_task_target(&target_id)
+                .map_err(|_| AssignmentDispatchError::AgentBusUnavailable)?
+                .as_deref(),
             now_epoch_secs,
         )
         .map_err(|_| AssignmentDispatchError::AgentBusUnavailable)?;

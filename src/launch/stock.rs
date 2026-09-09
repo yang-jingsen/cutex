@@ -22,9 +22,38 @@ pub const S6_EXECUTABLE_SHA256: &str =
     "b70d48151c9deb76a9c0ab14a820c582f2bc12a73bbb1512fee9b2f1bec9fa60";
 pub const S6_SCHEMA_SHA256: &str =
     "00e035e34ac1034ee34473f8f68b7704d6058c5b180ff4f4b6cad9fadab3a86d";
+pub const S6E_COMMIT: &str = "a83dbb47ba6aa775f5d4b679fafc532c4db74c7f";
+pub const S6E_EXECUTABLE_SHA256: &str =
+    "4638b86221593dd4bab1f66b504641836ac1adb864e946cbe42cb5cbf9f05a74";
+pub const S6E_CLI_SHA256: &str = "f360100339560e6a57eb08dea38ed740450904ce7bd72ea7b8a37238fff97bd6";
+pub const S6E_SCHEMA_SHA256: &str =
+    "459861225d5bfb73bb4c3896edb489169637424be410be346f955a39596da7e9";
 
 pub fn is_private_native_schema(hash: &str) -> bool {
-    matches!(hash, STOCK_SCHEMA_SHA256 | S6_SCHEMA_SHA256)
+    matches!(
+        hash,
+        STOCK_SCHEMA_SHA256 | S6_SCHEMA_SHA256 | S6E_SCHEMA_SHA256
+    )
+}
+
+pub fn validate_ingress_capability(schema: &str, init: &serde_json::Value) -> anyhow::Result<()> {
+    if matches!(schema, S6_SCHEMA_SHA256 | S6E_SCHEMA_SHA256) {
+        ensure!(
+            init.get("externalInputVersion")
+                .and_then(serde_json::Value::as_u64)
+                == Some(1),
+            "reviewed native owner omitted ExternalInput v1 capability"
+        );
+        if schema == S6E_SCHEMA_SHA256 {
+            ensure!(
+                init.get("externalInputDeliveries")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|modes| modes.iter().any(|m| m.as_str() == Some("soon"))),
+                "reviewed Soon bundle omitted supported-delivery capability; no downgrade"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Human receiver policy, never an ingress message/tool field. Null is invalid.
@@ -158,6 +187,8 @@ pub struct StockBundle {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_patch_commit: Option<String>,
     pub executable: VerifiedFile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli: Option<VerifiedFile>,
     pub code_mode_host: VerifiedFile,
     pub facade: VerifiedFile,
     /// Pinned stock experimental schema, or accepted S6 generated schema.
@@ -167,10 +198,22 @@ pub struct StockBundle {
 }
 impl StockBundle {
     pub fn common_ingress(&self) -> bool {
-        self.version == 2
+        (self.version == 2
             && self.native_patch_commit.as_deref() == Some(S6_COMMIT)
             && self.executable.sha256.as_str() == S6_EXECUTABLE_SHA256
             && self.schema.sha256.as_str() == S6_SCHEMA_SHA256
+            && self.cli.is_none())
+            || self.soon_ingress()
+    }
+    pub fn soon_ingress(&self) -> bool {
+        self.version == 3
+            && self.native_patch_commit.as_deref() == Some(S6E_COMMIT)
+            && self.executable.sha256.as_str() == S6E_EXECUTABLE_SHA256
+            && self.schema.sha256.as_str() == S6E_SCHEMA_SHA256
+            && self
+                .cli
+                .as_ref()
+                .is_some_and(|c| c.sha256.as_str() == S6E_CLI_SHA256)
     }
     fn validate_identity(&self) -> anyhow::Result<()> {
         ensure!(
@@ -178,6 +221,7 @@ impl StockBundle {
             "unsupported native upstream source"
         );
         let stock = self.version == 1
+            && self.cli.is_none()
             && self.native_patch_commit.is_none()
             && self.executable.sha256.as_str() == STOCK_EXECUTABLE_SHA256
             && self.schema.sha256.as_str() == STOCK_SCHEMA_SHA256;
@@ -197,6 +241,15 @@ impl StockBundle {
             .context("invalid stock bundle manifest")?;
         ensure!(cfg!(target_os = "linux"), "stock subset requires Linux");
         bundle.validate_identity()?;
+        ensure!(contract.version == if bundle.soon_ingress() { 2 } else { 1 },
+            "new coherent Soon bundle requires explicit version-2 activation; old markers cannot opt in");
+        if let Some(cli) = &bundle.cli {
+            cli.validate()?;
+            ensure!(
+                cli.path.parent() == bundle.executable.path.parent(),
+                "coherent CLI must be beside app-server and host"
+            );
+        }
         for file in [
             &bundle.executable,
             &bundle.code_mode_host,
@@ -575,6 +628,7 @@ mod tests {
             upstream_commit: STOCK_COMMIT.into(),
             native_patch_commit: Some(S6_COMMIT.into()),
             executable: file(S6_EXECUTABLE_SHA256),
+            cli: None,
             code_mode_host: file(STOCK_HOST_SHA256),
             facade: file(STOCK_HOST_SHA256),
             schema: file(S6_SCHEMA_SHA256),
@@ -592,9 +646,35 @@ mod tests {
         b.schema = file(STOCK_SCHEMA_SHA256);
         b.validate_identity().unwrap();
         assert!(!b.common_ingress());
+        b.version = 3;
+        b.native_patch_commit = Some(S6E_COMMIT.into());
+        b.executable = file(S6E_EXECUTABLE_SHA256);
+        b.schema = file(S6E_SCHEMA_SHA256);
+        assert!(b.validate_identity().is_err());
+        b.cli = Some(file(S6E_CLI_SHA256));
+        b.validate_identity().unwrap();
+        assert!(b.common_ingress() && b.soon_ingress());
+        b.version = 2;
+        assert!(b.validate_identity().is_err());
+        b.version = 3;
+        b.cli = Some(file(STOCK_EXECUTABLE_SHA256));
+        assert!(b.validate_identity().is_err());
         let mut raw = serde_json::to_value(b).unwrap();
         raw["externalInput"] = true.into();
         assert!(serde_json::from_value::<StockBundle>(raw).is_err());
+    }
+    #[test]
+    fn soon_requires_positive_reviewed_capability() {
+        let legacy = serde_json::json!({"externalInputVersion":1});
+        assert!(validate_ingress_capability(S6_SCHEMA_SHA256, &legacy).is_ok());
+        assert!(validate_ingress_capability(S6E_SCHEMA_SHA256, &legacy).is_err());
+        assert!(validate_ingress_capability(S6E_SCHEMA_SHA256, &serde_json::json!({"externalInputVersion":1,"externalInputDeliveries":["after_turn","passive"]})).is_err());
+        assert!(validate_ingress_capability(S6E_SCHEMA_SHA256, &serde_json::json!({"externalInputVersion":1,"externalInputDeliveries":["after_turn","passive","soon"]})).is_ok());
+        assert!(validate_ingress_capability(
+            S6E_SCHEMA_SHA256,
+            &serde_json::json!({"externalInputVersion":2,"externalInputDeliveries":["soon"]})
+        )
+        .is_err());
     }
     #[test]
     fn stock_shared_config_rejects_execution_auth_and_unknown_options() {

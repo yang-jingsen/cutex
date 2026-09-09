@@ -696,6 +696,7 @@ impl TaskWorkerActionHost {
                 &metadata,
                 delivery_mode,
                 &notification.external_message_id,
+                crate::agent_bus::queue::native_task_target(&target_id)?.as_deref(),
                 crate::platform::now_epoch_secs(),
             ) {
                 Ok(queued) => watchdog.record_delivery_fact(

@@ -42,6 +42,38 @@ fn clean_launch(
             std::env::var(key).with_context(|| format!("private {key} required"))?,
         );
     }
+    #[cfg(feature = "stock-launch-test-hook")]
+    if std::env::var("CUTEX_STOCK_TEST_GUARDED_NATIVE").as_deref() == Ok("1") {
+        // Explicit S7/S6f same-host-UID fixture only. Default builds have no
+        // inherited preload/endpoint authority. This is not OS isolation.
+        let private = std::path::PathBuf::from(std::env::var("CUTEX_TEST_PRIVATE_HOME")?);
+        ensure!(
+            private.is_absolute()
+                && private == std::path::PathBuf::from(std::env::var("HOME")?)
+                && private.join(".cutex-test-private-home").is_file(),
+            "guarded native requires exact private fixture HOME"
+        );
+        let guard = std::path::Path::new(
+            "/mnt/mambo/PersonaProjects/cutex-light-core-r1/artifacts/s7a/connect-guard-error.so",
+        );
+        ensure!(
+            guard.canonicalize()? == guard
+                && cutex::agent_management::file_sha256(guard)?.as_str()
+                    == "8fdf96e00b65c625c6c132f157eea03e081ae6ead7bcfc8dc82ad1865e2d9faa",
+            "private approved guard changed"
+        );
+        let ports = std::env::var("S4_TEST_ALLOWED_PORTS")?;
+        ensure!(
+            !ports.is_empty()
+                && ports
+                    .split(',')
+                    .all(|p| p.parse::<std::num::NonZeroU16>().is_ok()),
+            "private owned ports required"
+        );
+        launch = launch
+            .env("LD_PRELOAD", guard.to_str().unwrap())
+            .env("S4_TEST_ALLOWED_PORTS", ports);
+    }
     Ok(launch
         .env(
             "CODEX_HOME",
@@ -85,6 +117,15 @@ fn configured(
         launch = option(launch, "model_reasoning_effort", reasoning)?;
     }
     option(launch, "analytics.enabled", false)
+}
+
+fn receiver_profile(sandbox: &str) -> anyhow::Result<&'static str> {
+    match sandbox {
+        "read-only" => Ok(":read-only"),
+        "workspace-write" => Ok(":workspace"),
+        "danger-full-access" => Ok(":danger-full-access"),
+        _ => anyhow::bail!("unknown receiver permission profile"),
+    }
 }
 
 impl StockRuntimeExecutor for StockExecutor {
@@ -202,10 +243,28 @@ impl StockRuntimeExecutor for StockExecutor {
             )?,
             profile,
         )?;
+        if bundle.soon_ingress() {
+            launch = option(
+                launch,
+                "default_permissions",
+                receiver_profile(&profile.sandbox)?,
+            )?;
+        }
+        #[allow(unused_mut)]
+        let mut mcp_env = vec![
+            "CUTEX_AGENT_ID",
+            "CUTEX_RUNTIME_GENERATION",
+            "CUTEX_AGENT_BUS_URL",
+            "CUTEX_AGENT_BUS_TOKEN",
+        ];
+        #[cfg(feature = "stock-launch-test-hook")]
+        if std::env::var("CUTEX_STOCK_TEST_GUARDED_NATIVE").as_deref() == Ok("1") {
+            mcp_env.extend(["LD_PRELOAD", "S4_TEST_ALLOWED_PORTS"]);
+        }
         launch = option(
             launch,
             "mcp_servers.cutex",
-            serde_json::json!({"command":bundle.facade.path,"env_vars":["CUTEX_AGENT_ID","CUTEX_RUNTIME_GENERATION","CUTEX_AGENT_BUS_URL","CUTEX_AGENT_BUS_TOKEN"],"default_tools_approval_mode":"approve"}),
+            serde_json::json!({"command":bundle.facade.path,"env_vars":mcp_env,"default_tools_approval_mode":"approve"}),
         )?;
         launch = option(
             launch,
@@ -262,7 +321,9 @@ impl StockRuntimeExecutor for StockExecutor {
         } else {
             LaunchProfileSource::SessionConfigured
         });
-        binding.schema_version = if bundle.common_ingress() {
+        binding.schema_version = if bundle.soon_ingress() {
+            "U-0.153.4+S6e-a83dbb47-soon-v1"
+        } else if bundle.common_ingress() {
             "U-0.153.4+S6-c2aaceb4-external-input-v1"
         } else {
             "stock-0.153.4-app-server-v2"
@@ -277,7 +338,8 @@ impl StockRuntimeExecutor for StockExecutor {
         receipt: &StockRuntimeReceipt,
     ) -> anyhow::Result<()> {
         let binding = receipt.binding.as_ref().context("stock binding missing")?;
-        if StockBundle::load(&receipt.review.contract)?.common_ingress() {
+        let bundle = StockBundle::load(&receipt.review.contract)?;
+        if bundle.common_ingress() {
             ExternalInputBinding::from_review(receipt)
                 .verify(std::path::Path::new(&binding.runtime_dir))?;
         }
@@ -328,12 +390,24 @@ impl StockRuntimeExecutor for StockExecutor {
                     model_provider: Some(cfg.model_provider.clone()),
                     cwd: Some(cutex::session::service::cutex_session_launch_cwd(record).into()),
                     approval_policy: Some(serde_json::json!(cfg.approval)),
-                    sandbox: Some(cfg.sandbox.clone()),
+                    // The coherent CLI requires the receiver's named profile.
+                    // A legacy per-resume sandbox override erases that identity
+                    // even when its read-only projection appears equivalent.
+                    sandbox: (!bundle.soon_ingress()).then(|| cfg.sandbox.clone()),
                     ..Default::default()
                 },
                 receipt.expected_generation,
                 "host",
             )?;
+        }
+        if bundle.soon_ingress() {
+            let status = manager
+                .status(&record.cutex_session_id)?
+                .context("receiver settings unavailable")?;
+            let settings = status.thread_settings.context("receiver settings absent")?;
+            ensure!(settings.pointer("/activePermissionProfile/id").and_then(serde_json::Value::as_str)
+                == Some(receiver_profile(&receipt.review.configuration.sandbox)?),
+                "existing thread active permission profile mismatches reviewed receiver; explicit controller correction required");
         }
         if manager
             .agent_bus_bridge_status(&record.cutex_session_id)?
@@ -355,9 +429,7 @@ impl StockRuntimeExecutor for StockExecutor {
                 &receipt.review.contract.native_id,
             )
             .with_cutex_session_id(&record.cutex_session_id);
-            options.registration_only =
-                !cutex::launch::stock::StockBundle::load(&receipt.review.contract)?
-                    .common_ingress();
+            options.registration_only = !bundle.common_ingress();
             if !options.registration_only {
                 options.external_input_generation = Some(receipt.expected_generation);
             }
@@ -521,7 +593,7 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
         .as_ref()
         .context("stock activation missing")?;
     let bundle = StockBundle::load(contract)?;
-    ensure!(!bundle.common_ingress(),
+    ensure!(!bundle.common_ingress() || bundle.soon_ingress(),
         "U+S6 bundle contains only app-server; this slice has no pinned compatible CLI attach artifact");
     verify_stock_process(record, binding)?;
     super::app_server_runtime::verify_exact_live_runtime_claim(record, binding)?;
@@ -546,7 +618,8 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
         .context("stock ready receipt missing")?;
     // Remote CLI config must describe the running occurrence, not silently
     // substitute local OpenAI defaults or a newly selected durable profile.
-    let launch = clean_launch(&bundle.executable.path, &contract.native_home)?.args([
+    let cli = bundle.cli.as_ref().unwrap_or(&bundle.executable);
+    let launch = clean_launch(&cli.path, &contract.native_home)?.args([
         "resume",
         "--remote",
         &binding.endpoint,
@@ -557,7 +630,14 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
         "-c",
         "tui.resume_cwd=\"current\"",
     ]);
-    let launch = configured(launch, &ready.review.configuration)?;
+    let mut launch = configured(launch, &ready.review.configuration)?;
+    if bundle.soon_ingress() {
+        launch = option(
+            launch,
+            "default_permissions",
+            receiver_profile(&ready.review.configuration.sandbox)?,
+        )?;
+    }
     let status = launch.to_command().status()?;
     ensure!(
         status.success(),
@@ -568,6 +648,19 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
 
 #[cfg(all(test, target_os = "linux"))]
 mod ingress_guard_tests {
+    #[test]
+    fn coherent_receiver_profiles_are_explicit_and_unknown_is_not_full_access() {
+        for (sandbox, expected) in [
+            ("read-only", ":read-only"),
+            ("workspace-write", ":workspace"),
+            ("danger-full-access", ":danger-full-access"),
+        ] {
+            assert_eq!(super::receiver_profile(sandbox).unwrap(), expected);
+        }
+        for unknown in ["", "full-access", "managed", "inherit", "unknown"] {
+            assert!(super::receiver_profile(unknown).is_err());
+        }
+    }
     #[test]
     fn marked_generic_restart_stop_fence_preserves_real_owned_child() {
         use cutex::session::model::{CutexSessionRecord, CutexSessionStore};

@@ -22,6 +22,7 @@ fn pinned_artifact_fence_detects_same_length_write_and_symlink_replacement() {
         bundle_sha256: hash,
     };
     let bundle = StockBundle {
+        cli: None,
         version: 2,
         upstream_commit: String::new(),
         native_patch_commit: None,
@@ -136,6 +137,15 @@ fn exact_native_digest_and_receipt_vectors_generation_independent() {
     assert_eq!(e.digest(), envelope().digest());
     e.message.text.push(' ');
     assert_ne!(e.digest(), envelope().digest());
+    let mut soon = envelope();
+    soon.message.delivery = Delivery::Soon;
+    assert_eq!(
+        soon.digest(),
+        "23c280ead29895eaec1ee5a4c8479500d281a2733c3e3a8cb4389d74c81b02ba"
+    );
+    let digest = soon.digest();
+    soon.runtime_generation += 1;
+    assert_eq!(soon.digest(), digest);
 }
 #[test]
 fn envelope_strict_types_no_sender_authority_or_policy() {
