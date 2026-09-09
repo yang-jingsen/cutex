@@ -9020,12 +9020,32 @@ pub(super) fn format_selector_activity(
 
 pub(super) fn current_activity_by_durable_session(
 ) -> anyhow::Result<HashMap<String, SelectorActivity>> {
-    Ok(load_session_activity_states()?
+    let activity_states = load_session_activity_states()?;
+    let sessions = load_cutex_session_store()?;
+    Ok(current_activity_projection_by_durable_session(
+        activity_states,
+        &sessions,
+    ))
+}
+
+fn current_activity_projection_by_durable_session(
+    activity_states: HashMap<String, SessionActivityState>,
+    sessions: &CutexSessionStore,
+) -> HashMap<String, SelectorActivity> {
+    activity_states
         .into_iter()
         .filter_map(|(session_id, state)| {
-            selector_activity_from_state(&state).map(|activity| (session_id, activity))
+            let current_generation = sessions
+                .sessions
+                .get(&session_id)
+                .filter(|record| record.is_active())
+                .map(|record| record.runtime_generation);
+            (state.runtime_generation == current_generation)
+                .then(|| selector_activity_from_state(&state))
+                .flatten()
+                .map(|activity| (session_id, activity))
         })
-        .collect())
+        .collect()
 }
 
 #[cfg(test)]
@@ -15088,6 +15108,33 @@ mod tests {
 
         model.refresh_activity_states(&HashMap::new());
         assert!(model.rows[0].activity.is_none());
+    }
+
+    #[test]
+    fn task_activity_projection_rejects_an_old_runtime_generation() {
+        let mut record = editable_record();
+        record.runtime_generation = 2;
+        let session_id = record.cutex_session_id.clone();
+        let mut store = CutexSessionStore::default();
+        store.sessions.insert(session_id.clone(), record);
+
+        let mut stale = SessionActivityState::default();
+        stale.runtime_generation = Some(1);
+        stale.last_output = Some(output_projection("2026-08-13T06:00:00Z"));
+        assert!(current_activity_projection_by_durable_session(
+            HashMap::from([(session_id.clone(), stale)]),
+            &store,
+        )
+        .is_empty());
+
+        let mut current = SessionActivityState::default();
+        current.runtime_generation = Some(2);
+        current.last_output = Some(output_projection("2026-08-13T06:00:01Z"));
+        assert!(current_activity_projection_by_durable_session(
+            HashMap::from([(session_id.clone(), current)]),
+            &store,
+        )
+        .contains_key(&session_id));
     }
 
     #[test]

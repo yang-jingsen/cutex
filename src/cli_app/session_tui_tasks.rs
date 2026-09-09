@@ -1081,7 +1081,10 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, model: &TaskModel, focused: 
                 ]),
                 detail_field("Task updated", row.updated_at.clone()),
                 detail_field("Agent", row.agent_label()),
-                detail_field("Agent activity", row.agent_activity_label().to_string()),
+                detail_field(
+                    "Agent activity (last observed)",
+                    row.agent_activity_label().to_string(),
+                ),
                 detail_field(
                     "Status summary",
                     row.status_summary
@@ -1292,7 +1295,7 @@ mod tests {
             "EDIT  2s",
             "Task Inspector",
             "Task updated",
-            "Agent activity",
+            "Agent activity (last observed)",
             "Task semantic progress",
             "Validated current assignment",
             "/private/result/report.json",
