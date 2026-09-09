@@ -4630,6 +4630,10 @@ fn task_worker_sender(
     request: &crate::http::server::SimpleHttpRequest,
     state: &Arc<Mutex<AgentBusState>>,
 ) -> Result<TaskWorkerRosterSender, TaskWorkerActionNoWrite> {
+    // MCP adds an occurrence fence; provider Task roles/assignment checks below
+    // remain authoritative. Native callers without these headers are unchanged.
+    validate_mcp_caller_fence(request, state)
+        .map_err(|_| TaskWorkerActionNoWrite::SenderNotRegistered)?;
     let sender_id = request
         .headers
         .get("x-cutex-agent-id")

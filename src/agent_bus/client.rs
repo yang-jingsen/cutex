@@ -449,7 +449,11 @@ pub fn submit_mcp_control(
 ) -> anyhow::Result<Value> {
     if !matches!(
         path,
-        "/api/agent-management/v1/actions" | "/api/messages/send"
+        "/api/agent-management/v1/actions"
+            | "/api/messages/send"
+            | "/api/task/v2/worker-prepare"
+            | "/api/task/v2/actions"
+            | "/api/task/v2/director-action"
     ) {
         anyhow::bail!("unsupported MCP route");
     }
@@ -464,10 +468,19 @@ pub fn submit_mcp_control(
         path,
         &body,
         "MCP",
-        AGENT_MANAGEMENT_ACTION_TIMEOUT,
+        if path.starts_with("/api/task/v2/") {
+            Duration::from_secs(5)
+        } else {
+            AGENT_MANAGEMENT_ACTION_TIMEOUT
+        },
         Some(fence),
     )?;
-    Ok(serde_json::from_slice(&response)?)
+    if path.starts_with("/api/task/v2/") {
+        Ok(serde_json::from_slice(&response)
+            .unwrap_or_else(|_| serde_json::json!({"mcp_transport_invalid_response":true})))
+    } else {
+        Ok(serde_json::from_slice(&response)?)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -502,7 +515,16 @@ fn submit_authenticated_agent_control_with_fence(
     stream.write_all(headers.as_bytes())?;
     stream.write_all(&body)?;
     let mut response = Vec::new();
-    stream
+    let task_mcp = fence.is_some() && path.starts_with("/api/task/v2/");
+    // Native Task adapter limit: 1 MiB body. Bound framing too before allocating
+    // an unbounded response; other existing callers retain their limits.
+    let limit = if task_mcp {
+        1024 * 1024 + 65536 + 1
+    } else {
+        u64::MAX
+    };
+    Read::by_ref(&mut stream)
+        .take(limit)
         .read_to_end(&mut response)
         .with_context(|| format!("Failed to read Cutex {label} response"))?;
     let split = response
@@ -510,6 +532,9 @@ fn submit_authenticated_agent_control_with_fence(
         .position(|window| window == b"\r\n\r\n")
         .with_context(|| format!("Cutex {label} response has no HTTP header boundary"))?;
     let header = String::from_utf8_lossy(&response[..split]);
+    if task_mcp && (split > 65536 || response.len() - split - 4 > 1024 * 1024) {
+        return Ok(b"{\"mcp_transport_invalid_response\":true}".to_vec());
+    }
     if !header.starts_with("HTTP/1.1 2") {
         let body = String::from_utf8_lossy(&response[split + 4..]);
         if fence.is_some() {

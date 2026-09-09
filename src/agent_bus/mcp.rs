@@ -4,6 +4,9 @@ use anyhow::{bail, Context};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+#[path = "mcp_tasks.rs"]
+mod tasks;
+
 pub const THREAD_HEADER: &str = "x-cutex-mcp-thread-id";
 pub const GENERATION_HEADER: &str = "x-cutex-mcp-generation";
 
@@ -30,10 +33,52 @@ struct SendArgs {
 }
 
 pub fn tools() -> Value {
-    json!({"tools":[
+    let mut result = json!({"tools":[
         {"name":"query_managed","description":"Query managed Agents in an authorized Cutex Project. Caller comes from the current runtime, never arguments.","inputSchema":{"type":"object","properties":{"action_id":{"type":"string"},"project_id":{"type":"string"}},"required":["action_id"],"additionalProperties":false}},
         {"name":"send","description":"Enqueue to an exact durable Cutex Agent with a current registered endpoint; offline targets are rejected. Pending is not inbound delivery or A4. Exact payload replay deduplicates within the existing Bus dedupe window; changed payload may create a new message even with the same external_message_id.","inputSchema":{"type":"object","properties":{"to":{"type":"string"},"message":{"type":"string"},"external_message_id":{"type":"string"},"delivery_mode":{"type":"string","enum":["after_turn","soon","passive","interrupt"]}},"required":["to","message","external_message_id","delivery_mode"],"additionalProperties":false}}
-    ]})
+    ]});
+    result["tools"]
+        .as_array_mut()
+        .unwrap()
+        .extend(tasks::tools());
+    result
+}
+
+struct TaskTransport<'a> {
+    port: u16,
+    token: &'a str,
+    runtime: &'a RuntimeAgentId,
+    fence: &'a CallerFence,
+}
+impl tasks::Transport for TaskTransport<'_> {
+    fn post(&mut self, path: &str, body: &Value) -> anyhow::Result<Value> {
+        // Same bounded retry policy as the native wrapper. Never return raw
+        // transport diagnostics or provider HTTP error bodies to the model.
+        for attempt in 0..2 {
+            match crate::agent_bus::client::submit_mcp_control(
+                self.port,
+                self.token,
+                self.runtime,
+                self.fence,
+                path,
+                body,
+            ) {
+                Ok(value)
+                    if value["http_status"]
+                        .as_u64()
+                        .is_some_and(|s| s >= 500 || s == 408) =>
+                {
+                    if attempt == 1 {
+                        anyhow::bail!("response uncertain");
+                    }
+                }
+                Ok(value) => return Ok(value),
+                Err(_) if attempt == 0 => {}
+                Err(_) => anyhow::bail!("response uncertain"),
+            }
+        }
+        unreachable!()
+    }
 }
 
 pub fn request(
@@ -117,22 +162,37 @@ pub fn run() -> anyhow::Result<()> {
                     .as_str()
                     .context("Core threadId missing")?;
                 let thread = crate::session::identity::normalize_codex_session_id(thread)?;
-                let (path, body) = request(
-                    message["params"]["name"]
-                        .as_str()
-                        .context("tool name missing")?,
-                    message["params"]["arguments"].clone(),
-                    &runtime,
-                )?;
+                let name = message["params"]["name"]
+                    .as_str()
+                    .context("tool name missing")?;
+                let args = message["params"]["arguments"].clone();
                 let fence = CallerFence {
                     thread_id: thread,
                     generation,
                 };
-                let result = crate::agent_bus::client::submit_mcp_control(
-                    port, &token, &runtime, &fence, path, &body,
-                )?;
+                let result = if matches!(name, tasks::WORKER | tasks::DIRECTOR) {
+                    tasks::invoke(
+                        name,
+                        args,
+                        &mut TaskTransport {
+                            port,
+                            token: &token,
+                            runtime: &runtime,
+                            fence: &fence,
+                        },
+                    )
+                } else {
+                    let (path, body) = request(name, args, &runtime)?;
+                    crate::agent_bus::client::submit_mcp_control(
+                        port, &token, &runtime, &fence, path, &body,
+                    )?
+                };
                 let failed = result.get("http_status").is_some()
                     || result["outcome"]["status"] == "no_write"
+                    || matches!(
+                        result["status"].as_str(),
+                        Some("no_write" | "conflict" | "response_uncertain")
+                    )
                     || result["ok"] == false;
                 Ok(
                     json!({"isError":failed,"content":[{"type":"text","text":serde_json::to_string(&result)?}]}),
