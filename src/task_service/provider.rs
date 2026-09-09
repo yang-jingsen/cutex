@@ -5573,6 +5573,63 @@ mod tests {
         );
     }
 
+    /// Test-only trusted controller for the namespace-contained S6g fixture.
+    /// No production endpoint, scheduler, model authority, or raw state edit.
+    #[test]
+    #[ignore = "requires an explicitly owned S6g private provider fixture"]
+    fn s6g_private_retries_exhausted_controller() {
+        let home =
+            PathBuf::from(std::env::var_os("CUTEX_TEST_PRIVATE_HOME").expect("private home"));
+        let root = PathBuf::from("/mnt/mambo/PersonaProjects/cutex-mcp-facade-r1");
+        assert!(home.starts_with(&root));
+        assert!(home.join(".cutex-test-private-home").is_file());
+        assert_eq!(std::fs::canonicalize(&home).unwrap(), home);
+        let provider =
+            TaskServiceProvider::open(home.join(
+                ".cutex/runtime/task-service/task-worker-actions-v1/task-service/provider-v2",
+            ))
+            .unwrap();
+        let snapshot = provider.query().unwrap();
+        let send = snapshot
+            .send_attempts
+            .values()
+            .find(|send| send.assignment_id.as_str() == "a-s6g-exhausted")
+            .expect("real prepared assignment");
+        assert!(send
+            .events
+            .iter()
+            .any(|e| e.kind == CommunicationEventKind::SendPrepared));
+        assert!(!send
+            .events
+            .iter()
+            .any(|e| e.kind == CommunicationEventKind::ContextInserted));
+        let request = CommunicationEventRequest {
+            schema: ProviderActionSchema::V2,
+            action_id: action("s6g-retries-exhausted"),
+            send_attempt_id: send.send_attempt_id.clone(),
+            expected_send_attempt_revision: send.local_revision,
+            kind: CommunicationEventKind::RetriesExhausted,
+            receipt_reference: Some("private-controller-explicit-exhaustion".into()),
+        };
+        let principal = AuthenticatedPrincipal::task_service_system();
+        let receipt = provider
+            .record_communication_event(&principal, &request)
+            .unwrap();
+        assert_eq!(
+            provider
+                .record_communication_event(&principal, &request)
+                .unwrap(),
+            receipt
+        );
+        let changed = CommunicationEventRequest {
+            receipt_reference: Some("changed-semantics".into()),
+            ..request
+        };
+        assert!(provider
+            .record_communication_event(&principal, &changed)
+            .is_err());
+    }
+
     #[test]
     fn nonempty_snapshot_query_response_roundtrips_numeric_map_keys() {
         let fixture = Fixture::new("snapshot-query-roundtrip");
