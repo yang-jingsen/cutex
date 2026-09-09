@@ -198,8 +198,45 @@ impl BootstrapExecutionPermit<'_> {
             review.configuration == self.intent.configuration,
             "bootstrap runtime configuration changed"
         );
-        self.provider
-            .execute_stock_runtime_locked(path, &action, &review, tasks, runtime)
+        let reconnect = matches!(
+            sessions.explicit_launch_receipts.get(action.as_str()),
+            Some(ExplicitLaunchActionReceipt::Runtime(prior))
+                if prior.stage == StockRuntimeStage::Ready
+        );
+        let receipt = self
+            .provider
+            .execute_stock_runtime_locked(path, &action, &review, tasks, runtime)?;
+        if reconnect {
+            // Receipt replay is immutable, but a new Cutex process must attach
+            // its connection to the SAME still-current owner. No spawn/stop or
+            // new generation is permitted by this recovery step.
+            let fence = || -> anyhow::Result<crate::session::model::CutexSessionRecord> {
+                let current = crate::session::store::load_cutex_session_store_from_path(path)?
+                    .sessions
+                    .remove(id.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("captured successor missing"))?;
+                anyhow::ensure!(
+                    !current.is_retired()
+                        && current.agent_enabled
+                        && current.revision == review.subject.revision
+                        && current.app_server_launch_claim_id.is_none()
+                        && current.app_server_runtime == receipt.binding
+                        && current.runtime_pid == receipt.binding.as_ref().map(|b| b.pid)
+                        && current.runtime_generation == receipt.expected_generation
+                        && current.current_runtime_agent_id.as_deref()
+                            == Some(&receipt.runtime_agent_id)
+                        && current.explicit_launch.as_ref() == Some(&review.contract)
+                        && crate::launch::stock::current_configuration(&current)?
+                            == review.configuration,
+                    "captured successor occurrence/configuration changed; no reconnect"
+                );
+                Ok(current)
+            };
+            runtime.connect(&fence()?, &receipt)?;
+            runtime.retain_owner();
+            fence()?;
+        }
+        Ok(receipt)
     }
 }
 
