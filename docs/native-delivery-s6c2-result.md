@@ -1,9 +1,11 @@
 # S6c2 result — private integration candidate
 
-Parent/base `5864e151a8be29b4f6af774289a58ba25e127b6d`, tree
+Base `5864e151a8be29b4f6af774289a58ba25e127b6d`, tree
 `fcc5f201c764385601048e8dcb570b0d7af41d2b`. The immutable submission commit
 containing this report is the candidate; its exact commit/tree accompany the
 Task Service submission. No merge, remote/canonical edit or deployment.
+Implementation commit `e1aa3bae3ff316e47c274031b3f77a0a7be218c6` has that
+exact base as its sole parent; the submission adds only this final resource record.
 Contract/provenance/recovery details: [native-delivery-s6c2.md](native-delivery-s6c2.md).
 
 ## Evidence
@@ -95,7 +97,8 @@ production auth/live stores/services/Agents and deployment are omitted gates.
 S2/S46 incidents remain unremediated/uninvestigated; S4 PID-time and socket
 baseline risks remain. No business result execution/acceptance inferred from A4.
 
-Resources: approximately 8.6 GiB task root before, 8.9 GiB retained after;
+Resources: approximately 8.6 GiB task root before, 9.6 GiB retained after
+the final binary-test build;
 filesystem free 418 GiB at last check (above 100 GiB floor, below 20 GiB cap).
 Only owned private children were stopped. Keep frozen manifests/evidence and
 candidate-writer private stores; reject/revert source before any exposure.
