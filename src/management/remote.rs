@@ -95,7 +95,7 @@ pub fn management_http_json_with_timeout(
     body: Option<&[u8]>,
     timeout: Duration,
 ) -> anyhow::Result<Value> {
-    let url = format!("{base_url}{path}");
+    let url = management_request_url(base_url, path);
     http_json_request(HttpJsonRequest {
         url: &url,
         method,
@@ -111,4 +111,44 @@ pub fn management_http_json_with_timeout(
         parse_context: "Failed to parse management API JSON response",
         ok_text_as_null: true,
     })
+}
+
+// Join the configured base path, rather than URL::join (whose leading slash
+// replaces a configured prefix, and whose // form can replace the authority).
+// Only the separator is canonicalized; endpoint/query text is left intact.
+fn management_request_url(base_url: &str, path: &str) -> String {
+    format!(
+        "{}/{}",
+        base_url.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::management_request_url;
+
+    #[test]
+    fn management_url_join_preserves_base_and_single_boundary_separator() {
+        for base in ["http://127.0.0.1:12345", "http://127.0.0.1:12345/"] {
+            for path in [
+                "v2/agent-management/explicit-launch",
+                "/v2/agent-management/explicit-launch",
+            ] {
+                assert_eq!(
+                    management_request_url(base, path),
+                    "http://127.0.0.1:12345/v2/agent-management/explicit-launch"
+                );
+            }
+            assert_eq!(management_request_url(base, "/"), "http://127.0.0.1:12345/");
+        }
+        assert_eq!(
+            management_request_url("http://127.0.0.1:12345/prefix/", "/v2/items?limit=1"),
+            "http://127.0.0.1:12345/prefix/v2/items?limit=1"
+        );
+        assert_eq!(
+            management_request_url("http://127.0.0.1:12345/", "//foreign.invalid/path"),
+            "http://127.0.0.1:12345/foreign.invalid/path"
+        );
+    }
 }
