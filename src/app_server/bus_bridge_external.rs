@@ -489,7 +489,7 @@ pub(super) fn deliver(
                         .get(&options.cutex_session_id)
                         .context("recipient absent")?;
                     r.app_server_runtime.as_ref().context("recipient offline")?;
-                    let activation = store
+                    let activated_at = store
                         .explicit_launch_receipts
                         .values()
                         .filter_map(|receipt| match receipt {
@@ -498,19 +498,39 @@ pub(super) fn deliver(
                                     == options.cutex_session_id
                                     && r.explicit_launch.as_ref() == Some(&a.review.contract) =>
                             {
-                                Some(a)
+                                Some(a.committed_at.as_str())
+                            }
+                            crate::agent_management::ExplicitLaunchActionReceipt::Bootstrap(a)
+                                if a.cutex_session_id.as_str() == options.cutex_session_id
+                                    && r.codex_session_id.as_deref()
+                                        == Some(a.native_id.as_str())
+                                    && before.bootstrap_intents.values().any(|intent| {
+                                        use sha2::{Digest, Sha256};
+                                        serde_json::to_vec(intent).is_ok_and(|bytes| {
+                                            format!("{:x}", Sha256::digest(bytes))
+                                                == a.intent_sha256.as_str()
+                                                && r.explicit_launch.as_ref().is_some_and(|c| {
+                                                    c.native_id == a.native_id
+                                                        && c.native_home == intent.native_home
+                                                        && c.bundle_manifest
+                                                            == intent.bundle_manifest
+                                                        && c.bundle_sha256 == intent.bundle_sha256
+                                                })
+                                        })
+                                    }) =>
+                            {
+                                // S8a creates the new durable record, marker and
+                                // receipt in ONE save. Its immutable creation
+                                // timestamp is that lineage, not a later launch.
+                                Some(r.created_at.as_str())
                             }
                             _ => None,
                         })
-                        .min_by_key(|a| &a.committed_at)
+                        .min()
                         .context("native activation provenance absent")?;
                     // The explicit activation, not the latest runtime start,
                     // establishes this private lineage across owned restarts.
-                    fresh_task_projection(
-                        &polled,
-                        &options.cutex_session_id,
-                        &activation.committed_at,
-                    )?;
+                    fresh_task_projection(&polled, &options.cutex_session_id, activated_at)?;
                     let mut canonical = polled.clone();
                     canonical.to_cutex_session_id = Some(options.cutex_session_id.clone());
                     validate_target(&canonical, &options.cutex_session_id, s, &before)?;
@@ -692,6 +712,27 @@ mod tests {
             canonical_byte_limit: Default::default(),
         }
     }
+    #[test]
+    fn management_start_is_reserved_service_data_not_human_or_agent_authority() {
+        let mut m = message();
+        m.from = AGENT_MANAGEMENT_SYSTEM_SENDER.into();
+        m.control_type = Some(AGENT_MANAGEMENT_START_CONTROL_TYPE.into());
+        m.external_message_id = Some("management-action".into());
+        m.control_payload = Some(
+            serde_json::json!({"schema":"cutex/agent-management/v1","requested_by_director":"cutex.director","requested_by_operator":null}),
+        );
+        let e = envelope(&m, &binding()).unwrap();
+        assert_eq!(e.message.source.kind, SourceKind::Service);
+        assert_eq!(e.message.source.id, AGENT_MANAGEMENT_SYSTEM_SENDER);
+        assert_eq!(e.message.event_type, "management_start");
+        assert!(e
+            .message
+            .text
+            .contains("Requested by Director: cutex.director"));
+        m.from = "forged ordinary sender".into();
+        assert!(envelope(&m, &binding()).is_err());
+    }
+
     #[test]
     fn external_bus_template_uses_authenticated_id_not_name_or_claimed_text() {
         let mut m = message();

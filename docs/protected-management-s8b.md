@@ -30,6 +30,10 @@ source, with requested Director and explicit instructions. Native is still
 the accepted a83dbb47 bundle3/contract2. Bus freezes and commits the original
 envelope/A4; actual Management action/successor provenance is checked again at
 business commit. A4 is context persistence, not successor work completion.
+Fresh Task projections also recognize the existing atomic bootstrap-adoption
+receipt, matched to its exact reviewed intent/native ID/marker. The durable
+record's immutable creation timestamp is the atomic adoption lineage boundary;
+it is not inferred from a later runtime start. Missing provenance stays pending.
 
 `cutex_task_service_terminal` exposes only `accept_result`, `request_changes`
 and `fail_result`, with action ID, assignment ID and optional decision reference.
