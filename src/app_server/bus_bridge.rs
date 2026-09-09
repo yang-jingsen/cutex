@@ -58,6 +58,9 @@ const MODEL_VISIBLE_MESSAGE_ID_HASH_DOMAIN: &str = "cutex:model-visible-inter-ag
 const INTER_AGENT_SEMANTIC_HASH_DOMAIN: &[u8] = b"cutex:inter-agent-message-semantic:v1\0";
 const INTER_AGENT_STATUS_SCHEMA: &str = "cutex/inter-agent-delivery-status/v1";
 
+#[path = "bus_bridge_external.rs"]
+mod external;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct DeliverySweepOutcome {
     had_messages: bool,
@@ -418,6 +421,8 @@ impl InterAgentMessageSubmitter for AppServerCommands {
 pub struct AppServerAgentBusBridgeOptions {
     /// Stock outbound-only prototype: maintain registration, never poll/ack.
     pub registration_only: bool,
+    /// Trusted launcher only; client still proves exact pinned occurrence.
+    pub external_input_generation: Option<u64>,
     pub registration: AgentBusRegisterRequest,
     pub cutex_session_id: String,
     pub thread_id: String,
@@ -431,6 +436,7 @@ impl AppServerAgentBusBridgeOptions {
         let thread_id = thread_id.into();
         Self {
             registration_only: false,
+            external_input_generation: None,
             registration,
             cutex_session_id: default_cutex_session_id_for_codex_session(&thread_id),
             thread_id,
@@ -624,6 +630,7 @@ fn run_bridge_worker(
     .to_string();
     let mut next_registration = Instant::now() + options.registration_refresh_interval;
     let mut pending_poll_backoff = PendingPollBackoff::default();
+    let mut external_client = None;
     loop {
         if !runtime_alive.load(Ordering::Acquire) {
             mark_error(&status, "app-server runtime disconnected".to_string());
@@ -672,18 +679,30 @@ fn run_bridge_worker(
         match bus.poll(&options.registration.id) {
             Ok(messages) => {
                 mark_poll(&status);
-                let outcome = match deliver_polled_messages(
-                    bus.as_ref(),
-                    submitter.as_ref(),
-                    &DurableTaskServiceContextRecorder,
-                    &options.registration.id,
-                    &recipient_label,
-                    &options.cutex_session_id,
-                    &options.thread_id,
-                    messages,
-                    &mut pending_acks,
-                    &status,
-                ) {
+                let delivery = if let Some(generation) = options.external_input_generation {
+                    external::deliver(
+                        bus.as_ref(),
+                        &options,
+                        generation,
+                        messages,
+                        &status,
+                        &mut external_client,
+                    )
+                } else {
+                    deliver_polled_messages(
+                        bus.as_ref(),
+                        submitter.as_ref(),
+                        &DurableTaskServiceContextRecorder,
+                        &options.registration.id,
+                        &recipient_label,
+                        &options.cutex_session_id,
+                        &options.thread_id,
+                        messages,
+                        &mut pending_acks,
+                        &status,
+                    )
+                };
+                let outcome = match delivery {
                     Ok(outcome) => outcome,
                     Err(error) => {
                         mark_error(&status, error.to_string());

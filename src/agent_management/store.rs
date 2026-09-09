@@ -180,6 +180,22 @@ impl AgentManagementStore {
         Ok(lock)
     }
 
+    /// Delivery must not wait behind a lifecycle action which is joining its
+    /// bridge worker. Return pending instead; the next occurrence reconciles.
+    pub(crate) fn try_lock_delivery_mutations(&self) -> Result<Option<File>, AgentManagementError> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        set_private_open_options(&mut options);
+        let lock = options
+            .open(self.root.join(MUTATION_LOCK_FILE))
+            .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
+        match FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => Ok(Some(lock)),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(_) => Err(AgentManagementError::PersistenceUnavailable),
+        }
+    }
+
     pub(crate) fn with_state<T>(
         &self,
         create: bool,

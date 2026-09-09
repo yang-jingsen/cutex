@@ -401,6 +401,7 @@ pub(crate) fn enqueue_task_service_completion_message_once(
     delivery_mode: AgentDeliveryMode,
     external_action_id: &str,
     external_message_id: &str,
+    native_target: Option<&str>,
     now: u64,
 ) -> anyhow::Result<AgentBusSendOutcome> {
     if !principal.authenticate() {
@@ -408,6 +409,9 @@ pub(crate) fn enqueue_task_service_completion_message_once(
             "Task Service system principal authentication failed"
         ));
     }
+    let message_id = native_target
+        .map(|owner| native_completion_message_id(metadata.notification_id.as_str(), owner))
+        .unwrap_or_else(|| format!("tsc_{}", metadata.notification_id.as_str()));
     enqueue_agent_bus_message_once_with_id(
         state,
         "cutex-task-service",
@@ -424,10 +428,36 @@ pub(crate) fn enqueue_task_service_completion_message_once(
         Some(external_action_id.to_string()),
         Some(external_message_id.to_string()),
         None,
-        None,
-        Some(format!("tsc_{}", metadata.notification_id.as_str())),
+        native_target.map(str::to_string),
+        Some(message_id),
         now,
     )
+}
+
+/// A seat change creates a distinct recipient context obligation, never mutates
+/// the already frozen envelope/receipt for its predecessor. Runtime restart
+/// retains the same durable recipient and therefore the same message identity.
+pub(crate) fn native_completion_message_id(notification: &str, owner: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("tsc_{notification}_{:x}", Sha256::digest(owner.as_bytes()))
+}
+
+#[cfg(test)]
+#[test]
+fn native_completion_identity_is_recipient_scoped_not_runtime_scoped() {
+    let owner = "cutex.11111111-1111-4111-8111-111111111111";
+    let successor = "cutex.22222222-2222-4222-8222-222222222222";
+    let first = native_completion_message_id("tsn-notification", owner);
+    assert_eq!(
+        first,
+        native_completion_message_id("tsn-notification", owner)
+    );
+    assert_ne!(
+        first,
+        native_completion_message_id("tsn-notification", successor)
+    );
+    assert_ne!(first, native_completion_message_id("tsn-other", owner));
+    assert!(first.len() < 256);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -852,6 +882,7 @@ mod tests {
             AgentDeliveryMode::Soon,
             "block-1",
             "notification-1",
+            None,
             1,
         )
         .unwrap();
@@ -865,6 +896,7 @@ mod tests {
             AgentDeliveryMode::Soon,
             "block-1",
             "notification-1",
+            None,
             100,
         )
         .unwrap();

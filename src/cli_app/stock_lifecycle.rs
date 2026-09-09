@@ -355,7 +355,12 @@ impl StockRuntimeExecutor for StockExecutor {
                 &receipt.review.contract.native_id,
             )
             .with_cutex_session_id(&record.cutex_session_id);
-            options.registration_only = true;
+            options.registration_only =
+                !cutex::launch::stock::StockBundle::load(&receipt.review.contract)?
+                    .common_ingress();
+            if !options.registration_only {
+                options.external_input_generation = Some(receipt.expected_generation);
+            }
             #[allow(unused_mut)]
             let mut config = cutex::config::store::load_codez_config_checked()?;
             #[cfg(feature = "stock-launch-test-hook")]

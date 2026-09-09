@@ -8523,6 +8523,7 @@ mod tests {
             AgentDeliveryMode::AfterTurn,
             notification.transition_action_id.as_str(),
             &notification.external_message_id,
+            None,
             now_epoch_secs(),
         )
         .unwrap();

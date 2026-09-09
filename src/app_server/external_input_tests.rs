@@ -1,6 +1,52 @@
 use super::*;
 use serde_json::json;
 
+#[cfg(unix)]
+#[test]
+fn pinned_artifact_fence_detects_same_length_write_and_symlink_replacement() {
+    use crate::launch::stock::VerifiedFile;
+    let root = std::env::temp_dir().join(format!("s6-artifact-stamp-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let path = root.join("file");
+    std::fs::write(&path, b"first").unwrap();
+    let hash = crate::role_revision::Sha256::new("a".repeat(64)).unwrap();
+    let file = VerifiedFile {
+        path: path.clone(),
+        sha256: hash.clone(),
+    };
+    let contract = crate::agent_management::ExplicitLaunchContract {
+        version: 1,
+        native_id: "native".into(),
+        native_home: root.clone(),
+        bundle_manifest: path.clone(),
+        bundle_sha256: hash,
+    };
+    let bundle = StockBundle {
+        version: 2,
+        upstream_commit: String::new(),
+        native_patch_commit: None,
+        executable: file.clone(),
+        code_mode_host: file.clone(),
+        facade: file.clone(),
+        schema: file.clone(),
+        shared_config: file,
+    };
+    let stamps = PinnedArtifacts::stamps(&contract, &bundle).unwrap();
+    let pinned = PinnedArtifacts {
+        contract,
+        bundle,
+        stamps,
+    };
+    pinned.check().unwrap();
+    std::fs::write(&path, b"other").unwrap();
+    assert!(pinned.check().is_err());
+    let replacement = root.join("other");
+    std::fs::rename(&path, &replacement).unwrap();
+    std::os::unix::fs::symlink(&replacement, &path).unwrap();
+    assert!(pinned.check().is_err());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn native_status_changed_hint_is_not_an_ack_and_rejects_control_fields() {
     let hint: StatusChanged =

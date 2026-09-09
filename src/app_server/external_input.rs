@@ -172,7 +172,11 @@ impl Receipt {
         hash.update(self.ordinal.to_be_bytes());
         format!("eir1_{:x}", hash.finalize())
     }
-    fn validate(&self, binding: &ExternalInputBinding, key: &MessageKey) -> anyhow::Result<()> {
+    pub(crate) fn validate(
+        &self,
+        binding: &ExternalInputBinding,
+        key: &MessageKey,
+    ) -> anyhow::Result<()> {
         ensure!(
             self.schema == "codex.external-input-receipt.v1"
                 && self.ordinal > 0
@@ -327,11 +331,90 @@ pub struct ExternalInputClient {
     binding: ExternalInputBinding,
     runtime: CutexAppServerRuntimeBinding,
     client: AppServerClient,
+    artifacts: PinnedArtifacts,
+}
+
+/// Scoped to one owned connection, not a persistent authority/cache. Hash once
+/// between matching file-identity snapshots; every occurrence fence checks them
+/// again. Replacement/write/chmod, including same-length writes, invalidates it.
+struct PinnedArtifacts {
+    contract: crate::agent_management::ExplicitLaunchContract,
+    bundle: StockBundle,
+    stamps: Vec<(PathBuf, Vec<i128>)>,
+}
+impl PinnedArtifacts {
+    fn stamps(
+        contract: &crate::agent_management::ExplicitLaunchContract,
+        bundle: &StockBundle,
+    ) -> anyhow::Result<Vec<(PathBuf, Vec<i128>)>> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            [
+                &contract.bundle_manifest,
+                &bundle.executable.path,
+                &bundle.code_mode_host.path,
+                &bundle.facade.path,
+                &bundle.schema.path,
+                &bundle.shared_config.path,
+            ]
+            .into_iter()
+            .map(|path| {
+                ensure!(
+                    path.canonicalize()? == *path,
+                    "ingress artifact path changed/symlinked"
+                );
+                let m = std::fs::symlink_metadata(path)?;
+                ensure!(m.is_file(), "ingress artifact is not regular");
+                Ok((
+                    path.clone(),
+                    vec![
+                        m.dev() as i128,
+                        m.ino() as i128,
+                        m.len() as i128,
+                        m.mtime() as i128,
+                        m.mtime_nsec() as i128,
+                        m.ctime() as i128,
+                        m.ctime_nsec() as i128,
+                        m.mode() as i128,
+                        m.uid() as i128,
+                        m.gid() as i128,
+                    ],
+                ))
+            })
+            .collect()
+        }
+        #[cfg(not(unix))]
+        anyhow::bail!("native artifact fence requires Unix")
+    }
+    fn load(contract: crate::agent_management::ExplicitLaunchContract) -> anyhow::Result<Self> {
+        let proposed: StockBundle =
+            serde_json::from_slice(&std::fs::read(&contract.bundle_manifest)?)?;
+        let before = Self::stamps(&contract, &proposed)?;
+        let bundle = StockBundle::load(&contract)?;
+        ensure!(
+            bundle == proposed && before == Self::stamps(&contract, &bundle)?,
+            "ingress artifacts changed during verification"
+        );
+        Ok(Self {
+            contract,
+            bundle,
+            stamps: before,
+        })
+    }
+    fn check(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.stamps == Self::stamps(&self.contract, &self.bundle)?,
+            "ingress verified artifact changed; reconnect/review required"
+        );
+        Ok(())
+    }
 }
 fn occurrence(
     path: &Path,
     owner: &str,
     generation: u64,
+    artifacts: &PinnedArtifacts,
 ) -> anyhow::Result<(ExternalInputBinding, CutexAppServerRuntimeBinding)> {
     let store = crate::session::store::load_cutex_session_store_from_path(path)?;
     let record = store.sessions.get(owner).context("ingress owner absent")?;
@@ -346,7 +429,12 @@ fn occurrence(
         .explicit_launch
         .as_ref()
         .context("ingress explicit launch missing")?;
-    let bundle = StockBundle::load(contract)?;
+    ensure!(
+        *contract == artifacts.contract,
+        "ingress launch contract changed"
+    );
+    artifacts.check()?;
+    let bundle = &artifacts.bundle;
     ensure!(
         bundle.common_ingress(),
         "unchanged stock is registration-only; common ingress unavailable"
@@ -417,7 +505,14 @@ fn occurrence(
 }
 impl ExternalInputClient {
     pub fn connect(path: &Path, owner: &str, generation: u64) -> anyhow::Result<Self> {
-        let (binding, runtime) = occurrence(path, owner, generation)?;
+        let store = crate::session::store::load_cutex_session_store_from_path(path)?;
+        let contract = store
+            .sessions
+            .get(owner)
+            .and_then(|r| r.explicit_launch.clone())
+            .context("ingress explicit launch absent")?;
+        let artifacts = PinnedArtifacts::load(contract)?;
+        let (binding, runtime) = occurrence(path, owner, generation, &artifacts)?;
         let endpoint = super::runtime::endpoint_from_runtime_binding(&runtime)?;
         match &endpoint {
             #[cfg(unix)]
@@ -438,6 +533,7 @@ impl ExternalInputClient {
             binding,
             runtime,
             client,
+            artifacts,
         };
         result.fence()?;
         Ok(result)
@@ -445,12 +541,13 @@ impl ExternalInputClient {
     pub fn binding(&self) -> &ExternalInputBinding {
         &self.binding
     }
-    fn fence(&self) -> anyhow::Result<()> {
+    pub(crate) fn fence(&self) -> anyhow::Result<()> {
         ensure!(
             occurrence(
                 &self.path,
                 &self.binding.owner_id,
-                self.binding.runtime_generation
+                self.binding.runtime_generation,
+                &self.artifacts
             )? == (self.binding.clone(), self.runtime.clone()),
             "ingress occurrence changed; reconcile exact key on current owner"
         );
@@ -555,6 +652,36 @@ impl ExternalInputClient {
             ) => anyhow::bail!("ingress observation unavailable"),
             _ => Ok(None),
         }
+    }
+
+    /// Existing bridge owner drains its own bounded control subscription. Hints
+    /// are not ACKs. Exhausting the bound closes/reconciles instead of spinning.
+    pub(crate) fn drain_hints(&self) -> anyhow::Result<()> {
+        self.fence()?;
+        for _ in 0..256 {
+            match self.client.recv_event_timeout(Duration::ZERO)? {
+                None => {
+                    self.fence()?;
+                    return Ok(());
+                }
+                Some(AppServerEvent::Notification(n))
+                    if n.method == "thread/externalInput/statusChanged" =>
+                {
+                    let hint: StatusChanged =
+                        serde_json::from_value(n.params.context("missing ingress hint")?)?;
+                    ensure!(
+                        hint.thread_id == self.binding.thread_id,
+                        "foreign ingress hint"
+                    );
+                    bounded(&hint.message_id, 256)?;
+                }
+                Some(
+                    AppServerEvent::Disconnected { .. } | AppServerEvent::ProtocolViolation { .. },
+                ) => anyhow::bail!("ingress observation disconnected; reconcile durable keys"),
+                _ => {}
+            }
+        }
+        anyhow::bail!("ingress event drain bound reached; reconnect and reconcile")
     }
 }
 
