@@ -239,6 +239,46 @@ mod tests {
         assert_eq!(detail_lines(raw, 5).concat(), raw);
         assert!(detail_lines("\u{1b}bad", 10).concat().contains("\\u{1b}"));
     }
+
+    #[test]
+    fn details_footer_reports_line_range_not_fake_page_count() {
+        let draw = |width, height, body: &str, end: bool| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            let scroll = DetailScroll::default();
+            terminal
+                .draw(|f| render_details(f, f.area(), "Details", body, &scroll))
+                .unwrap();
+            if end {
+                scroll.handle(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::End,
+                    crossterm::event::KeyModifiers::NONE,
+                ));
+                terminal
+                    .draw(|f| render_details(f, f.area(), "Details", body, &scroll))
+                    .unwrap();
+            }
+            text(terminal.backend().buffer())
+        };
+        let all = draw(80, 12, "one\ntwo\nthree", false);
+        assert!(all.contains("lines 1–3 of 3 · all visible"));
+        assert!(!all.contains("1/3"));
+        let overflow = draw(
+            80,
+            7,
+            &(1..=20)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            true,
+        );
+        assert!(overflow.contains("lines 17–20 of 20"));
+        assert!(overflow.contains("PgUp/Dn"));
+        let narrow = draw(30, 7, "one\ntwo", false);
+        assert!(narrow.contains("Esc · all 2 lines"));
+        let empty = draw(30, 7, "", false);
+        assert!(empty.contains("Esc · all 1 lines"));
+    }
     #[test]
     fn ui_contract_c_v04_columns_fit_inner_width_without_zero_placeholders() {
         for width in 1..=240 {
@@ -853,13 +893,22 @@ pub(super) fn render_styled_details(
             ..inner
         },
     );
+    let total = scroll.total.get();
+    let first = if total == 0 { 0 } else { offset + 1 };
+    let last = (offset + page).min(total);
+    let footer = if total <= page {
+        if inner.width >= 44 {
+            format!("Esc back · lines {first}–{last} of {total} · all visible")
+        } else {
+            format!("Esc · all {total} lines")
+        }
+    } else if inner.width >= 54 {
+        format!("↑↓ PgUp/Dn Home/End · Esc back · lines {first}–{last} of {total}")
+    } else {
+        format!("↑↓ Pg · lines {first}–{last}/{total} · Esc")
+    };
     frame.render_widget(
-        Paragraph::new(format!(
-            "↑↓ PgUp/Dn Home/End · Esc back · {}/{}",
-            offset + 1,
-            scroll.total.get()
-        ))
-        .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Paragraph::new(footer).style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Rect {
             y: inner.y + inner.height - 1,
             height: 1,

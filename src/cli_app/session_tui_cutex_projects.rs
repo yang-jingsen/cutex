@@ -936,6 +936,161 @@ fn execute_import_confirmation(model: &mut CutexProjectsModel) -> anyhow::Result
     Ok(())
 }
 
+fn import_failure_message(error: &anyhow::Error) -> String {
+    let raw = format!("{error:#}");
+    let structured = raw
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok());
+    if let Some(error) = structured.as_ref().and_then(|value| value.get("error")) {
+        let code = error.get("code").and_then(serde_json::Value::as_str);
+        let message = error.get("message").and_then(serde_json::Value::as_str);
+        let retryable = error.get("retryable").and_then(serde_json::Value::as_bool);
+        if code == Some("stale_durable_candidate")
+            || message.is_some_and(|message| message.contains("stale_durable_candidate"))
+        {
+            return "Candidate changed after this review; this submission did not start the import. Cancel to keep the Project draft, reopen Initial Director, press F5 to refresh, reselect by durable ID, and review again. Server code: stale_durable_candidate (not retryable).".into();
+        }
+        if code.is_some() || message.is_some() {
+            return format!(
+                "Management rejected this import: {} [code={}, retryable={}]. No automatic retry was attempted; use F2 for the retained review identifiers.",
+                message.unwrap_or("unspecified error"),
+                code.unwrap_or("unknown"),
+                retryable
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".into())
+            );
+        }
+    }
+    let sanitized = raw.replace(['\r', '\n'], " ");
+    format!(
+        "Import request failed: {}. No automatic retry was attempted.",
+        views::clipped(&sanitized, 320)
+    )
+}
+
+fn project_mutation_summary(request: &HumanManagementProjectMutationRequest) -> String {
+    match &request.operation {
+        HumanManagementProjectMutationKind::Create {
+            director_cutex_session_id,
+            presentation,
+        } => format!(
+            "Create Project {} ({}, badge {} / {}) with Initial Director {}",
+            request.project_id,
+            presentation.display_name,
+            presentation.badge_label,
+            presentation.color.token(),
+            director_cutex_session_id.as_str()
+        ),
+        HumanManagementProjectMutationKind::AddMember { cutex_session_id } => {
+            format!(
+                "Add Agent {} to Project {}",
+                cutex_session_id.as_str(),
+                request.project_id
+            )
+        }
+        HumanManagementProjectMutationKind::DetachMember { cutex_session_id } => format!(
+            "Detach Agent {} from Project {}",
+            cutex_session_id.as_str(),
+            request.project_id
+        ),
+        HumanManagementProjectMutationKind::RepairDirectorSeat { .. } => {
+            format!("Repair Director seat for Project {}", request.project_id)
+        }
+        HumanManagementProjectMutationKind::Archive => {
+            format!("Archive Project {}", request.project_id)
+        }
+        HumanManagementProjectMutationKind::Restore => {
+            format!("Restore Project {}", request.project_id)
+        }
+        HumanManagementProjectMutationKind::Remove => {
+            format!("Remove Project {}", request.project_id)
+        }
+    }
+}
+
+fn import_review_details(request: &cutex::agent_management::DurableImportRequest) -> String {
+    let candidate = &request.candidate;
+    let mut lines = vec![
+        "IMPORT REVIEW (read only)".to_string(),
+        format!("Action ID: {}", request.action_id),
+        format!(
+            "Durable Agent ID: {}",
+            candidate
+                .cutex_session_id
+                .as_ref()
+                .map(|id| id.as_str())
+                .unwrap_or("invalid")
+        ),
+        format!("Formal Agent name: {}", request.confirmed_formal_name),
+        format!("Candidate durable revision: {}", candidate.durable_revision),
+        format!(
+            "Candidate state: {}; {}; {}",
+            if candidate.in_roster {
+                "roster"
+            } else {
+                "durable, not in roster"
+            },
+            candidate
+                .current_project_id
+                .as_ref()
+                .map(|id| format!("Project {id}"))
+                .unwrap_or_else(|| "unassigned".into()),
+            if candidate.online {
+                "Online"
+            } else {
+                "Offline"
+            }
+        ),
+    ];
+    lines.push(
+        request
+            .detach
+            .as_ref()
+            .map(|detach| format!("Planned source step: {}", project_mutation_summary(detach)))
+            .unwrap_or_else(|| "Planned source step: none".into()),
+    );
+    lines.push(
+        request
+            .assignment
+            .as_ref()
+            .map(|assignment| {
+                format!(
+                    "Planned destination step: {}",
+                    project_mutation_summary(assignment)
+                )
+            })
+            .unwrap_or_else(|| "Planned destination step: none (import only)".into()),
+    );
+    lines.join("\n")
+}
+
+fn project_status_details(model: &CutexProjectsModel) -> String {
+    let mut sections = vec![format!(
+        "STATUS\nError: {}\nNotice: {}",
+        model.failure.as_deref().unwrap_or("None"),
+        model.notice.as_deref().unwrap_or("None")
+    )];
+    if let Some(request) = &model.import_request {
+        sections.push(import_review_details(request));
+    }
+    if let Some(request) = &model.pending_project_mutation {
+        sections.push(format!(
+            "PROJECT REVIEW (read only)\nAction: {}",
+            request.label
+        ));
+    }
+    if let Some(request) = &model.pending_operator {
+        sections.push(format!(
+            "OPERATOR REVIEW (read only)\nOperation: {:?}\nOperator: {}\nOperator durable ID: {}",
+            request.operation,
+            request.name,
+            request.cutex_session_id.as_str()
+        ));
+    }
+    sections.join("\n\n")
+}
+
 fn execute_operator_action(model: &mut CutexProjectsModel) -> anyhow::Result<()> {
     let target = model
         .pending_operator
@@ -1144,7 +1299,7 @@ fn project_command(
 ) -> Option<PrimaryPanelOutcome> {
     if command == Command::Details {
         model.status_scroll.reset();
-        model.details_text = Some(format!("Error: {}\nNotice: {}\nImport review: {:?}\nProject review: {:?}\nOperator review: {:?}", model.failure.as_deref().unwrap_or("None"), model.notice.as_deref().unwrap_or("None"), model.import_request, model.pending_project_mutation, model.pending_operator));
+        model.details_text = Some(project_status_details(model));
         return None;
     }
     if model.view == ProjectView::Details
@@ -1552,7 +1707,7 @@ fn handle_project_widget_key(
             KeyCode::Enter if model.confirm_selected => match execute_import_confirmation(model) {
                 Ok(()) => model.failure = None,
                 Err(error) => {
-                    model.failure = Some(format!("{error:#}"));
+                    model.failure = Some(import_failure_message(&error));
                     model.confirm_selected = false;
                 }
             },
@@ -2014,9 +2169,7 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
     }
     if matches!(
         model.view,
-        ProjectView::ConfirmImport
-            | ProjectView::ConfirmOperator
-            | ProjectView::ConfirmProjectMutation
+        ProjectView::ConfirmOperator | ProjectView::ConfirmProjectMutation
     ) && !model.import_name_focused
         && model.help.is_none()
         && model.leave_review.is_none()
@@ -2403,23 +2556,130 @@ fn render_import_confirmation(frame: &mut Frame<'_>, area: Rect, model: &CutexPr
     let Some(request) = &model.import_request else {
         return;
     };
-    let target = request
+    let field = |label: &'static str, value: String| {
+        Line::from(vec![
+            Span::styled(
+                format!("{label:<14}"),
+                Style::new().fg(super::session_tui_layout::MUTED),
+            ),
+            Span::styled(value, Style::new().fg(super::session_tui_layout::TEXT)),
+        ])
+    };
+    let assignment = request
         .assignment
         .as_ref()
-        .map(|a| format!("{:?} → {}", a.operation, a.project_id))
+        .map(project_mutation_summary)
         .unwrap_or_else(|| "Import only; remains unassigned".into());
-    let source = request.detach.as_ref().map(|d| format!("Explicit Detach from {} first (revision {}, authority {}). Protected roles may require Director rotation or grant revocation before detachment.", d.project_id, d.expected_project_revision, d.expected_authority_epoch)).unwrap_or_else(|| "No source detachment".into());
-    frame.render_widget(Paragraph::new(vec![
-        Line::from(format!("Durable Agent ID: {}", request.candidate.cutex_session_id.as_ref().map(|id| id.as_str()).unwrap_or("invalid — cannot confirm"))),
-        Line::from(candidate_label(&request.candidate)),
-        Line::from(format!("Formal Cutex Agent name: {}", model.import_name.value())),
-        Line::from(if request.candidate.formal_name.is_none() { "Historical record: type a formal Agent name. No thread title is supplied." } else { "Existing authoritative formal name; name changes require a fresh review." }),
-        Line::from(if request.candidate.in_roster { "Already in roster" } else { "Confirm authorizes setting the formal name if missing and importing into the roster." }),
-        Line::from(source), Line::from(target),
-        Line::from(format!("Action: {}", request.action_id)),
-        Line::from("Each completed step is retained if a later step fails. Retry uses this exact action."),
-        Line::from(if model.confirm_selected { "  Cancel     > Confirm" } else { "> Cancel       Confirm" }),
-    ]).wrap(Wrap { trim: true }).block(Block::bordered().title(" Confirm durable Agent import / Project assignment ")), area);
+    let source = request
+        .detach
+        .as_ref()
+        .map(project_mutation_summary)
+        .unwrap_or_else(|| "None".into());
+    let selected = Style::new()
+        .fg(Color::White)
+        .bg(super::session_tui_layout::SELECTION)
+        .add_modifier(Modifier::BOLD);
+    let idle = Style::new().fg(super::session_tui_layout::MUTED);
+    let buttons = Line::from(vec![
+        Span::styled(
+            " [ Cancel ] ",
+            if model.confirm_selected {
+                idle
+            } else {
+                selected
+            },
+        ),
+        Span::raw("   "),
+        Span::styled(
+            " [ Confirm import + Project step ] ",
+            if model.confirm_selected {
+                selected
+            } else {
+                idle
+            },
+        ),
+    ]);
+    let block = Block::bordered()
+        .border_style(Style::new().fg(super::session_tui_layout::FOCUS))
+        .title(" Confirm durable Agent import / Project assignment ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "Review the exact Agent and Project plan",
+                Style::new()
+                    .fg(super::session_tui_layout::FOCUS)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            field(
+                "Agent",
+                request
+                    .candidate
+                    .formal_name
+                    .clone()
+                    .unwrap_or_else(|| "Formal name required".into()),
+            ),
+            field(
+                "Durable ID",
+                request
+                    .candidate
+                    .cutex_session_id
+                    .as_ref()
+                    .map(|id| id.as_str().to_owned())
+                    .unwrap_or_else(|| "invalid — cannot confirm".into()),
+            ),
+            field(
+                "Current state",
+                format!(
+                    "{} · {} · {}",
+                    if request.candidate.in_roster {
+                        "roster"
+                    } else {
+                        "durable, not in roster"
+                    },
+                    request
+                        .candidate
+                        .current_project_id
+                        .as_ref()
+                        .map(|id| format!("Project {id}"))
+                        .unwrap_or_else(|| "unassigned".into()),
+                    if request.candidate.online {
+                        "Online"
+                    } else {
+                        "Offline"
+                    }
+                ),
+            ),
+            field("Formal name", model.import_name.value().to_string()),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Planned steps",
+                Style::new().add_modifier(Modifier::BOLD),
+            )),
+            field(
+                "1 · Import",
+                if request.candidate.in_roster {
+                    "Already present; validate retained roster identity".into()
+                } else {
+                    "Add this durable Agent to the roster".into()
+                },
+            ),
+            field("2 · Detach", source),
+            field("3 · Project", assignment),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Completed steps are retained if a later step fails. The server never retries this action automatically.",
+                Style::new().fg(super::session_tui_layout::WARNING),
+            )),
+            field("Action ID", request.action_id.to_string()),
+        ])
+        .wrap(Wrap { trim: true }),
+        chunks[0],
+    );
+    frame.render_widget(Paragraph::new(buttons), chunks[1]);
 }
 
 fn render_create_editor(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel) {
@@ -3559,6 +3819,129 @@ mod tests {
             name: name.unwrap_or("Formal name required").to_string(),
             current_project_id: project_id,
         });
+    }
+
+    fn import_review_model(with_detach: bool) -> CutexProjectsModel {
+        let mut model = model_with_projects();
+        add_director_candidate(
+            &mut model,
+            "cutex.019f4b34-82e6-7f72-9027-34df7bdcb82e",
+            Some("scpolya-2"),
+            with_detach.then_some("source-project"),
+            true,
+            false,
+        );
+        let candidate = model.durable_candidates[0].clone();
+        let id = candidate.cutex_session_id.clone().unwrap();
+        let assignment = HumanManagementProjectMutationRequest {
+            schema: HumanManagementProjectMutationSchema::V1,
+            action_id: AgentActionId::new("management-project-create-test").unwrap(),
+            project_id: cutex::agent_management::ProjectId::new("scpolya").unwrap(),
+            expected_authority_epoch: 0,
+            expected_project_revision: 0,
+            operation: HumanManagementProjectMutationKind::Create {
+                director_cutex_session_id: id.clone(),
+                presentation: ProjectPresentationInput {
+                    display_name: "ScPolyA 中文".into(),
+                    badge_label: "SP".into(),
+                    color: ProjectPaletteColor::Cyan,
+                },
+            },
+        };
+        let detach = with_detach.then(|| HumanManagementProjectMutationRequest {
+            schema: HumanManagementProjectMutationSchema::V1,
+            action_id: AgentActionId::new("management-detach-test").unwrap(),
+            project_id: cutex::agent_management::ProjectId::new("source-project").unwrap(),
+            expected_authority_epoch: 7,
+            expected_project_revision: 11,
+            operation: HumanManagementProjectMutationKind::DetachMember {
+                cutex_session_id: id,
+            },
+        });
+        model.import_name = Input::new("scpolya-2".into());
+        model.import_request = Some(cutex::agent_management::DurableImportRequest {
+            action_id: AgentActionId::new("management-import-fc80c7ae-75b9-46e8-99fe-7153eaa68bef")
+                .unwrap(),
+            confirmed_formal_name: "scpolya-2".into(),
+            candidate,
+            assignment: Some(assignment),
+            detach,
+        });
+        model.view = ProjectView::ConfirmImport;
+        model
+    }
+
+    #[test]
+    fn import_confirmation_is_human_readable_and_keeps_exact_review_details() {
+        for with_detach in [false, true] {
+            let mut model = import_review_model(with_detach);
+            for (width, height) in [(62, 22), (100, 30), (160, 40)] {
+                let screen = rendered(&model, width, height);
+                assert!(screen.contains("Review the exact Agent and Project plan"));
+                assert!(screen.contains("scpolya-2"));
+                assert!(screen.contains("[ Cancel ]"));
+                assert!(screen.contains("[ Confirm import + Project step ]"));
+            }
+            let wide = rendered(&model, 160, 40);
+            assert!(wide.contains("ScPolyA 中文"));
+            assert!(wide.contains("SP / cyan"));
+            if !with_detach {
+                if let Ok(path) = std::env::var("CUTEX_CONFIRM_FRAME_CAPTURE") {
+                    let frame = rendered_buffer(&model, 100, 30);
+                    let mut text = String::new();
+                    for y in 0..frame.area.height {
+                        for x in 0..frame.area.width {
+                            text.push_str(frame[(x, y)].symbol());
+                        }
+                        text.push('\n');
+                    }
+                    std::fs::write(path, text).unwrap();
+                }
+            }
+            model.confirm_selected = true;
+            let buffer = rendered_buffer(&model, 120, 32);
+            let (x, y) = badge_cell(&buffer, "Confirm import + Project step");
+            assert_eq!(
+                buffer[(x, y)].bg,
+                super::super::session_tui_layout::SELECTION
+            );
+            model.details_text = Some(project_status_details(&model));
+            let details = model.details_text.as_deref().unwrap();
+            assert!(details.contains("Durable Agent ID: cutex.019f4b34"));
+            assert!(details.contains("Action ID: management-import-fc80c7ae"));
+            assert!(details.contains("Candidate durable revision: 1"));
+            assert!(!details.contains("ProjectPresentationInput"));
+            assert!(!details.contains("Create {"));
+            if with_detach {
+                assert!(details.contains("Detach Agent"));
+            } else {
+                assert!(details.contains("Planned source step: none"));
+            }
+        }
+    }
+
+    #[test]
+    fn stale_candidate_http_error_is_safe_actionable_and_not_auto_retryable() {
+        let error = anyhow::anyhow!(
+            "HTTP 409 Conflict\r\nsecret-header: hidden\r\n{}",
+            serde_json::json!({
+                "contractVersion": 2,
+                "error": {
+                    "code": "conflict",
+                    "details": {},
+                    "message": "conflict: stale_durable_candidate",
+                    "retryable": false,
+                    "source": "cutex"
+                }
+            })
+        );
+        let message = import_failure_message(&error);
+        assert!(message.contains("Candidate changed after this review"));
+        assert!(message.contains("F5 to refresh"));
+        assert!(message.contains("reselect by durable ID"));
+        assert!(message.contains("not retryable"));
+        assert!(!message.contains("secret-header"));
+        assert!(!message.contains('\r'));
     }
 
     #[test]
