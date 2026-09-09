@@ -172,6 +172,7 @@ fn agent_management_admin_path(path: &str) -> bool {
         path,
         "/v2/agent-management/authority"
             | "/v2/agent-management/explicit-launch"
+            | "/v2/agent-management/native-recovery"
             | "/v2/agent-management/durable-candidates"
             | "/v2/agent-management/durable-import"
             | "/v2/agent-management/archive-review"
@@ -257,6 +258,38 @@ fn handle_v2_request_with_repository(
         }
         ("GET", "/v2/agent-management/projects") => {
             handle_management_project_collection(stream, context)
+        }
+        ("POST", "/v2/agent-management/native-recovery") => {
+            let payload: crate::app_server::external_recovery::RecoveryRequest =
+                match serde_json::from_slice(&request.body) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return write_v2_error(
+                            stream,
+                            400,
+                            "Bad Request",
+                            "invalid_request",
+                            "strict native recovery request required",
+                            false,
+                            json!({}),
+                        )
+                    }
+                };
+            match crate::app_server::external_recovery::handle(
+                &crate::management::control_plane::HumanManagementPrincipal::authenticated(),
+                &payload,
+            ) {
+                Ok(value) => write_json_response(stream, 200, "OK", &value),
+                Err(error) => write_v2_error(
+                    stream,
+                    409,
+                    "Conflict",
+                    "native_recovery_not_committed",
+                    &error.to_string(),
+                    false,
+                    json!({"recovery":"inspect status and reconcile the exact action; never infer rollback or choose a new retry ID"}),
+                ),
+            }
         }
         ("POST", "/v2/agent-management/explicit-launch") => {
             let payload: crate::agent_management::ExplicitLaunchRequest =
@@ -4240,6 +4273,7 @@ mod tests {
     #[test]
     fn human_management_projects_tasks_and_writes_require_the_dedicated_root_credential() {
         for path in [
+            "/v2/agent-management/native-recovery",
             "/v2/agent-management/durable-candidates",
             "/v2/agent-management/durable-import",
             "/v2/agent-management/projects",

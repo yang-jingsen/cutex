@@ -61,6 +61,15 @@ const INTER_AGENT_STATUS_SCHEMA: &str = "cutex/inter-agent-delivery-status/v1";
 #[path = "bus_bridge_external.rs"]
 mod external;
 
+pub(crate) fn validate_external_recovery_target(
+    message: &AgentBusMessage,
+    owner: &str,
+    seats: &crate::seat::SeatOccupancySnapshot,
+    roster: &crate::agent_management::AgentManagementSnapshot,
+) -> anyhow::Result<()> {
+    external::validate_target(message, owner, seats, roster)
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct DeliverySweepOutcome {
     had_messages: bool,

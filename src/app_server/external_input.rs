@@ -563,9 +563,61 @@ impl ExternalInputClient {
         params: serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
         self.fence()?;
+        #[cfg(feature = "stock-launch-test-hook")]
+        let lost_key = if method == "thread/externalInput/submit" {
+            params
+                .get("message")
+                .and_then(|m| m.get("id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        } else {
+            None
+        };
         let result = self.client.handle().request(method, params);
         // Even an error/lost reply is fenced; never commit a stale response.
         self.fence()?;
+        #[cfg(feature = "stock-launch-test-hook")]
+        if result.is_ok() {
+            if let Some(key) = lost_key {
+                let selected = std::env::var("CUTEX_NATIVE_TEST_LOST_SUBMIT").ok();
+                let first_owned = selected.as_deref() == Some("first")
+                    && std::env::var("CUTEX_NATIVE_TEST_LOST_OWNER")
+                        .ok()
+                        .as_deref()
+                        == Some(self.binding.owner_id.as_str());
+                if selected.as_deref() == Some(&key) || first_owned {
+                    let private = PathBuf::from(std::env::var("CUTEX_TEST_PRIVATE_HOME")?);
+                    ensure!(
+                        private.is_absolute() && private.join(".cutex-test-private-home").is_file(),
+                        "lost reply hook requires private fixture"
+                    );
+                    static LOST: std::sync::OnceLock<
+                        std::sync::Mutex<std::collections::HashSet<String>>,
+                    > = std::sync::OnceLock::new();
+                    let once = if first_owned {
+                        self.binding.owner_id.clone()
+                    } else {
+                        key.clone()
+                    };
+                    if LOST
+                        .get_or_init(Default::default)
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("fault hook poisoned"))?
+                        .insert(once)
+                    {
+                        use std::io::Write;
+                        let mut evidence = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(private.join("lost-native-submit"))?;
+                        evidence.write_all(key.as_bytes())?;
+                        anyhow::bail!(
+                            "private fault: native submit reply discarded; reconcile exact key"
+                        );
+                    }
+                }
+            }
+        }
         result.context("native ingress RPC outcome: reconcile the same key; never infer absence from a transport error")
     }
     pub fn submit(&self, envelope: &Envelope) -> anyhow::Result<Response> {

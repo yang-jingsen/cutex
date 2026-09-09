@@ -77,6 +77,9 @@ struct StoredAgentBusMessage {
 struct AgentBusMessageStore {
     version: u8,
     #[serde(default)]
+    external_recovery_actions:
+        BTreeMap<String, crate::app_server::external_recovery::RecoveryReceipt>,
+    #[serde(default)]
     messages: BTreeMap<String, StoredAgentBusMessage>,
 }
 
@@ -147,6 +150,34 @@ fn validate_private_test_home(home: &str, private: &str) -> anyhow::Result<()> {
 }
 
 impl AgentBusMessageRepository {
+    pub(crate) fn recovery_action(
+        &self,
+        action: &str,
+    ) -> anyhow::Result<Option<crate::app_server::external_recovery::RecoveryReceipt>> {
+        self.read(|s| Ok(s.external_recovery_actions.get(action).cloned()))
+    }
+
+    pub(crate) fn save_recovery_action(
+        &self,
+        receipt: &crate::app_server::external_recovery::RecoveryReceipt,
+    ) -> anyhow::Result<()> {
+        self.mutate(|s| {
+            if let Some(old) = s.external_recovery_actions.get(&receipt.action_id) {
+                anyhow::ensure!(
+                    old.review == receipt.review && old.retry_id == receipt.retry_id,
+                    "recovery action semantic conflict"
+                );
+                anyhow::ensure!(
+                    old.result.is_none() || old.result == receipt.result,
+                    "recovery receipt conflict"
+                );
+            }
+            s.external_recovery_actions
+                .insert(receipt.action_id.clone(), receipt.clone());
+            s.version = 4;
+            Ok(())
+        })
+    }
     pub fn open(root: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let root = root.into();
         fs::create_dir_all(&root)?;
@@ -299,7 +330,7 @@ impl AgentBusMessageRepository {
                 "native envelope recipient/message mismatch"
             );
             stored.snapshot.external_input = Some(envelope.clone());
-            store.version = 3;
+            store.version = store.version.max(3);
             Ok(envelope)
         })
     }
@@ -688,7 +719,7 @@ fn validate_session_identity(value: &str) -> anyhow::Result<()> {
 
 fn load_store(path: &Path) -> anyhow::Result<AgentBusMessageStore> {
     let store = load_store_unchecked(path)?;
-    if !matches!(store.version, 2 | 3) {
+    if !matches!(store.version, 2 | 3 | 4) {
         anyhow::bail!("unsupported management v2 agent-bus state version");
     }
     Ok(store)
@@ -701,6 +732,7 @@ fn load_store_unchecked(path: &Path) -> anyhow::Result<AgentBusMessageStore> {
             Ok(store)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(AgentBusMessageStore {
+            external_recovery_actions: BTreeMap::new(),
             version: 2,
             messages: BTreeMap::new(),
         }),
@@ -801,6 +833,66 @@ mod tests {
             })
             .unwrap();
         let reopened = AgentBusMessageRepository::open(&root).unwrap();
+        let mut permission = crate::app_server::external_recovery::RecoveryReceipt {
+            action_id: "private-recovery".into(),
+            retry_id: "private-retry".into(),
+            review: crate::app_server::external_recovery::RecoveryReview {
+                envelope: frozen.clone(),
+                binding: crate::launch::stock::ExternalInputBinding {
+                    version: 1,
+                    owner_id: owner.clone(),
+                    thread_id: frozen.thread_id.clone(),
+                    runtime_generation: 1,
+                    canonical_byte_limit: Default::default(),
+                },
+                status: Status {
+                    message_id: frozen.message.id.clone(),
+                    semantic_sha256: frozen.semantic_sha256.clone(),
+                    delivery_state: DeliveryState::Unknown,
+                    receipt: None,
+                    processing: ProcessingStatus {
+                        state: ProcessingState::Held,
+                        attempt_id: None,
+                        reason: Some(HoldReason::NoOutput),
+                    },
+                },
+                durable_sha256: "private-spec".into(),
+                authority_sha256: "private-authority".into(),
+                warning: crate::app_server::external_recovery::REPEAT_WARNING.into(),
+            },
+            result: None,
+        };
+        reopened.save_recovery_action(&permission).unwrap();
+        reopened.save_recovery_action(&permission).unwrap();
+        assert_eq!(
+            reopened.recovery_action("private-recovery").unwrap(),
+            Some(permission.clone())
+        );
+        let mut conflict = permission.clone();
+        conflict.retry_id = "different".into();
+        assert!(reopened.save_recovery_action(&conflict).is_err());
+        permission.result = Some(RetryResponse {
+            version: 1,
+            owner_id: owner.clone(),
+            thread_id: frozen.thread_id.clone(),
+            runtime_generation: 1,
+            message_id: frozen.message.id.clone(),
+            semantic_sha256: frozen.semantic_sha256.clone(),
+            expected_attempt_id: None,
+            retry_id: permission.retry_id.clone(),
+            disposition: RetryDisposition::Released,
+        });
+        reopened.save_recovery_action(&permission).unwrap();
+        reopened.save_recovery_action(&permission).unwrap();
+        conflict = permission.clone();
+        conflict.result = None;
+        assert!(reopened.save_recovery_action(&conflict).is_err());
+        reopened
+            .mutate(|s| {
+                assert_eq!(s.version, 4);
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(
             reopened
                 .freeze_external_input(&owner, "jsc_stable", |_| panic!(
@@ -851,7 +943,14 @@ mod tests {
             .is_err());
         let raw: Value =
             serde_json::from_slice(&fs::read(root.join(AGENT_BUS_STATE_FILE)).unwrap()).unwrap();
-        assert_eq!(raw["version"], 3);
+        assert_eq!(raw["version"], 4);
+        assert_eq!(
+            AgentBusMessageRepository::open(&root)
+                .unwrap()
+                .recovery_action("private-recovery")
+                .unwrap(),
+            Some(permission)
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

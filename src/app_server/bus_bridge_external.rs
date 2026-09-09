@@ -14,9 +14,14 @@ fn task_provider() -> anyhow::Result<crate::task_service::TaskServiceProvider> {
 }
 
 #[cfg(all(unix, feature = "stock-launch-test-hook"))]
-fn before_commit_test_gate(message: &AgentBusMessage) -> anyhow::Result<()> {
+fn before_commit_test_gate(message: &AgentBusMessage, stage: &str) -> anyhow::Result<()> {
     use std::io::{BufRead, Write};
     use std::os::unix::fs::MetadataExt;
+    let configured = std::env::var("CUTEX_NATIVE_DELIVERY_TEST_STAGE")
+        .unwrap_or_else(|_| "before_business_commit".into());
+    if configured != stage {
+        return Ok(());
+    }
     let Ok(selected) = std::env::var("CUTEX_NATIVE_DELIVERY_TEST_MESSAGE") else {
         return Ok(());
     };
@@ -50,10 +55,11 @@ fn before_commit_test_gate(message: &AgentBusMessage) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_target(
+pub(super) fn validate_target(
     message: &AgentBusMessage,
     owner: &str,
     seats: &crate::seat::SeatOccupancySnapshot,
+    roster: &crate::agent_management::AgentManagementSnapshot,
 ) -> anyhow::Result<()> {
     ensure!(
         message.to_cutex_session_id.as_deref() == Some(owner),
@@ -82,6 +88,15 @@ fn validate_target(
             target.occupant_cutex_session.as_str() == owner,
             "completion recipient rotated; retain pending for current Director"
         );
+        if n.target_seat_id.as_str() == "cutex-director" {
+            if let Some(project) = &n.project_id {
+                let authority = roster
+                    .projects
+                    .get(project)
+                    .context("project Director authority absent")?;
+                ensure!(authority.authorized_director_session.as_str() == owner, "project Director authority/seat mismatch; coupled transfer must resolve before delivery");
+            }
+        }
     }
     if let Some(metadata) = task_service_metadata(message)? {
         DurableTaskServiceContextRecorder.validate_assignment(&metadata)?;
@@ -252,6 +267,8 @@ pub(super) fn deliver(
     let repository = agent_bus_message_repository()?;
     for polled in messages {
         let result = (|| -> anyhow::Result<bool> {
+            let before =
+                crate::agent_management::AgentManagementStore::open_default()?.snapshot()?;
             let seats = crate::seat::SeatOccupancyStore::open_default()?;
             if repository.snapshot_by_message_id(&polled.id)?.is_none()
                 && polled.sender_kind.is_task_service_system()
@@ -280,7 +297,7 @@ pub(super) fn deliver(
                     ensure!(polled.from == TASK_SERVICE_SYSTEM_SENDER && polled.from_cutex_session_id.is_none() && polled.content == n.human_readable_content && polled.id == crate::agent_bus::queue::native_completion_message_id(n.notification_id.as_str(), &options.cutex_session_id), "Task outbox projection conflict");
                     let mut canonical = polled.clone();
                     canonical.to_cutex_session_id = Some(options.cutex_session_id.clone());
-                    validate_target(&canonical, &options.cutex_session_id, s)?;
+                    validate_target(&canonical, &options.cutex_session_id, s, &before)?;
                     let params = inter_agent_params(&options.thread_id, &options.cutex_session_id, &options.cutex_session_id, &canonical)?;
                     repository.record_queued(crate::management::v2::agent_bus_state::AgentBusQueuedMessage {
                         owner_cutex_session_id: options.cutex_session_id.clone(), message_id: canonical.id.clone(), from_cutex_session_id: None,
@@ -295,8 +312,6 @@ pub(super) fn deliver(
             let recipient =
                 crate::role_revision::CutexSessionId::new(options.cutex_session_id.clone())
                     .map_err(|_| anyhow::anyhow!("invalid durable recipient"))?;
-            let before =
-                crate::agent_management::AgentManagementStore::open_default()?.snapshot()?;
             ensure!(
                 before
                     .agents
@@ -305,7 +320,7 @@ pub(super) fn deliver(
                 "recipient permanently retired"
             );
             seats.with_notification_snapshot(|s| {
-                validate_target(&message, &options.cutex_session_id, s)
+                validate_target(&message, &options.cutex_session_id, s, &before)
             })??;
             let frozen =
                 repository.freeze_external_input(&options.cutex_session_id, &message.id, |m| {
@@ -336,7 +351,7 @@ pub(super) fn deliver(
                 "native receipt without A4"
             );
             #[cfg(all(unix, feature = "stock-launch-test-hook"))]
-            before_commit_test_gate(&message)?;
+            before_commit_test_gate(&message, "before_business_commit")?;
             // Provider -> seat -> durable occurrence -> Task fact -> Bus CAS.
             // Lifecycle mutations cannot slip between the last fence and CAS.
             let management = crate::agent_management::AgentManagementStore::open_default()?;
@@ -354,7 +369,7 @@ pub(super) fn deliver(
                 "recipient permanently retired"
             );
             seats.with_notification_snapshot(|s| -> anyhow::Result<()> {
-                validate_target(&message, &options.cutex_session_id, s)?;
+                validate_target(&message, &options.cutex_session_id, s, &roster)?;
                 crate::session::store::with_locked_session_store(&path, |_| {
                     client.fence()?;
                     // Existing Task context-fact adapters retain their idempotent
@@ -372,6 +387,8 @@ pub(super) fn deliver(
                             &message.id,
                             &receipt.receipt_id,
                         )?;
+                        #[cfg(all(unix, feature = "stock-launch-test-hook"))]
+                        before_commit_test_gate(&message, "after_task_fact")?;
                     }
                     if let Some(m) = task_service_worker_followup_metadata(&message)? {
                         DurableTaskServiceContextRecorder.record_worker_followup_context_inserted(
