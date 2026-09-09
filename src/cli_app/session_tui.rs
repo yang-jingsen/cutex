@@ -90,8 +90,7 @@ use super::session_tui_workspace_render::{render_workspace, WorkspaceRenderer};
 
 const WIDE_LAYOUT_MIN_WIDTH: u16 = 96;
 const SETTINGS_TWO_PANE_MIN_WIDTH: u16 = 64;
-#[cfg(test)]
-const INSPECTOR_SPLIT_MIN_WIDTH: u16 = 115;
+pub(super) const INSPECTOR_SPLIT_MIN_WIDTH: u16 = 115;
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -243,7 +242,7 @@ impl SelectorActivityClass {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SelectorActivity {
+pub(super) struct SelectorActivity {
     class: SelectorActivityClass,
     updated_at: String,
     failed: bool,
@@ -8990,7 +8989,10 @@ fn selector_activity_details(value: Option<&SelectorActivity>) -> Option<String>
     })
 }
 
-fn format_selector_activity(value: Option<&SelectorActivity>, now: DateTime<Utc>) -> String {
+pub(super) fn format_selector_activity(
+    value: Option<&SelectorActivity>,
+    now: DateTime<Utc>,
+) -> String {
     let Some(value) = value else {
         return "-".to_string();
     };
@@ -9014,6 +9016,16 @@ fn format_selector_activity(value: Option<&SelectorActivity>, now: DateTime<Utc>
     let failed = if value.failed { "!" } else { "" };
     let action = format!("{}{failed}", value.class.label());
     format!("{action:>5} {age} ")
+}
+
+pub(super) fn current_activity_by_durable_session(
+) -> anyhow::Result<HashMap<String, SelectorActivity>> {
+    Ok(load_session_activity_states()?
+        .into_iter()
+        .filter_map(|(session_id, state)| {
+            selector_activity_from_state(&state).map(|activity| (session_id, activity))
+        })
+        .collect())
 }
 
 #[cfg(test)]

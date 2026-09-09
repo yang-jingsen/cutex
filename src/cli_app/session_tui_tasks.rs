@@ -6,7 +6,7 @@
 //! task state, and the Management route preserves the exact current Director
 //! seat plus Primary Director project-authority scope.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, IsTerminal, Stdout};
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
@@ -93,6 +93,7 @@ struct AgentJoin {
     display_name: String,
     runtime_id: String,
     availability: &'static str,
+    activity: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +117,10 @@ struct TaskRow {
     attempt_number: Option<u64>,
     updated_at: String,
     activity: String,
+    status_summary: Option<String>,
+    result_reference: Option<String>,
+    last_output: Option<String>,
+    last_tool_call: Option<String>,
 }
 
 impl TaskRow {
@@ -139,6 +144,13 @@ impl TaskRow {
             None if self.project_id == "-" => "-".to_string(),
             None => format!("unavailable ({})", self.project_id),
         }
+    }
+
+    fn agent_activity_label(&self) -> &str {
+        self.agent
+            .as_ref()
+            .map(|agent| agent.activity.as_str())
+            .unwrap_or("-")
     }
 
     fn matches(&self, filter: &str) -> bool {
@@ -173,7 +185,12 @@ impl TaskRow {
     }
 }
 
-fn exact_agent_join(agents: &[AgentBusAgent], assignee_session_id: &str) -> Option<AgentJoin> {
+fn exact_agent_join(
+    agents: &[AgentBusAgent],
+    activities: &HashMap<String, super::session_tui::SelectorActivity>,
+    assignee_session_id: &str,
+    now: DateTime<Utc>,
+) -> Option<AgentJoin> {
     // `cutex_session_id` is the sole join key. In particular, display names,
     // runtime IDs, thread names, cwd, and groups must never act as fallbacks.
     let mut matches = agents
@@ -181,10 +198,17 @@ fn exact_agent_join(agents: &[AgentBusAgent], assignee_session_id: &str) -> Opti
         .filter(|agent| agent.cutex_session_id.as_deref() == Some(assignee_session_id))
         .collect::<Vec<_>>();
     matches.sort_by(|left, right| left.id.cmp(&right.id));
-    matches.first().map(|agent| AgentJoin {
-        display_name: agent.name.clone(),
-        runtime_id: agent.id.clone(),
-        availability: "online",
+    (matches.len() == 1).then(|| {
+        let agent = matches[0];
+        AgentJoin {
+            display_name: agent.name.clone(),
+            runtime_id: agent.id.clone(),
+            availability: "online",
+            activity: super::session_tui::format_selector_activity(
+                activities.get(assignee_session_id),
+                now,
+            ),
+        }
     })
 }
 
@@ -216,6 +240,8 @@ fn task_rows(
     receipt: &cutex::task_service::DirectorActionReceipt,
     agents: &[AgentBusAgent],
     project_presentations: &BTreeMap<ProjectId, TaskProjectPresentation>,
+    activities: &HashMap<String, super::session_tui::SelectorActivity>,
+    now: DateTime<Utc>,
 ) -> Vec<TaskRow> {
     let mut rows = receipt
         .assignments
@@ -250,12 +276,25 @@ fn task_rows(
                 task_revision: assignment.task_revision.get(),
                 assignment_id: assignment.assignment_id.as_str().to_string(),
                 assignee_session_id: assignment.assignee_cutex_session_id.as_str().to_string(),
-                agent: exact_agent_join(agents, assignment.assignee_cutex_session_id.as_str()),
+                agent: exact_agent_join(
+                    agents,
+                    activities,
+                    assignment.assignee_cutex_session_id.as_str(),
+                    now,
+                ),
                 state,
                 phase: active.map(|attempt| attempt.phase.clone()),
                 attempt_number: active.map(|attempt| attempt.attempt_number),
                 updated_at,
                 activity: merged_activity(active),
+                status_summary: active.and_then(|attempt| attempt.latest_status_summary.clone()),
+                result_reference: active.and_then(|attempt| attempt.result_reference.clone()),
+                last_output: active
+                    .and_then(|attempt| attempt.last_output.as_ref())
+                    .map(|output| output.display_text.clone()),
+                last_tool_call: active
+                    .and_then(|attempt| attempt.last_tool_call.as_ref())
+                    .map(|tool| tool.display_text.clone()),
             }
         })
         .collect::<Vec<_>>();
@@ -492,10 +531,14 @@ fn spawn_refresh(sender: mpsc::Sender<RefreshResult>) {
             .map_err(|error| format!("Management Task query unavailable: {error:#}"))
             .and_then(|response| match response.receipt.status {
                 DirectorActionStatus::CurrentState | DirectorActionStatus::Committed => {
+                    let activities = super::session_tui::current_activity_by_durable_session()
+                        .unwrap_or_default();
                     Ok(task_rows(
                         &response.receipt,
                         &agent_bus_fetch_agents_if_healthy(&config),
                         &exact_project_presentations(&response),
+                        &activities,
+                        Utc::now(),
                     ))
                 }
                 _ => Err(format!(
@@ -729,7 +772,16 @@ fn render(frame: &mut Frame<'_>, model: &TaskModel) {
         chunks[1],
     );
     render_filter(frame, chunks[2], model);
-    render_table(frame, chunks[3], model);
+    let wide_inspector = area.width >= super::session_tui::INSPECTOR_SPLIT_MIN_WIDTH;
+    if wide_inspector {
+        let panes = Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .spacing(1)
+            .split(chunks[3]);
+        render_table(frame, panes[0], model);
+        render_detail(frame, panes[1], model, model.detail);
+    } else {
+        render_table(frame, chunks[3], model);
+    }
     let footer = if model.filter_focused {
         footer_hints(&[
             ("Type", "filter"),
@@ -757,8 +809,8 @@ fn render(frame: &mut Frame<'_>, model: &TaskModel) {
         Paragraph::new(Line::from(footer)).style(Style::new().fg(Color::DarkGray)),
         chunks[4],
     );
-    if model.detail {
-        render_detail(frame, centered_rect(area, 86, 72), model);
+    if model.detail && !wide_inspector {
+        render_detail(frame, chunks[3], model, true);
     }
 }
 
@@ -854,6 +906,7 @@ enum TaskColumn {
     Task,
     State,
     Agent,
+    AgentActivity,
     Attempt,
     Updated,
     Activity,
@@ -865,6 +918,7 @@ impl TaskColumn {
             Self::Task => "TASK",
             Self::State => "STATE",
             Self::Agent => "AGENT",
+            Self::AgentActivity => "AGENT ACT",
             Self::Attempt => "TRY",
             Self::Updated => "UPDATED",
             Self::Activity => "ACTIVITY",
@@ -876,22 +930,24 @@ fn task_columns(width: u16) -> Vec<(TaskColumn, u16)> {
     // Two cells are reserved for the selection marker and one between columns.
     if width >= 110 {
         return vec![
-            (TaskColumn::Task, 32),
+            (TaskColumn::Task, 26),
             (TaskColumn::State, 8),
-            (TaskColumn::Agent, 22),
+            (TaskColumn::Agent, 18),
+            (TaskColumn::AgentActivity, 10),
             (TaskColumn::Attempt, 4),
             (TaskColumn::Updated, 8),
-            (TaskColumn::Activity, width - 81),
+            (TaskColumn::Activity, width - 82),
         ];
     }
     if width >= 78 {
         return vec![
-            (TaskColumn::Task, 26),
+            (TaskColumn::Task, 20),
             (TaskColumn::State, 8),
-            (TaskColumn::Agent, 18),
-            (TaskColumn::Attempt, 4),
+            (TaskColumn::Agent, 14),
+            (TaskColumn::AgentActivity, 9),
+            (TaskColumn::Attempt, 3),
             (TaskColumn::Updated, 7),
-            (TaskColumn::Activity, width - 70),
+            (TaskColumn::Activity, width - 69),
         ];
     }
     if width >= 52 {
@@ -963,6 +1019,10 @@ fn task_table_row(row: &TaskRow, selected: bool, columns: &[(TaskColumn, u16)]) 
                 Cell::from(views::clipped(row.state.label(), width)).style(row.state.style())
             }
             TaskColumn::Agent => Cell::from(views::clipped(&row.agent_label(), width)),
+            TaskColumn::AgentActivity => {
+                Cell::from(views::clipped(row.agent_activity_label(), width))
+                    .style(Style::new().fg(Color::Gray))
+            }
             TaskColumn::Attempt => Cell::from(
                 row.attempt_number
                     .map(|number| number.to_string())
@@ -1009,22 +1069,48 @@ fn format_age(value: &str, now: DateTime<Utc>) -> String {
     }
 }
 
-fn render_detail(frame: &mut Frame<'_>, area: Rect, model: &TaskModel) {
+fn render_detail(frame: &mut Frame<'_>, area: Rect, model: &TaskModel, focused: bool) {
     let content = model
         .selected_row()
         .map(|row| {
             vec![
                 detail_field("Task", row.task_id.clone()),
+                Line::from(vec![
+                    detail_label("State"),
+                    Span::styled(row.state.label(), row.state.style()),
+                ]),
+                detail_field("Task updated", row.updated_at.clone()),
+                detail_field("Agent", row.agent_label()),
+                detail_field("Agent activity", row.agent_activity_label().to_string()),
+                detail_field(
+                    "Status summary",
+                    row.status_summary
+                        .clone()
+                        .unwrap_or_else(|| "-".to_string()),
+                ),
+                detail_field("Task activity", row.activity.clone()),
+                detail_field(
+                    "Last output",
+                    row.last_output.clone().unwrap_or_else(|| "-".to_string()),
+                ),
+                detail_field(
+                    "Last tool",
+                    row.last_tool_call
+                        .clone()
+                        .unwrap_or_else(|| "-".to_string()),
+                ),
+                detail_field(
+                    "Result ref",
+                    row.result_reference
+                        .clone()
+                        .unwrap_or_else(|| "-".to_string()),
+                ),
+                Line::from(""),
                 detail_field("Revision", row.task_revision.to_string()),
                 detail_field("Assignment", row.assignment_id.clone()),
                 detail_field("Project", row.project_label()),
                 detail_field("Project ID", row.project_id.clone()),
                 detail_field("Assignee", row.assignee_session_id.clone()),
-                detail_field("Agent", row.agent_label()),
-                Line::from(vec![
-                    detail_label("State"),
-                    Span::styled(row.state.label(), row.state.style()),
-                ]),
                 detail_field(
                     "Phase",
                     row.phase.clone().unwrap_or_else(|| "-".to_string()),
@@ -1035,13 +1121,6 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, model: &TaskModel) {
                         .map(|value| value.to_string())
                         .unwrap_or_else(|| "-".to_string()),
                 ),
-                detail_field("Updated", row.updated_at.clone()),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "Activity",
-                    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                )),
-                Line::from(row.activity.clone()),
                 Line::from(""),
                 Line::from(Span::styled(
                     "Read-only · ↑/↓ PgUp/PgDn scroll · Esc closes",
@@ -1053,7 +1132,11 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, model: &TaskModel) {
     views::render_styled_details(
         frame,
         area,
-        Some(" Task details "),
+        Some(if focused {
+            " Task Inspector · focused "
+        } else {
+            " Task Inspector "
+        }),
         content,
         &model.detail_scroll,
     );
@@ -1061,28 +1144,13 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, model: &TaskModel) {
 
 fn detail_label(label: &str) -> Span<'static> {
     Span::styled(
-        format!("{label:<12}"),
+        format!("{label:<16}"),
         Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
     )
 }
 
 fn detail_field(label: &str, value: String) -> Line<'static> {
     Line::from(vec![detail_label(label), Span::raw(value)])
-}
-
-fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
-    let vertical = Layout::vertical([
-        Constraint::Percentage((100 - height_percent) / 2),
-        Constraint::Percentage(height_percent),
-        Constraint::Percentage((100 - height_percent) / 2),
-    ])
-    .split(area);
-    Layout::horizontal([
-        Constraint::Percentage((100 - width_percent) / 2),
-        Constraint::Percentage(width_percent),
-        Constraint::Percentage((100 - width_percent) / 2),
-    ])
-    .split(vertical[1])[1]
 }
 
 #[cfg(test)]
@@ -1155,6 +1223,10 @@ mod tests {
             attempt_number: Some(1),
             updated_at: updated_at.to_string(),
             activity: "old, bounded activity".to_string(),
+            status_summary: Some("Task status summary".to_string()),
+            result_reference: Some("/private/result.json".to_string()),
+            last_output: Some("bounded output projection".to_string()),
+            last_tool_call: Some("bounded tool projection".to_string()),
         }
     }
 
@@ -1177,13 +1249,56 @@ mod tests {
             last_seen_epoch_secs: 1,
         }];
         assert_eq!(
-            exact_agent_join(&agents, "cutex.worker")
+            exact_agent_join(&agents, &HashMap::new(), "cutex.worker", Utc::now())
                 .unwrap()
                 .display_name,
             "Worker"
         );
-        assert!(exact_agent_join(&agents, "Worker").is_none());
-        assert!(exact_agent_join(&agents, "runtime-worker").is_none());
+        assert!(exact_agent_join(&agents, &HashMap::new(), "Worker", Utc::now()).is_none());
+        assert!(exact_agent_join(&agents, &HashMap::new(), "runtime-worker", Utc::now()).is_none());
+        let mut ambiguous = agents.clone();
+        let mut duplicate = agents[0].clone();
+        duplicate.id = "newer-looking-runtime".into();
+        ambiguous.push(duplicate);
+        assert!(
+            exact_agent_join(&ambiguous, &HashMap::new(), "cutex.worker", Utc::now()).is_none(),
+            "multiple current occurrences fail closed instead of guessing"
+        );
+    }
+
+    #[test]
+    fn wide_inspector_keeps_task_updated_separate_from_current_agent_activity() {
+        let mut task = row("activity", TaskState::Running, "2026-01-02T03:04:05Z");
+        task.agent = Some(AgentJoin {
+            display_name: "Worker 中文".into(),
+            runtime_id: "runtime-current".into(),
+            availability: "online",
+            activity: " EDIT  2s ".into(),
+        });
+        task.activity = "Task semantic progress remains a different fact".into();
+        task.status_summary = Some("Validated current assignment boundary".into());
+        task.result_reference = Some("/private/result/report.json".into());
+        let model = TaskModel {
+            rows: vec![task],
+            selected_assignment_id: Some("activity".into()),
+            loading: false,
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(180, 32)).unwrap();
+        terminal.draw(|frame| render(frame, &model)).unwrap();
+        let output = buffer_text(terminal.backend().buffer());
+        for expected in [
+            "AGENT ACT",
+            "EDIT  2s",
+            "Task Inspector",
+            "Task updated",
+            "Agent activity",
+            "Task semantic progress",
+            "Validated current assignment",
+            "/private/result/report.json",
+        ] {
+            assert!(output.contains(expected), "missing {expected:?}\n{output}");
+        }
     }
 
     #[test]
@@ -1328,17 +1443,20 @@ mod tests {
             "2026-09-09T00:42:03Z",
         );
         review.activity = "Review evidence prepared".to_string();
+        let mut running = row("shell", TaskState::Running, "2026-09-09T01:02:03Z");
+        running.agent = Some(AgentJoin {
+            display_name: "Worker".into(),
+            runtime_id: "runtime-current".into(),
+            availability: "online",
+            activity: " CMD 37s ".into(),
+        });
         let model = TaskModel {
-            rows: vec![
-                row("shell", TaskState::Running, "2026-09-09T01:02:03Z"),
-                blocked,
-                review,
-            ],
+            rows: vec![running, blocked, review],
             selected_assignment_id: Some("shell".to_string()),
             loading: false,
             ..Default::default()
         };
-        for width in [72, 120] {
+        for width in [72, 120, 180] {
             let mut terminal = Terminal::new(TestBackend::new(width, 18)).unwrap();
             terminal.draw(|frame| render(frame, &model)).unwrap();
             let output = buffer_text(terminal.backend().buffer());
@@ -1360,7 +1478,7 @@ mod tests {
                 output.contains('┌') && output.contains('└'),
                 "width={width}\n{output}"
             );
-            if width == 120 {
+            if width == 180 {
                 if let Some(path) = std::env::var_os("CUTEX_TASKS_FRAME_CAPTURE") {
                     std::fs::write(path, output.trim_end()).expect("write full-frame evidence");
                 }
@@ -1398,7 +1516,7 @@ mod tests {
         let detail = buffer_text(terminal.backend().buffer());
         assert!(detail.contains("CUTEX"));
         assert!(detail.contains("Global Settings [Alt+S]"));
-        assert!(detail.contains("Task details"));
+        assert!(detail.contains("Task Inspector"));
 
         handle_key(
             &mut model,
@@ -1444,7 +1562,7 @@ mod tests {
         let mut task = row("detail", TaskState::ReviewReady, "2026-09-09T01:02:03Z");
         task.assignment_id = format!("assignment-{}-TAIL", "甲乙丙丁".repeat(24));
         task.assignee_session_id = format!("cutex.{}-SESSION-END", "worker".repeat(20));
-        task.activity = format!("/very/long/{}/result.json", "目录/".repeat(50));
+        task.activity = format!("/very/long/{}/result.json", "目录/".repeat(8));
         let mut model = TaskModel {
             selected_assignment_id: Some(task.assignment_id.clone()),
             rows: vec![task],
@@ -1454,9 +1572,19 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(74, 14)).unwrap();
         terminal.draw(|frame| render(frame, &model)).unwrap();
         let first = buffer_text(terminal.backend().buffer());
-        assert!(first.contains("Task details"));
-        assert!(first.contains("assignment-"));
-        assert!(!first.contains("result.json"));
+        assert!(first.contains("Task Inspector"));
+        assert!(first.contains("Task updated"));
+        handle_key(
+            &mut model,
+            &mut RefreshCadence::new(Instant::now()),
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+        );
+        terminal.draw(|frame| render(frame, &model)).unwrap();
+        let middle = buffer_text(terminal.backend().buffer());
+        assert!(
+            middle.contains("/very/long/") && middle.contains("lt.json"),
+            "{middle}"
+        );
         handle_key(
             &mut model,
             &mut RefreshCadence::new(Instant::now()),
@@ -1464,7 +1592,7 @@ mod tests {
         );
         terminal.draw(|frame| render(frame, &model)).unwrap();
         let last = buffer_text(terminal.backend().buffer());
-        assert!(last.contains("result.json"), "{last}");
+        assert!(last.contains("ESSION-END"), "{last}");
         assert!(last.contains("Read-only"), "{last}");
         assert_eq!(
             model.selected_assignment_id.as_deref(),
