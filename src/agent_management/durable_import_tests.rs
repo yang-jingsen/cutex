@@ -1,4 +1,5 @@
 use super::*;
+use crate::agent_bus::model::AgentBusAgent;
 use crate::session::store::{load_cutex_session_store_from_path, save_cutex_session_store_to_path};
 
 struct Fixture {
@@ -274,6 +275,152 @@ fn offline_named_and_historical_adopt_import_create_add_and_profile_remains_muta
         receipt,
         "completed replay is exact after profile changes"
     );
+}
+
+#[test]
+fn runtime_registration_observation_does_not_stale_reviewed_import_create() {
+    let f = Fixture::new();
+    f.add("cutex.director", Some("Formal Director"));
+    f.mutate("cutex.director", |record| {
+        record.last_runtime_agent_id = Some("runtime-director".into());
+    });
+    let mut request = f.request(
+        "cutex.director",
+        "Formal Director",
+        "observation-import-create",
+    );
+    request.assignment = Some(create("cutex.director", "observation-project"));
+    let before = load_cutex_session_store_from_path(&f.path).unwrap();
+    let before_record = before.sessions["cutex.director"].clone();
+    let mut observed = before;
+    let registration = AgentBusAgent {
+        id: "runtime-director".into(),
+        name: "runtime-director".into(),
+        base_name: None,
+        thread_name: None,
+        path_key: None,
+        session_id: None,
+        cutex_session_id: None,
+        profile: "not-authority".into(),
+        cwd: "/not-authority".into(),
+        pid: 4242,
+        host_id: Some(crate::platform::host::current_host_name()),
+        groups: Vec::new(),
+        registration_class: AgentRegistrationClass::Persistent,
+        last_seen_epoch_secs: 1,
+    };
+    let outcome =
+        crate::session::runtime_reconciliation::reconcile_cutex_session_store_for_registration(
+            &mut observed,
+            &registration,
+            &crate::platform::host::current_host_name(),
+            "2026-09-09T01:02:03Z",
+        )
+        .unwrap();
+    assert!(outcome.store_fence_required && outcome.outcome.is_none());
+    let observed_record = &observed.sessions["cutex.director"];
+    assert_eq!(observed_record.revision, before_record.revision);
+    assert_ne!(observed_record.updated_at, before_record.updated_at);
+    assert_ne!(
+        observed_record.current_runtime_agent_id,
+        before_record.current_runtime_agent_id
+    );
+    assert_eq!(
+        durable_candidate_digest(observed_record).unwrap(),
+        request.candidate.durable_sha256
+    );
+    save_cutex_session_store_to_path(&f.path, &observed).unwrap();
+    let receipt = f.run(&request).unwrap();
+    assert!(receipt.complete && receipt.imported, "{:?}", receipt.error);
+    assert_eq!(
+        f.candidate("cutex.director")
+            .current_project_id
+            .unwrap()
+            .as_str(),
+        "observation-project"
+    );
+    assert_eq!(f.run(&request).unwrap(), receipt);
+}
+
+#[test]
+fn candidate_fence_excludes_only_presentation_and_runtime_observation_fields() {
+    let f = Fixture::new();
+    f.add("cutex.worker", Some("Worker"));
+    let original = load_cutex_session_store_from_path(&f.path)
+        .unwrap()
+        .sessions["cutex.worker"]
+        .clone();
+    let digest = durable_candidate_digest(&original).unwrap();
+    let mut observation = original.clone();
+    observation.thread_name = Some("new native title".into());
+    observation.display_name_hint = Some("new display hint".into());
+    observation.pending_launch_id = Some("launch-observation".into());
+    observation.alden_session_name = Some("alden-observation".into());
+    observation.alden_pid = Some(10);
+    observation.runtime_pid = Some(11);
+    observation.current_runtime_agent_id = Some("runtime-observation".into());
+    observation.runtime_generation = 99;
+    observation.runtime_history_known = !observation.runtime_history_known;
+    observation.last_runtime_agent_id = Some("old-runtime".into());
+    observation.last_seen_at = Some("2026-09-09T02:00:00Z".into());
+    observation.last_user_selected_at = Some("2026-09-09T02:00:01Z".into());
+    observation.updated_at = "2026-09-09T02:00:02Z".into();
+    assert_eq!(durable_candidate_digest(&observation).unwrap(), digest);
+
+    for semantic in [
+        "revision",
+        "identity",
+        "native",
+        "name",
+        "cwd",
+        "profile",
+        "archive",
+        "registration",
+        "permissions",
+        "launch-claim",
+    ] {
+        let mut changed = original.clone();
+        match semantic {
+            "revision" => changed.revision += 1,
+            "identity" => changed.cutex_session_id = "cutex.other".into(),
+            "native" => changed.codex_session_id = Some("native-other".into()),
+            "name" => changed.formal_agent_name = Some("Other".into()),
+            "cwd" => changed.managed_cwd = Some("/other".into()),
+            "profile" => changed.profile = Some("other".into()),
+            "archive" => {
+                changed.archive_state = crate::session::model::CutexSessionArchiveState::Retired
+            }
+            "registration" => changed.registration_class = AgentRegistrationClass::Ephemeral,
+            "permissions" => changed.permission_defaults = Some("other".into()),
+            "launch-claim" => changed.app_server_launch_claim_id = Some("claim".into()),
+            _ => unreachable!(),
+        }
+        assert_ne!(
+            durable_candidate_digest(&changed).unwrap(),
+            digest,
+            "{semantic}"
+        );
+    }
+}
+
+#[test]
+fn former_whole_record_digest_requires_fresh_review_without_write() {
+    let f = Fixture::new();
+    f.add("cutex.worker", Some("Worker"));
+    let mut request = f.request("cutex.worker", "Worker", "old-digest-import");
+    let sessions = load_cutex_session_store_from_path(&f.path).unwrap();
+    request.candidate.durable_sha256 =
+        super::super::store::request_sha256(&sessions.sessions["cutex.worker"]).unwrap();
+    assert_ne!(
+        request.candidate.durable_sha256,
+        durable_candidate_digest(&sessions.sessions["cutex.worker"]).unwrap()
+    );
+    assert_eq!(
+        f.run(&request).unwrap_err(),
+        conflict("stale_durable_candidate")
+    );
+    let state = f.provider.store().snapshot().unwrap();
+    assert!(state.agents.is_empty() && state.durable_import_actions.is_empty());
 }
 
 #[test]

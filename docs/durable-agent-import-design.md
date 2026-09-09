@@ -78,15 +78,29 @@ session model/defaults/service/store; Management v2 server/context and client;
 Projects TUI and Home/name projections.
 
 Dedicated Management-root-only candidate GET and import POST routes mint the
-existing private Human principal. Typed requests bind the full candidate snapshot,
-exact durable ID, confirmed formal name, action, destination and optional explicit
-source detach. Selection and cancel do not mutate durable or roster state.
+existing private Human principal. Typed requests bind the reviewed semantic
+candidate snapshot, exact durable ID, confirmed formal name, action, destination
+and optional explicit source detach. Selection and cancel do not mutate durable
+or roster state.
 
 Lock order is provider execution, provider mutation, durable session store,
 provider state. A durable fence covers the roster commit. Candidate CAS includes
 durable revision/digest, roster record and current membership/operator context;
 runtime liveness is informational. Existing project handlers retain source and
 destination epoch/revision CAS and Director, seat, Operator/task protections.
+
+The durable digest is a versioned typed projection of stable reviewed facts:
+durable/native identity, revision, archive/retirement and unresolved launch-claim
+state, formal name, host/cwd, nullable profile and remaining launch/config policy,
+enabled/groups/registration/exposure/quick-action settings. It deliberately
+excludes native title/display hints, runtime endpoint/PID/generation bindings,
+last-seen/user-observation fields and timestamps. Those fields do not authorize
+import and can change during ordinary registration while the review is open.
+Roster/Agent/membership/operator digests remain separate fences. A profile is
+mutable reviewed configuration, not identity: a change before confirmation still
+requires a fresh review, while a completed action replays its original receipt.
+Candidates generated with the former whole-record digest fail closed after this
+change and must be refreshed; no digest-version compatibility bypass is provided.
 
 A confirmed composite has its own semantic request digest and receipt. Historical
 naming is separately receipted atomically with the name, including previous/new

@@ -5,7 +5,10 @@ use crate::{
     management::control_plane::*,
     role_revision::{CutexSessionId, Sha256},
     session::{
-        model::{CutexSessionRecord, CutexSessionRuntimeBackend, CutexSessionStore},
+        model::{
+            CutexSessionArchiveState, CutexSessionQuickActionMode, CutexSessionRecord,
+            CutexSessionRuntimeBackend, CutexSessionStore,
+        },
         store::{save_locked_session_store, with_locked_session_store},
     },
 };
@@ -27,6 +30,69 @@ pub struct DurableAgentCandidate {
     pub current_project_id: Option<ProjectId>,
     pub online: bool,
     pub rejection: Option<String>,
+}
+
+/// Stable Human-reviewed durable facts used by the import authorization fence.
+/// Runtime occurrence/observation fields and native presentation metadata are
+/// intentionally absent; they neither authorize import nor define Agent identity.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DurableCandidateFence<'a> {
+    schema: &'static str,
+    cutex_session_id: &'a str,
+    revision: u64,
+    archive_state: CutexSessionArchiveState,
+    retired_at: &'a Option<String>,
+    codex_session_id: &'a Option<String>,
+    app_server_launch_claim_id: &'a Option<String>,
+    formal_agent_name: &'a Option<String>,
+    host_id: &'a str,
+    cwd: &'a str,
+    managed_cwd: &'a Option<String>,
+    profile: &'a Option<String>,
+    runtime_backend: CutexSessionRuntimeBackend,
+    agent_enabled: bool,
+    agent_groups: &'a [String],
+    registration_class: AgentRegistrationClass,
+    exposed_to_backend: bool,
+    quick_action: CutexSessionQuickActionMode,
+    default_cli_args: &'a [String],
+    permission_defaults: &'a Option<String>,
+    approval_policy: &'a Option<String>,
+    sandbox_mode: &'a Option<String>,
+    model_defaults: &'a Option<String>,
+    reasoning_defaults: &'a Option<String>,
+}
+
+pub(super) fn durable_candidate_digest(
+    record: &CutexSessionRecord,
+) -> Result<Sha256, AgentManagementError> {
+    super::store::request_sha256(&DurableCandidateFence {
+        schema: "cutex.durable-import-candidate-fence.v1",
+        cutex_session_id: &record.cutex_session_id,
+        revision: record.revision,
+        archive_state: record.archive_state,
+        retired_at: &record.retired_at,
+        codex_session_id: &record.codex_session_id,
+        app_server_launch_claim_id: &record.app_server_launch_claim_id,
+        formal_agent_name: &record.formal_agent_name,
+        host_id: &record.host_id,
+        cwd: &record.cwd,
+        managed_cwd: &record.managed_cwd,
+        profile: &record.profile,
+        runtime_backend: record.runtime_backend,
+        agent_enabled: record.agent_enabled,
+        agent_groups: &record.agent_groups,
+        registration_class: record.registration_class,
+        exposed_to_backend: record.exposed_to_backend,
+        quick_action: record.quick_action,
+        default_cli_args: &record.default_cli_args,
+        permission_defaults: &record.permission_defaults,
+        approval_policy: &record.approval_policy,
+        sandbox_mode: &record.sandbox_mode,
+        model_defaults: &record.model_defaults,
+        reasoning_defaults: &record.reasoning_defaults,
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -239,7 +305,7 @@ fn candidate(
             .clone()
             .or_else(|| agent.map(|a| a.spec.name.clone())),
         durable_revision: record.revision,
-        durable_sha256: super::store::request_sha256(record)?,
+        durable_sha256: durable_candidate_digest(record)?,
         roster_sha256: match &id {
             Some(id) => roster_digest(state, id)?,
             None => super::store::request_sha256(&Option::<()>::None)?,
@@ -466,7 +532,7 @@ impl AgentManagementProvider {
                 original.revision = request.candidate.durable_revision;
                 original.updated_at = naming.previous_updated_at.clone();
             }
-            if super::store::request_sha256(&original)? != request.candidate.durable_sha256 {
+            if durable_candidate_digest(&original)? != request.candidate.durable_sha256 {
                 return Err(conflict("durable_candidate_changed_after_partial_import"));
             }
             self.validate_import_roster_replay(&state, request, receipt)?;

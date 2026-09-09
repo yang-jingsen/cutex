@@ -120,7 +120,8 @@ impl AgentManagementProvider {
                     })
                     .ok_or_else(|| anyhow::anyhow!("adopted candidate unavailable"))?;
                 anyhow::ensure!(
-                    candidate.durable_sha256 == super::store::request_sha256(&adopted.record)?,
+                    candidate.durable_sha256
+                        == super::durable_import::durable_candidate_digest(&adopted.record)?,
                     "adopted record changed; no refreshed CAS substitution"
                 );
                 let import = DurableImportRequest {

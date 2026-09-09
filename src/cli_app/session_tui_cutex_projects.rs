@@ -3291,6 +3291,48 @@ mod tests {
                 .agents
                 .is_empty()
         );
+        // Exercise the actual runtime-registration writer between the HTTP review
+        // and HTTP confirmation. Only occurrence/observation fields change, so
+        // the Human-reviewed import must remain valid.
+        let reviewed_id = create
+            .candidate
+            .cutex_session_id
+            .as_ref()
+            .unwrap()
+            .as_str()
+            .to_string();
+        let mut observed = load_cutex_session_store().unwrap();
+        let reviewed = observed.sessions[&reviewed_id].clone();
+        let reviewed_revision = reviewed.revision;
+        let registration = cutex::agent_bus::model::AgentBusAgent {
+            id: "runtime-observation-between-review-and-confirm".into(),
+            name: "runtime-observation".into(),
+            base_name: None,
+            thread_name: reviewed.thread_name.clone(),
+            path_key: None,
+            session_id: reviewed.codex_session_id.clone(),
+            cutex_session_id: None,
+            profile: "not-import-authority".into(),
+            cwd: reviewed.cwd.clone(),
+            pid: 4242,
+            host_id: Some(reviewed.host_id.clone()),
+            groups: reviewed.agent_groups.clone(),
+            registration_class: reviewed.registration_class,
+            last_seen_epoch_secs: 1,
+        };
+        cutex::session::runtime_reconciliation::reconcile_cutex_session_store_for_registration(
+            &mut observed,
+            &registration,
+            &reviewed.host_id,
+            "2026-09-09T01:02:03Z",
+        )
+        .unwrap();
+        assert_eq!(observed.sessions[&reviewed_id].revision, reviewed_revision);
+        assert_ne!(
+            observed.sessions[&reviewed_id].updated_at,
+            reviewed.updated_at
+        );
+        save_cutex_session_store(&observed).unwrap();
         handle_key(
             &mut model,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -3740,7 +3782,13 @@ mod tests {
             formal_name: "Explicit HTTP Agent".into(),
         };
         let adopted = client.adopt_saved_native(&adoption).unwrap();
-        assert!(adopted.imported.as_ref().unwrap().complete);
+        assert!(
+            adopted
+                .imported
+                .as_ref()
+                .is_some_and(|receipt| receipt.complete),
+            "{adopted:?}"
+        );
         assert_eq!(client.adopt_saved_native(&adoption).unwrap(), adopted);
         let mut changed = adoption;
         changed.formal_name = "Changed request".into();
