@@ -22,10 +22,12 @@ pub const S6_EXECUTABLE_SHA256: &str =
     "b70d48151c9deb76a9c0ab14a820c582f2bc12a73bbb1512fee9b2f1bec9fa60";
 pub const S6_SCHEMA_SHA256: &str =
     "00e035e34ac1034ee34473f8f68b7704d6058c5b180ff4f4b6cad9fadab3a86d";
-pub const S6E_COMMIT: &str = "a83dbb47ba6aa775f5d4b679fafc532c4db74c7f";
+// Exact accepted F5/F6/F7 repair; the S6e wire schema is unchanged. Older
+// bundle receipts remain historical facts, not permission to launch old bytes.
+pub const S6E_COMMIT: &str = "0c425b5f9fca90835fd2b4377a1bca212532f66c";
 pub const S6E_EXECUTABLE_SHA256: &str =
-    "4638b86221593dd4bab1f66b504641836ac1adb864e946cbe42cb5cbf9f05a74";
-pub const S6E_CLI_SHA256: &str = "f360100339560e6a57eb08dea38ed740450904ce7bd72ea7b8a37238fff97bd6";
+    "9caa26abe4ec3094543b402e235654f8434d09e49e14017b856b4cdac0801bde";
+pub const S6E_CLI_SHA256: &str = "f93c92bfe528636eae87450d918700d90d24db7d8f2eee0f4dd0fe5cbee998f4";
 pub const S6E_SCHEMA_SHA256: &str =
     "459861225d5bfb73bb4c3896edb489169637424be410be346f955a39596da7e9";
 
@@ -710,6 +712,43 @@ mod tests {
         b.cli = Some(file(S6E_CLI_SHA256));
         b.validate_identity().unwrap();
         assert!(b.common_ingress() && b.soon_ingress());
+        let accepted = b.clone();
+        // Each mixed/spoofed component rejects independently, including the
+        // previous coherent bundle. No descendant/version wildcard or fallback.
+        for (field, value) in [
+            (
+                "native_patch_commit",
+                "a83dbb47ba6aa775f5d4b679fafc532c4db74c7f",
+            ),
+            (
+                "executable",
+                "4638b86221593dd4bab1f66b504641836ac1adb864e946cbe42cb5cbf9f05a74",
+            ),
+            (
+                "cli",
+                "f360100339560e6a57eb08dea38ed740450904ce7bd72ea7b8a37238fff97bd6",
+            ),
+            ("code_mode_host", STOCK_EXECUTABLE_SHA256),
+            ("schema", S6_SCHEMA_SHA256),
+            ("executable", STOCK_HOST_SHA256),
+        ] {
+            let mut raw = serde_json::to_value(&accepted).unwrap();
+            if field == "native_patch_commit" {
+                raw[field] = value.into();
+            } else {
+                raw[field]["sha256"] = value.into();
+            }
+            let rejected: StockBundle = serde_json::from_value(raw).unwrap();
+            assert!(rejected.validate_identity().is_err(), "{field}");
+        }
+        let mut old = accepted.clone();
+        old.native_patch_commit = Some("a83dbb47ba6aa775f5d4b679fafc532c4db74c7f".into());
+        old.executable = file("4638b86221593dd4bab1f66b504641836ac1adb864e946cbe42cb5cbf9f05a74");
+        old.cli = Some(file(
+            "f360100339560e6a57eb08dea38ed740450904ce7bd72ea7b8a37238fff97bd6",
+        ));
+        assert!(old.validate_identity().is_err());
+        assert!(!old.common_ingress() && !old.soon_ingress());
         b.version = 2;
         assert!(b.validate_identity().is_err());
         b.version = 3;
