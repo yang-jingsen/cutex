@@ -128,6 +128,165 @@ fn receiver_profile(sandbox: &str) -> anyhow::Result<&'static str> {
     }
 }
 
+/// A neutral, model-free owner. Never retries thread/start after an uncertain
+/// response; the provider journals the known ID before adoption and online.
+pub(super) fn bootstrap_native(
+    permit: &cutex::agent_management::BootstrapExecutionPermit<'_>,
+    existing: Option<&str>,
+) -> Result<String, cutex::agent_management::LifecycleFailure> {
+    use cutex::agent_management::{AgentOperation, LifecycleFailure};
+    use cutex::app_server::client::{AppServerClient, AppServerClientOptions, AppServerEndpoint};
+    let review = permit.review();
+    let mut known = existing.map(str::to_owned);
+    let mut spawned = false;
+    let mut operation = || -> anyhow::Result<String> {
+        ensure!(
+            cfg!(target_os = "linux"),
+            "private bootstrap requires Linux"
+        );
+        ensure!(
+            cutex::config::paths::host_codex_home_dir()?.canonicalize()? == review.native_home
+                && !review.native_home.join("auth.json").try_exists()?,
+            "bootstrap home/auth changed before spawn"
+        );
+        let bundle = StockBundle::load_references(
+            &review.native_home,
+            &review.bundle_manifest,
+            &review.bundle_sha256,
+        )?;
+        ensure!(
+            bundle.version == 3 && bundle.soon_ingress(),
+            "bootstrap bundle mismatch"
+        );
+        let AgentOperation::Create { spec, .. } = &review.request.operation else {
+            anyhow::bail!("bootstrap create required")
+        };
+        ensure!(
+            cutex::launch::stock::bootstrap_configuration(spec)? == review.configuration,
+            "bootstrap config changed before spawn"
+        );
+        let directory = std::path::PathBuf::from(std::env::var("TMPDIR")?).join(format!(
+            "cb-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
+        }
+        let socket = directory.join("native.sock");
+        ensure!(
+            socket.as_os_str().len() < 104,
+            "private bootstrap socket path too long"
+        );
+        let launch = configured(
+            clean_launch(&bundle.executable.path, &review.native_home)?,
+            &review.configuration,
+        )?;
+        let launch = option(
+            launch,
+            "default_permissions",
+            receiver_profile(&review.configuration.sandbox)?,
+        )?
+        .arg("--listen")
+        .arg(format!("unix://{}", socket.display()));
+        let mut command = launch.to_command();
+        let mut log_options = std::fs::OpenOptions::new();
+        log_options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            log_options.mode(0o600);
+        }
+        let log = log_options.open(directory.join("native.stderr.log"))?;
+        command
+            .current_dir(&spec.cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(log);
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            let parent = std::process::id();
+            // Owned child only. Creator death before an ID is captured stays
+            // uncertain in the journal, and cannot leave a reusable writer.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::getppid() as u32 != parent {
+                        return Err(std::io::Error::other("bootstrap creator exited"));
+                    }
+                    Ok(())
+                });
+            }
+        }
+        struct Owned(std::process::Child);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let _owned = Owned(command.spawn()?);
+        spawned = true;
+        let client =
+            AppServerClient::connect(AppServerClientOptions::new(AppServerEndpoint::UnixSocket {
+                socket_path: socket,
+            }))?;
+        let handle = client.handle();
+        let response = if let Some(native) = existing {
+            handle.request("thread/resume", serde_json::json!({"threadId":native,"cwd":spec.cwd,"approvalPolicy":review.configuration.approval}))?
+        } else {
+            handle.request("thread/start", serde_json::json!({"cwd":spec.cwd,"approvalPolicy":review.configuration.approval,"ephemeral":false,"historyMode":"paginated"}))?
+        };
+        let native = response["thread"]["id"]
+            .as_str()
+            .context("bootstrap response missing native ID")?
+            .to_owned();
+        ensure!(
+            uuid::Uuid::parse_str(&native)?.to_string() == native,
+            "bootstrap malformed native ID"
+        );
+        ensure!(
+            existing.is_none_or(|expected| expected == native),
+            "bootstrap resumed wrong native ID"
+        );
+        #[cfg(feature = "stock-launch-test-hook")]
+        if existing.is_none()
+            && cutex::agent_management::bootstrap_test_fault(
+                "CUTEX_BOOTSTRAP_TEST_PRE_ID_ACTION",
+                &review.request.action_id,
+            )
+        {
+            // The request may have created history, but its ID is not in the
+            // Cutex journal. Abort the owned creator; no retry is authorized.
+            std::process::exit(86);
+        }
+        known = Some(native.clone());
+        // Accepted aa382cdb5 foundation: paginated read(true) awaits persist()
+        // and propagates write failures. Metadata-only read is not this ACK.
+        let ack = handle.request(
+            "thread/read",
+            serde_json::json!({"threadId":native,"includeTurns":true}),
+        )?;
+        ensure!(
+            ack["thread"]["id"].as_str() == Some(&native)
+                && ack["thread"]["historyMode"].as_str() == Some("paginated")
+                && ack["thread"]["turns"].as_array().is_some_and(Vec::is_empty),
+            "neutral bootstrap persistence ACK mismatch"
+        );
+        Ok(native)
+    };
+    operation().map_err(|error| LifecycleFailure {
+        code: "reviewed_native_bootstrap_failed".into(),
+        detail: error.to_string(),
+        outcome_unknown: spawned || known.is_some(),
+        known_native_session_id: known,
+    })
+}
+
 impl StockRuntimeExecutor for StockExecutor {
     fn published_owner_absent(&mut self, receipt: &StockRuntimeReceipt) -> anyhow::Result<bool> {
         let binding = receipt

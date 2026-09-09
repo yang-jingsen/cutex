@@ -89,6 +89,16 @@ impl AgentManagementProvider {
         tasks: &crate::task_service::TaskServiceProvider,
     ) -> anyhow::Result<StockRuntimeReview> {
         let _mutation = self.store().lock_mutations()?;
+        self.review_stock_runtime_locked(path, id, restart, tasks)
+    }
+
+    pub(crate) fn review_stock_runtime_locked(
+        &self,
+        path: &Path,
+        id: &CutexSessionId,
+        restart: bool,
+        tasks: &crate::task_service::TaskServiceProvider,
+    ) -> anyhow::Result<StockRuntimeReview> {
         tasks.with_archive_read_fence(|tasks| -> anyhow::Result<_> {
             let state = self.store().snapshot()?;
             let project = super::archive::guard(&state, id)
@@ -153,6 +163,17 @@ impl AgentManagementProvider {
             .lock()
             .map_err(|_| anyhow::anyhow!("stock execution lock unavailable"))?;
         let _mutation = self.store().lock_mutations()?;
+        self.execute_stock_runtime_locked(path, action_id, review, tasks, runtime)
+    }
+
+    pub(crate) fn execute_stock_runtime_locked(
+        &self,
+        path: &Path,
+        action_id: &AgentActionId,
+        review: &StockRuntimeReview,
+        tasks: &crate::task_service::TaskServiceProvider,
+        runtime: &mut dyn StockRuntimeExecutor,
+    ) -> anyhow::Result<StockRuntimeReceipt> {
         tasks.with_archive_read_fence(|tasks| -> anyhow::Result<_> {
             let id = &review.subject.cutex_session_id;
             let sessions = load_cutex_session_store_from_path(path)?;

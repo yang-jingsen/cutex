@@ -54,6 +54,10 @@ pub enum AgentManagementSchema {
 pub enum AgentManagementStoreSchema {
     #[serde(rename = "cutex/agent-management-store/v1")]
     V1,
+    /// Private candidate writers only: reviewed bootstrap intents must never be
+    /// dropped by an older writer or interpreted as a legacy default launch.
+    #[serde(rename = "cutex/agent-management-store/v2")]
+    V2,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -266,6 +270,8 @@ impl ManagedAgentSpec {
 pub enum AgentOperation {
     Create {
         spec: ManagedAgentSpec,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap_intent: Option<AgentActionId>,
         start_mode: AgentStartMode,
         #[serde(default)]
         frozen_message: Option<String>,
@@ -377,7 +383,7 @@ impl<'de> Deserialize<'de> for AgentManagementRequest {
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| serde::de::Error::custom("operation must be a string"))?;
         let operation_fields: &[&str] = match operation {
-            "create" => &["spec", "start_mode", "frozen_message"],
+            "create" => &["spec", "start_mode", "frozen_message", "bootstrap_intent"],
             "query_managed" => &[],
             "online" | "offline" | "restart" | "close" => &["cutex_session_id"],
             "replace" => &[
@@ -430,9 +436,18 @@ impl AgentManagementRequest {
         match &self.operation {
             AgentOperation::Create {
                 spec,
+                bootstrap_intent,
                 start_mode,
                 frozen_message,
             } => {
+                if bootstrap_intent
+                    .as_ref()
+                    .is_some_and(|id| id != &self.action_id)
+                {
+                    return Err(AgentManagementError::InvalidRequest(
+                        "bootstrap_intent_requires_exact_action",
+                    ));
+                }
                 spec.validate()?;
                 validate_start(*start_mode, frozen_message.as_deref())
             }

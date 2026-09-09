@@ -116,12 +116,23 @@ pub struct ExplicitLaunchReceipt {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "receipt", rename_all = "snake_case")]
 pub enum ExplicitLaunchActionReceipt {
+    Bootstrap(BootstrapAdoptionReceipt),
     Activation(ExplicitLaunchReceipt),
     Runtime(StockRuntimeReceipt),
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExplicitLaunchRequest {
+    ReviewBootstrap {
+        request: AgentManagementRequest,
+        native_home: PathBuf,
+        bundle_manifest: PathBuf,
+        bundle_sha256: Sha256,
+        expires_at_unix: i64,
+    },
+    AuthorizeBootstrap {
+        review: BootstrapIntentReview,
+    },
     ReviewRuntime {
         cutex_session_id: CutexSessionId,
         restart: bool,
@@ -151,6 +162,53 @@ impl AgentManagementProvider {
         tasks: &crate::task_service::TaskServiceProvider,
     ) -> anyhow::Result<serde_json::Value> {
         match request {
+            ExplicitLaunchRequest::ReviewBootstrap {
+                request,
+                native_home,
+                bundle_manifest,
+                bundle_sha256,
+                expires_at_unix,
+            } => {
+                let _mutation = self.store().lock_mutations()?;
+                let state = self.store().snapshot()?;
+                let project = request
+                    .project_id
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("bootstrap requires exact project"))?;
+                let authority = state
+                    .projects
+                    .get(project)
+                    .ok_or_else(|| anyhow::anyhow!("bootstrap project missing"))?;
+                let AgentOperation::Create { spec, .. } = &request.operation else {
+                    anyhow::bail!("bootstrap intent requires create")
+                };
+                let review = BootstrapIntentReview {
+                    version: 1,
+                    request: request.clone(),
+                    director: authority.authorized_director_session.clone(),
+                    authority_sha256: super::store::request_sha256(authority)?,
+                    store_revision: state.store_revision,
+                    native_home: native_home.clone(),
+                    bundle_manifest: bundle_manifest.clone(),
+                    bundle_sha256: bundle_sha256.clone(),
+                    configuration: crate::launch::stock::bootstrap_configuration(spec)?,
+                    runtime_groups: crate::agent_bus::groups::normalize_registered_agent_groups(
+                        spec.groups.clone(),
+                        None,
+                        &spec.cwd,
+                    ),
+                    expires_at_unix: *expires_at_unix,
+                };
+                review.validate_evidence()?;
+                anyhow::ensure!(
+                    *expires_at_unix > chrono::Utc::now().timestamp(),
+                    "bootstrap intent expired"
+                );
+                Ok(serde_json::to_value(review)?)
+            }
+            ExplicitLaunchRequest::AuthorizeBootstrap { review } => Ok(serde_json::to_value(
+                self.authorize_bootstrap_intent(review)?,
+            )?),
             ExplicitLaunchRequest::ReviewRuntime {
                 cutex_session_id,
                 restart,

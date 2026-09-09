@@ -6,6 +6,7 @@
 //! without creating real Agents.
 
 mod archive;
+mod bootstrap_intent;
 mod durable_adoption;
 mod durable_import;
 mod explicit_launch;
@@ -16,6 +17,7 @@ mod stock_runtime;
 mod store;
 
 pub use archive::*;
+pub use bootstrap_intent::*;
 pub use durable_adoption::*;
 pub use durable_import::*;
 pub use explicit_launch::*;

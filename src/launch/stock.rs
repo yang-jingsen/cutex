@@ -237,12 +237,34 @@ impl StockBundle {
     }
     pub fn load(contract: &ExplicitLaunchContract) -> anyhow::Result<Self> {
         contract.validate()?;
-        let bundle: Self = serde_json::from_slice(&std::fs::read(&contract.bundle_manifest)?)
+        let bundle = Self::load_references(
+            &contract.native_home,
+            &contract.bundle_manifest,
+            &contract.bundle_sha256,
+        )?;
+        ensure!(contract.version == if bundle.soon_ingress() { 2 } else { 1 },
+            "new coherent Soon bundle requires explicit version-2 activation; old markers cannot opt in");
+        Ok(bundle)
+    }
+
+    /// Validate execution evidence before a native identity exists. This does
+    /// not authorize launch or manufacture an ExplicitLaunchContract.
+    pub fn load_references(
+        native_home: &Path,
+        manifest: &Path,
+        digest: &Sha256,
+    ) -> anyhow::Result<Self> {
+        canonical(native_home)?;
+        canonical(manifest)?;
+        ensure!(native_home.is_dir(), "native home missing");
+        ensure!(
+            &file_sha256(manifest)? == digest,
+            "bundle evidence missing or changed"
+        );
+        let bundle: Self = serde_json::from_slice(&std::fs::read(manifest)?)
             .context("invalid stock bundle manifest")?;
         ensure!(cfg!(target_os = "linux"), "stock subset requires Linux");
         bundle.validate_identity()?;
-        ensure!(contract.version == if bundle.soon_ingress() { 2 } else { 1 },
-            "new coherent Soon bundle requires explicit version-2 activation; old markers cannot opt in");
         if let Some(cli) = &bundle.cli {
             cli.validate()?;
             ensure!(
@@ -270,7 +292,7 @@ impl StockBundle {
             "stock companion must be beside executable"
         );
         ensure!(
-            bundle.shared_config.path == contract.native_home.join("config.toml"),
+            bundle.shared_config.path == native_home.join("config.toml"),
             "wrong shared config/home"
         );
         let schema: serde_json::Value =
@@ -374,16 +396,56 @@ struct ProfileConfig {
 }
 
 pub fn current_configuration(record: &CutexSessionRecord) -> anyhow::Result<StockConfiguration> {
-    use crate::profiles::model::{AccountsStore, CliKind, RuntimeConfig};
     ensure!(
         record.default_cli_args.is_empty(),
         "stock does not accept arbitrary durable CLI overrides"
     );
+    let (sandbox, approval) = crate::runtime::args::effective_runtime_permission_defaults(record);
+    ensure!(
+        record.approval_policy.is_some(),
+        "explicit stock approval policy required"
+    );
+    configuration_for_selection(
+        record.profile.as_ref(),
+        record.permission_defaults.as_deref(),
+        sandbox,
+        approval,
+        record.model_defaults.as_ref(),
+        record.reasoning_defaults.as_ref(),
+    )
+}
+
+/// Configuration is independent of identity. Bootstrap has no durable/native
+/// ID yet, so it must not construct a placeholder session to resolve a profile.
+pub fn bootstrap_configuration(
+    spec: &crate::agent_management::ManagedAgentSpec,
+) -> anyhow::Result<StockConfiguration> {
+    ensure!(
+        spec.runtime_backend == "host",
+        "stock bootstrap requires host backend"
+    );
+    configuration_for_selection(
+        spec.profile.as_ref(),
+        Some(&spec.permissions),
+        Some(spec.sandbox_mode.clone()),
+        Some(spec.approval_policy.clone()),
+        Some(&spec.model),
+        Some(&spec.reasoning),
+    )
+}
+
+fn configuration_for_selection(
+    selected_profile: Option<&String>,
+    permission: Option<&str>,
+    sandbox: Option<String>,
+    approval: Option<String>,
+    selected_model: Option<&String>,
+    selected_reasoning: Option<&String>,
+) -> anyhow::Result<StockConfiguration> {
+    use crate::profiles::model::{AccountsStore, CliKind, RuntimeConfig};
     let config = crate::config::store::load_codez_config_checked()?;
-    let inherited = record.profile.is_none();
-    let name = record
-        .profile
-        .as_ref()
+    let inherited = selected_profile.is_none();
+    let name = selected_profile
         .or(config.default_profile.as_ref())
         .context("stock inherited profile unavailable; explicit current default required")?;
     ensure!(!name.trim().is_empty(), "stock profile is empty");
@@ -479,7 +541,6 @@ pub fn current_configuration(record: &CutexSessionRecord) -> anyhow::Result<Stoc
             && provider.wire_api == "responses",
         "only private loopback unauthenticated fake Responses provider is supported"
     );
-    let (sandbox, approval) = crate::runtime::args::effective_runtime_permission_defaults(record);
     let sandbox = sandbox.context("explicit stock sandbox required")?;
     ensure!(
         matches!(
@@ -489,19 +550,15 @@ pub fn current_configuration(record: &CutexSessionRecord) -> anyhow::Result<Stoc
         "unsupported stock sandbox"
     );
     // Approval remains explicit: do not silently turn full access into never.
-    ensure!(
-        record.approval_policy.is_some(),
-        "explicit stock approval policy required"
-    );
     let approval = approval.context("explicit stock approval policy required")?;
     ensure!(
         matches!(approval.as_str(), "untrusted" | "on-request" | "never"),
         "unsupported stock approval policy"
     );
-    if let Some(permission) = &record.permission_defaults {
+    if let Some(permission) = permission {
         ensure!(
             matches!(
-                (permission.as_str(), sandbox.as_str()),
+                (permission, sandbox.as_str()),
                 ("read-only", "read-only")
                     | ("workspace", "workspace-write")
                     | ("full-access", "danger-full-access")
@@ -509,14 +566,13 @@ pub fn current_configuration(record: &CutexSessionRecord) -> anyhow::Result<Stoc
             "unknown or inconsistent stock permission alias"
         );
     }
-    let model = record.model_defaults.clone().unwrap_or(profile.model);
+    let model = selected_model.cloned().unwrap_or(profile.model);
     ensure!(
         !model.trim().is_empty() && !model.chars().any(char::is_control),
         "invalid stock model"
     );
-    let reasoning = record
-        .reasoning_defaults
-        .clone()
+    let reasoning = selected_reasoning
+        .cloned()
         .or(profile.model_reasoning_effort);
     ensure!(
         reasoning

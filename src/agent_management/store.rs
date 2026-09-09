@@ -30,6 +30,8 @@ const MUTATION_LOCK_FILE: &str = "agent-management-mutation-v1.lock";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentManagementSnapshot {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bootstrap_intents: BTreeMap<AgentActionId, super::BootstrapIntentReview>,
     /// Read-only durable projection, never persisted into roster history.
     #[serde(skip)]
     pub reversible_archive_projection: BTreeMap<crate::role_revision::CutexSessionId, bool>,
@@ -105,6 +107,7 @@ pub struct AgentManagementSnapshot {
 impl AgentManagementSnapshot {
     fn empty() -> Self {
         Self {
+            bootstrap_intents: BTreeMap::new(),
             reversible_archive_projection: BTreeMap::new(),
             agent_archive_actions: BTreeMap::new(),
             agent_archive_audit: BTreeMap::new(),
@@ -276,7 +279,20 @@ fn prepare_private_root(root: &Path) -> Result<(), AgentManagementError> {
 fn read_snapshot(root: &Path) -> Result<AgentManagementSnapshot, AgentManagementError> {
     let path = root.join(STORE_FILE);
     match fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| AgentManagementError::InvalidStore),
+        Ok(bytes) => {
+            let state: AgentManagementSnapshot =
+                serde_json::from_slice(&bytes).map_err(|_| AgentManagementError::InvalidStore)?;
+            if !state.bootstrap_intents.is_empty() && state.schema != AgentManagementStoreSchema::V2
+            {
+                return Err(AgentManagementError::InvalidStore);
+            }
+            for (action, intent) in &state.bootstrap_intents {
+                if &intent.request.action_id != action || intent.spec().is_err() {
+                    return Err(AgentManagementError::InvalidStore);
+                }
+            }
+            Ok(state)
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             Ok(AgentManagementSnapshot::empty())
         }
