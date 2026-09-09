@@ -1,6 +1,7 @@
 # S8a private reviewed Management bootstrap
 
-Work in progress; not a release or live Management acceptance.
+Private integration candidate; not a release or live Management acceptance.
+Executable evidence and limitations: `management-bootstrap-s8a-result.md`.
 Base `29a0539f0395eb45581b813e4795ed1c8d3f0cea`.
 Native stays `a83dbb47ba6aa775f5d4b679fafc532c4db74c7f`, bundle3 /
 explicit-launch contract2. No native, Task, Job, TUI or default-launch change.

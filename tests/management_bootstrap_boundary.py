@@ -83,6 +83,7 @@ if fault_mode:
     assert bus.wait(timeout=10)==86
     journal=json.loads((CONF/'runtime/agent-management/v1/agent-management-v1.json').read_text())
     staged=journal['actions']['s8a-create']
+    (RUN/'crash-stage.json').write_text(json.dumps({'exit':86,'cutpoint':fault_mode,'journal':staged}))
     assert staged['known_successor_cutex_session'] is None
     assert (staged['known_native_session_id'] is None)==(fault_mode=='pre-id')
     native_files=list((NATIVE/'sessions').glob('**/*.jsonl'))
@@ -139,6 +140,11 @@ try:
     terminal.prompt(b'Private Human input after neutral Management create')
     terminal.wait(b'Private external data observed')
     assert Model.calls==1
+    # Output can precede the terminal's turn-completed notification. Use the
+    # native explicit Exit command, not two Ctrl+C bytes racing completion.
+    # This exits only the client; the bound app-server remains the same owner.
+    terminal.prompt(b'/exit')
+    terminal.child.wait(timeout=30)
 finally:terminal.close()
 assert store()['sessions'][ident]['runtime_generation']==runtime['expected_generation']
 (RUN/'result.json').write_text(json.dumps({'facts':facts,'neutral_model_calls':0,'cli_model_calls':Model.calls,'source':'actual root/Director/provider/native/CLI path; private actors and fake Responses'}))
