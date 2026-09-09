@@ -815,7 +815,7 @@ pub(super) fn render_details(
     );
 }
 
-fn render_styled_details(
+pub(super) fn render_styled_details(
     frame: &mut Frame<'_>,
     area: Rect,
     title: Option<&str>,

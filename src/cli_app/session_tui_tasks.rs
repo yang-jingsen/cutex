@@ -21,7 +21,7 @@ use crossterm::terminal::{
 };
 use cutex::agent_bus::client::agent_bus_fetch_agents_if_healthy;
 use cutex::agent_bus::model::AgentBusAgent;
-use cutex::agent_management::ProjectId;
+use cutex::agent_management::{ProjectId, ProjectPaletteColor};
 use cutex::config::store::load_codez_config;
 use cutex::management::control_plane::{
     HumanManagementTaskQueryRequest, HumanManagementTaskQueryResponse,
@@ -35,20 +35,20 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState};
 use ratatui::{Frame, Terminal};
 use tui_input::{Input, InputRequest};
 use uuid::Uuid;
 
 use super::management_control_plane::ManagementControlClient;
 use super::session_tui::footer_hints;
+use super::session_tui_view::{self as views, DetailScroll};
 use super::session_tui_workspace::{
     primary_panel_shortcut, primary_panel_tabs, PrimaryPanel, PrimaryPanelOutcome,
 };
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
-const ACTIVITY_LIMIT: usize = 96;
 
 type TaskTerminal = Terminal<CrosstermBackend<Stdout>>;
 
@@ -100,6 +100,7 @@ struct AgentJoin {
 struct TaskProjectPresentation {
     display_name: String,
     badge_label: String,
+    color: ProjectPaletteColor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,6 +137,7 @@ impl TaskRow {
                 "{} {} ({})",
                 presentation.badge_label, presentation.display_name, self.project_id
             ),
+            None if self.project_id == "-" => "-".to_string(),
             None => format!("unavailable ({})", self.project_id),
         }
     }
@@ -240,7 +242,7 @@ fn task_rows(
                     .project_id
                     .as_ref()
                     .map(ToString::to_string)
-                    .unwrap_or_else(|| "unscoped".to_string()),
+                    .unwrap_or_else(|| "-".to_string()),
                 project_presentation: assignment
                     .project_id
                     .as_ref()
@@ -298,6 +300,7 @@ fn exact_project_presentations(
                         TaskProjectPresentation {
                             display_name: presentation.display_name.clone(),
                             badge_label: presentation.badge_label.clone(),
+                            color: presentation.color,
                         },
                     )
                 })
@@ -326,19 +329,11 @@ fn merged_activity(attempt: Option<&DirectorAttemptView>) -> String {
         .into_iter()
         .find(|value| !value.trim().is_empty())
         .unwrap_or("-");
-    bounded_single_line(text, ACTIVITY_LIMIT)
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn bounded_single_line(value: &str, max: usize) -> String {
-    let mut value = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if value.chars().count() > max {
-        value = value
-            .chars()
-            .take(max.saturating_sub(1))
-            .collect::<String>();
-        value.push('…');
-    }
-    value
+    views::clipped(&value.split_whitespace().collect::<Vec<_>>().join(" "), max)
 }
 
 #[derive(Debug, Clone)]
@@ -349,6 +344,7 @@ pub(super) struct TaskModel {
     filter_focused: bool,
     show_closed: bool,
     detail: bool,
+    detail_scroll: DetailScroll,
     loading: bool,
     warning: Option<String>,
     refreshed_at: Option<Instant>,
@@ -363,6 +359,7 @@ impl Default for TaskModel {
             filter_focused: false,
             show_closed: false,
             detail: false,
+            detail_scroll: DetailScroll::default(),
             loading: true,
             warning: None,
             refreshed_at: None,
@@ -648,6 +645,9 @@ fn handle_key(
         }
         return None;
     }
+    if model.detail && model.detail_scroll.handle(key) {
+        return None;
+    }
     match key.code {
         KeyCode::Esc => {
             if model.detail {
@@ -668,11 +668,17 @@ fn handle_key(
         }
         KeyCode::Right => return None,
         KeyCode::Tab if model.detail => model.detail = false,
-        KeyCode::Tab => model.detail = model.selected_row().is_some(),
+        KeyCode::Tab => {
+            model.detail = model.selected_row().is_some();
+            model.detail_scroll.reset();
+        }
         KeyCode::BackTab => model.detail = false,
         KeyCode::Up => model.move_selection(-1),
         KeyCode::Down => model.move_selection(1),
-        KeyCode::Enter => model.detail = model.selected_row().is_some(),
+        KeyCode::Enter => {
+            model.detail = model.selected_row().is_some();
+            model.detail_scroll.reset();
+        }
         KeyCode::Char('/') => model.filter_focused = true,
         _ => {}
     }
@@ -724,8 +730,8 @@ fn render(frame: &mut Frame<'_>, model: &TaskModel) {
         ])
     } else if model.detail {
         footer_hints(&[
-            ("←/BackTab/Tab/Esc", "close inspector"),
-            ("↑/↓", "select"),
+            ("Esc/Tab", "close"),
+            ("↑/↓ PgUp/PgDn", "scroll"),
             ("F5", "refresh"),
         ])
     } else {
@@ -783,42 +789,31 @@ fn render_filter(frame: &mut Frame<'_>, area: Rect, model: &TaskModel) {
 
 fn render_table(frame: &mut Frame<'_>, area: Rect, model: &TaskModel) {
     let visible = model.visible_indices();
-    let wide = area.width >= 100;
+    let columns = task_columns(area.width);
+    let selected = model.selected_visible_index();
     let rows = visible
         .iter()
-        .map(|index| task_table_row(&model.rows[*index], wide))
+        .enumerate()
+        .map(|(visible_index, index)| {
+            task_table_row(
+                &model.rows[*index],
+                selected == Some(visible_index),
+                &columns,
+            )
+        })
         .collect::<Vec<_>>();
-    let header = Row::new(["TASK", "ST", "AGENT", "TRY", "UPDATED", "ACTIVITY"])
+    let header = Row::new(columns.iter().map(|(column, _)| column.label()))
         .style(Style::new().fg(Color::Gray).add_modifier(Modifier::BOLD))
         .bottom_margin(1);
-    let widths = if wide {
-        vec![
-            Constraint::Length(20),
-            Constraint::Length(8),
-            Constraint::Length(22),
-            Constraint::Length(5),
-            Constraint::Length(12),
-            Constraint::Min(18),
-        ]
-    } else {
-        vec![
-            Constraint::Length(12),
-            Constraint::Length(7),
-            Constraint::Length(16),
-            Constraint::Length(4),
-            Constraint::Length(9),
-            Constraint::Min(10),
-        ]
-    };
-    let table = Table::new(rows, widths)
-        .header(header)
-        .column_spacing(1)
-        .highlight_symbol("> ")
-        .row_highlight_style(
-            Style::new()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        );
+    let table = Table::new(
+        rows,
+        columns.iter().map(|(_, width)| Constraint::Length(*width)),
+    )
+    .header(header)
+    .column_spacing(1)
+    .highlight_symbol("> ")
+    // Row styles carry selection so semantic status and badge colors survive.
+    .row_highlight_style(Style::new());
     let mut state = TableState::default().with_selected(model.selected_visible_index());
     frame.render_stateful_widget(table, area, &mut state);
     if visible.is_empty() && area.height > 2 {
@@ -841,29 +836,143 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, model: &TaskModel) {
     }
 }
 
-fn task_table_row(row: &TaskRow, wide: bool) -> Row<'static> {
-    let task = if wide {
-        format!("{} r{}", row.task_id, row.task_revision)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskColumn {
+    Task,
+    State,
+    Agent,
+    Attempt,
+    Updated,
+    Activity,
+}
+
+impl TaskColumn {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Task => "TASK",
+            Self::State => "STATE",
+            Self::Agent => "AGENT",
+            Self::Attempt => "TRY",
+            Self::Updated => "UPDATED",
+            Self::Activity => "ACTIVITY",
+        }
+    }
+}
+
+fn task_columns(width: u16) -> Vec<(TaskColumn, u16)> {
+    // Two cells are reserved for the selection marker and one between columns.
+    if width >= 110 {
+        return vec![
+            (TaskColumn::Task, 32),
+            (TaskColumn::State, 8),
+            (TaskColumn::Agent, 22),
+            (TaskColumn::Attempt, 4),
+            (TaskColumn::Updated, 8),
+            (TaskColumn::Activity, width - 81),
+        ];
+    }
+    if width >= 78 {
+        return vec![
+            (TaskColumn::Task, 26),
+            (TaskColumn::State, 8),
+            (TaskColumn::Agent, 18),
+            (TaskColumn::Attempt, 4),
+            (TaskColumn::Updated, 7),
+            (TaskColumn::Activity, width - 70),
+        ];
+    }
+    if width >= 52 {
+        return vec![
+            (TaskColumn::Task, width - 24),
+            (TaskColumn::State, 8),
+            (TaskColumn::Attempt, 4),
+            (TaskColumn::Updated, 7),
+        ];
+    }
+    if width < 38 {
+        if width < 14 {
+            return vec![(TaskColumn::Task, width.saturating_sub(2).max(1))];
+        }
+        return vec![
+            (TaskColumn::Task, width.saturating_sub(11)),
+            (TaskColumn::State, 8),
+        ];
+    }
+    vec![
+        (TaskColumn::Task, width - 19),
+        (TaskColumn::State, 8),
+        (TaskColumn::Updated, 7),
+    ]
+}
+
+fn task_name_line(row: &TaskRow, width: usize) -> Line<'static> {
+    if width < 6 {
+        return Line::from(views::clipped(&row.task_id, width));
+    }
+    let badge = row.project_presentation.as_ref().map_or_else(
+        || Span::raw("    "),
+        |project| {
+            let label = views::clipped(&project.badge_label, 2);
+            Span::styled(
+                format!(
+                    " {}{} ",
+                    label,
+                    " ".repeat(
+                        2usize
+                            .saturating_sub(unicode_width::UnicodeWidthStr::width(label.as_str(),))
+                    )
+                ),
+                super::session_tui_cutex_projects::project_badge_style(project.color),
+            )
+        },
+    );
+    let revision = format!(" r{}", row.task_revision);
+    let show_revision = width >= 24;
+    let text_width = width.saturating_sub(5);
+    let text = if show_revision {
+        views::clipped(&format!("{}{}", row.task_id, revision), text_width)
     } else {
-        bounded_single_line(&row.task_id, 12)
+        views::clipped(&row.task_id, text_width)
     };
-    let agent = if wide {
-        row.agent_label()
-    } else {
-        bounded_single_line(&row.agent_label(), 16)
-    };
-    Row::new([
-        Cell::from(task),
-        Cell::from(row.state.label()).style(row.state.style()),
-        Cell::from(agent),
-        Cell::from(
-            row.attempt_number
-                .map(|number| number.to_string())
-                .unwrap_or_else(|| "-".to_string()),
-        ),
-        Cell::from(format_age(&row.updated_at, Utc::now())).style(Style::new().fg(Color::Gray)),
-        Cell::from(row.activity.clone()).style(Style::new().fg(Color::Gray)),
+    Line::from(vec![
+        badge,
+        Span::raw(" "),
+        Span::styled(text, Style::new().add_modifier(Modifier::BOLD)),
     ])
+}
+
+fn task_table_row(row: &TaskRow, selected: bool, columns: &[(TaskColumn, u16)]) -> Row<'static> {
+    Row::new(columns.iter().map(|(column, width)| {
+        let width = usize::from(*width);
+        match column {
+            TaskColumn::Task => Cell::from(task_name_line(row, width)),
+            TaskColumn::State => {
+                Cell::from(views::clipped(row.state.label(), width)).style(row.state.style())
+            }
+            TaskColumn::Agent => Cell::from(views::clipped(&row.agent_label(), width)),
+            TaskColumn::Attempt => Cell::from(
+                row.attempt_number
+                    .map(|number| number.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
+            TaskColumn::Updated => Cell::from(views::clipped(
+                &format_age(&row.updated_at, Utc::now()),
+                width,
+            ))
+            .style(Style::new().fg(Color::Gray)),
+            TaskColumn::Activity => {
+                Cell::from(views::clipped(&row.activity, width)).style(Style::new().fg(Color::Gray))
+            }
+        }
+    }))
+    .style(if selected {
+        Style::new()
+            .bg(super::session_tui_layout::SELECTION)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::new()
+    })
 }
 
 fn format_age(value: &str, now: DateTime<Utc>) -> String {
@@ -888,81 +997,64 @@ fn format_age(value: &str, now: DateTime<Utc>) -> String {
 }
 
 fn render_detail(frame: &mut Frame<'_>, area: Rect, model: &TaskModel) {
-    frame.render_widget(Clear, area);
     let content = model
         .selected_row()
         .map(|row| {
             vec![
+                detail_field("Task", row.task_id.clone()),
+                detail_field("Revision", row.task_revision.to_string()),
+                detail_field("Assignment", row.assignment_id.clone()),
+                detail_field("Project", row.project_label()),
+                detail_field("Project ID", row.project_id.clone()),
+                detail_field("Assignee", row.assignee_session_id.clone()),
+                detail_field("Agent", row.agent_label()),
                 Line::from(vec![
-                    Span::styled("Task: ", Style::new().add_modifier(Modifier::BOLD)),
-                    Span::raw(format!("{} r{}", row.task_id, row.task_revision)),
-                ]),
-                Line::from(vec![
-                    Span::styled("Assignment: ", Style::new().add_modifier(Modifier::BOLD)),
-                    Span::raw(row.assignment_id.clone()),
-                ]),
-                Line::from(vec![
-                    Span::styled("Project: ", Style::new().add_modifier(Modifier::BOLD)),
-                    Span::raw(row.project_label()),
-                ]),
-                Line::from(vec![
-                    Span::styled("Project ID: ", Style::new().add_modifier(Modifier::BOLD)),
-                    Span::raw(row.project_id.clone()),
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        "Assignee session: ",
-                        Style::new().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(row.assignee_session_id.clone()),
-                ]),
-                Line::from(vec![
-                    Span::styled("Agent: ", Style::new().add_modifier(Modifier::BOLD)),
-                    Span::raw(row.agent_label()),
-                ]),
-                Line::from(vec![
-                    Span::styled("State: ", Style::new().add_modifier(Modifier::BOLD)),
+                    detail_label("State"),
                     Span::styled(row.state.label(), row.state.style()),
-                    Span::raw(
-                        row.phase
-                            .as_deref()
-                            .map(|phase| format!(" ({phase})"))
-                            .unwrap_or_default(),
-                    ),
                 ]),
-                Line::from(vec![
-                    Span::styled(
-                        "Attempt / updated: ",
-                        Style::new().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(format!(
-                        "{} / {}",
-                        row.attempt_number
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "-".to_string()),
-                        row.updated_at
-                    )),
-                ]),
+                detail_field(
+                    "Phase",
+                    row.phase.clone().unwrap_or_else(|| "-".to_string()),
+                ),
+                detail_field(
+                    "Attempt",
+                    row.attempt_number
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                ),
+                detail_field("Updated", row.updated_at.clone()),
                 Line::from(""),
                 Line::from(Span::styled(
                     "Activity",
-                    Style::new().add_modifier(Modifier::BOLD),
+                    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 )),
                 Line::from(row.activity.clone()),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "Read-only Task Service view. Esc closes.",
+                    "Read-only · ↑/↓ PgUp/PgDn scroll · Esc closes",
                     Style::new().fg(Color::DarkGray),
                 )),
             ]
         })
         .unwrap_or_else(|| vec![Line::from("Selected task is no longer visible.")]);
-    frame.render_widget(
-        Paragraph::new(content)
-            .wrap(Wrap { trim: true })
-            .block(Block::bordered().title(" Task details ")),
+    views::render_styled_details(
+        frame,
         area,
+        Some(" Task details "),
+        content,
+        &model.detail_scroll,
     );
+}
+
+fn detail_label(label: &str) -> Span<'static> {
+    Span::styled(
+        format!("{label:<12}"),
+        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )
+}
+
+fn detail_field(label: &str, value: String) -> Line<'static> {
+    Line::from(vec![detail_label(label), Span::raw(value)])
 }
 
 fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
@@ -1018,7 +1110,19 @@ mod tests {
     }
     use super::*;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
     use std::time::Duration;
+
+    fn buffer_text(buffer: &Buffer) -> String {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     fn row(id: &str, state: TaskState, updated_at: &str) -> TaskRow {
         TaskRow {
@@ -1026,6 +1130,7 @@ mod tests {
             project_presentation: Some(TaskProjectPresentation {
                 display_name: "Alpha Project".to_string(),
                 badge_label: "AP".to_string(),
+                color: ProjectPaletteColor::Magenta,
             }),
             task_id: format!("task-{id}"),
             task_revision: 1,
@@ -1134,6 +1239,7 @@ mod tests {
         let alpha_presentation = presentations.get(&alpha).cloned().unwrap();
         assert_eq!(alpha_presentation.display_name, "Core Platform");
         assert_eq!(alpha_presentation.badge_label, "CP");
+        assert_eq!(alpha_presentation.color, ProjectPaletteColor::Magenta);
         assert!(!presentations.contains_key(&beta));
 
         let mut alpha_row = row("alpha", TaskState::Running, "2026-01-01T00:00:00Z");
@@ -1144,6 +1250,117 @@ mod tests {
         assert!(alpha_row.matches("project-alpha"));
         assert!(!beta_row.matches("project-alpha"));
         assert_eq!(beta_row.project_label(), "unavailable (project-beta)");
+        beta_row.project_id = "-".to_string();
+        assert_eq!(beta_row.project_label(), "-");
+    }
+
+    #[test]
+    fn responsive_columns_fit_and_keep_primary_task_first() {
+        for width in [10, 20, 30, 38, 52, 77, 78, 109, 110, 160] {
+            let columns = task_columns(width);
+            let used = columns.iter().map(|(_, width)| *width).sum::<u16>()
+                + columns.len().saturating_sub(1) as u16
+                + 2;
+            assert!(used <= width, "{width}: {columns:?}");
+            assert_eq!(columns[0].0, TaskColumn::Task);
+            if width >= 14 {
+                assert!(columns
+                    .iter()
+                    .any(|(column, _)| *column == TaskColumn::State));
+            }
+        }
+    }
+
+    #[test]
+    fn configured_badge_survives_selection_and_unicode_at_all_layouts() {
+        let mut task = row(
+            "任务-非常长的标识",
+            TaskState::Blocked,
+            "2026-01-01T00:00:00Z",
+        );
+        task.task_id = "任务-非常长的标识-abcdef0123456789".to_string();
+        let model = TaskModel {
+            rows: vec![task],
+            selected_assignment_id: Some("任务-非常长的标识".to_string()),
+            ..Default::default()
+        };
+        for width in [38, 58, 88, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 18)).unwrap();
+            terminal.draw(|frame| render(frame, &model)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let output = buffer_text(buffer);
+            assert!(output.contains("AP"), "width={width}\n{output}");
+            assert!(
+                output.contains('任') && output.contains('务'),
+                "width={width}\n{output}"
+            );
+            // Header y=5, margin y=6, selected row y=7; badge begins after "> ".
+            assert_eq!(buffer[(3, 7)].bg, Color::LightMagenta);
+            assert_eq!(buffer[(3, 7)].fg, Color::Black);
+            assert_eq!(
+                buffer[(12, 7)].bg,
+                super::super::session_tui_layout::SELECTION
+            );
+        }
+    }
+
+    #[test]
+    fn unset_badge_reserves_alignment_slot() {
+        let with_badge = row("badge", TaskState::Running, "2026-01-01T00:00:00Z");
+        let mut without_badge = row("blank", TaskState::Running, "2026-01-01T00:00:00Z");
+        without_badge.project_presentation = None;
+        let columns = task_columns(80);
+        let first = task_table_row(&with_badge, false, &columns);
+        let second = task_table_row(&without_badge, false, &columns);
+        let mut terminal = Terminal::new(TestBackend::new(80, 4)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Table::new(
+                        vec![first, second],
+                        columns.iter().map(|(_, width)| Constraint::Length(*width)),
+                    )
+                    .column_spacing(1),
+                    frame.area(),
+                )
+            })
+            .unwrap();
+        let output = buffer_text(terminal.backend().buffer());
+        assert!(output.contains(" AP  task-badge"));
+        assert!(output.contains("     task-blank"));
+    }
+
+    #[test]
+    fn detail_scroll_reaches_long_exact_identifiers_and_activity_tail() {
+        let mut task = row("detail", TaskState::ReviewReady, "2026-09-09T01:02:03Z");
+        task.assignment_id = format!("assignment-{}-TAIL", "甲乙丙丁".repeat(24));
+        task.assignee_session_id = format!("cutex.{}-SESSION-END", "worker".repeat(20));
+        task.activity = format!("/very/long/{}/result.json", "目录/".repeat(50));
+        let mut model = TaskModel {
+            selected_assignment_id: Some(task.assignment_id.clone()),
+            rows: vec![task],
+            detail: true,
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(74, 14)).unwrap();
+        terminal.draw(|frame| render(frame, &model)).unwrap();
+        let first = buffer_text(terminal.backend().buffer());
+        assert!(first.contains("Task details"));
+        assert!(first.contains("assignment-"));
+        assert!(!first.contains("result.json"));
+        handle_key(
+            &mut model,
+            &mut RefreshCadence::new(Instant::now()),
+            KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+        );
+        terminal.draw(|frame| render(frame, &model)).unwrap();
+        let last = buffer_text(terminal.backend().buffer());
+        assert!(last.contains("result.json"), "{last}");
+        assert!(last.contains("Read-only"), "{last}");
+        assert_eq!(
+            model.selected_assignment_id.as_deref(),
+            Some(model.rows[0].assignment_id.as_str())
+        );
     }
 
     #[test]
