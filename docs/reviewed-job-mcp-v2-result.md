@@ -46,6 +46,11 @@ neutral history was empty, zero model calls, and native inventory reported
 connected `cutex_job` with submit/query/read_output/cancel. This is native
 discovery, not a claimed model-selected Management create.
 
+Separate c4 `None` passed on the same exact bytes with its cwd trusted before
+review: one durable/native identity, Ready generation1, exact replay, empty
+neutral history, zero model calls. Native inventory contains only `cutex`, not
+`cutex_job`. No Job descriptor was silently inherited from the Director runtime.
+
 Seven negative-only stdio requests against the same real adapter/Bus/daemon
 rejected missing metadata, foreign thread, external policy, forged subscriber,
 empty argv, wrong API credential and missing occurrence without creating a Job.
@@ -73,6 +78,10 @@ positive actual Core automatic-metadata proof above. No grants were hand-signed.
   the already pretrusted `new-agent` fixture directory; no pin relaxation or
   shared-config change after review is allowed.
 
+All completed fixture processes exited through their owned-handle cleanup;
+the VM remains running. Original c2/c3 files and captured uncertain native
+history are preserved. No original action was changed into a duplicate create.
+
 The unit/provider tests prove full-record legacy hashing, v1 wire omission,
 unknown-version refusal, historical Ready replay without runtime calls or file
 changes, and changed version/config/authority replay conflicts. V2 tests compare
@@ -90,3 +99,23 @@ Prior S2/S46/PID/socket risks remain disclosed, not remediated here.
 Temporal stale-occurrence/retirement race permutations were not independently
 repeated end to end on these bytes; missing/foreign occurrence refusal and
 unchanged provider guards are not labelled equivalent proof of every race.
+Validation remains expensive (the observed review took45seconds); this task
+does not weaken hashing/custody checks or introduce a performance cache.
+Resource observation: Mambo task13GiB/free376GiB; guest upload5.2GiB/free51GiB,
+within the respective20/8GiB budgets and100/30GiB free-space floors.
+
+## Handoff
+
+**Feature integration candidate only**, subject to Director acceptance. The
+minimum remaining external gate is separately authorized real-provider and
+deployment/PRH pairing validation; this result does not authorize it. Do not
+mix old writers, rewrite old reviews/history, or treat rollback as safe history
+downgrade. Before exposure reject/revert this candidate; preserve experimental
+stores and reviewed artifacts for explicit recovery instead of clearing markers.
+
+Compact evidence is in owner root `artifacts/reviewed-job-launch-v2/`:
+`build-manifest.json`, `v2-result.json`, `v2-review.json`, `c3-some.json`,
+`c4-result.json`, `negative-adapter.json`, and preserved c2/c3 refusal receipts.
+Guest full fixtures remain under `acceptance-upload/job-launch-r1/{v2,c2,c3,c4}`.
+No claim that direct negative transport is an automatic Core call, that A4 is
+business success, or that every stale/retired temporal permutation was exercised.
