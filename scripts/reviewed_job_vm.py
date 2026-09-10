@@ -30,13 +30,16 @@ for candidate in socket_candidates:
     assert not os.path.lexists(candidate)
 print(json.dumps({'preflight':'owned-new-short-path','socketBytes':[len(os.fsencode(p)) for p in socket_candidates]}),flush=True)
 
-def record_digest(record):
+def record_digest(record, version=2):
     # Disk is serde_json::to_vec_pretty(CutexSessionStore); preserve its typed
     # field order and remove whitespace, matching request_sha256(record).
-    return hashlib.sha256(json.dumps(record,ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
+    assert version in (1,2)
+    if version==2:
+        record={k:v for k,v in record.items() if k not in ('last_seen_at','updated_at')}
+    return hashlib.sha256(json.dumps(record,ensure_ascii=False,separators=(',',':'),sort_keys=version==2).encode()).hexdigest()
 
 def diagnose_review(g, descriptor):
-    """Read-only: one real review, natural registration writes, no confirm."""
+    """One original V2 review, natural heartbeat, exactly one confirmation."""
     import ctypes
     import select
     import struct
@@ -80,8 +83,21 @@ def diagnose_review(g, descriptor):
         assert refresh.wait(timeout=45),'no natural registration observation within bound'
         final=capture('final-observation')
         changed={k:{'before':before['record'].get(k),'after':final['record'].get(k)} for k in set(before['record'])|set(final['record']) if before['record'].get(k)!=final['record'].get(k)}
-        result={'reviewSeconds':returned,'reviewDigest':review['subject']['durable_sha256'],'beforeDigest':before['digest'],'returnDigest':after['digest'],'finalDigest':final['digest'],'matchingObservationLabels':[x['label'] for x in observations if x['digest']==review['subject']['durable_sha256']],'changedFields':changed,'confirmationSent':False}
+        assert review['digest_version']==2
+        assert changed and set(changed)<= {'last_seen_at','updated_at'},changed
+        assert before['digest']==after['digest']==final['digest']==review['subject']['durable_sha256']
+        result={'reviewSeconds':returned,'reviewDigest':review['subject']['durable_sha256'],'beforeDigest':before['digest'],'returnDigest':after['digest'],'finalDigest':final['digest'],'changedFields':changed,'confirmationSent':True}
         (g['RUN']/'review-diagnosis.json').write_text(json.dumps(result,indent=2))
+        request={'operation':'run','action_id':'heartbeat-reviewed-restart','review':review}
+        current=g['action'](request)
+        (g['RUN']/'restart-receipt.json').write_text(json.dumps(current,indent=2))
+        assert current['stage']=='ready'
+        assert current['expected_generation']==before['record']['runtime_generation']+1
+        assert current['review']==review and g['action'](request)==current
+        g['stock_pids'].append(current['binding']['pid'])
+        result.update({'ready':True,'exactReplay':True,'generation':current['expected_generation']})
+        (g['RUN']/'review-diagnosis.json').write_text(json.dumps(result,indent=2))
+        return current
     finally:
         stop.set(); observer.join(timeout=2); os.close(fd)
 
@@ -162,7 +178,7 @@ def prepared_launch(g):
     assert current['stage']=='ready' and g['action'](request)==current
     g['stock_pids'].append(current['binding']['pid'])
     if MODE=='readonly':
-        diagnose_review(g,descriptor)
+        current=diagnose_review(g,descriptor)
     (root/'review.json').write_text(json.dumps(review,indent=2))
     (root/'launch-receipt.json').write_text(json.dumps(current,indent=2))
     return current
@@ -224,7 +240,7 @@ assert hashlib.sha256(base.encode()).hexdigest()=='ed1ebdb57d413db2f3f382aa65c1b
 assert base.count('    current=launch(durable,\'vm-job-subscriber\')')==1
 base = base.replace("CUTEX = FROZEN/'package/artifacts/linux/cutex'", "CUTEX = ROOT/'bin/cutex'")
 base = base.replace("MCP = FROZEN/'package/artifacts/linux/cutex-mcp'", "MCP = ROOT/'bin/cutex-mcp'")
-base = base.replace("CUTEX = ROOT/'bin/cutex'", "CUTEX = ROOT/'bin/cutex-final-5f752958'")
+base = base.replace("CUTEX = ROOT/'bin/cutex'", "CUTEX = ROOT/'bin/cutex-reviewed-v2'")
 base = base.replace("model = http.server.ThreadingHTTPServer", "Model.do_POST = model_response\nmodel = http.server.ThreadingHTTPServer")
 base = base.replace('actual Job daemon/process/completion; actual separate Job MCP adapter issuer, harness-driven trusted metadata', 'actual native Core configured MCP; per-scenario results below, fake Responses, no injected metadata')
 if MODE=='readonly':

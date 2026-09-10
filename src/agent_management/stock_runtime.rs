@@ -15,6 +15,8 @@ use std::path::Path;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StockRuntimeReview {
+    #[serde(default, skip_serializing_if = "RuntimeReviewDigestVersion::is_legacy")]
+    pub digest_version: RuntimeReviewDigestVersion,
     pub subject: ExplicitLaunchSubject,
     pub contract: ExplicitLaunchContract,
     pub configuration: StockConfiguration,
@@ -26,6 +28,53 @@ pub struct StockRuntimeReview {
         skip_serializing_if = "crate::launch::stock::CanonicalBytePolicy::is_default"
     )]
     pub receiver_canonical_byte_limit: crate::launch::stock::CanonicalBytePolicy,
+}
+
+/// Version 1 is the historical typed full-record serialization. Never upgrade
+/// an incoming/persisted review at execution. Version 2 excludes only telemetry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u8", into = "u8")]
+pub enum RuntimeReviewDigestVersion {
+    #[default]
+    FullRecordV1,
+    SemanticV2,
+}
+impl TryFrom<u8> for RuntimeReviewDigestVersion {
+    type Error = &'static str;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::FullRecordV1),
+            2 => Ok(Self::SemanticV2),
+            _ => Err("unsupported runtime review digest version"),
+        }
+    }
+}
+impl From<RuntimeReviewDigestVersion> for u8 {
+    fn from(value: RuntimeReviewDigestVersion) -> Self {
+        match value {
+            RuntimeReviewDigestVersion::FullRecordV1 => 1,
+            RuntimeReviewDigestVersion::SemanticV2 => 2,
+        }
+    }
+}
+impl RuntimeReviewDigestVersion {
+    fn is_legacy(&self) -> bool {
+        *self == Self::FullRecordV1
+    }
+    fn digest(&self, record: &CutexSessionRecord) -> anyhow::Result<crate::role_revision::Sha256> {
+        match self {
+            Self::FullRecordV1 => Ok(super::store::request_sha256(record)?),
+            Self::SemanticV2 => {
+                let mut value = serde_json::to_value(record)?;
+                let object = value
+                    .as_object_mut()
+                    .expect("serialized session record object");
+                object.remove("last_seen_at");
+                object.remove("updated_at");
+                Ok(super::store::request_sha256(&value)?)
+            }
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -136,10 +185,11 @@ impl AgentManagementProvider {
                 .or_else(|| state.agents.get(id).map(|a| a.spec.name.clone()))
                 .ok_or_else(|| anyhow::anyhow!("formal Agent name unavailable"))?;
             Ok(StockRuntimeReview {
+                digest_version: RuntimeReviewDigestVersion::SemanticV2,
                 subject: ExplicitLaunchSubject {
                     cutex_session_id: id.clone(),
                     formal_name,
-                    durable_sha256: super::store::request_sha256(record)?,
+                    durable_sha256: RuntimeReviewDigestVersion::SemanticV2.digest(record)?,
                     authority_sha256: self.archive_authority_digest(&state, id)?,
                     current_project_id: project,
                     revision: record.revision,
@@ -202,7 +252,7 @@ impl AgentManagementProvider {
                         .get(id.as_str())
                         .ok_or_else(|| anyhow::anyhow!("stock durable record missing"))?;
                     anyhow::ensure!(
-                        super::store::request_sha256(record)? == review.subject.durable_sha256
+                        review.digest_version.digest(record)? == review.subject.durable_sha256
                             && record.revision == review.subject.revision
                             && record.runtime_generation == review.subject.runtime_generation,
                         "stock confirmation stale"
@@ -280,13 +330,22 @@ impl AgentManagementProvider {
             }
             if receipt.stage == StockRuntimeStage::Prepared {
                 anyhow::ensure!(
-                    super::store::request_sha256(record)? == review.subject.durable_sha256,
+                    review.digest_version.digest(record)? == review.subject.durable_sha256,
                     "stock prepared outcome uncertain; no repeated destructive stop"
                 );
                 save_receipt(path, &receipt)?;
+                // Reobserve after potentially expensive evidence validation.
+                // Compare to the ORIGINAL review, never mint a replacement CAS.
+                if let Some(job) = &review.job_mcp { job.validate(&bundle)?; }
+                let before_execution = load_cutex_session_store_from_path(path)?.sessions
+                    .remove(id.as_str()).ok_or_else(|| anyhow::anyhow!("stock durable record missing"))?;
+                anyhow::ensure!(review.digest_version.digest(&before_execution)? == review.subject.durable_sha256
+                    && before_execution.revision == review.subject.revision
+                    && before_execution.runtime_generation == review.subject.runtime_generation
+                    && current_configuration(&before_execution)? == review.configuration,
+                    "stock confirmation stale before execution; owner unchanged");
                 if review.restart {
-                    if let Some(job) = &review.job_mcp { job.validate(&bundle)?; }
-                    runtime.stop(record)?;
+                    runtime.stop(&before_execution)?;
                 }
                 receipt.publication = Some(runtime.publication(&receipt)?);
                 with_locked_session_store(path, |store| {
@@ -519,4 +578,226 @@ pub fn commit_stock_runtime_stop(path: &Path, expected: &CutexSessionRecord) -> 
         )?;
         save_locked_session_store(path, store)
     })
+}
+
+#[cfg(test)]
+mod review_digest_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn record() -> CutexSessionRecord {
+        CutexSessionRecord::new(
+            "cutex.digest-test".into(),
+            Some(uuid::Uuid::new_v4().to_string()),
+            "private".into(),
+            "/private".into(),
+            Some("alpha".into()),
+        )
+        .unwrap()
+    }
+    fn review(record: &CutexSessionRecord) -> StockRuntimeReview {
+        serde_json::from_value(json!({
+            "subject":{"cutex_session_id":record.cutex_session_id,"formal_name":"Explicit formal name","durable_sha256":RuntimeReviewDigestVersion::FullRecordV1.digest(record).unwrap(),"authority_sha256":"a".repeat(64),"current_project_id":null,"revision":record.revision,"runtime_generation":record.runtime_generation},
+            "contract":{"version":2,"native_id":record.codex_session_id,"native_home":"/private","bundle_manifest":"/private/manifest","bundle_sha256":"b".repeat(64)},
+            "configuration":{"profile_name":"alpha","profile_id":"private-profile","inherited":false,"profile_sha256":"c".repeat(64),"account_sha256":"d".repeat(64),"model":"private-model","reasoning":null,"model_provider":"private","provider":{"name":"private","base_url":"http://127.0.0.1:1/v1","wire_api":"responses","requires_openai_auth":false,"supports_websockets":false},"sandbox":"read-only","approval":"on-request"},
+            "restart":true
+        })).unwrap()
+    }
+
+    #[test]
+    fn runtime_review_digest_v2_excludes_only_two_observations() {
+        let base = record();
+        let old = RuntimeReviewDigestVersion::FullRecordV1
+            .digest(&base)
+            .unwrap();
+        assert_eq!(old, super::super::store::request_sha256(&base).unwrap());
+        let expected = RuntimeReviewDigestVersion::SemanticV2
+            .digest(&base)
+            .unwrap();
+        let mut refreshed = base.clone();
+        refreshed.last_seen_at = Some("2030-01-01T00:00:00Z".into());
+        refreshed.updated_at = "2030-01-01T00:00:00Z".into();
+        assert_eq!(
+            RuntimeReviewDigestVersion::SemanticV2
+                .digest(&refreshed)
+                .unwrap(),
+            expected
+        );
+        assert_ne!(
+            RuntimeReviewDigestVersion::FullRecordV1
+                .digest(&refreshed)
+                .unwrap(),
+            old
+        );
+        // Exact serialized input contains all other present fields, including
+        // future fields: no handwritten allowlist can silently omit one.
+        let mut semantic = serde_json::to_value(&base).unwrap();
+        semantic.as_object_mut().unwrap().remove("last_seen_at");
+        semantic.as_object_mut().unwrap().remove("updated_at");
+        assert_eq!(
+            super::super::store::request_sha256(&semantic).unwrap(),
+            expected
+        );
+        for (field, value) in [
+            ("revision", json!(base.revision + 1)),
+            ("runtime_generation", json!(1)),
+            ("cutex_session_id", json!("cutex.other")),
+            ("codex_session_id", json!(uuid::Uuid::new_v4().to_string())),
+            ("profile", json!("beta")),
+            ("formal_agent_name", json!("different formal name")),
+            ("managed_cwd", json!("/different")),
+            ("model_defaults", json!("different-model")),
+            ("permission_defaults", json!("full-access")),
+            ("approval_policy", json!("never")),
+            ("app_server_launch_claim_id", json!("different-claim")),
+            ("runtime_pid", json!(42)),
+            ("current_runtime_agent_id", json!("stock.other")),
+            ("lifecycle", json!("retired")),
+            ("agent_enabled", json!(!base.agent_enabled)),
+            ("agent_groups", json!(["different-group"])),
+            ("default_cli_args", json!(["--different"])),
+            (
+                "app_server_runtime",
+                json!({"transport":"unix_socket","endpoint":"unix:///private/s","pid":42,"runtime_dir":"/private","auth_token_path":null,"diagnostic_journal_path":"/private/j","schema_version":"private","schema_sha256":"e".repeat(64),"started_at":"2030-01-01T00:00:00Z"}),
+            ),
+        ] {
+            let mut value_record = serde_json::to_value(&base).unwrap();
+            value_record[field] = value;
+            let changed: CutexSessionRecord = serde_json::from_value(value_record).unwrap();
+            assert_ne!(
+                RuntimeReviewDigestVersion::SemanticV2
+                    .digest(&changed)
+                    .unwrap(),
+                expected,
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_review_version_legacy_wire_and_unknown_versions() {
+        let legacy = review(&record());
+        assert_eq!(
+            legacy.digest_version,
+            RuntimeReviewDigestVersion::FullRecordV1
+        );
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("digest_version"));
+        assert_eq!(
+            serde_json::to_vec(&serde_json::from_slice::<StockRuntimeReview>(&bytes).unwrap())
+                .unwrap(),
+            bytes
+        );
+        for version in [0, 3, 255, 256] {
+            let mut raw = serde_json::to_value(&legacy).unwrap();
+            raw["digest_version"] = json!(version);
+            assert!(serde_json::from_value::<StockRuntimeReview>(raw).is_err());
+        }
+        let mut new = legacy.clone();
+        new.digest_version = RuntimeReviewDigestVersion::SemanticV2;
+        assert_eq!(serde_json::to_value(&new).unwrap()["digest_version"], 2);
+        assert_ne!(new, legacy);
+    }
+
+    struct NeverRuntime;
+    impl StockRuntimeExecutor for NeverRuntime {
+        fn publication(&mut self, _: &StockRuntimeReceipt) -> anyhow::Result<StockPublication> {
+            panic!("unexpected runtime")
+        }
+        fn published_owner_absent(&mut self, _: &StockRuntimeReceipt) -> anyhow::Result<bool> {
+            panic!("unexpected runtime")
+        }
+        fn stop(&mut self, _: &CutexSessionRecord) -> anyhow::Result<()> {
+            panic!("unexpected runtime")
+        }
+        fn spawn(
+            &mut self,
+            _: &CutexSessionRecord,
+            _: &StockBundle,
+            _: &StockRuntimeReceipt,
+        ) -> anyhow::Result<CutexAppServerRuntimeBinding> {
+            panic!("unexpected runtime")
+        }
+        fn connect(
+            &mut self,
+            _: &CutexSessionRecord,
+            _: &StockRuntimeReceipt,
+        ) -> anyhow::Result<()> {
+            panic!("unexpected runtime")
+        }
+        fn cleanup_owned(&mut self) -> anyhow::Result<()> {
+            panic!("unexpected runtime")
+        }
+        fn retain_owner(&mut self) {
+            panic!("unexpected runtime")
+        }
+    }
+    #[test]
+    fn runtime_review_completed_legacy_replay_keeps_bytes_and_conflicts_on_changes() {
+        let root = std::env::temp_dir().join(format!("runtime-review-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let provider = AgentManagementProvider::open(root.join("management")).unwrap();
+        let tasks = crate::task_service::TaskServiceProvider::open(root.join("tasks")).unwrap();
+        let review = review(&record());
+        let action = AgentActionId::new("legacy-completed").unwrap();
+        let receipt = StockRuntimeReceipt {
+            action_id: action.clone(),
+            review: review.clone(),
+            stage: StockRuntimeStage::Ready,
+            claim_id: "old-claim".into(),
+            runtime_agent_id: "stock.old".into(),
+            expected_generation: 1,
+            binding: None,
+            publication: None,
+            error: None,
+            updated_at: "2030-01-01T00:00:00Z".into(),
+        };
+        let mut store = crate::session::model::CutexSessionStore::default();
+        store.explicit_launch_receipts.insert(
+            action.to_string(),
+            ExplicitLaunchActionReceipt::Runtime(receipt.clone()),
+        );
+        let path = root.join("sessions.json");
+        crate::session::store::save_cutex_session_store_to_path(&path, &store).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        {
+            let _execution = super::super::provider::provider_execution_lock()
+                .lock()
+                .unwrap();
+            let _mutation = provider.store().lock_mutations().unwrap();
+            let got = provider
+                .execute_stock_runtime_locked(&path, &action, &review, &tasks, &mut NeverRuntime)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_vec(&got).unwrap(),
+                serde_json::to_vec(&receipt).unwrap()
+            );
+            for field in ["digest_version", "configuration", "subject"] {
+                let mut changed = review.clone();
+                match field {
+                    "digest_version" => {
+                        changed.digest_version = RuntimeReviewDigestVersion::SemanticV2
+                    }
+                    "configuration" => changed.configuration.model = "different".into(),
+                    _ => {
+                        changed.subject.authority_sha256 =
+                            crate::role_revision::Sha256::new("f".repeat(64)).unwrap()
+                    }
+                }
+                assert!(provider
+                    .execute_stock_runtime_locked(
+                        &path,
+                        &action,
+                        &changed,
+                        &tasks,
+                        &mut NeverRuntime
+                    )
+                    .unwrap_err()
+                    .to_string()
+                    .contains("explicit_launch_action_conflict"));
+            }
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
