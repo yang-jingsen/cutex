@@ -80,3 +80,27 @@ ssh -t -F /mnt/mambo/vmstore/cutex-linux-acceptance/ssh/config cutex-linux-accep
 - 实际私有 PTY 同 owner attach 已显示 gpt-5.6-terra，未发送文字/Enter/审批；
   Ctrl+C 正常退出0，未强制杀 CLI，termios 恢复。接收端及三服务/观察器仍由出生身份核验存活。
   这不是 Job执行/模型最终回复验证；完整真实provider结果仍未证明。
+
+## Human 测试后的只读收尾
+
+Human 随后实际完成一次测试，报告 Submitted → 完成通知触发续行 →
+cutex_job.read_output → 正确最终 stdout。read_output 显示36字节、gap=false、
+truncated=false，内容为 private-read-success 换行接 real-job-output。
+
+只读持久化核对：仅1个 Job，actionId=human-fixed-job-1，
+job_9763f63c55844a3ca8cd294ed7824d3a，exited/exitCode0；completionDelivery=delivered，
+outbox acknowledged=true/delivered，包含 a4Receipt 字段，attemptCount9。
+通知尝试次数不等于 Job 执行次数；没有观测到重复 Job 或重复 external_event item。
+原生历史恰有1个 external_event，持久化 ID 仍为68字符（符合只修改请求副本的修复）。
+
+脱敏错误观察器有1条中间断流：willRetry=true，responseStreamDisconnected，
+“Reconnecting... 1/5”；因此不宣称零重连。Human 的后续正确输出证明本次恢复后完成，
+未再报告旧 string_above_max_length 终止错误。未捕获完整请求或推断所有FCO兼容性。
+
+可见性仍有限：ca580a783 的 tui/chatwidget/protocol.rs 将
+ThreadExternalInputStatusChanged 归入空处理分支；目前没有可见入站通知卡片，
+不是 Human 漏开信任开关。通知上下文/触发成功与可见条目是不同边界。
+
+本收尾仅只读：无新模型请求、提交、retry/ACK、进程停止或认证删除。运行时和
+guest临时认证仍保留，待 Human/Director 明确结束后按本页清理；旧hj1同样未动。
+此结果证明这一真实terra-low Job闭环，不代表全量迁移、Windows或发布验收。
