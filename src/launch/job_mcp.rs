@@ -307,7 +307,16 @@ mod tests {
     fn job_mcp_schema_forbids_raw_config_and_authority_fields() {
         let raw = serde_json::json!({"version":1,"adapter":{"path":"/private/job","sha256":JOB_SHA256},"launcher":{"path":"/private/codex","sha256":S6E_CLI_SHA256},"endpoint":"/private/job.sock","api_token_file":"/private/api","grant_key_file":"/private/grant","daemon_pid":123,"daemon_start_ticks":1});
         let d: JobMcpDescriptor = serde_json::from_value(raw.clone()).unwrap();
-        for field in ["env", "args", "cwd", "principal", "token", "raw_config"] {
+        for field in [
+            "env",
+            "env_vars",
+            "args",
+            "cwd",
+            "principal",
+            "token",
+            "raw_config",
+            "default_tools_approval_mode",
+        ] {
             let mut bad = raw.clone();
             bad[field] = serde_json::json!("forged");
             assert!(serde_json::from_value::<JobMcpDescriptor>(bad).is_err());
@@ -343,5 +352,70 @@ mod tests {
             "[mcp_servers.cutex_job]\ncommand='job'"
         )
         .is_err());
+    }
+
+    #[test]
+    fn job_mcp_pin_refusals_precede_filesystem_or_peer_access() {
+        use super::super::stock::*;
+        let file = |hash: &str| VerifiedFile {
+            path: "/absent-private-test-artifact".into(),
+            sha256: crate::role_revision::Sha256::new(hash.to_owned()).unwrap(),
+        };
+        let bundle = StockBundle {
+            version: 3,
+            upstream_commit: STOCK_COMMIT.into(),
+            native_patch_commit: Some(S6E_COMMIT.into()),
+            executable: file(S6E_EXECUTABLE_SHA256),
+            cli: Some(file(S6E_CLI_SHA256)),
+            code_mode_host: file(STOCK_HOST_SHA256),
+            facade: file(STOCK_HOST_SHA256),
+            schema: file(S6E_SCHEMA_SHA256),
+            shared_config: file(STOCK_HOST_SHA256),
+        };
+        let descriptor = JobMcpDescriptor {
+            version: 1,
+            adapter: file(JOB_SHA256),
+            launcher: bundle.cli.clone().unwrap(),
+            endpoint: "/absent-private-test-socket".into(),
+            api_token_file: "/absent-private-test-api".into(),
+            grant_key_file: "/absent-private-test-grant".into(),
+            daemon_pid: 1,
+            daemon_start_ticks: 0,
+        };
+        let mut bad = descriptor.clone();
+        bad.version = 2;
+        assert!(bad
+            .review(&bundle)
+            .unwrap_err()
+            .to_string()
+            .contains("descriptor version"));
+        bad = descriptor.clone();
+        bad.adapter.sha256 = file(STOCK_HOST_SHA256).sha256;
+        assert!(bad
+            .review(&bundle)
+            .unwrap_err()
+            .to_string()
+            .contains("adapter bytes"));
+        bad = descriptor.clone();
+        bad.launcher.sha256 = file(STOCK_HOST_SHA256).sha256;
+        assert!(bad
+            .review(&bundle)
+            .unwrap_err()
+            .to_string()
+            .contains("launcher pairing"));
+        bad = descriptor.clone();
+        bad.launcher.path = "/another-private-launcher".into();
+        assert!(bad
+            .review(&bundle)
+            .unwrap_err()
+            .to_string()
+            .contains("equal reviewed native CLI"));
+        let mut legacy = bundle;
+        legacy.version = 1;
+        assert!(descriptor
+            .review(&legacy)
+            .unwrap_err()
+            .to_string()
+            .contains("coherent native bundle"));
     }
 }

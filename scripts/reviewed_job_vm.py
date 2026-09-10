@@ -10,11 +10,25 @@ import time
 import threading
 import sys
 import hashlib
+import os
+import stat
 
 CONTEXT = {}
 STEP = 0
 MODE = sys.argv[2] if len(sys.argv)>2 else 'fullaccess'
 assert MODE in ('fullaccess', 'readonly', 'decline')
+
+# Pure local preflight, before base fixture starts any child or creates state.
+fixture_root=Path(__file__).absolute().parents[1]
+assert fixture_root.resolve()==fixture_root
+assert stat.S_ISDIR(fixture_root.lstat().st_mode) and fixture_root.stat().st_uid==os.getuid()
+fixture_run=fixture_root/sys.argv[1]
+assert fixture_run.parent==fixture_root and not os.path.lexists(fixture_run)
+socket_candidates=[fixture_run/'bootstrap.sock',fixture_run/'h/job.sock',fixture_run/'h/.cutex/runtime/app-server/000000000000/s']
+for candidate in socket_candidates:
+    assert len(os.fsencode(candidate))<=100, ('socket preflight failed',str(candidate),len(os.fsencode(candidate)))
+    assert not os.path.lexists(candidate)
+print(json.dumps({'preflight':'owned-new-short-path','socketBytes':[len(os.fsencode(p)) for p in socket_candidates]}),flush=True)
 
 def model_response(self):
     global STEP
@@ -34,7 +48,10 @@ def model_response(self):
         if MODE=='readonly':
             args['argv']=['/bin/sh','-c','cat probe-readable; if printf no > probe-denied-a; then exit 71; fi; if printf no > probe-denied-b; then exit 72; fi; printf configured-core-output']
         item = {'type':'function_call','call_id':f'job-submit-{n}','namespace':'mcp__cutex_job','name':'submit','arguments':json.dumps(args)}
-    elif n in (2, 3) and MODE!='decline':
+    elif n==2 and MODE=='readonly':
+        args={'actionId':'wrong-cwd-rejected','argv':['/bin/true'],'cwd':str(g['RUN']/'other-cwd')}
+        item={'type':'function_call','call_id':'job-wrong-cwd','namespace':'mcp__cutex_job','name':'submit','arguments':json.dumps(args)}
+    elif n in ((3,4) if MODE=='readonly' else (2,3)) and MODE!='decline':
         # Await actual authoritative terminal state, not incidental roundtrips.
         deadline = time.monotonic()+30
         while True:
@@ -45,8 +62,9 @@ def model_response(self):
         assert len(state['jobs'])==1
         jid = next(iter(state['jobs']))
         args = {'jobId':jid}
-        if n == 3: args['stream']='stdout'
-        item = {'type':'function_call','call_id':f'job-read-{n}','namespace':'mcp__cutex_job','name':'query' if n==2 else 'read_output','arguments':json.dumps(args)}
+        read_output=n==(4 if MODE=='readonly' else 3)
+        if read_output: args['stream']='stdout'
+        item = {'type':'function_call','call_id':f'job-read-{n}','namespace':'mcp__cutex_job','name':'read_output' if read_output else 'query','arguments':json.dumps(args)}
     else:
         item = {'type':'message','role':'assistant','id':f'job-done-{n}','content':[{'type':'output_text','text':'Private configured Job proof complete'}]}
     events = [{'type':'response.created','response':{'id':f'job-{n}'}}, {'type':'response.output_item.done','item':item}, {'type':'response.completed','response':{'id':f'job-{n}','usage':{'input_tokens':0,'output_tokens':0,'total_tokens':0}}}]
@@ -62,6 +80,7 @@ def prepared_launch(g):
     assert g['sha'](binary)=='d98d5e33322c7200eb9b149bc39d99da3bb169c994fe14c7f401d26c06d7b1f2'
     home.chmod(0o700)
     (root/'probe-readable').write_text('private-read-success\n')
+    (root/'other-cwd').mkdir()
     for name in ['job-api','job-grant']:
         p = home/name; p.write_bytes(os.urandom(32)); p.chmod(0o600)
     sock = home/'job.sock'
@@ -87,6 +106,9 @@ def prepared_launch(g):
             status,_=g['api'](g['mp'],'/v2/agent-management/explicit-launch',{'operation':'review_runtime','cutex_session_id':g['durable'],'restart':False,'job_mcp':bad})
             assert status!=200
             negative.append({'field':field,'status':status})
+        status,_=g['api'](g['mp'],'/v2/agent-management/explicit-launch',{'operation':'review_runtime','cutex_session_id':g['durable'],'restart':False,'job_mcp':descriptor},token=g['BUS_TOKEN'])
+        assert status==401
+        negative.append({'field':'nonroot-review','status':status})
         (root/'descriptor-negatives.json').write_text(json.dumps(negative,indent=2))
     review = g['action']({'operation':'review_runtime','cutex_session_id':g['durable'],'restart':False,'job_mcp':descriptor})
     assert review['job_mcp']['descriptor']==descriptor
@@ -162,6 +184,7 @@ def run_job(g):
         assert not (g['RUN']/'probe-denied-a').exists() and not (g['RUN']/'probe-denied-b').exists()
         assert job['request']['origin']['permissionProfileType']=='managed'
         assert 'private-read-success'.encode().hex() in json.dumps(g['Model'].requests)
+        assert 'sandboxCwd differs from the bound request cwd' in json.dumps(g['Model'].requests)
     return {'jobId':jid,'native_thread':g['thread'],'durable':g['durable'],'job':job,'receipt':matched[0]['externalInputReceipt'],'actualCore':True,'manualMetadataOrGrant':False,'modelCalls':g['Model'].calls}
 
 base = Path(__file__).with_name('base-fixture.py').read_text()
@@ -169,8 +192,9 @@ assert hashlib.sha256(base.encode()).hexdigest()=='ed1ebdb57d413db2f3f382aa65c1b
 assert base.count('    current=launch(durable,\'vm-job-subscriber\')')==1
 base = base.replace("CUTEX = FROZEN/'package/artifacts/linux/cutex'", "CUTEX = ROOT/'bin/cutex'")
 base = base.replace("MCP = FROZEN/'package/artifacts/linux/cutex-mcp'", "MCP = ROOT/'bin/cutex-mcp'")
+base = base.replace("CUTEX = ROOT/'bin/cutex'", "CUTEX = ROOT/'bin/cutex-final-5f752958'")
 base = base.replace("model = http.server.ThreadingHTTPServer", "Model.do_POST = model_response\nmodel = http.server.ThreadingHTTPServer")
-base = base.replace('actual Job daemon/process/completion; actual separate Job MCP adapter issuer, harness-driven trusted metadata', 'actual native Core configured MCP, real adapter grant issuer/daemon/Bus/native A4; fake Responses, no injected metadata')
+base = base.replace('actual Job daemon/process/completion; actual separate Job MCP adapter issuer, harness-driven trusted metadata', 'actual native Core configured MCP; per-scenario results below, fake Responses, no injected metadata')
 if MODE=='readonly':
     base=base.replace('default_permissions=":danger-full-access"', 'default_permissions=":read-only"')
     base=base.replace("'sandbox': 'danger-full-access'", "'sandbox': 'read-only'")
