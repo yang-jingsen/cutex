@@ -16,7 +16,7 @@ import stat
 CONTEXT = {}
 STEP = 0
 MODE = sys.argv[2] if len(sys.argv)>2 else 'fullaccess'
-assert MODE in ('fullaccess', 'readonly', 'decline')
+assert MODE in ('fullaccess', 'readonly', 'decline', 'create', 'create_none')
 
 # Pure local preflight, before base fixture starts any child or creates state.
 fixture_root=Path(__file__).absolute().parents[1]
@@ -170,6 +170,7 @@ def prepared_launch(g):
         daemon_pid,uid,_=struct.unpack('3i',peer.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
     assert uid==os.getuid() and daemon_pid in g['owned_tree'](daemon.pid)
     descriptor = {'version':1,'adapter':g['verified'](binary),'launcher':g['verified'](g['STOCK']),'endpoint':str(sock),'api_token_file':str(home/'job-api'),'grant_key_file':str(home/'job-grant'),'daemon_pid':daemon_pid,'daemon_start_ticks':int(g['process_identity'](daemon_pid)[0])}
+    g['job_descriptor']=descriptor
     review = g['action']({'operation':'review_runtime','cutex_session_id':g['durable'],'restart':False,'job_mcp':descriptor})
     assert review['job_mcp']['descriptor']==descriptor
     assert record_digest(g['store']()['sessions'][g['durable']])==review['subject']['durable_sha256'], 'typed digest oracle mismatch before offline launch'
@@ -184,6 +185,8 @@ def prepared_launch(g):
     return current
 
 def run_job(g):
+    if MODE in ('create','create_none'):
+        return create_discovery(g)
     rpc, init = g['native_rpc'](g['current'])
     rpc.call('thread/resume', {'threadId':g['thread']})
     inventory = rpc.call('mcpServerStatus/list', {'threadId':g['thread'],'detail':'toolsAndAuthOnly'})
@@ -235,12 +238,52 @@ def run_job(g):
         assert 'sandboxCwd differs from the bound request cwd' in json.dumps(g['Model'].requests)
     return {'jobId':jid,'native_thread':g['thread'],'durable':g['durable'],'job':job,'receipt':matched[0]['externalInputReceipt'],'actualCore':True,'manualMetadataOrGrant':False,'modelCalls':g['Model'].calls}
 
+def create_discovery(g):
+    """Actual existing root-intent/Director provider path; no model calls."""
+    project='job-create-private'
+    mutation={'schema':'cutex/human-management-project-mutation/v1','action_id':'job-project','project_id':project,'expected_authority_epoch':0,'expected_project_revision':0,'operation':{'kind':'create','director_cutex_session_id':g['durable'],'presentation':{'display_name':'Private Job','badge_label':'J','color':'cyan'}}}
+    code,candidates=g['api'](g['mp'],'/v2/agent-management/durable-candidates');assert code==200
+    candidate=next(c for c in candidates if c['cutex_session_id']==g['durable'])
+    code,result=g['api'](g['mp'],'/v2/agent-management/durable-import',{'action_id':'job-import-director','candidate':candidate,'confirmed_formal_name':'Private S6 Agent 0','assignment':mutation,'detach':None})
+    assert code==200 and result['complete'],(code,result)
+    facts=[]
+    for enabled in ((False,) if MODE=='create_none' else (True,False)):
+        aid='create-job-some' if enabled else 'create-job-none'
+        spec={'name':'Explicit Job '+('Some' if enabled else 'None'),'cwd':str(g['RUN']/('new-agent' if enabled or MODE=='create_none' else 'other-cwd')),'profile':'alpha','runtime_backend':'host','model':'unknown-private-model','reasoning':'low','permissions':'full-access','approval_policy':'on-request','sandbox_mode':'danger-full-access','groups':['job-private'],'expose_to_im':False,'pin':False}
+        request={'schema':'cutex/agent-management/v1','action_id':aid,'bootstrap_intent':aid,'project_id':project,'operation':'create','spec':spec,'start_mode':'bootstrap_only','frozen_message':None}
+        review_request={'operation':'review_bootstrap','request':request,'native_home':str(g['NATIVE']),'bundle_manifest':str(g['RUN']/'bundle-0.json'),'bundle_sha256':g['sha'](g['RUN']/'bundle-0.json'),'expires_at_unix':int(time.time())+1800}
+        if enabled:review_request['job_mcp']=g['job_descriptor']
+        review=g['action'](review_request)
+        assert bool(review.get('job_mcp'))==enabled
+        g['action']({'operation':'authorize_bootstrap','review':review})
+        before=set(g['store']()['sessions'])
+        result=g['call'](g['current'],g['thread'],'/api/agent-management/v1/actions',request)
+        (g['RUN']/(aid+'-result.json')).write_text(json.dumps(result,indent=2))
+        assert result['outcome']['status']=='complete',result
+        assert g['call'](g['current'],g['thread'],'/api/agent-management/v1/actions',request)==result
+        new=set(g['store']()['sessions'])-before;assert len(new)==1
+        ident=new.pop();record=g['store']()['sessions'][ident]
+        assert record['formal_agent_name']==spec['name'] and record['profile']=='alpha'
+        receipt=next(v['receipt'] for v in g['store']()['explicit_launch_receipts'].values() if v['kind']=='runtime' and v['receipt']['review']['subject']['cutex_session_id']==ident)
+        g['stock_pids'].append(receipt['binding']['pid'])
+        assert receipt['stage']=='ready' and bool(receipt['review'].get('job_mcp'))==enabled
+        rpc,_=g['native_rpc'](receipt)
+        native=record['codex_session_id']
+        assert rpc.call('thread/read',{'threadId':native,'includeTurns':True})['thread']['turns']==[]
+        inventory=rpc.call('mcpServerStatus/list',{'threadId':native,'detail':'toolsAndAuthOnly'})
+        assert any(s['name']=='cutex_job' for s in inventory['data'])==enabled,inventory
+        assert g['Model'].calls==0
+        facts.append({'some':enabled,'durable':ident,'native':native,'generation':record['runtime_generation'],'inventory':inventory,'exactReplay':True})
+        (g['RUN']/'create-discovery.json').write_text(json.dumps(facts,indent=2))
+    return {'create':facts,'neutralModelCalls':0,'boundary':'real root review and authenticated Director HTTP provider, native MCP inventory; not model-selected Management'}
+
 base = Path(__file__).with_name('base-fixture.py').read_text()
 assert hashlib.sha256(base.encode()).hexdigest()=='ed1ebdb57d413db2f3f382aa65c1bf014e4ccb8b8483b63dd85e774717d9728e'
 assert base.count('    current=launch(durable,\'vm-job-subscriber\')')==1
 base = base.replace("CUTEX = FROZEN/'package/artifacts/linux/cutex'", "CUTEX = ROOT/'bin/cutex'")
-base = base.replace("MCP = FROZEN/'package/artifacts/linux/cutex-mcp'", "MCP = ROOT/'bin/cutex-mcp'")
+base = base.replace("MCP = FROZEN/'package/artifacts/linux/cutex-mcp'", "MCP = ROOT/'bin/cutex-mcp-reviewed-v2'")
 base = base.replace("CUTEX = ROOT/'bin/cutex'", "CUTEX = ROOT/'bin/cutex-reviewed-v2'")
+base = base.replace("in [RUN,RUN/'new-agent']", "in [RUN,RUN/'new-agent',RUN/'other-cwd']")
 base = base.replace("model = http.server.ThreadingHTTPServer", "Model.do_POST = model_response\nmodel = http.server.ThreadingHTTPServer")
 base = base.replace('actual Job daemon/process/completion; actual separate Job MCP adapter issuer, harness-driven trusted metadata', 'actual native Core configured MCP; per-scenario results below, fake Responses, no injected metadata')
 if MODE=='readonly':
