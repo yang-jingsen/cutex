@@ -19,6 +19,8 @@ pub struct StockRuntimeReview {
     pub contract: ExplicitLaunchContract,
     pub configuration: StockConfiguration,
     pub restart: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_mcp: Option<crate::launch::job_mcp::ReviewedJobMcp>,
     #[serde(
         default,
         skip_serializing_if = "crate::launch::stock::CanonicalBytePolicy::is_default"
@@ -146,6 +148,7 @@ impl AgentManagementProvider {
                 contract,
                 configuration,
                 restart,
+                job_mcp: None,
                 receiver_canonical_byte_limit: Default::default(),
             })
         })?
@@ -242,6 +245,13 @@ impl AgentManagementProvider {
                 "stock configuration changed; fresh review required"
             );
             let bundle = StockBundle::load(&review.contract)?;
+            if let Some(job) = &review.job_mcp {
+                job.validate(&bundle)?;
+            } else {
+                anyhow::ensure!(!sessions.explicit_launch_receipts.values().any(|r| matches!(r,
+                    ExplicitLaunchActionReceipt::Runtime(r) if r.review.subject.cutex_session_id == *id && r.review.job_mcp.is_some())),
+                    "previously reviewed Job MCP cannot be silently omitted; provide an explicit descriptor");
+            }
             anyhow::ensure!(bundle.common_ingress() || review.receiver_canonical_byte_limit.is_default(),
                 "unchanged stock is registration-only; receiver ingress policy unsupported");
             validate_native(record, &sessions, &review.contract)?;
@@ -275,10 +285,12 @@ impl AgentManagementProvider {
                 );
                 save_receipt(path, &receipt)?;
                 if review.restart {
+                    if let Some(job) = &review.job_mcp { job.validate(&bundle)?; }
                     runtime.stop(record)?;
                 }
                 receipt.publication = Some(runtime.publication(&receipt)?);
                 with_locked_session_store(path, |store| {
+                    if let Some(job) = &review.job_mcp { job.validate(&bundle)?; }
                     let current = store
                         .sessions
                         .get_mut(id.as_str())
@@ -339,6 +351,7 @@ impl AgentManagementProvider {
                     unsafe { libc::_exit(86); }
                 }
                 let persisted = with_locked_session_store(path, |store| {
+                    if let Some(job) = &review.job_mcp { job.validate(&bundle)?; }
                     #[cfg(feature = "stock-launch-test-hook")]
                     { static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                     if std::env::var("CUTEX_STOCK_TEST_COMMIT_FAIL_ACTION")
@@ -410,6 +423,7 @@ impl AgentManagementProvider {
             }
             runtime.retain_owner();
             with_locked_session_store(path, |store| {
+                if let Some(job) = &review.job_mcp { job.validate(&bundle)?; }
                 let current = store
                     .sessions
                     .get_mut(id.as_str())

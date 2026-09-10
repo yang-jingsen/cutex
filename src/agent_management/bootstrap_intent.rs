@@ -184,15 +184,20 @@ impl BootstrapExecutionPermit<'_> {
             Some(ExplicitLaunchActionReceipt::Runtime(prior)) => {
                 anyhow::ensure!(
                     &prior.review.subject.cutex_session_id == id
-                        && prior.review.configuration == self.intent.configuration,
+                        && prior.review.configuration == self.intent.configuration
+                        && prior.review.job_mcp == self.intent.job_mcp,
                     "bootstrap runtime receipt conflict"
                 );
                 prior.review.clone()
             }
             Some(_) => anyhow::bail!("bootstrap runtime action conflict"),
-            None => self
-                .provider
-                .review_stock_runtime_locked(path, id, false, tasks)?,
+            None => {
+                let mut review = self
+                    .provider
+                    .review_stock_runtime_locked(path, id, false, tasks)?;
+                review.job_mcp = self.intent.job_mcp.clone();
+                review
+            }
         };
         anyhow::ensure!(
             review.configuration == self.intent.configuration,
@@ -254,6 +259,8 @@ pub struct BootstrapIntentReview {
     pub configuration: StockConfiguration,
     pub runtime_groups: Vec<String>,
     pub expires_at_unix: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_mcp: Option<crate::launch::job_mcp::ReviewedJobMcp>,
 }
 
 impl BootstrapIntentReview {
@@ -319,6 +326,9 @@ impl BootstrapIntentReview {
             &self.bundle_manifest,
             &self.bundle_sha256,
         )?;
+        if let Some(job) = &self.job_mcp {
+            job.validate(&bundle)?;
+        }
         anyhow::ensure!(
             bundle.version == 3 && bundle.soon_ingress(),
             "bootstrap requires the exact reviewed coherent bundle3"

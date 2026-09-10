@@ -444,6 +444,12 @@ impl StockRuntimeExecutor for StockExecutor {
             "code_mode.direct_only_tool_namespaces",
             vec!["mcp__cutex"],
         )?;
+        if let Some(job) = &receipt.review.job_mcp {
+            job.validate(bundle)?;
+            // Business MCP tools retain ordinary native approval. Never add
+            // this namespace to the privileged control direct-only set.
+            launch = option(launch, "mcp_servers.cutex_job", job.config()?)?;
+        }
         let mut args = layout.app_server_args();
         if bundle.common_ingress() {
             // The accepted artifact is the direct app-server, not the stock CLI.

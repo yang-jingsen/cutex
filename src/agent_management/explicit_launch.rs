@@ -129,6 +129,8 @@ pub enum ExplicitLaunchRequest {
         bundle_manifest: PathBuf,
         bundle_sha256: Sha256,
         expires_at_unix: i64,
+        #[serde(default)]
+        job_mcp: Option<crate::launch::job_mcp::JobMcpDescriptor>,
     },
     AuthorizeBootstrap {
         review: BootstrapIntentReview,
@@ -138,6 +140,8 @@ pub enum ExplicitLaunchRequest {
         restart: bool,
         #[serde(default)]
         receiver_canonical_byte_limit: crate::launch::stock::CanonicalBytePolicy,
+        #[serde(default)]
+        job_mcp: Option<crate::launch::job_mcp::JobMcpDescriptor>,
     },
     Run {
         action_id: AgentActionId,
@@ -168,6 +172,7 @@ impl AgentManagementProvider {
                 bundle_manifest,
                 bundle_sha256,
                 expires_at_unix,
+                job_mcp,
             } => {
                 let _mutation = self.store().lock_mutations()?;
                 let state = self.store().snapshot()?;
@@ -209,6 +214,17 @@ impl AgentManagementProvider {
                         &spec.cwd,
                     ),
                     expires_at_unix: *expires_at_unix,
+                    job_mcp: job_mcp
+                        .as_ref()
+                        .map(|job| {
+                            let bundle = crate::launch::stock::StockBundle::load_references(
+                                native_home,
+                                bundle_manifest,
+                                bundle_sha256,
+                            )?;
+                            job.review(&bundle)
+                        })
+                        .transpose()?,
                 };
                 review.validate_evidence()?;
                 anyhow::ensure!(
@@ -224,6 +240,7 @@ impl AgentManagementProvider {
                 cutex_session_id,
                 restart,
                 receiver_canonical_byte_limit,
+                job_mcp,
             } => self
                 .review_stock_runtime(path, cutex_session_id, *restart, tasks)
                 .and_then(|mut r| {
@@ -233,6 +250,12 @@ impl AgentManagementProvider {
                         "unchanged stock is registration-only; receiver ingress policy unsupported"
                     );
                     r.receiver_canonical_byte_limit = receiver_canonical_byte_limit.clone();
+                    r.job_mcp = job_mcp
+                        .as_ref()
+                        .map(|job| {
+                            job.review(&crate::launch::stock::StockBundle::load(&r.contract)?)
+                        })
+                        .transpose()?;
                     Ok(serde_json::to_value(r)?)
                 }),
             ExplicitLaunchRequest::Run { .. } => {
