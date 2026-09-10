@@ -22,12 +22,12 @@ pub const S6_EXECUTABLE_SHA256: &str =
     "b70d48151c9deb76a9c0ab14a820c582f2bc12a73bbb1512fee9b2f1bec9fa60";
 pub const S6_SCHEMA_SHA256: &str =
     "00e035e34ac1034ee34473f8f68b7704d6058c5b180ff4f4b6cad9fadab3a86d";
-// Exact accepted F5/F6/F7 repair; the S6e wire schema is unchanged. Older
+// Exact accepted provider item-ID repair; the S6e wire schema is unchanged. Older
 // bundle receipts remain historical facts, not permission to launch old bytes.
-pub const S6E_COMMIT: &str = "0c425b5f9fca90835fd2b4377a1bca212532f66c";
+pub const S6E_COMMIT: &str = "ca580a783fc1ab34613be4f81ceab96ef4d393a2";
 pub const S6E_EXECUTABLE_SHA256: &str =
-    "9caa26abe4ec3094543b402e235654f8434d09e49e14017b856b4cdac0801bde";
-pub const S6E_CLI_SHA256: &str = "f93c92bfe528636eae87450d918700d90d24db7d8f2eee0f4dd0fe5cbee998f4";
+    "cac03d6d1b77e4d3681a2d71b25435a537bc257807c28ea0f5aff491c622b69d";
+pub const S6E_CLI_SHA256: &str = "9e887b3a3439154fc00f8bb2a44b0f534ba33c587a5aa0f2aed354b7842bef15";
 pub const S6E_SCHEMA_SHA256: &str =
     "459861225d5bfb73bb4c3896edb489169637424be410be346f955a39596da7e9";
 
@@ -779,6 +779,18 @@ mod tests {
         for (field, value) in [
             (
                 "native_patch_commit",
+                "0c425b5f9fca90835fd2b4377a1bca212532f66c",
+            ),
+            (
+                "executable",
+                "9caa26abe4ec3094543b402e235654f8434d09e49e14017b856b4cdac0801bde",
+            ),
+            (
+                "cli",
+                "f93c92bfe528636eae87450d918700d90d24db7d8f2eee0f4dd0fe5cbee998f4",
+            ),
+            (
+                "native_patch_commit",
                 "a83dbb47ba6aa775f5d4b679fafc532c4db74c7f",
             ),
             (
@@ -807,6 +819,13 @@ mod tests {
         old.executable = file("4638b86221593dd4bab1f66b504641836ac1adb864e946cbe42cb5cbf9f05a74");
         old.cli = Some(file(
             "f360100339560e6a57eb08dea38ed740450904ce7bd72ea7b8a37238fff97bd6",
+        ));
+        assert!(old.validate_identity().is_err());
+        assert!(!old.common_ingress() && !old.soon_ingress());
+        old.native_patch_commit = Some("0c425b5f9fca90835fd2b4377a1bca212532f66c".into());
+        old.executable = file("9caa26abe4ec3094543b402e235654f8434d09e49e14017b856b4cdac0801bde");
+        old.cli = Some(file(
+            "f93c92bfe528636eae87450d918700d90d24db7d8f2eee0f4dd0fe5cbee998f4",
         ));
         assert!(old.validate_identity().is_err());
         assert!(!old.common_ingress() && !old.soon_ingress());

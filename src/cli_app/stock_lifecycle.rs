@@ -507,7 +507,7 @@ impl StockRuntimeExecutor for StockExecutor {
             LaunchProfileSource::SessionConfigured
         });
         binding.schema_version = if bundle.soon_ingress() {
-            "U-0.153.4+F567-0c425b5f-soon-v1"
+            "U-0.153.4+provider-item-id-ca580a78-soon-v1"
         } else if bundle.common_ingress() {
             "U-0.153.4+S6-c2aaceb4-external-input-v1"
         } else {
