@@ -597,7 +597,7 @@ fn configuration_for_selection(
                     base_url: super::aemeath_auth::ENDPOINT.into(),
                     wire_api: "responses".into(),
                     requires_openai_auth: true,
-                    supports_websockets: false,
+                    supports_websockets: true,
                 },
                 Some(auth),
             )

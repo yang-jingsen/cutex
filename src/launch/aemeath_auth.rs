@@ -142,9 +142,39 @@ pub fn review(path: PathBuf) -> anyhow::Result<ReviewedAemeathAuth> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .context("native ChatGPT account identity missing")?;
+    // Match native login/token_data.rs metadata projection, not an OAuth
+    // implementation or a credential signature verifier. Native authenticates.
+    use base64::Engine;
+    let parts: Vec<_> = tokens["id_token"].as_str().unwrap().split('.').collect();
+    ensure!(
+        parts.len() == 3 && parts.iter().all(|p| !p.is_empty()),
+        "invalid native ID token structure"
+    );
+    let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .map_err(|_| anyhow::anyhow!("invalid native ID token metadata"))?;
+    let claims: serde_json::Value = serde_json::from_slice(&claims)
+        .map_err(|_| anyhow::anyhow!("invalid native ID token metadata"))?;
+    let claims = &claims["https://api.openai.com/auth"];
+    let user = claims
+        .get("chatgpt_user_id")
+        .or_else(|| claims.get("user_id"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .context("native account user identity missing")?;
+    ensure!(
+        claims
+            .get("chatgpt_account_is_fedramp")
+            .is_none_or(|v| v.as_bool() == Some(false)),
+        "unsupported native account route"
+    );
     let account_sha256 = crate::role_revision::Sha256::new(format!(
         "{:x}",
-        sha2::Sha256::digest(format!("cutex-aemeath-account-v1:{account}"))
+        sha2::Sha256::digest(serde_json::to_vec(&(
+            "cutex-aemeath-account-user-v1",
+            account,
+            user
+        ))?)
     ))
     .map_err(|_| anyhow::anyhow!("invalid account identity digest"))?;
     Ok(ReviewedAemeathAuth {
@@ -190,8 +220,14 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = root.join("auth.json");
+        use base64::Engine;
+        let id = format!(
+            "header.{}.signature",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(br#"{"https://api.openai.com/auth":{"chatgpt_user_id":"fixture-user"}}"#)
+        );
         let value = serde_json::json!({"auth_mode":"chatgpt","OPENAI_API_KEY":null,
-            "tokens":{"id_token":"private-fixture-id","access_token":"secret-fixture-access",
+            "tokens":{"id_token":id,"access_token":"secret-fixture-access",
                 "refresh_token":"secret-fixture-refresh","account_id":"fixture-account"},"last_refresh":null});
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -239,6 +275,32 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::rename(&path, root.join("real-auth")).unwrap();
         std::os::unix::fs::symlink(root.join("real-auth"), &path).unwrap();
+        assert!(review(path).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn aemeath_same_account_different_user_and_unsupported_route_rejected() {
+        use base64::Engine;
+        let (root, path, mut value) = setup();
+        let original = review(path.clone()).unwrap();
+        for (user, fedramp) in [("other-user", false), ("fixture-user", true)] {
+            let claims = serde_json::json!({"https://api.openai.com/auth": {
+                "chatgpt_user_id":user,"chatgpt_account_is_fedramp":fedramp}});
+            value["tokens"]["id_token"] = serde_json::json!(format!(
+                "header.{}.signature",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(serde_json::to_vec(&claims).unwrap())
+            ));
+            std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            if fedramp {
+                assert!(review(path.clone()).is_err());
+            } else {
+                assert_ne!(review(path.clone()).unwrap(), original);
+            }
+        }
+        value["tokens"]["id_token"] = serde_json::json!("not-a-native-token");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(review(path).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }

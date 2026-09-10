@@ -30,7 +30,8 @@ Agent-callable activation permission. Director project authority stays separate.
 `StockConfiguration.aemeath_auth` is optional and omitted for old/fake reviews.
 Present version1 binds exact canonical auth path, opened file device/inode/UID,
 native directory device/inode and a domain-separated hash of native
-`tokens.account_id`. No access/refresh/ID token or token digest is persisted,
+`tokens.account_id` plus native ID-token user identity (same native metadata
+projection; unsupported FedRAMP route rejects). No access/refresh/ID token or token digest is persisted,
 serialized in reviews, put in argv or exposed as a model tool. File reads are
 bounded, no-follow, same-handle and checked before/after; wrong owner, public
 mode, hardlink, symlink, malformed/unknown auth fields or account drift reject.
@@ -43,9 +44,12 @@ mixed bytes. The native backend, not Cutex, authenticates/refreshes the existing
 native token format. This is not hostile-same-UID security or a new OAuth flow.
 
 The selected reviewed provider is HTTPS
-`https://chatgpt.com/backend-api/codex`, Responses, native OpenAI auth and no
-WebSockets. Native file credential storage is explicit; request and stream
-retry maxima are0. No loopback proxy, alternate endpoint, model fallback or K
+`https://chatgpt.com/backend-api/codex`, Responses and native OpenAI auth.
+The builtin provider retains native WebSocket capability and native retry
+defaults: native0c refuses reserved builtin provider overrides, including retry
+fields. The smoke stops on its first surfaced error; it cannot claim zero
+internal HTTP retries. Native file credential storage is explicit.
+No loopback proxy, alternate endpoint, model fallback or K
 fallback is supplied. Native-supported refresh endpoints remain native-owned.
 
 Profile/account configuration digests, runtime-review digest v2, expiry, root

@@ -106,15 +106,14 @@ fn configured(
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
         "unsupported stock provider key"
     );
-    launch = option(
-        launch,
-        &format!("model_providers.{}", profile.model_provider),
-        &profile.provider,
-    )?;
     if profile.aemeath_auth.is_some() {
         launch = option(launch, "cli_auth_credentials_store", "file")?;
-        launch = option(launch, "model_providers.openai.request_max_retries", 0)?;
-        launch = option(launch, "model_providers.openai.stream_max_retries", 0)?;
+    } else {
+        launch = option(
+            launch,
+            &format!("model_providers.{}", profile.model_provider),
+            &profile.provider,
+        )?;
     }
     launch = option(launch, "approval_policy", &profile.approval)?;
     launch = option(launch, "sandbox_mode", &profile.sandbox)?;
