@@ -366,6 +366,8 @@ pub fn canonical(path: &Path) -> anyhow::Result<()> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StockConfiguration {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aemeath_auth: Option<super::aemeath_auth::ReviewedAemeathAuth>,
     pub profile_name: String,
     pub profile_id: String,
     pub inherited: bool,
@@ -388,13 +390,45 @@ pub struct DummyProvider {
     pub requires_openai_auth: bool,
     pub supports_websockets: bool,
 }
+impl StockConfiguration {
+    pub fn validate_auth_home(&self, home: &Path) -> anyhow::Result<()> {
+        match &self.aemeath_auth {
+            Some(auth) => {
+                ensure!(
+                    auth.version == 1 && auth.path == home.join("auth.json"),
+                    "reviewed native auth home/version mismatch"
+                );
+                ensure!(
+                    super::aemeath_auth::review(auth.path.clone())? == *auth,
+                    "reviewed native auth custody/account changed"
+                );
+            }
+            None => ensure!(
+                !home.join("auth.json").try_exists()?,
+                "stock fake subset does not consume native auth files"
+            ),
+        }
+        Ok(())
+    }
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProfileConfig {
+    #[serde(default)]
+    cutex_provider_mode: ProviderMode,
     model: String,
     model_provider: String,
     model_reasoning_effort: Option<String>,
+    #[serde(default)]
     model_providers: BTreeMap<String, DummyProvider>,
+}
+
+#[derive(Default, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ProviderMode {
+    #[default]
+    Fake,
+    AemeathChatgptV1,
 }
 
 pub fn current_configuration(record: &CutexSessionRecord) -> anyhow::Result<StockConfiguration> {
@@ -509,10 +543,6 @@ fn configuration_for_selection(
             && account.default_cli_args.is_empty(),
         "unsupported stock account/runtime/options"
     );
-    ensure!(
-        account.email.is_none() && account.plan_type.is_none(),
-        "real account authentication is unsupported by private stock subset"
-    );
     let files = crate::profiles::materialize::materialized_account_files(account)?;
     ensure!(
         !files.auth_path.try_exists()?,
@@ -522,27 +552,57 @@ fn configuration_for_selection(
     let raw = std::fs::read_to_string(&files.config_path)?;
     let profile: ProfileConfig = toml::from_str(&raw)
         .map_err(|_| anyhow::anyhow!("unsupported stock profile configuration"))?;
-    ensure!(
-        profile.model_providers.len() == 1,
-        "exactly one dummy provider required"
-    );
-    let provider = profile
-        .model_providers
-        .get(&profile.model_provider)
-        .context("configured provider missing")?
-        .clone();
-    let url = url::Url::parse(&provider.base_url)?;
-    ensure!(
-        url.scheme() == "http"
-            && matches!(url.host_str(), Some("127.0.0.1") | Some("[::1]"))
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url.query().is_none()
-            && !provider.requires_openai_auth
-            && !provider.supports_websockets
-            && provider.wire_api == "responses",
-        "only private loopback unauthenticated fake Responses provider is supported"
-    );
+    let (provider, aemeath_auth) = match profile.cutex_provider_mode {
+        ProviderMode::Fake => {
+            ensure!(
+                account.email.is_none() && account.plan_type.is_none(),
+                "real account authentication is unsupported by private fake subset"
+            );
+            ensure!(
+                profile.model_providers.len() == 1,
+                "exactly one dummy provider required"
+            );
+            let provider = profile
+                .model_providers
+                .get(&profile.model_provider)
+                .context("configured provider missing")?
+                .clone();
+            let url = url::Url::parse(&provider.base_url)?;
+            ensure!(
+                url.scheme() == "http"
+                    && matches!(url.host_str(), Some("127.0.0.1") | Some("[::1]"))
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.query().is_none()
+                    && !provider.requires_openai_auth
+                    && !provider.supports_websockets
+                    && provider.wire_api == "responses",
+                "only private loopback unauthenticated fake Responses provider is supported"
+            );
+            (provider, None)
+        }
+        ProviderMode::AemeathChatgptV1 => {
+            super::aemeath_auth::validate_selection(
+                &account.id,
+                name,
+                &profile.model_provider,
+                profile.model_providers.is_empty(),
+            )?;
+            let auth = super::aemeath_auth::review(
+                crate::config::paths::host_codex_home_dir()?.join("auth.json"),
+            )?;
+            (
+                DummyProvider {
+                    name: "OpenAI".into(),
+                    base_url: super::aemeath_auth::ENDPOINT.into(),
+                    wire_api: "responses".into(),
+                    requires_openai_auth: true,
+                    supports_websockets: false,
+                },
+                Some(auth),
+            )
+        }
+    };
     let sandbox = sandbox.context("explicit stock sandbox required")?;
     ensure!(
         matches!(
@@ -576,6 +636,9 @@ fn configuration_for_selection(
     let reasoning = selected_reasoning
         .cloned()
         .or(profile.model_reasoning_effort);
+    if aemeath_auth.is_some() {
+        super::aemeath_auth::validate_model(&model, reasoning.as_deref())?;
+    }
     ensure!(
         reasoning
             .as_deref()
@@ -584,6 +647,7 @@ fn configuration_for_selection(
     );
     use sha2::Digest;
     Ok(StockConfiguration {
+        aemeath_auth,
         profile_name: name.clone(),
         profile_id: account.id.clone(),
         inherited,
@@ -635,10 +699,7 @@ pub fn validate_native(
         crate::config::paths::host_codex_home_dir()?.canonicalize()? == contract.native_home,
         "stock home is not authoritative native home"
     );
-    ensure!(
-        !contract.native_home.join("auth.json").try_exists()?,
-        "stock private subset does not consume native auth files"
-    );
+    current_configuration(record)?.validate_auth_home(&contract.native_home)?;
     let mut found = Vec::new();
     let mut pending = vec![contract.native_home.join("sessions")];
     while let Some(dir) = pending.pop() {
@@ -769,6 +830,23 @@ mod tests {
             S6E_SCHEMA_SHA256,
             &serde_json::json!({"externalInputVersion":2,"externalInputDeliveries":["soon"]})
         )
+        .is_err());
+    }
+    #[test]
+    fn aemeath_profile_mode_is_explicit_and_unknown_mcp_stays_rejected() {
+        let base = "model='gpt-5.6-terra'\nmodel_provider='openai'\nmodel_reasoning_effort='low'\n";
+        let legacy: ProfileConfig = toml::from_str(base).unwrap();
+        assert!(legacy.cutex_provider_mode == ProviderMode::Fake);
+        let explicit: ProfileConfig =
+            toml::from_str(&format!("{base}cutex_provider_mode='aemeath_chatgpt_v1'\n")).unwrap();
+        assert!(explicit.cutex_provider_mode == ProviderMode::AemeathChatgptV1);
+        assert!(toml::from_str::<ProfileConfig>(&format!(
+            "{base}cutex_provider_mode='aemeath_chatgpt_v2'\n"
+        ))
+        .is_err());
+        assert!(toml::from_str::<ProfileConfig>(&format!(
+            "{base}[mcp_servers.arbitrary]\ncommand='anything'\n"
+        ))
         .is_err());
     }
     #[test]

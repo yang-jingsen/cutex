@@ -111,6 +111,11 @@ fn configured(
         &format!("model_providers.{}", profile.model_provider),
         &profile.provider,
     )?;
+    if profile.aemeath_auth.is_some() {
+        launch = option(launch, "cli_auth_credentials_store", "file")?;
+        launch = option(launch, "model_providers.openai.request_max_retries", 0)?;
+        launch = option(launch, "model_providers.openai.stream_max_retries", 0)?;
+    }
     launch = option(launch, "approval_policy", &profile.approval)?;
     launch = option(launch, "sandbox_mode", &profile.sandbox)?;
     if let Some(reasoning) = &profile.reasoning {
@@ -146,10 +151,12 @@ pub(super) fn bootstrap_native(
             "private bootstrap requires Linux"
         );
         ensure!(
-            cutex::config::paths::host_codex_home_dir()?.canonicalize()? == review.native_home
-                && !review.native_home.join("auth.json").try_exists()?,
-            "bootstrap home/auth changed before spawn"
+            cutex::config::paths::host_codex_home_dir()?.canonicalize()? == review.native_home,
+            "bootstrap home changed before spawn"
         );
+        review
+            .configuration
+            .validate_auth_home(&review.native_home)?;
         let bundle = StockBundle::load_references(
             &review.native_home,
             &review.bundle_manifest,

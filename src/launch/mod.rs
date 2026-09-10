@@ -4,6 +4,7 @@
 //! Target boundary: this module builds commands; durable lifecycle policy lives
 //! in `runtime`.
 
+pub mod aemeath_auth;
 pub mod args;
 pub mod command;
 pub mod docker;

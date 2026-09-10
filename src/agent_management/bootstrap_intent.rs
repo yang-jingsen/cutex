@@ -317,10 +317,7 @@ impl BootstrapIntentReview {
             crate::config::paths::host_codex_home_dir()?.canonicalize()? == self.native_home,
             "bootstrap home is not authoritative native home"
         );
-        anyhow::ensure!(
-            !self.native_home.join("auth.json").try_exists()?,
-            "private bootstrap does not consume native auth"
-        );
+        self.configuration.validate_auth_home(&self.native_home)?;
         let bundle = StockBundle::load_references(
             &self.native_home,
             &self.bundle_manifest,
