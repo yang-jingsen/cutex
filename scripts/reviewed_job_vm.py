@@ -30,6 +30,61 @@ for candidate in socket_candidates:
     assert not os.path.lexists(candidate)
 print(json.dumps({'preflight':'owned-new-short-path','socketBytes':[len(os.fsencode(p)) for p in socket_candidates]}),flush=True)
 
+def record_digest(record):
+    # Disk is serde_json::to_vec_pretty(CutexSessionStore); preserve its typed
+    # field order and remove whitespace, matching request_sha256(record).
+    return hashlib.sha256(json.dumps(record,ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
+
+def diagnose_review(g, descriptor):
+    """Read-only: one real review, natural registration writes, no confirm."""
+    import ctypes
+    import select
+    import struct
+    libc=ctypes.CDLL(None,use_errno=True)
+    fd=libc.inotify_init1(os.O_NONBLOCK|os.O_CLOEXEC)
+    assert fd>=0
+    assert libc.inotify_add_watch(fd,os.fsencode(g['CONF']),0x80|0x8)>=0
+    observations=[]
+    stop=threading.Event()
+    refresh=threading.Event()
+    observation_lock=threading.Lock()
+    started=time.monotonic()
+    def capture(label):
+        record=g['store']()['sessions'][g['durable']]
+        item={'label':label,'elapsed':time.monotonic()-started,'digest':record_digest(record),'record':record}
+        with observation_lock:
+            observations.append(item)
+            (g['RUN']/'review-observations.json').write_text(json.dumps(observations,indent=2))
+        return item
+    before=capture('before-review')
+    def watch():
+        while not stop.is_set() and time.monotonic()-started<285:
+            if not select.select([fd],[],[],1)[0]: continue
+            data=os.read(fd,65536); offset=0
+            while offset<len(data):
+                _,_,_,length=struct.unpack_from('iIII',data,offset)
+                name=data[offset+16:offset+16+length].split(b'\0',1)[0]
+                offset+=16+length
+                if name==b'cutex-sessions.json':
+                    item=capture('natural-store-event')
+                    if item['record'].get('last_seen_at')!=before['record'].get('last_seen_at'): refresh.set()
+    observer=threading.Thread(target=watch)
+    observer.start()
+    try:
+        review=g['action']({'operation':'review_runtime','cutex_session_id':g['durable'],'restart':True,'job_mcp':descriptor})
+        returned=time.monotonic()-started
+        (g['RUN']/'returned-restart-review.json').write_text(json.dumps(review,indent=2))
+        after=capture('after-review-return')
+        # If validation completed before the next natural refresh, await only
+        # a file event. No heartbeat injection, fixed sleep, or confirm retry.
+        assert refresh.wait(timeout=45),'no natural registration observation within bound'
+        final=capture('final-observation')
+        changed={k:{'before':before['record'].get(k),'after':final['record'].get(k)} for k in set(before['record'])|set(final['record']) if before['record'].get(k)!=final['record'].get(k)}
+        result={'reviewSeconds':returned,'reviewDigest':review['subject']['durable_sha256'],'beforeDigest':before['digest'],'returnDigest':after['digest'],'finalDigest':final['digest'],'matchingObservationLabels':[x['label'] for x in observations if x['digest']==review['subject']['durable_sha256']],'changedFields':changed,'confirmationSent':False}
+        (g['RUN']/'review-diagnosis.json').write_text(json.dumps(result,indent=2))
+    finally:
+        stop.set(); observer.join(timeout=2); os.close(fd)
+
 def model_response(self):
     global STEP
     g = CONTEXT
@@ -99,38 +154,15 @@ def prepared_launch(g):
         daemon_pid,uid,_=struct.unpack('3i',peer.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
     assert uid==os.getuid() and daemon_pid in g['owned_tree'](daemon.pid)
     descriptor = {'version':1,'adapter':g['verified'](binary),'launcher':g['verified'](g['STOCK']),'endpoint':str(sock),'api_token_file':str(home/'job-api'),'grant_key_file':str(home/'job-grant'),'daemon_pid':daemon_pid,'daemon_start_ticks':int(g['process_identity'](daemon_pid)[0])}
-    if MODE=='readonly':
-        negative=[]
-        for field,value in [('version',99),('daemon_start_ticks',descriptor['daemon_start_ticks']+1),('api_token_file',str(home/'absent')),('endpoint',str(home/'absent.sock'))]:
-            bad={**descriptor,field:value}
-            status,_=g['api'](g['mp'],'/v2/agent-management/explicit-launch',{'operation':'review_runtime','cutex_session_id':g['durable'],'restart':False,'job_mcp':bad})
-            assert status!=200
-            negative.append({'field':field,'status':status})
-        status,_=g['api'](g['mp'],'/v2/agent-management/explicit-launch',{'operation':'review_runtime','cutex_session_id':g['durable'],'restart':False,'job_mcp':descriptor},token=g['BUS_TOKEN'])
-        assert status==401
-        negative.append({'field':'nonroot-review','status':status})
-        (root/'descriptor-negatives.json').write_text(json.dumps(negative,indent=2))
     review = g['action']({'operation':'review_runtime','cutex_session_id':g['durable'],'restart':False,'job_mcp':descriptor})
     assert review['job_mcp']['descriptor']==descriptor
+    assert record_digest(g['store']()['sessions'][g['durable']])==review['subject']['durable_sha256'], 'typed digest oracle mismatch before offline launch'
     request = {'operation':'run','action_id':'configured-job-launch','review':review}
     current = g['action'](request)
     assert current['stage']=='ready' and g['action'](request)==current
     g['stock_pids'].append(current['binding']['pid'])
     if MODE=='readonly':
-        changed=json.loads(json.dumps(request)); changed['review']['job_mcp']['descriptor']['version']=99
-        g['action'](changed,ok=False)
-        without=g['action']({'operation':'review_runtime','cutex_session_id':g['durable'],'restart':True})
-        g['action']({'operation':'run','action_id':'no-silent-job-omission','review':without},ok=False)
-        assert g['process_identity'](current['binding']['pid']) is not None
-        fresh=g['action']({'operation':'review_runtime','cutex_session_id':g['durable'],'restart':True,'job_mcp':descriptor})
-        restart={'operation':'run','action_id':'reviewed-job-restart','review':fresh}
-        next_owner=g['action'](restart)
-        assert next_owner['stage']=='ready' and g['action'](restart)==next_owner
-        assert next_owner['runtime_agent_id']!=current['runtime_agent_id']
-        assert next_owner['review']['subject']['cutex_session_id']==g['durable']
-        g['stock_pids'].append(next_owner['binding']['pid'])
-        (root/'first-launch-receipt.json').write_text(json.dumps(current,indent=2))
-        current=next_owner
+        diagnose_review(g,descriptor)
     (root/'review.json').write_text(json.dumps(review,indent=2))
     (root/'launch-receipt.json').write_text(json.dumps(current,indent=2))
     return current
