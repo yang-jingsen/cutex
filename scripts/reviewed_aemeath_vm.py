@@ -123,8 +123,8 @@ def run_job(g):
 
 base=Path(__file__).with_name('base-fixture.py').read_text()
 assert hashlib.sha256(base.encode()).hexdigest()=='ed1ebdb57d413db2f3f382aa65c1bf014e4ccb8b8483b63dd85e774717d9728e'
-base=base.replace("CUTEX = FROZEN/'package/artifacts/linux/cutex'","CUTEX = ROOT/'bin/cutex'")
-base=base.replace("MCP = FROZEN/'package/artifacts/linux/cutex-mcp'","MCP = ROOT/'bin/cutex-mcp'")
+base=base.replace("CUTEX = FROZEN/'package/artifacts/linux/cutex'","CUTEX = ROOT/'bin-v2/cutex'")
+base=base.replace("MCP = FROZEN/'package/artifacts/linux/cutex-mcp'","MCP = ROOT/'bin-v2/cutex-mcp'")
 base=base.replace('profile_id = str(uuid.uuid4())',"profile_id = 'cd6a39eb-3997-45c6-9824-5113fe36a4b8'")
 base=base.replace("'alpha'","'aemeath'")
 base=base.replace('unknown-private-model',MODEL)
