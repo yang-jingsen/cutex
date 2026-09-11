@@ -197,10 +197,19 @@ if __name__ == '__main__':
     sub=parser.add_subparsers(dest='op',required=True)
     p=sub.add_parser('capture');p.add_argument('output',type=Path)
     p=sub.add_parser('apply');p.add_argument('plan',type=Path);p.add_argument('destination',type=Path)
+    p=sub.add_parser('plan');p.add_argument('snapshot',type=Path)
     args=parser.parse_args()
     if args.op=='capture':
         private_parent(args.output.parent);create(args.output,encoded(capture()))
         print('Fixed34 nonsecret plan captured; no authentication files read.')
+    elif args.op=='plan':
+        snapshot=json.loads(read(args.snapshot))
+        keys=('durable_id','native_id','formal_name','project_id','configured_profile','effective_profile',
+              'model','effort','sandbox','approval','source_status','source_backend','private_target_backend','apply_runtime')
+        print(json.dumps({'plan_sha256':digest(encoded(snapshot)),
+                          'subjects':[{k:r[k] for k in keys} for r in snapshot['rows']],
+                          'outside_cohort_prerequisite':snapshot['prerequisite'],
+                          'launch_authorized':False},ensure_ascii=False,sort_keys=True,indent=2))
     else:
         apply(json.loads(read(args.plan)),args.destination)
         print('Fresh private histories prepared; no runtime launched. Existing destinations always refuse.')

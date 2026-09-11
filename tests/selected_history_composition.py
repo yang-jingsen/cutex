@@ -39,6 +39,10 @@ def adopt(row):
     group_args=[v for group in row['groups'] for v in ('--group',group)]
     cli('session','adopt',row['native_id'],'--name',row['formal_name'],'--cwd',row['cwd'],*group_args)
     ident=row['durable_id'];assert ident in store()['sessions']
+    # Adopt adds its normal cwd-derived convenience group. The supported Set
+    # operation restores the exact frozen groups before authoritative import.
+    # Added after the second run; requires separately authorized runtime proof.
+    cli('session','groups','set',ident,*group_args)
     cli('session','defaults','set',ident,'--runtime-backend','host','--permission',row['permission_alias'],
         '--sandbox',row['sandbox'],'--approval-policy',row['approval'],'--model',row['model'],'--reasoning',row['effort'])
     if row['configured_profile'] is not None:cli('session','profile','set',ident,row['configured_profile'])
@@ -70,6 +74,7 @@ def pty_probe(ident,label):
     original=termios.tcgetattr(slave)
     child=subprocess.Popen([str(CUTEX),'session','stock-attach',ident],env=env,cwd=ROOT,stdin=slave,stdout=slave,stderr=slave,start_new_session=True,preexec_fn=lambda:fcntl.ioctl(0,termios.TIOCSCTTY,0))
     children.append(child);screen=b'';ready=False
+    forced_exit=False
     try:
         end=time.monotonic()+90
         while time.monotonic()<end:
@@ -85,10 +90,15 @@ def pty_probe(ident,label):
         if child.poll() is None:
             os.write(master,b'\x03\x03')
             try:child.wait(timeout=10)
-            except subprocess.TimeoutExpired:stop(child)
+            except subprocess.TimeoutExpired:
+                forced_exit=True;stop(child)
         restored=termios.tcgetattr(slave)==original
         os.close(master);os.close(slave)
-    assert child.returncode==0 and restored
+    observation={'ready':ready,'exit_code':child.returncode,'terminal_restored':restored,
+                 'forced_exit':forced_exit,'screen_bytes':len(screen),
+                 'screen_sha256':hashlib.sha256(screen).hexdigest(),'input_sent':False}
+    save('pty-'+ident+'.json',observation)
+    assert child.returncode==0 and restored,observation
     # Deliberately do not retain screen/history bodies.
     return {'profile':label,'pink':True,'terminal_restored':True,'screen_bytes':len(screen),'screen_sha256':hashlib.sha256(screen).hexdigest(),'input_sent':False}
 
@@ -178,6 +188,7 @@ try:
         for key,value in [('profile',row['configured_profile']),('model_defaults',row['model']),('reasoning_defaults',row['effort']),('sandbox_mode',row['sandbox']),('approval_policy',row['approval'])]:assert r.get(key)==value,(key,row['durable_id'])
         assert not r.get('app_server_runtime') and not r.get('current_runtime_agent_id') and r.get('runtime_generation',0)==0
         assert managed['current_project_memberships'][row['durable_id']]['project_id']==row['project_id']
+        assert r['agent_groups']==row['groups'],'group projection drift'
     save('all34-PASS.json',{'subjects':34,'outside_cohort_nonlaunching_prerequisites':1,'offline_registry':35,'api_import_replay_equal':True,'project_membership_equal':True,'private_authority_epochs':'fresh; not migrated originals'})
     stop(m);stop(b)
     representatives=['cesc-tutor-r1','cute-codex-log-wal-fix-r2','tethys-director-r2','ifm-ema-figures']
