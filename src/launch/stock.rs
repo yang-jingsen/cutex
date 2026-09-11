@@ -24,12 +24,14 @@ pub const S6_SCHEMA_SHA256: &str =
     "00e035e34ac1034ee34473f8f68b7704d6058c5b180ff4f4b6cad9fadab3a86d";
 // Exact accepted durable-presentation CLI/server family. Older
 // bundle receipts remain historical facts, not permission to launch old bytes.
-pub const S6E_COMMIT: &str = "cc4a080df1df4433f6fd67fee9c1c4fa4a42baab";
+pub const S6E_COMMIT: &str = "f8c33add01bf9ef8cea04f531fa1319090751cb2";
+// Coherent CLI-only child; server bytes remain built from its accepted parent.
+pub const S6E_SERVER_COMMIT: &str = "b8e9cc3a1bc6e88a1d9bd7454e886882f58b9fb8";
 pub const S6E_EXECUTABLE_SHA256: &str =
-    "df95936f3f0d1ff62efb978fee32b85e45da0f7f3166de7606cce3b49fb12018";
-pub const S6E_CLI_SHA256: &str = "52b868441c65cf12370ffbd7dea30d972b801f875b7e3d69b41ce2a0501fd2a9";
+    "7bc7f3d73a80981b1d77b0af40a685cfebec5258527156a8801e601cbe098dee";
+pub const S6E_CLI_SHA256: &str = "b830757173395acbb648c6d067bac235817802ed8c3a96d65e39014411f4e1a4";
 pub const S6E_SCHEMA_SHA256: &str =
-    "77e75b7fc47c9b8a9caacf5a7d31c040c6520679a9833f1c2b0e55937ed39c27";
+    "c2a54d598c816cfd402829b3855ecbfdd7857c6dbad51d95564f6dcc7fbd1d12";
 
 pub fn is_private_native_schema(hash: &str) -> bool {
     matches!(
