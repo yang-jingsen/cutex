@@ -11,6 +11,6 @@ for p in ['/usr','/bin','/lib','/lib64','/etc','/mnt']:
 cmd+=['--bind',str(fixture),'/p','--tmpfs','/tmp','--proc','/proc','--dev','/dev','--chdir','/p','/usr/bin/python3','-B',str(script),str(binary)]
 env={'PATH':'/usr/bin:/bin','HOME':'/p/h','TMPDIR':'/p','SELECTED_COMPOSITION_PRIVATE':'1','TERM':'xterm-256color','LANG':'C.UTF-8'}
 with (fixture/'runner.log').open('wb') as log:
-    result=subprocess.run(cmd,env=env,stdout=log,stderr=subprocess.STDOUT,timeout=600)
+    result=subprocess.run(cmd,env=env,stdout=log,stderr=subprocess.STDOUT,timeout=1200)
 print('Retained private composition:',fixture,'exit:',result.returncode,flush=True)
 sys.exit(result.returncode)

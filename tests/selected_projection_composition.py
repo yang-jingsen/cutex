@@ -125,7 +125,8 @@ try:
     (CONF/'config.json').write_text(json.dumps({'agent_bus_enabled':True,'agent_bus_port':24870,'agent_bus_token':BUS,'management_api_token':HUMAN,'default_profile':'aemeath'}))
     for name in IDS:profile(name)
     (CONF/'accounts.json').write_text(json.dumps({'version':3,'accounts':[{'id':i,'name':n,'email':None,'plan_type':None,'last_used_at':None} for n,i in IDS.items()],'active_account_id':None}))
-    (NATIVE/'config.toml').write_text('[projects."/p"]\ntrust_level="trusted"\n[analytics]\nenabled=false\n')
+    for label in ('octobre','GLM'): (ROOT/label).mkdir(mode=0o700)
+    (NATIVE/'config.toml').write_text('[projects."/p"]\ntrust_level="trusted"\n[projects."/p/octobre"]\ntrust_level="trusted"\n[projects."/p/GLM"]\ntrust_level="trusted"\n[analytics]\nenabled=false\n')
     bundle={'version':3,'upstream_commit':'3d2ee51ca2d5db578f328aa75e20aa22c0197c9a','native_patch_commit':'8cde795620e8b2fa6ba3bfa1fd15a5732a1e12f6','executable':ref(SERVER),'cli':ref(NB/'codex'),'code_mode_host':ref(NB/'codex-code-mode-host'),'schema':ref(NB/'codex_app_server_protocol.schemas.json'),'facade':ref(MCP),'shared_config':ref(NATIVE/'config.toml')}
     save('bundle.json',bundle)
     boot=owner([SERVER,'--auth-file',CONF/'profiles'/IDS['aemeath']/'auth.json','-c','cli_auth_credentials_store="file"','-c','default_permissions=":read-only"','--listen','unix:///p/b.sock'],'bootstrap')
@@ -153,7 +154,8 @@ try:
     code,result=api(24871,'/v2/agent-management/durable-import',{'action_id':'selected-import','candidate':candidate,'confirmed_formal_name':'Private selected Director','assignment':project,'detach':None});assert code==200 and result['complete'],result
     for label in ('octobre','GLM'):
         model='glm-5.3' if label=='GLM' else 'gpt-5.6-sol'
-        spec={'name':'Private '+label,'cwd':'/p','profile':label,'runtime_backend':'host','model':model,'reasoning':'max','permissions':':danger-full-access','approval_policy':'never','sandbox_mode':'danger-full-access','groups':['selected-private'],'expose_to_im':False,'pin':False}
+        spec={'name':'Private '+label,'cwd':str(ROOT/label),'profile':label,'runtime_backend':'host','model':model,'reasoning':'max','permissions':':danger-full-access','approval_policy':'never','sandbox_mode':'danger-full-access','groups':['selected-private'],'expose_to_im':False,'pin':False}
+        assert spec['cwd'] != '/p' and spec['cwd'] != str(ROOT/('GLM' if label=='octobre' else 'octobre'))
         request={'schema':'cutex/agent-management/v1','action_id':'selected-create-'+label,'bootstrap_intent':'selected-create-'+label,'project_id':'selected-private','operation':'create','spec':spec,'start_mode':'bootstrap_only','frozen_message':None}
         review=action({'operation':'review_bootstrap','request':request,'native_home':str(NATIVE),'bundle_manifest':'/p/bundle.json','bundle_sha256':sha(ROOT/'bundle.json'),'expires_at_unix':int(time.time())+600})
         action({'operation':'authorize_bootstrap','review':review})

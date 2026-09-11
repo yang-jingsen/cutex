@@ -735,7 +735,7 @@ mod tests {
     fn actual_catalog_reference_is_pinned_not_remote_claim() {
         // Fixture source identity is independently checked by the protocol test.
         assert_eq!(
-            super::super::stock::S6E_COMMIT,
+            super::super::stock::S6E_SERVER_COMMIT,
             "2eab060b191a0fe59e22b28785d02d76eafb7fc4"
         );
         assert!(Settings {
