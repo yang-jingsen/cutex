@@ -13,6 +13,33 @@ exec(compile(helper,'accepted-r3-helpers','exec'))
 PLAN=json.loads(Path('/p/input/plan.json').read_text())
 JOB=Path('/mnt/mambo/PersonaProjects/cutex-job-frozen-completion-facts-v2-r1/artifacts/linux/cutex-job-service')
 phase='setup'
+sys.path.insert(0,str(SOURCE/'scripts'))
+from human_error_text import redact
+
+def json_terminal(value):
+    if isinstance(value,bytes):return list(value)
+    if isinstance(value,(list,tuple)):return [json_terminal(v) for v in value]
+    return value
+
+def drain_exit(child,master,consume,timeout=20):
+    """Keep draining the terminal during shutdown; wait() alone can deadlock."""
+    end=time.monotonic()+timeout
+    while child.poll() is None and time.monotonic()<end:
+        if select.select([master],[],[],.1)[0]:
+            try:data=os.read(master,65536)
+            except OSError:break
+            if data:consume(data)
+    return child.poll() is not None
+
+def error_evidence():
+    out=[]
+    for path in sorted((CONF/'runtime/app-server').glob('*/stock.stderr.log')):
+        for line in path.read_text(errors='replace').splitlines():
+            plain=re.sub(r'\x1b\[[0-9;?<>=]*[ -/]*[@-~]','',line)
+            if re.search(r'\b(?:ERROR|WARN)\b',plain):
+                out.append(redact(plain))
+    # Owner-only diagnostics; never include the rendered transcript or auth.
+    return out[-32:]
 def prepare(label):
     global HOME,CONF,NATIVE,env
     HOME=ROOT/label;CONF=HOME/'.cutex';NATIVE=CONF/'codex-home'
@@ -75,29 +102,35 @@ def pty_probe(ident,label):
     child=subprocess.Popen([str(CUTEX),'session','stock-attach',ident],env=env,cwd=ROOT,stdin=slave,stdout=slave,stderr=slave,start_new_session=True,preexec_fn=lambda:fcntl.ioctl(0,termios.TIOCSCTTY,0))
     children.append(child);screen=b'';ready=False
     forced_exit=False
+    after=None
+    def consume(part):
+        nonlocal screen
+        screen+=part
+        if b'\x1b[6n' in part:os.write(master,b'\x1b[1;1R')
+        if b'\x1b[c' in part:os.write(master,b'\x1b[?1;2c')
     try:
         end=time.monotonic()+90
         while time.monotonic()<end:
             assert child.poll() is None,'CLI exited before reviewed status'
             if select.select([master],[],[],.1)[0]:
-                part=os.read(master,65536);screen+=part
-                if b'\x1b[6n' in part:os.write(master,b'\x1b[1;1R')
-                if b'\x1b[c' in part:os.write(master,b'\x1b[?1;2c')
+                part=os.read(master,65536);consume(part)
                 plain=re.sub(rb'\x1b\[[0-9;?<>=]*[ -/]*[@-~]',b'',screen)
                 if b'Bon voyage' in plain and label.encode() in plain and b'38;2;246;163;200' in screen:ready=True;break
         assert ready,'reviewed historical CLI status not rendered'
     finally:
         if child.poll() is None:
             os.write(master,b'\x03\x03')
-            try:child.wait(timeout=10)
-            except subprocess.TimeoutExpired:
+            if not drain_exit(child,master,consume):
                 forced_exit=True;stop(child)
-        restored=termios.tcgetattr(slave)==original
+        after=termios.tcgetattr(slave);restored=after==original
+        observation={'ready':ready,'exit_code':child.returncode,'terminal_restored':restored,
+                     'exit_signal':-child.returncode if child.returncode is not None and child.returncode<0 else None,
+                     'forced_exit':forced_exit,'screen_bytes':len(screen),
+                     'terminal_before':json_terminal(original),'terminal_after':json_terminal(after),
+                     'screen_sha256':hashlib.sha256(screen).hexdigest(),'model_input_sent':False,
+                     'exit_keys':'Ctrl-C twice','sanitized_owner_errors':error_evidence()}
+        save('pty-'+ident+'.json',observation)
         os.close(master);os.close(slave)
-    observation={'ready':ready,'exit_code':child.returncode,'terminal_restored':restored,
-                 'forced_exit':forced_exit,'screen_bytes':len(screen),
-                 'screen_sha256':hashlib.sha256(screen).hexdigest(),'input_sent':False}
-    save('pty-'+ident+'.json',observation)
     assert child.returncode==0 and restored,observation
     # Deliberately do not retain screen/history bodies.
     return {'profile':label,'pink':True,'terminal_restored':True,'screen_bytes':len(screen),'screen_sha256':hashlib.sha256(screen).hexdigest(),'input_sent':False}
@@ -136,6 +169,9 @@ def run_probe(row,index):
         types={}
         for turn in response['turns']:
             for item in turn['items']:types[item['type']]=types.get(item['type'],0)+1
+        save('read-'+row['native_id']+'.json',{'native_id':response['id'],'turns_read':len(response['turns']),
+              'item_types':types,'ready_generation':result['expected_generation'],
+              'configuration':{k:review['configuration'][k] for k in ('profile_name','inherited','model','reasoning','sandbox','approval')}})
         phase='probe-'+str(index)+'-attach'
         visual=pty_probe(row['durable_id'],row['effective_profile'])
         configuration=review['configuration']
@@ -158,9 +194,12 @@ def run_probe(row,index):
                 'model':row['model'],'effort':row['effort'],'sandbox':row['sandbox'],'approval':row['approval'],
                 'history_mode':history['mode'],'memory_mode':'enabled','history_sha256':history['sha256'],
                 'turns_read':len(response['turns']),'item_types':types,'visual':visual,'generation':result['expected_generation']}
-    finally:stop(m);stop(b)
+    finally:
+        save('errors-'+row['native_id']+'.json',{'phase':phase,'messages':error_evidence()})
+        stop(m);stop(b)
 
-try:
+def registry():
+    global phase
     prepare('h')
     rows=PLAN['rows'];assert len(rows)==34
     phase='all34-adopt'
@@ -191,12 +230,17 @@ try:
         assert r['agent_groups']==row['groups'],'group projection drift'
     save('all34-PASS.json',{'subjects':34,'outside_cohort_nonlaunching_prerequisites':1,'offline_registry':35,'api_import_replay_equal':True,'project_membership_equal':True,'private_authority_epochs':'fresh; not migrated originals'})
     stop(m);stop(b)
-    representatives=['cesc-tutor-r1','cute-codex-log-wal-fix-r2','tethys-director-r2','ifm-ema-figures']
+
+try:
+    mode=sys.argv[2] if len(sys.argv)>2 else 'all'
+    if mode in ('all','registry'):registry()
+    representatives=['cesc-tutor-r1','cute-codex-log-wal-fix-r2','tethys-director-r2','ifm-ema-figures'] if mode=='all' else ([mode.removeprefix('probe:')] if mode.startswith('probe:') else [])
+    rows=PLAN['rows']
     proof=[]
     for index,name in enumerate(representatives):
         proof.append(run_probe(next(r for r in rows if r['formal_name']==name),index))
         save('probe-progress.json',proof)
-    save('PASS.json',{'all34_api_import':True,'representatives':proof,'automatic_model_turns':0,'job_executions':0,'auth':'synthetic only','offline_originals_and_all34_registry_unchanged':True})
+    save('PASS.json',{'mode':mode,'all34_api_import':mode in ('all','registry'),'representatives':proof,'automatic_model_turns':0,'job_executions':0,'auth':'synthetic only','offline_originals_and_all34_registry_unchanged':True})
 except BaseException as error:
     save('FAILURE.json',{'phase':phase,'type':type(error).__name__,'error':str(error),'traceback':traceback.format_exc()})
     raise
