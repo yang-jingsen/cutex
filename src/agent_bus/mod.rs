@@ -9,6 +9,7 @@ pub mod delivery;
 pub mod federation;
 pub mod groups;
 pub mod identity;
+pub mod job_completion;
 pub mod launch;
 pub mod mcp;
 pub mod message;
