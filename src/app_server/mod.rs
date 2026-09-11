@@ -13,5 +13,6 @@ pub mod external_recovery;
 pub mod journal;
 pub mod manager;
 pub mod participants;
+pub mod presentation;
 pub mod protocol;
 pub mod runtime;

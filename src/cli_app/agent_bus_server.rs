@@ -645,19 +645,24 @@ fn submit_job_service_completion(
         );
     }
     let repository = agent_bus_message_repository()?;
-    let commit = repository.record_queued(AgentBusQueuedMessage {
-        owner_cutex_session_id: request.target_cutex_session_id.clone(),
-        message_id: message_id.clone(),
-        from_cutex_session_id: None,
-        to_cutex_session_id: request.target_cutex_session_id.clone(),
-        from_runtime_agent_id: None,
-        to_runtime_agent_id: target_id.clone(),
-        delivery_mode: "after_turn".to_string(),
-        content: content.clone(),
-        queued_at: Utc::now(),
-        canonical_envelope: envelope.clone(),
-        semantic_sha256,
-    });
+    let presentation_policy =
+        cutex::config::store::load_codez_config_checked()?.private_job_presentation;
+    let commit = repository.record_queued_private_job(
+        AgentBusQueuedMessage {
+            owner_cutex_session_id: request.target_cutex_session_id.clone(),
+            message_id: message_id.clone(),
+            from_cutex_session_id: None,
+            to_cutex_session_id: request.target_cutex_session_id.clone(),
+            from_runtime_agent_id: None,
+            to_runtime_agent_id: target_id.clone(),
+            delivery_mode: "after_turn".to_string(),
+            content: content.clone(),
+            queued_at: Utc::now(),
+            canonical_envelope: envelope.clone(),
+            semantic_sha256,
+        },
+        presentation_policy.as_ref(),
+    );
     let first_commit = match commit {
         Ok(first_commit) => first_commit,
         Err(error) => {

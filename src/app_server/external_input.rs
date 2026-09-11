@@ -548,6 +548,17 @@ impl ExternalInputClient {
     pub fn binding(&self) -> &ExternalInputBinding {
         &self.binding
     }
+    pub(crate) fn require_presentation_capability(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.client
+                .initialize_response()
+                .get("presentationVersion")
+                .and_then(serde_json::Value::as_u64)
+                == Some(1),
+            "durable presentation capability unavailable; no input fallback"
+        );
+        self.fence()
+    }
     pub(crate) fn fence(&self) -> anyhow::Result<()> {
         ensure!(
             occurrence(
@@ -564,7 +575,7 @@ impl ExternalInputClient {
         serde_json::json!({"version":1,"ownerId":self.binding.owner_id,"threadId":self.binding.thread_id,
             "runtimeGeneration":self.binding.runtime_generation})
     }
-    fn request(
+    pub(crate) fn request(
         &self,
         method: &str,
         params: serde_json::Value,

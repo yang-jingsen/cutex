@@ -252,6 +252,9 @@ pub struct CodezConfig {
     pub agent_bus_port: Option<u16>,
     #[serde(default)]
     pub agent_bus_token: Option<String>,
+    /// Explicit private-only opt-in; absent never creates display obligations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_job_presentation: Option<crate::app_server::presentation::PrivateJobPolicy>,
     #[serde(default)]
     pub management_api_token: Option<ManagementApiToken>,
     /// Dedicated project-scoped read credentials. They never authorize
@@ -290,6 +293,7 @@ impl Default for CodezConfig {
             agent_bus_enabled: true,
             agent_bus_port: None,
             agent_bus_token: None,
+            private_job_presentation: None,
             management_api_token: None,
             owner_task_read_credentials: Vec::new(),
             agent_message_prefix_template: default_agent_message_prefix_template(),

@@ -56,6 +56,8 @@ pub struct AgentBusMessageSnapshot {
     pub external_input_last_observed: Option<crate::app_server::external_input::Status>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_input_commit_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<crate::app_server::presentation::Obligation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<Value>,
 }
@@ -150,6 +152,177 @@ fn validate_private_test_home(home: &str, private: &str) -> anyhow::Result<()> {
 }
 
 impl AgentBusMessageRepository {
+    /// Includes already ACKed input records. The canonical store has no pruning;
+    /// do not derive this worklist from the transport's pending-message queue.
+    pub(crate) fn due_presentations(&self, owner: &str, now: i64) -> anyhow::Result<Vec<String>> {
+        self.read(|s| {
+            let mut due: Vec<_> = s
+                .messages
+                .values()
+                .filter(|m| m.snapshot.to_cutex_session_id == owner)
+                .filter_map(|m| {
+                    m.snapshot
+                        .presentation
+                        .as_ref()
+                        .filter(|p| p.receipt.is_none() && p.next_attempt_at <= now)
+                        .map(|p| (p.next_attempt_at, m.snapshot.message_id.clone()))
+                })
+                .collect();
+            due.sort();
+            Ok(due.into_iter().take(4).map(|(_, id)| id).collect())
+        })
+    }
+    pub(crate) fn begin_presentation_attempt(
+        &self,
+        owner: &str,
+        id: &str,
+        now: i64,
+    ) -> anyhow::Result<()> {
+        self.mutate(|s| {
+            let m = s
+                .messages
+                .get_mut(id)
+                .context("presentation canonical absent")?;
+            anyhow::ensure!(
+                m.snapshot.to_cutex_session_id == owner,
+                "presentation recipient changed"
+            );
+            let p = m
+                .snapshot
+                .presentation
+                .as_mut()
+                .context("presentation not requested")?;
+            anyhow::ensure!(
+                p.receipt.is_none() && p.next_attempt_at <= now,
+                "presentation attempt not due"
+            );
+            p.next_attempt_at = now.saturating_add(30);
+            Ok(())
+        })
+    }
+    pub(crate) fn freeze_presentation(
+        &self,
+        owner: &str,
+        id: &str,
+        thread: &str,
+    ) -> anyhow::Result<crate::app_server::presentation::Receipt> {
+        self.mutate(|s| {
+            let m = s
+                .messages
+                .get_mut(id)
+                .context("presentation canonical absent")?;
+            anyhow::ensure!(
+                m.snapshot.to_cutex_session_id == owner,
+                "presentation recipient changed"
+            );
+            let p = m
+                .snapshot
+                .presentation
+                .as_mut()
+                .context("presentation not requested")?;
+            anyhow::ensure!(
+                p.version == 1
+                    && m.snapshot.semantic_sha256.as_deref() == Some(&p.canonical_sha256),
+                "presentation canonical conflict"
+            );
+            let input = m
+                .snapshot
+                .external_input
+                .as_ref()
+                .context("presentation waiting for input binding")?;
+            let a4 = m
+                .snapshot
+                .external_input_receipt
+                .as_ref()
+                .context("presentation waiting for input Commit")?;
+            input.validate()?;
+            a4.validate(
+                &crate::launch::stock::ExternalInputBinding {
+                    version: 1,
+                    owner_id: input.owner_id.clone(),
+                    thread_id: input.thread_id.clone(),
+                    runtime_generation: input.runtime_generation,
+                    canonical_byte_limit: Default::default(),
+                },
+                &input.key(),
+            )?;
+            anyhow::ensure!(
+                input.owner_id == owner
+                    && input.thread_id == thread
+                    && a4.owner_id == owner
+                    && a4.thread_id == thread
+                    && a4.message_id == id,
+                "presentation input reference conflict"
+            );
+            let expected = crate::app_server::presentation::Receipt::prepare(
+                owner.into(),
+                thread.into(),
+                p.presentation.clone(),
+            )?;
+            if let Some(old) = &p.frozen {
+                anyhow::ensure!(
+                    old == &expected,
+                    "presentation frozen target/payload conflict"
+                );
+            } else {
+                p.frozen = Some(expected.clone());
+            }
+            Ok(expected)
+        })
+    }
+    pub(crate) fn commit_presentation(
+        &self,
+        owner: &str,
+        id: &str,
+        expected: &crate::app_server::presentation::Receipt,
+        receipt: &crate::app_server::presentation::Receipt,
+        generation: u64,
+    ) -> anyhow::Result<()> {
+        receipt.validate()?;
+        anyhow::ensure!(
+            expected == receipt && receipt.owner_id == owner,
+            "presentation receipt mismatch"
+        );
+        self.mutate(|s| {
+            let m = s
+                .messages
+                .get_mut(id)
+                .context("presentation canonical absent")?;
+            anyhow::ensure!(
+                m.snapshot.to_cutex_session_id == owner,
+                "presentation recipient changed"
+            );
+            let p = m
+                .snapshot
+                .presentation
+                .as_mut()
+                .context("presentation not requested")?;
+            anyhow::ensure!(
+                p.frozen.as_ref() == Some(expected)
+                    && m.snapshot.semantic_sha256.as_deref() == Some(&p.canonical_sha256)
+                    && p.receipt.as_ref().is_none_or(|r| r == receipt),
+                "presentation commit CAS conflict"
+            );
+            p.receipt = Some(receipt.clone());
+            p.commit_generation.get_or_insert(generation);
+            p.last_error = None;
+            // Deliberately leave input state/A4/Job ACK unchanged.
+            Ok(())
+        })
+    }
+    pub(crate) fn presentation_error(&self, id: &str, error: &str) -> anyhow::Result<()> {
+        self.mutate(|s| {
+            let p = s
+                .messages
+                .get_mut(id)
+                .and_then(|m| m.snapshot.presentation.as_mut())
+                .context("presentation absent")?;
+            if p.receipt.is_none() {
+                p.last_error = Some(error.chars().take(512).collect());
+            }
+            Ok(())
+        })
+    }
     pub(crate) fn recovery_action(
         &self,
         action: &str,
@@ -174,7 +347,7 @@ impl AgentBusMessageRepository {
             }
             s.external_recovery_actions
                 .insert(receipt.action_id.clone(), receipt.clone());
-            s.version = 4;
+            s.version = s.version.max(4);
             Ok(())
         })
     }
@@ -191,18 +364,38 @@ impl AgentBusMessageRepository {
     /// Returns `true` only for the first durable commit and `false` for an
     /// exact replay of the same message identity and semantic content.
     pub fn record_queued(&self, message: AgentBusQueuedMessage) -> anyhow::Result<bool> {
-        self.record_queued_internal(message, true)
+        self.record_queued_internal(message, true, None)
+    }
+
+    /// Only the authenticated Job handler calls this after its source checks.
+    /// Existing records never gain an obligation on replay/config change.
+    pub fn record_queued_private_job(
+        &self,
+        message: AgentBusQueuedMessage,
+        policy: Option<&crate::app_server::presentation::PrivateJobPolicy>,
+    ) -> anyhow::Result<bool> {
+        let display = match policy {
+            Some(p) if p.permits(&message.to_cutex_session_id)? => {
+                Some(crate::app_server::presentation::Obligation::job(
+                    &message.canonical_envelope,
+                    &message.semantic_sha256,
+                )?)
+            }
+            _ => None,
+        };
+        self.record_queued_internal(message, true, display)
     }
 
     #[cfg(test)]
     fn record_queued_isolated(&self, message: AgentBusQueuedMessage) -> anyhow::Result<bool> {
-        self.record_queued_internal(message, false)
+        self.record_queued_internal(message, false, None)
     }
 
     fn record_queued_internal(
         &self,
         message: AgentBusQueuedMessage,
         record_management_event: bool,
+        presentation: Option<crate::app_server::presentation::Obligation>,
     ) -> anyhow::Result<bool> {
         validate_session_identity(&message.owner_cutex_session_id)?;
         if let Some(from) = message.from_cutex_session_id.as_deref() {
@@ -257,6 +450,9 @@ impl AgentBusMessageRepository {
                     }),
                 )?;
             }
+            if presentation.is_some() {
+                store.version = 5;
+            }
             store.messages.insert(
                 message.message_id.clone(),
                 StoredAgentBusMessage {
@@ -278,6 +474,7 @@ impl AgentBusMessageRepository {
                         external_input_receipt: None,
                         external_input_last_observed: None,
                         external_input_commit_generation: None,
+                        presentation,
                         error: None,
                     },
                     updated_at: message.queued_at.to_rfc3339(),
@@ -725,8 +922,50 @@ fn validate_session_identity(value: &str) -> anyhow::Result<()> {
 
 fn load_store(path: &Path) -> anyhow::Result<AgentBusMessageStore> {
     let store = load_store_unchecked(path)?;
-    if !matches!(store.version, 2 | 3 | 4) {
+    if !matches!(store.version, 2 | 3 | 4 | 5) {
         anyhow::bail!("unsupported management v2 agent-bus state version");
+    }
+    if store.version < 5
+        && store
+            .messages
+            .values()
+            .any(|m| m.snapshot.presentation.is_some())
+    {
+        anyhow::bail!("presentation obligation requires Bus state v5");
+    }
+    for m in store.messages.values() {
+        if let Some(p) = &m.snapshot.presentation {
+            anyhow::ensure!(
+                p.version == 1
+                    && m.snapshot.semantic_sha256.as_deref() == Some(&p.canonical_sha256),
+                "invalid presentation obligation"
+            );
+            let canonical = m
+                .canonical_envelope
+                .as_ref()
+                .context("presentation canonical absent")?;
+            let expected =
+                crate::app_server::presentation::Obligation::job(canonical, &p.canonical_sha256)?;
+            anyhow::ensure!(
+                expected.presentation == p.presentation,
+                "presentation template/canonical conflict"
+            );
+            if let Some(frozen) = &p.frozen {
+                frozen.validate()?;
+                anyhow::ensure!(
+                    frozen.owner_id == m.snapshot.to_cutex_session_id
+                        && frozen.presentation == p.presentation,
+                    "presentation frozen conflict"
+                );
+            }
+            if let Some(receipt) = &p.receipt {
+                receipt.validate()?;
+                anyhow::ensure!(
+                    p.frozen.as_ref() == Some(receipt) && p.commit_generation.is_some(),
+                    "presentation receipt without frozen commit"
+                );
+            }
+        }
     }
     Ok(store)
 }
@@ -998,6 +1237,211 @@ mod tests {
         }
     }
 
+    fn presentation_job() -> AgentBusQueuedMessage {
+        let mut q = system_queued_message("model input is not the Human summary");
+        q.canonical_envelope.control_payload = Some(serde_json::json!({
+            "schema":crate::agent_bus::model::JOB_SERVICE_COMPLETION_SCHEMA,
+            "eventId":"event-1","jobId":"job-1","jobRevision":1,"terminalStatus":"exited",
+            "resultSha256":"a".repeat(64),"targetCutexSessionId":q.to_cutex_session_id,
+            "summary":"bounded result data"
+        }));
+        q
+    }
+    fn fixture_a4(repository: &AgentBusMessageRepository, owner: &str) {
+        use crate::app_server::external_input::*;
+        let e = repository
+            .freeze_external_input(owner, "jsc_stable", |m| {
+                let mut e = Envelope {
+                    version: 1,
+                    owner_id: owner.into(),
+                    thread_id: "native-test".into(),
+                    runtime_generation: 1,
+                    message: Message {
+                        id: m.id.clone(),
+                        source: Source {
+                            kind: SourceKind::Service,
+                            id: "cutex-job-service".into(),
+                        },
+                        event_type: "job_completion".into(),
+                        delivery: Delivery::AfterTurn,
+                        text: m.content.clone(),
+                    },
+                    semantic_sha256: String::new(),
+                };
+                e.semantic_sha256 = e.digest();
+                Ok(e)
+            })
+            .unwrap();
+        let mut r = Receipt {
+            schema: "codex.external-input-receipt.v1".into(),
+            receipt_id: String::new(),
+            owner_id: owner.into(),
+            thread_id: e.thread_id.clone(),
+            message_id: e.message.id.clone(),
+            semantic_sha256: e.semantic_sha256.clone(),
+            response_item_id: e.message.id.clone(),
+            turn_id: "fixture-turn".into(),
+            ordinal: 1,
+        };
+        r.receipt_id = r.digest_id();
+        repository
+            .record_external_input_delivered(owner, "jsc_stable", &e, &r, 1)
+            .unwrap();
+    }
+    #[test]
+    fn presentation_obligation_survives_input_ack_reopen_and_exact_receipt_cas() {
+        use crate::app_server::presentation::PrivateJobPolicy;
+        let root =
+            std::env::temp_dir().join(format!("presentation-store-{}", uuid::Uuid::new_v4()));
+        let repo = AgentBusMessageRepository::open(&root).unwrap();
+        let q = presentation_job();
+        let owner = q.to_cutex_session_id.clone();
+        let policy = PrivateJobPolicy {
+            version: 1,
+            recipients: vec![owner.clone()],
+        };
+        assert!(repo
+            .record_queued_private_job(q.clone(), Some(&policy))
+            .unwrap());
+        assert!(repo
+            .freeze_presentation(&owner, "jsc_stable", "native-test")
+            .is_err());
+        fixture_a4(&repo, &owner); // Synthetic A4; this test proves repository semantics only.
+        let before = repo.snapshot_by_message_id("jsc_stable").unwrap().unwrap();
+        assert_eq!(before.state, "delivered");
+        drop(repo);
+        let repo = AgentBusMessageRepository::open(&root).unwrap();
+        assert_eq!(
+            repo.due_presentations(&owner, 100).unwrap(),
+            vec!["jsc_stable"]
+        );
+        repo.begin_presentation_attempt(&owner, "jsc_stable", 100)
+            .unwrap();
+        assert!(repo.due_presentations(&owner, 100).unwrap().is_empty());
+        let frozen = repo
+            .freeze_presentation(&owner, "jsc_stable", "native-test")
+            .unwrap();
+        assert_ne!(frozen.presentation.body, q.content);
+        assert_eq!(frozen.presentation.title, "Job 终态通知");
+        assert_eq!(frozen.presentation.body, "Job: job-1\n状态：exited\n输出读取状态：未观测。\n摘要（外部数据）：bounded result data");
+        assert!(!frozen.presentation.body.contains("退出码 0"));
+        assert!(repo
+            .freeze_presentation(&owner, "jsc_stable", "foreign-native")
+            .is_err());
+        // Lost append reply/local CAS: same persisted frozen fact after reopening.
+        drop(repo);
+        let repo = AgentBusMessageRepository::open(&root).unwrap();
+        assert_eq!(
+            repo.freeze_presentation(&owner, "jsc_stable", "native-test")
+                .unwrap(),
+            frozen
+        );
+        let mut changed = frozen.clone();
+        changed.presentation.body.push('!');
+        assert!(repo
+            .commit_presentation(&owner, "jsc_stable", &frozen, &changed, 2)
+            .is_err());
+        assert!(repo
+            .commit_presentation("foreign", "jsc_stable", &frozen, &frozen, 2)
+            .is_err());
+        repo.commit_presentation(&owner, "jsc_stable", &frozen, &frozen, 2)
+            .unwrap();
+        repo.commit_presentation(&owner, "jsc_stable", &frozen, &frozen, 3)
+            .unwrap();
+        let after = repo.snapshot_by_message_id("jsc_stable").unwrap().unwrap();
+        assert_eq!(after.external_input_receipt, before.external_input_receipt);
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.presentation.unwrap().commit_generation, Some(2));
+        assert!(repo.due_presentations(&owner, 200).unwrap().is_empty());
+        assert!(!repo.record_queued_private_job(q, None).unwrap());
+        assert_eq!(
+            load_store(&root.join(AGENT_BUS_STATE_FILE))
+                .unwrap()
+                .version,
+            5
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn presentation_no_backfill_default_none_or_downgrade() {
+        use crate::app_server::presentation::PrivateJobPolicy;
+        let root =
+            std::env::temp_dir().join(format!("presentation-legacy-{}", uuid::Uuid::new_v4()));
+        let repo = AgentBusMessageRepository::open(&root).unwrap();
+        let q = presentation_job();
+        let owner = q.to_cutex_session_id.clone();
+        repo.record_queued_private_job(q.clone(), None).unwrap();
+        fixture_a4(&repo, &owner);
+        let policy = PrivateJobPolicy {
+            version: 1,
+            recipients: vec![owner.clone()],
+        };
+        assert!(!repo.record_queued_private_job(q, Some(&policy)).unwrap());
+        assert!(repo
+            .snapshot_by_message_id("jsc_stable")
+            .unwrap()
+            .unwrap()
+            .presentation
+            .is_none());
+        let mut q = presentation_job();
+        q.message_id = "new-job".into();
+        q.canonical_envelope.id = q.message_id.clone();
+        repo.record_queued_private_job(q, Some(&policy)).unwrap();
+        let path = root.join(AGENT_BUS_STATE_FILE);
+        let mut state = load_store(&path).unwrap();
+        assert_eq!(state.version, 5);
+        // Exact old reader version predicate rejects v5, rather than dropping new fields.
+        assert!(!matches!(state.version, 2 | 3 | 4));
+        state.version = 4;
+        write_private_pretty_json_atomic(&path, &state, "fixture downgrade").unwrap();
+        assert!(load_store(&path).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn presentation_bounded_round_robin_preserves_waiting_work_and_rejects_forged_source() {
+        use crate::app_server::presentation::PrivateJobPolicy;
+        let root =
+            std::env::temp_dir().join(format!("presentation-schedule-{}", uuid::Uuid::new_v4()));
+        let repo = AgentBusMessageRepository::open(&root).unwrap();
+        let owner = presentation_job().to_cutex_session_id;
+        let policy = PrivateJobPolicy {
+            version: 1,
+            recipients: vec![owner.clone()],
+        };
+        for n in 0..6 {
+            let mut q = presentation_job();
+            q.message_id = format!("job-{n}");
+            q.canonical_envelope.id = q.message_id.clone();
+            repo.record_queued_private_job(q, Some(&policy)).unwrap();
+        }
+        let first = repo.due_presentations(&owner, 100).unwrap();
+        assert_eq!(first.len(), 4);
+        for id in &first {
+            repo.begin_presentation_attempt(&owner, id, 100).unwrap();
+            repo.presentation_error(id, "recipient offline; not accepted by native")
+                .unwrap();
+        }
+        let next = repo.due_presentations(&owner, 100).unwrap();
+        assert_eq!(next.len(), 2);
+        assert!(next.iter().all(|id| !first.contains(id)));
+        assert!(repo.due_presentations("foreign", 100).unwrap().is_empty());
+        assert_eq!(repo.due_presentations(&owner, 130).unwrap().len(), 4);
+        let mut forged = presentation_job();
+        forged.canonical_envelope.sender_kind = crate::agent_bus::model::AgentMessageKind::Agent;
+        assert!(repo
+            .record_queued_private_job(forged, Some(&policy))
+            .is_err());
+        assert_eq!(
+            load_store(&root.join(AGENT_BUS_STATE_FILE))
+                .unwrap()
+                .messages
+                .len(),
+            6
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn system_source_persists_before_redrive_and_changed_replay_conflicts() {
         let root = std::env::temp_dir().join(format!("cutex-js3a-state-{}", uuid::Uuid::new_v4()));
@@ -1046,6 +1490,7 @@ mod tests {
                             external_input_receipt: None,
                             external_input_last_observed: None,
                             external_input_commit_generation: None,
+                            presentation: None,
                             error: None,
                         },
                         updated_at: Utc::now().to_rfc3339(),

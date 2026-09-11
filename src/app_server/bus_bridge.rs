@@ -711,6 +711,13 @@ fn run_bridge_worker(
                         &status,
                     )
                 };
+                // Input delivery and ACK have already run. Display failures do
+                // not alter their result; recovery also runs on an empty poll.
+                if let Some(generation) = options.external_input_generation {
+                    if let Err(error) = external::deliver_presentations(&options, generation) {
+                        mark_error(&status, format!("presentation recovery: {error}"));
+                    }
+                }
                 let outcome = match delivery {
                     Ok(outcome) => outcome,
                     Err(error) => {

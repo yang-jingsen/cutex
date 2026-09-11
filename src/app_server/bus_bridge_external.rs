@@ -440,6 +440,97 @@ fn envelope(
     Ok(e)
 }
 
+/// Independent display recovery runs after input ACK, including on empty polls.
+/// It never submits input, retries a held turn, or changes business delivery.
+pub(super) fn deliver_presentations(
+    options: &AppServerAgentBusBridgeOptions,
+    generation: u64,
+) -> anyhow::Result<()> {
+    use crate::app_server::presentation::PresentationClient;
+    let repository = agent_bus_message_repository()?;
+    let now = Utc::now().timestamp();
+    let ids = repository.due_presentations(&options.cutex_session_id, now)?;
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let path = crate::session::store::cutex_sessions_path()?;
+    let mut client = None;
+    for id in ids {
+        if repository
+            .begin_presentation_attempt(&options.cutex_session_id, &id, now)
+            .is_err()
+        {
+            continue;
+        }
+        let result = (|| -> anyhow::Result<()> {
+            let message = repository.canonical_message(&id)?;
+            let management = crate::agent_management::AgentManagementStore::open_default()?;
+            let seats = crate::seat::SeatOccupancyStore::open_default()?;
+            let roster = management.snapshot()?;
+            let target =
+                crate::role_revision::CutexSessionId::new(options.cutex_session_id.clone())
+                    .map_err(|_| anyhow::anyhow!("invalid presentation recipient"))?;
+            ensure!(
+                roster
+                    .agents
+                    .get(&target)
+                    .is_none_or(|a| a.retired_at.is_none()),
+                "presentation recipient permanently retired"
+            );
+            seats.with_notification_snapshot(|s| {
+                validate_target(&message, &options.cutex_session_id, s, &roster)
+            })??;
+            if client.is_none() {
+                client = Some(PresentationClient::connect(
+                    &path,
+                    &options.cutex_session_id,
+                    generation,
+                )?);
+            }
+            let c = client.as_ref().expect("connected");
+            let frozen = repository.freeze_presentation(
+                &options.cutex_session_id,
+                &id,
+                &c.binding().thread_id,
+            )?;
+            let receipt = match c.status(&frozen)? {
+                Some(r) => r,
+                None => c.append(&frozen)?,
+            };
+            let _mutation = management
+                .try_lock_delivery_mutations()?
+                .context("lifecycle transition in progress")?;
+            let roster = management.snapshot()?;
+            ensure!(
+                roster
+                    .agents
+                    .get(&target)
+                    .is_none_or(|a| a.retired_at.is_none()),
+                "presentation recipient permanently retired"
+            );
+            seats.with_notification_snapshot(|s| -> anyhow::Result<()> {
+                validate_target(&message, &options.cutex_session_id, s, &roster)?;
+                crate::session::store::with_locked_session_store(&path, |_| {
+                    c.fence()?;
+                    repository.commit_presentation(
+                        &options.cutex_session_id,
+                        &id,
+                        &frozen,
+                        &receipt,
+                        generation,
+                    )
+                })
+            })??;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            repository.presentation_error(&id, &error.to_string())?;
+            // Recorded reason + per-record 30s backoff; unrelated work continues.
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn deliver(
     bus: &dyn RuntimeAgentBus,
     options: &AppServerAgentBusBridgeOptions,
