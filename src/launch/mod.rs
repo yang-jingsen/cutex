@@ -14,4 +14,5 @@ pub mod profile;
 pub mod program;
 pub mod runtime;
 pub mod selected_profile;
+pub mod selected_status;
 pub mod stock;

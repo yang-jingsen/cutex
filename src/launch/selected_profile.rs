@@ -41,6 +41,8 @@ pub struct Projection {
     pub settings: Settings,
     pub catalog: Option<VerifiedFile>,
     pub requires_job: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<super::selected_status::Status>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,6 +274,7 @@ impl Config {
                 settings,
                 catalog,
                 requires_job: !self.mcp_servers.is_empty(),
+                status: None,
             },
             model,
             effort,
@@ -334,8 +337,18 @@ impl Settings {
             "unsupported plugin projection"
         );
         if let Some(tui) = &self.tui {
-            ensure!(tui.status_line.iter().all(|s| matches!(s.as_str(), "model-with-reasoning" | "current-dir" | "context-used" | "weekly-limit")),
-                "selected custom status items require accepted native restoration; no silent omission");
+            ensure!(
+                tui.status_line.iter().all(|s| matches!(
+                    s.as_str(),
+                    "model-with-reasoning"
+                        | "current-dir"
+                        | "context-used"
+                        | "weekly-limit"
+                        | "custom:profile"
+                        | "custom:bon-voyage"
+                )),
+                "unsupported selected status item"
+            );
         }
         Ok(())
     }
@@ -391,7 +404,7 @@ pub fn validate_model(
     Ok(())
 }
 
-fn bounded_asset(path: &Path) -> anyhow::Result<Vec<u8>> {
+pub(super) fn bounded_asset(path: &Path) -> anyhow::Result<Vec<u8>> {
     use std::io::Read;
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -426,7 +439,7 @@ fn bounded_asset(path: &Path) -> anyhow::Result<Vec<u8>> {
     ensure!(bytes.len() <= 4 * 1024 * 1024, "reviewed asset grew");
     Ok(bytes)
 }
-fn validate_asset(path: &Path) -> anyhow::Result<()> {
+pub(super) fn validate_asset(path: &Path) -> anyhow::Result<()> {
     super::stock::canonical(path)?;
     ensure!(path.is_file(), "reviewed asset missing");
     #[cfg(unix)]
@@ -623,6 +636,18 @@ impl Projection {
     }
     pub fn validate(&self) -> anyhow::Result<()> {
         self.settings.validate()?;
+        let wants_status = self
+            .settings
+            .tui
+            .as_ref()
+            .is_some_and(|t| t.status_line.iter().any(|s| s.starts_with("custom:")));
+        ensure!(
+            wants_status == self.status.is_some(),
+            "selected status projection missing or inappropriate"
+        );
+        if let Some(status) = &self.status {
+            status.validate()?;
+        }
         ensure!(
             review_auth(&self.auth.path, &self.route)? == self.auth,
             "selected auth custody/account changed"
@@ -698,11 +723,13 @@ mod tests {
             status_line: vec!["custom:profile".into()],
             status_line_use_colors: true,
         });
-        assert!(s
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("native restoration"));
+        assert!(s.validate().is_ok());
+        s.tui
+            .as_mut()
+            .unwrap()
+            .status_line
+            .push("custom:unknown".into());
+        assert!(s.validate().is_err());
     }
     #[test]
     fn actual_catalog_reference_is_pinned_not_remote_claim() {

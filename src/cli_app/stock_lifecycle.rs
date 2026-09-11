@@ -845,6 +845,20 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
         "tui.resume_cwd=\"current\"",
     ]);
     let mut launch = configured(launch, &ready.review.configuration, false)?;
+    if let Some(status) = ready
+        .review
+        .configuration
+        .selected_projection
+        .as_ref()
+        .and_then(|p| p.status.as_ref())
+    {
+        launch = launch.arg("--status-items-file").arg(
+            status
+                .materialize()?
+                .to_str()
+                .context("status path must be UTF-8")?,
+        );
+    }
     if bundle.soon_ingress() {
         launch = option(
             launch,

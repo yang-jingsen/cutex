@@ -24,12 +24,12 @@ pub const S6_SCHEMA_SHA256: &str =
     "00e035e34ac1034ee34473f8f68b7704d6058c5b180ff4f4b6cad9fadab3a86d";
 // Exact accepted durable-presentation CLI/server family. Older
 // bundle receipts remain historical facts, not permission to launch old bytes.
-pub const S6E_COMMIT: &str = "2eab060b191a0fe59e22b28785d02d76eafb7fc4";
+pub const S6E_COMMIT: &str = "8cde795620e8b2fa6ba3bfa1fd15a5732a1e12f6";
 // Coherent accepted auth/legacy-reader family, not a descendant allowlist.
 pub const S6E_SERVER_COMMIT: &str = "2eab060b191a0fe59e22b28785d02d76eafb7fc4";
 pub const S6E_EXECUTABLE_SHA256: &str =
     "15c72a6bd476a60af9ba99cfbc0672a8376e8bb447cda2f1745e72aef2070c49";
-pub const S6E_CLI_SHA256: &str = "8173b51cb89961a34f4586207429c9ea28e619b86bdcc32bfb5e3c7ea68972cc";
+pub const S6E_CLI_SHA256: &str = "f66dd9126fb73b8f6bc04cd275f619630c96c4255e6281dcbeb1fe41f8b691cf";
 pub const S6E_SCHEMA_SHA256: &str =
     "3fc006075408b0a001f9cb3f706625c0161e083ab0691d6be6116622b434f1d3";
 
@@ -488,6 +488,17 @@ impl StockConfiguration {
                 "conflicting reviewed auth modes"
             );
             projection.validate()?;
+            if let Some(status) = &projection.status {
+                status.validate_projection(
+                    &projection
+                        .settings
+                        .tui
+                        .as_ref()
+                        .context("status selection missing")?
+                        .status_line,
+                    &self.profile_name,
+                )?;
+            }
             if projection
                 .settings
                 .plugins
@@ -660,12 +671,20 @@ fn configuration_for_selection(
         .and_then(toml::Value::as_str)
         == Some("selected_profile_v2")
     {
-        let (projection, model, reasoning) = super::selected_profile::Config::parse(&raw)?.review(
-            &account.id,
-            files.auth_path.clone(),
-            selected_model,
-            selected_reasoning,
-        )?;
+        let (mut projection, model, reasoning) = super::selected_profile::Config::parse(&raw)?
+            .review(
+                &account.id,
+                files.auth_path.clone(),
+                selected_model,
+                selected_reasoning,
+            )?;
+        if let Some(tui) = &projection.settings.tui {
+            projection.status = super::selected_status::Status::review(
+                &files.custom_status_items_path,
+                &tui.status_line,
+                &account.name,
+            )?;
+        }
         let sandbox = sandbox.context("explicit selected sandbox required")?;
         let approval = approval.context("explicit selected approval required")?;
         validate_selected_permissions(permission, &sandbox, &approval)?;
@@ -953,12 +972,12 @@ mod tests {
     #[test]
     #[ignore = "requires the task-owned accepted native manifest"]
     fn accepted_auth_manifest_matches_compiled_pins() {
-        let path=Path::new("/mnt/mambo/PersonaProjects/cutex-light-core-r1/artifacts/independent-auth-file-r1/build-manifest.json");
+        let path=Path::new("/mnt/mambo/PersonaProjects/cutex-light-core-r1/artifacts/custom-status-r1/build-manifest.json");
         let bytes = std::fs::read(path).expect("accepted immutable native manifest");
         use sha2::Digest;
         assert_eq!(
             format!("{:x}", sha2::Sha256::digest(&bytes)),
-            "6392a1e686be1940aa51d2a944e89300d6fde852c988f45684cf8b439ed5678c"
+            "6727a35e9154ed53f1384e3c3bcc5362097dd4ef6e3c9de7dd93dec1d3556063"
         );
         let m: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(m["source_commit"], S6E_COMMIT);

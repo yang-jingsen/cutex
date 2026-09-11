@@ -208,7 +208,8 @@ fn selected_private_files_protocol_and_secret_boundary() {
             &p.join("auth.json"),
             &serde_json::to_vec(&auth(name)).unwrap(),
         );
-        write(&p.join("config.toml"),b"cutex_provider_mode='selected_profile_v2'\ncli_auth_credentials_store='file'\nmodel='gpt-5.6-terra'\nmodel_reasoning_effort='low'\n");
+        write(&p.join("config.toml"),b"cutex_provider_mode='selected_profile_v2'\ncli_auth_credentials_store='file'\nmodel='gpt-5.6-terra'\nmodel_reasoning_effort='low'\n[tui]\nstatus_line=['custom:bon-voyage','custom:profile','model-with-reasoning']\nstatus_line_use_colors=true\n");
+        write(&p.join("custom-status-items.json"), br##"{"items":[{"id":"custom:bon-voyage","title":"Bon voyage","source":{"kind":"static","value":"Bon voyage !"},"style":{"fg":"#F6A3C8","bold":true}},{"id":"custom:profile","title":"Profile","source":{"kind":"launch_profile"},"style":{"fg":"#FFFFFF","bold":true}}]}"##);
         accounts
             .push(json!({"id":id,"name":name,"email":null,"plan_type":null,"last_used_at":null}));
     }
@@ -231,6 +232,16 @@ fn selected_private_files_protocol_and_secret_boundary() {
     record.approval_policy = Some("never".into());
     let inherited = cutex::launch::stock::current_configuration(&record).unwrap();
     assert!(inherited.inherited);
+    let status = inherited
+        .selected_projection
+        .as_ref()
+        .unwrap()
+        .status
+        .as_ref()
+        .unwrap();
+    assert_eq!(status.payload.items[1].text, "aemeath");
+    assert_eq!(status.payload.items[0].style.fg.as_deref(), Some("#F6A3C8"));
+    status.materialize().unwrap();
     assert_eq!(
         inherited.profile_id,
         cutex::launch::aemeath_auth::PROFILE_ID
