@@ -50,12 +50,64 @@ pub struct Execution {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Stream {
-    pub observed_bytes: u64,
     pub retained_bytes: u64,
+    pub observed_bytes: u64,
     pub truncated: bool,
 }
 
 impl CompletionV2 {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.schema == SCHEMA_V2 && self.facts.facts_version == 1,
+            "unsupported Job facts version"
+        );
+        for id in [&self.event_id, &self.job_id] {
+            ensure!(
+                !id.is_empty()
+                    && id.len() <= 128
+                    && id.bytes().all(
+                        |b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-')
+                    ),
+                "invalid Job completion identifier"
+            );
+        }
+        ensure!(self.job_revision > 0, "Job revision must be positive");
+        crate::role_revision::Sha256::new(self.result_sha256.clone())
+            .map_err(|_| anyhow::anyhow!("invalid Job result digest"))?;
+        ensure!(
+            !self.facts.action_id.trim().is_empty() && self.facts.action_id.len() <= 256,
+            "invalid Job action label"
+        );
+        ensure!(
+            self.output_reference.len() <= 2048,
+            "Job output reference exceeds limit"
+        );
+        ensure!(
+            self.facts
+                .terminal_reason
+                .as_ref()
+                .is_none_or(|v| v.len() <= 2048),
+            "Job reason exceeds limit"
+        );
+        ensure!(
+            self.facts.exit_code.is_none_or(|code| code >= 0),
+            "Job facts exit code must not encode a signal"
+        );
+        if let Some(execution) = &self.facts.execution {
+            ensure!(
+                execution.basis == "runner_release_to_wait_v1",
+                "unsupported Job execution basis"
+            );
+        }
+        for stream in [&self.facts.stdout, &self.facts.stderr] {
+            ensure!(
+                stream.retained_bytes <= stream.observed_bytes,
+                "Job retained bytes exceed observed bytes"
+            );
+        }
+        self.view()?;
+        Ok(())
+    }
     pub fn model_text(&self) -> String {
         let label = match (&self.terminal_status, self.facts.exit_code) {
             (JobServiceTerminalStatus::Exited, Some(0)) => "completed",
@@ -169,5 +221,22 @@ mod tests {
         assert!(restored.model_text().contains("Observed run: 0 ms"));
         request.terminal_status = JobServiceTerminalStatus::Cancelled;
         assert!(request.model_text().starts_with("Job cancelled."));
+    }
+
+    #[test]
+    fn exact_producer_bounds_and_unknown_fields_fail_closed() {
+        let mut request = fixture();
+        request.validate().unwrap();
+        request.facts.action_id = "中".repeat(86);
+        assert!(request.validate().is_err());
+        request = fixture();
+        request.facts.exit_code = Some(-9);
+        assert!(request.validate().is_err());
+        request = fixture();
+        request.facts.stdout.retained_bytes = 40;
+        assert!(request.validate().is_err());
+        let mut value = serde_json::to_value(fixture()).unwrap();
+        value["summary"] = "not a v2 field".into();
+        assert!(serde_json::from_value::<CompletionV2>(value).is_err());
     }
 }
