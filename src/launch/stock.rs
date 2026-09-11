@@ -962,6 +962,10 @@ mod tests {
     fn selected_shared_version_is_explicit_and_unknowns_stay_closed() {
         let raw="cutex_projection_version=2\nmodel='gpt-5.6-sol'\nmodel_reasoning_effort='max'\nsandbox_mode='danger-full-access'\napprovals_reviewer='user'\n[shell_environment_policy]\nexclude=['CODEX_AUTH_FILE']\n";
         assert!(validate_shared_config(raw).is_ok());
+        assert!(validate_shared_config(&format!(
+            "{raw}\n[tui]\nstatus_line=['model-with-reasoning']\nstatus_line_use_colors=true\n[tui.model_availability_nux]\n'gpt-5.5'=2\n'gpt-5.6-sol'=1\n"
+        ))
+        .is_ok());
         assert!(validate_shared_config(&raw.replace("cutex_projection_version=2\n", "")).is_err());
         assert!(validate_shared_config(&raw.replace("version=2", "version=3")).is_err());
         assert!(

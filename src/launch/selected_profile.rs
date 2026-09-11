@@ -112,6 +112,10 @@ pub struct Skill {
 pub struct Tui {
     pub status_line: Vec<String>,
     pub status_line_use_colors: bool,
+    /// Native persisted tooltip counters, not model availability authority.
+    /// Absent/empty preserves the original reviewed serialization exactly.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_availability_nux: BTreeMap<String, u32>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -337,6 +341,17 @@ impl Settings {
             "unsupported plugin projection"
         );
         if let Some(tui) = &self.tui {
+            ensure!(
+                tui.model_availability_nux.len() <= 64
+                    && tui.model_availability_nux.keys().all(|model| {
+                        !model.is_empty()
+                            && model.len() <= 128
+                            && model.bytes().all(|b| {
+                                b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')
+                            })
+                    }),
+                "unsupported model tooltip counter keys"
+            );
             ensure!(
                 tui.status_line.iter().all(|s| matches!(
                     s.as_str(),
@@ -722,6 +737,7 @@ mod tests {
         s.tui = Some(Tui {
             status_line: vec!["custom:profile".into()],
             status_line_use_colors: true,
+            model_availability_nux: BTreeMap::new(),
         });
         assert!(s.validate().is_ok());
         s.tui
@@ -730,6 +746,34 @@ mod tests {
             .status_line
             .push("custom:unknown".into());
         assert!(s.validate().is_err());
+    }
+    #[test]
+    fn tooltip_counters_preserve_native_values_without_changing_legacy_bytes() {
+        let old =
+            serde_json::json!({"status_line":["custom:profile"],"status_line_use_colors":true});
+        let mut tui: Tui = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&tui).unwrap(), old);
+        tui.model_availability_nux.insert("gpt-5.5".into(), 2);
+        tui.model_availability_nux.insert("gpt-5.6-sol".into(), 1);
+        let mut settings = Settings {
+            tui: Some(tui),
+            ..Default::default()
+        };
+        assert!(settings.validate().is_ok());
+        assert_eq!(
+            serde_json::to_value(&settings).unwrap()["tui"]["model_availability_nux"]["gpt-5.5"],
+            2
+        );
+        settings
+            .tui
+            .as_mut()
+            .unwrap()
+            .model_availability_nux
+            .insert("bad/key".into(), 1);
+        assert!(settings.validate().is_err());
+        let mut malformed = old;
+        malformed["model_availability_nux"] = serde_json::json!({"gpt-5.5":-1});
+        assert!(serde_json::from_value::<Tui>(malformed).is_err());
     }
     #[test]
     fn actual_catalog_reference_is_pinned_not_remote_claim() {
