@@ -184,6 +184,9 @@ summary still works as before. Its stored body is not rewritten for new styling.
 Only show `completed`/success when observed state+code prove it. Otherwise `Job
 exited`, `Job failed`, `Job cancelled`, or `Job interrupted — result unknown`.
 Details retain full IDs, absolute observation timestamps and stream counters.
+Omit unavailable optional action/exit/duration fields entirely in the compact
+view; do not add "unavailable" rows. With only terminal state Exited known, the
+safe title is `Job exited`, not a success claim.
 OutputPage metadata simplification is a native-only task using current returned
 bytes; no Job service change is needed to hide routine offsets or retain a bounded
 text preview. Gap/truncation remain visible exceptions. No fake filesystem links.
@@ -207,10 +210,21 @@ text preview. Gap/truncation remain visible exceptions. No fake filesystem links
 | New fact semantics | explicit data schema/producers/consumers; not a color-only update |
 | Old native/writer with v2 data | reject before unsupported write/send; no downgrade/history rewrite |
 
-Alternative: put formatted text in the existing Presentation and keep generic
-External input unchanged. It avoids a native data extension but recreates delayed
-duplicate/supplement cards and makes semantic future reformatting depend on frozen
-prose. Not recommended for the approved natural single-event display. Encoding
+Alternative: use the already supported explicitly linked Presentation carrying
+independent display content and keep generic External input unchanged. This is
+valid and cheaper when the requirement is a frozen human-written summary:
+no new native wire, and existing receipts/replay/adjacent grouping apply. It does
+not always produce a duplicate card: explicit adjacent grouping can combine the
+visual presentation; late/non-adjacent arrival remains a truthful supplement.
+It still needs a separate obligation/append/receipt and stores prose rather than
+typed execution facts. Later layout can redraw that prose, but cannot reliably
+select/relabel/reformat its facts without a parser or another producer event.
+
+The proposed extension is worth its mechanical-history/projection/hash cost
+specifically for re-renderable structured facts on the original inbound event,
+with no second delivery race. If that requirement is deferred, linked frozen
+Presentation is a sufficient smaller alternative, not an unsupported workaround.
+Keep it for genuinely independent display content in either design. Encoding
 JSON inside model text merely moves parsing into prose and does not separate data
 from provider input; no opaque parser workaround.
 
