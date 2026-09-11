@@ -408,23 +408,13 @@ fn envelope(
                     .clone()
                     .context("job metadata absent")?,
             )?;
-            let status = serde_json::to_value(&m.terminal_status)?
-                .as_str()
-                .context("job status shape")?
-                .to_string();
             (
                 Source {
                     kind: SourceKind::Service,
                     id: "cutex-job-service".into(),
                 },
                 "job_completion",
-                format!(
-                    "Job: {}\nResult: {}\nOutput reference: {}\nSummary (external data): {}",
-                    m.job_id,
-                    status,
-                    m.output_reference.as_deref().unwrap_or("unavailable"),
-                    m.summary.as_deref().unwrap_or("unavailable")
-                ),
+                legacy_job_model_text(&m)?,
             )
         }
         _ => anyhow::bail!("Human/owner ingress not enabled through Agent Bus adapter"),
@@ -446,6 +436,50 @@ fn envelope(
     e.semantic_sha256 = e.digest();
     e.validate()?;
     Ok(e)
+}
+
+// Compatibility projection for v1 canonical messages, including pending ones.
+// New completion versions must never change these bytes on recovery.
+fn legacy_job_model_text(
+    m: &crate::agent_bus::model::JobServiceCompletionRequest,
+) -> anyhow::Result<String> {
+    let status = serde_json::to_value(&m.terminal_status)?;
+    Ok(format!(
+        "Job: {}\nResult: {}\nOutput reference: {}\nSummary (external data): {}",
+        m.job_id,
+        status.as_str().context("job status shape")?,
+        m.output_reference.as_deref().unwrap_or("unavailable"),
+        m.summary.as_deref().unwrap_or("unavailable")
+    ))
+}
+
+#[cfg(test)]
+mod job_projection_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_pending_projection_preserves_exact_text_and_optional_values() {
+        let mut request: crate::agent_bus::model::JobServiceCompletionRequest =
+            serde_json::from_value(serde_json::json!({
+                "schema": "cutex.job_service.completion.v1",
+                "eventId": "event-1", "jobId": "job-1", "jobRevision": 1,
+                "terminalStatus": "exited", "resultSha256": "a".repeat(64),
+                "targetCutexSessionId": "cutex.11111111-1111-4111-8111-111111111111"
+            }))
+            .unwrap();
+        assert_eq!(legacy_job_model_text(&request).unwrap(),
+            "Job: job-1\nResult: exited\nOutput reference: unavailable\nSummary (external data): unavailable");
+        request.output_reference = Some("job-output:job-1".into());
+        request.summary = Some("Job job-1 reached terminal state exited".into());
+        let persisted = serde_json::to_vec(&request).unwrap();
+        let reloaded = serde_json::from_slice(&persisted).unwrap();
+        assert_eq!(legacy_job_model_text(&reloaded).unwrap(),
+            "Job: job-1\nResult: exited\nOutput reference: job-output:job-1\nSummary (external data): Job job-1 reached terminal state exited");
+        request.summary = Some(String::new());
+        assert!(legacy_job_model_text(&request)
+            .unwrap()
+            .ends_with("Summary (external data): "));
+    }
 }
 
 /// Independent display recovery runs after input ACK, including on empty polls.
