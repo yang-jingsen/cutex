@@ -24,10 +24,10 @@ pub const S6_SCHEMA_SHA256: &str =
     "00e035e34ac1034ee34473f8f68b7704d6058c5b180ff4f4b6cad9fadab3a86d";
 // Exact accepted durable-presentation CLI/server family. Older
 // bundle receipts remain historical facts, not permission to launch old bytes.
-pub const S6E_COMMIT: &str = "3d8a73a747cf5b957a7ca0491c28d1517f6d7722";
+pub const S6E_COMMIT: &str = "cc4a080df1df4433f6fd67fee9c1c4fa4a42baab";
 pub const S6E_EXECUTABLE_SHA256: &str =
     "df95936f3f0d1ff62efb978fee32b85e45da0f7f3166de7606cce3b49fb12018";
-pub const S6E_CLI_SHA256: &str = "d97f8d4f32377b22066d25dd545b79b32bb9cacb8b501f9db9a21c290504ad60";
+pub const S6E_CLI_SHA256: &str = "52b868441c65cf12370ffbd7dea30d972b801f875b7e3d69b41ce2a0501fd2a9";
 pub const S6E_SCHEMA_SHA256: &str =
     "77e75b7fc47c9b8a9caacf5a7d31c040c6520679a9833f1c2b0e55937ed39c27";
 
@@ -783,6 +783,14 @@ mod tests {
         // Each mixed/spoofed component rejects independently, including the
         // previous coherent bundle. No descendant/version wildcard or fallback.
         for (field, value) in [
+            (
+                "native_patch_commit",
+                "3d8a73a747cf5b957a7ca0491c28d1517f6d7722",
+            ),
+            (
+                "cli",
+                "d97f8d4f32377b22066d25dd545b79b32bb9cacb8b501f9db9a21c290504ad60",
+            ),
             (
                 "native_patch_commit",
                 "ca580a783fc1ab34613be4f81ceab96ef4d393a2",
