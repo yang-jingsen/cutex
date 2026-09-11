@@ -873,14 +873,22 @@ struct ManagedRuntime {
 }
 
 fn stop_managed_runtime(mut runtime: ManagedRuntime) -> anyhow::Result<()> {
+    #[cfg(feature = "stock-launch-test-hook")]
+    super::private_restart_phase("manager.bridge_shutdown.begin");
     runtime.runtime_alive.store(false, Ordering::Release);
     let bridge_result = runtime
         .agent_bus_bridge
         .take()
         .map(AppServerAgentBusBridge::shutdown)
         .transpose();
+    #[cfg(feature = "stock-launch-test-hook")]
+    super::private_restart_phase("manager.bridge_shutdown.end");
     let _ = runtime.stop_tx.try_send(());
+    #[cfg(feature = "stock-launch-test-hook")]
+    super::private_restart_phase("manager.handle_shutdown.begin");
     let _ = runtime.handle.shutdown();
+    #[cfg(feature = "stock-launch-test-hook")]
+    super::private_restart_phase("manager.event_join.begin");
     let worker_result = if let Some(worker) = runtime.worker.take() {
         worker
             .join()
@@ -888,6 +896,8 @@ fn stop_managed_runtime(mut runtime: ManagedRuntime) -> anyhow::Result<()> {
     } else {
         Ok(())
     };
+    #[cfg(feature = "stock-launch-test-hook")]
+    super::private_restart_phase("manager.event_join.end");
     bridge_result?;
     worker_result
 }
@@ -929,11 +939,15 @@ fn run_event_worker(
                     }
                     _ => None,
                 };
+                #[cfg(feature = "stock-launch-test-hook")]
+                super::private_restart_phase("event.sink.begin");
                 if let Err(error) = event_sink.handle_event(&event_context, &event) {
                     let reason = format!("failed to durably handle app-server event: {error:#}");
                     mark_disconnected(&status, &reason);
                     break;
                 }
+                #[cfg(feature = "stock-launch-test-hook")]
+                super::private_restart_phase("event.sink.end");
                 if disconnected_reason.is_some() {
                     break;
                 }

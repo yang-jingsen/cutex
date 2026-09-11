@@ -3053,12 +3053,16 @@ pub fn handle_agent_bus_request(
         }
         ("POST", "/api/agents/unregister") => {
             require_service_bridge_token(&request, token, "Agent Bus")?;
+            #[cfg(feature = "stock-launch-test-hook")]
+            crate::app_server::private_restart_phase("bus.unregister.lock.begin");
             let payload: AgentBusUnregisterRequest = serde_json::from_slice(&request.body)
                 .context("Failed to parse agent unregister JSON")?;
             let removed = {
                 let mut state = state
                     .lock()
                     .map_err(|_| anyhow!("agent bus state lock poisoned"))?;
+                #[cfg(feature = "stock-launch-test-hook")]
+                crate::app_server::private_restart_phase("bus.unregister.lock.acquired");
                 state.messages.remove(&payload.id);
                 let removed = state.agents.remove(&payload.id).is_some();
                 if removed {
@@ -3069,6 +3073,8 @@ pub fn handle_agent_bus_request(
             if removed {
                 notify_agent_bus_message_available();
             }
+            #[cfg(feature = "stock-launch-test-hook")]
+            crate::app_server::private_restart_phase("bus.unregister.reply");
             write_json_response(
                 stream,
                 200,
@@ -4842,12 +4848,20 @@ fn register_agent_with_reconciliation(
     // The registration callback does not re-enter Agent Bus. Keeping the state
     // lock across its store CAS and roster persistence prevents unregister or
     // roster observation from entering the post-CAS/pre-visibility gap.
+    #[cfg(feature = "stock-launch-test-hook")]
+    crate::app_server::private_restart_phase("bus.register.lock.begin");
     let mut state = state
         .lock()
         .map_err(|_| anyhow!("agent bus state lock poisoned"))?;
+    #[cfg(feature = "stock-launch-test-hook")]
+    crate::app_server::private_restart_phase("bus.register.reconcile.begin");
     reconcile_registration_agent(&agent)?;
+    #[cfg(feature = "stock-launch-test-hook")]
+    crate::app_server::private_restart_phase("bus.register.reconcile.end");
     state.agents.insert(agent.id.clone(), agent.clone());
     persist_registry(&state)?;
+    #[cfg(feature = "stock-launch-test-hook")]
+    crate::app_server::private_restart_phase("bus.register.persist.end");
     Ok(())
 }
 

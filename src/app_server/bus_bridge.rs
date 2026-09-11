@@ -601,16 +601,26 @@ impl AppServerAgentBusBridge {
     }
 
     fn stop_and_join(&mut self) -> anyhow::Result<()> {
+        #[cfg(feature = "stock-launch-test-hook")]
+        super::private_restart_phase("bridge.stop_signal");
         let _ = self.stop_tx.try_send(());
         if self.worker.is_some() {
             // Removing the volatile registration wakes an in-flight long poll,
             // allowing the worker to observe the stop signal immediately.
+            #[cfg(feature = "stock-launch-test-hook")]
+            super::private_restart_phase("bridge.unregister.begin");
             let _ = self.shutdown_bus.unregister(&self.runtime_agent_id);
+            #[cfg(feature = "stock-launch-test-hook")]
+            super::private_restart_phase("bridge.unregister.end");
         }
         if let Some(worker) = self.worker.take() {
+            #[cfg(feature = "stock-launch-test-hook")]
+            super::private_restart_phase("bridge.worker_join.begin");
             worker
                 .join()
                 .map_err(|_| anyhow::anyhow!("agent-bus bridge worker panicked"))?;
+            #[cfg(feature = "stock-launch-test-hook")]
+            super::private_restart_phase("bridge.worker_join.end");
         }
         Ok(())
     }
@@ -663,6 +673,8 @@ fn run_bridge_worker(
             }
         }
         if Instant::now() >= next_registration {
+            #[cfg(feature = "stock-launch-test-hook")]
+            super::private_restart_phase("bridge.refresh_register.begin");
             if let Err(error) = bus.register(&options.registration) {
                 mark_registration(&status, false);
                 mark_error(
@@ -674,6 +686,8 @@ fn run_bridge_worker(
                 }
                 continue;
             }
+            #[cfg(feature = "stock-launch-test-hook")]
+            super::private_restart_phase("bridge.refresh_register.end");
             mark_registration(&status, true);
             next_registration = Instant::now() + options.registration_refresh_interval;
         }

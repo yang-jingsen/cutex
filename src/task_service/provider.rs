@@ -1229,13 +1229,20 @@ impl TaskServiceProvider {
         &self,
         operation: impl FnOnce(&TaskServiceSnapshot) -> T,
     ) -> Result<T, ProviderError> {
+        #[cfg(feature = "stock-launch-test-hook")]
+        crate::app_server::private_restart_phase("task.archive_fence.begin");
         let _process = self
             .process_lock
             .lock()
             .map_err(|_| ProviderError::PersistenceUnavailable)?;
         self.with_store_lock(true, |lock| {
+            #[cfg(feature = "stock-launch-test-hook")]
+            crate::app_server::private_restart_phase("task.archive_fence.acquired");
             let state = recover_checkpoint_locked(&self.root, lock)?;
-            Ok(operation(&state))
+            let result = operation(&state);
+            #[cfg(feature = "stock-launch-test-hook")]
+            crate::app_server::private_restart_phase("task.archive_fence.operation.end");
+            Ok(result)
         })
     }
 

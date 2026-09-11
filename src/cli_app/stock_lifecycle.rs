@@ -388,12 +388,24 @@ impl StockRuntimeExecutor for StockExecutor {
             );
             return Ok(());
         };
+        #[cfg(feature = "stock-launch-test-hook")]
+        cutex::app_server::private_restart_phase("stop.verify_claim.begin");
         super::app_server_runtime::verify_exact_live_runtime_claim(record, binding)?;
+        #[cfg(feature = "stock-launch-test-hook")]
+        cutex::app_server::private_restart_phase("stop.verify_process.begin");
         verify_stock_process(record, binding)?;
+        #[cfg(feature = "stock-launch-test-hook")]
+        cutex::app_server::private_restart_phase("stop.interrupt.begin");
         super::app_server_runtime::runtime_manager()
             .interrupt_active_turn(&record.cutex_session_id)?;
+        #[cfg(feature = "stock-launch-test-hook")]
+        cutex::app_server::private_restart_phase("stop.disconnect.begin");
         super::app_server_runtime::disconnect_runtime(&record.cutex_session_id)?;
+        #[cfg(feature = "stock-launch-test-hook")]
+        cutex::app_server::private_restart_phase("stop.group.begin");
         stop_group(binding.pid)?;
+        #[cfg(feature = "stock-launch-test-hook")]
+        cutex::app_server::private_restart_phase("stop.commit.begin");
         let path = cutex::session::store::cutex_sessions_path()?;
         cutex::agent_management::commit_stock_runtime_stop(&path, record)
     }

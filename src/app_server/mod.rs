@@ -16,3 +16,30 @@ pub mod participants;
 pub mod presentation;
 pub mod protocol;
 pub mod runtime;
+
+/// One private diagnostic: static phase labels only, never payloads/credentials.
+#[cfg(feature = "stock-launch-test-hook")]
+pub fn private_restart_phase(phase: &'static str) {
+    if std::env::var("CUTEX_PRESENTATION_DIAGNOSTIC_PHASES").as_deref() != Ok("1") {
+        return;
+    }
+    let Ok(home) = std::env::var("CUTEX_TEST_PRIVATE_HOME") else {
+        return;
+    };
+    if std::env::var("HOME").as_deref() != Ok(home.as_str())
+        || !std::path::Path::new(&home)
+            .join(".cutex-test-private-home")
+            .is_file()
+    {
+        return;
+    }
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    eprintln!(
+        "PDIAG {ms} {} {:?} {phase}",
+        std::process::id(),
+        std::thread::current().id()
+    );
+}

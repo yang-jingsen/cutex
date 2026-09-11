@@ -481,13 +481,19 @@ impl AppServerClient {
 
 impl Drop for AppServerClient {
     fn drop(&mut self) {
+        #[cfg(feature = "stock-launch-test-hook")]
+        super::private_restart_phase("client.drop.begin");
         // The actor may be blocked applying lossless event backpressure. Drop
         // its receiver before joining so shutdown can always unblock the send.
         drop(self.event_rx.take());
         let _ = self.handle.shutdown();
+        #[cfg(feature = "stock-launch-test-hook")]
+        super::private_restart_phase("client.drop.actor_join.begin");
         if let Some(actor) = self.actor.take() {
             let _ = actor.join();
         }
+        #[cfg(feature = "stock-launch-test-hook")]
+        super::private_restart_phase("client.drop.end");
     }
 }
 
