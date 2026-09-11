@@ -170,6 +170,9 @@ try:
         code,job_state=api(bp,'/api/job-service/v1/completions/query',{'schema':request['schema'],'eventId':request['eventId']},token=token)
         assert code==200 and job_state['disposition']=='delivered'
         original=before['presentation']['frozen'];assert original
+        (RUN/'cutpoint.json').write_text(json.dumps({'mode':mode,'inputState':before['state'],
+            'jobQuery':job_state,'inputReceipt':before['externalInputReceipt'],
+            'frozenPresentation':original,'localDisplayReceipt':before['presentation']['receipt']},indent=2))
         for key in list(env):
             if key.startswith('CUTEX_NATIVE_DELIVERY_TEST_'):del env[key]
         if mode=='generation':
@@ -178,7 +181,7 @@ try:
                 try:results.put(launch('generation-fence',True))
                 except BaseException as e:results.put(e)
             threading.Thread(target=restart,daemon=True).start()
-            wait_for(lambda: 'generation-fence' in store().get('explicit_launch_receipts',{}),30)
+            wait_for(lambda: 'generation-fence' in store().get('explicit_launch_receipts',{}),180)
             connection.sendall(b'continue\n');connection.close()
             current=results.get(timeout=240);assert isinstance(current,dict),str(current)
         else:

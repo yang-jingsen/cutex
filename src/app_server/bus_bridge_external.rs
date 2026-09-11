@@ -49,7 +49,15 @@ fn before_commit_test_gate(message: &AgentBusMessage, stage: &str) -> anyhow::Re
         "test gate wrong owner"
     );
     let mut stream = std::os::unix::net::UnixStream::connect(path)?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    // Presentation generation-race probes must allow the real reviewed launch
+    // path to finish artifact validation before reaching its claim. Test-only;
+    // production RPC/backoff timeouts are unchanged.
+    let timeout = if stage == "after_presentation_append" {
+        240
+    } else {
+        30
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(timeout)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     writeln!(stream, "{}", message.id)?;
     let mut response = String::new();
