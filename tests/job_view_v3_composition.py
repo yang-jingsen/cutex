@@ -22,7 +22,7 @@ changes = {
     "'3d8a73a747cf5b957a7ca0491c28d1517f6d7722'": "'f8c33add01bf9ef8cea04f531fa1319090751cb2'",
     "config['private_job_presentation']={'version':1,'recipients':[durable]}": "config['private_job_presentation']={'version':2,'recipients':[durable]}",
     "current=launch('presentation-launch')": "current=launch_job(globals())",
-    "model=http.server.ThreadingHTTPServer": "Model.do_POST=model_response\nmodel=http.server.ThreadingHTTPServer",
+    "model=http.server.ThreadingHTTPServer": "Model.do_POST=safe_model_response\nmodel=http.server.ThreadingHTTPServer",
     "default_permissions=\":read-only\"": "default_permissions=\":danger-full-access\"",
     "'sandbox':'read-only'": "'sandbox':'danger-full-access'",
     "'--permission','read-only','--sandbox','read-only'": "'--permission','full-access','--sandbox','danger-full-access'",
@@ -35,7 +35,17 @@ context = {}
 step = 0
 approvals = []
 stock_birth = {}
+fixture_error = {}
+prefix = prefix.replace('        value=f()', '        assert not fixture_error, str(fixture_error)\n        value=f()')
 cleanup = cleanup.replace("if os.getpgid(pid)==pid and", "if process_identity(pid) and process_identity(pid)[0]==stock_birth.get(pid) and os.getpgid(pid)==pid and")
+
+def safe_model_response(self):
+    try:
+        model_response(self)
+    except Exception as error:
+        fixture_error.update(kind=type(error).__name__, message=str(error)[:1000])
+        (context['RUN']/'fixture-error.json').write_text(json.dumps(fixture_error))
+        self.send_error(400, 'private fixture assertion failed; no fallback')
 
 def model_response(self):
     global step
@@ -116,10 +126,13 @@ body = r'''
     assert len(jobs)==1 and jobs[0]['runtimeStatus']=='connected' and len(jobs[0]['tools'])==4
     (RUN/'inventory.json').write_text(json.dumps(inventory))
     assert Model.calls==0
-    # RPC supplies the one user input; real same-owner CLI renders and approves.
+    # Same CLI initiates the turn and owns its ordinary approval interaction.
     terminal=Terminal()
     terminal.wait('gpt-5.6-terra')
-    r.call('turn/start',{'threadId':thread,'input':[{'type':'text','text':'Run the authorized private Job once, then read stdout on completion.'}]})
+    prompt='Run the authorized private Job once, then read stdout on completion.'
+    os.write(terminal.master,b'\x1b[200~'+prompt.encode()+b'\x1b[201~')
+    terminal.wait(prompt)
+    os.write(terminal.master,b'\r')
     for tool in ('submit','query','read_output'):
         terminal.wait('Allow the cutex_job MCP server to run tool "'+tool+'"?')
         os.write(terminal.master,b'\r');approvals.append(tool)
@@ -153,6 +166,7 @@ body = r'''
     assert '76332d6a6f622d6f7574707574' in json.dumps(Model.requests)
     terminal.wait('Job completed');terminal.wait('Observed run');terminal.wait('v3-private-job')
     terminal.close();terminal=None
+    (RUN/'terminal.pty').rename(RUN/'terminal-first.pty')
     timeline=r.call('thread/timeline/list',{'threadId':thread,'limit':100})
     (RUN/'timeline.json').write_text(json.dumps(timeline,ensure_ascii=False))
     before=json.dumps(snap['externalInputReceipt'],sort_keys=True)
