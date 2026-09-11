@@ -32,6 +32,9 @@ assert mode in ('default','before','after','generation')
 if mode=='default':
     CUTEX=ROOT/'artifacts/presentation-job-r1/default-bin/cutex'
     MCP=ROOT/'artifacts/presentation-job-r1/default-bin/cutex-mcp'
+elif (ROOT/'artifacts/presentation-job-r1/feature-r2-bin/cutex').is_file():
+    CUTEX=ROOT/'artifacts/presentation-job-r1/feature-r2-bin/cutex'
+    MCP=ROOT/'artifacts/presentation-job-r1/feature-r2-bin/cutex-mcp'
 model_tree=ast.parse(Path(__file__).with_name('external_input_boundary.py').read_text())
 model_node=next(n for n in model_tree.body if isinstance(n,ast.ClassDef) and n.name=='Model')
 exec(compile(ast.Module(body=[model_node],type_ignores=[]),'accepted-fake-responses','exec'),globals())
