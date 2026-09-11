@@ -3,6 +3,19 @@ use anyhow::{ensure, Context};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// v2 framing; generation is a fence, never a semantic identity field.
+pub fn semantic_digest(fields: [&str; 8], view: Option<&StructuredView>) -> anyhow::Result<String> {
+    use sha2::Digest;
+    let canonical = match view {
+        Some(view) => view.canonical_json()?,
+        None => "null".to_string(),
+    };
+    let mut hash = super::framed(b"codex:external-input:v2\0", &fields);
+    hash.update((canonical.len() as u64).to_be_bytes());
+    hash.update(canonical.as_bytes());
+    Ok(format!("{:x}", hash.finalize()))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StructuredView {
@@ -95,6 +108,43 @@ mod tests {
         assert_eq!(
             v.canonical_json().unwrap(),
             "{\"data\":{\"a\":\"🦀\\n\",\"z\":[true,null,7]},\"schema\":\"test.v1\"}"
+        );
+    }
+    #[test]
+    fn native_independent_digest_and_receipt_vector() {
+        let v = view(serde_json::json!({"z":[true,null,7],"a":"🦀\n"}));
+        let digest = semantic_digest(
+            [
+                "owner",
+                "thread",
+                "message",
+                "service",
+                "service-id",
+                "opaque.v1",
+                "after_turn",
+                "hello\n世界",
+            ],
+            Some(&v),
+        )
+        .unwrap();
+        assert_eq!(
+            digest,
+            "871d2fc606fe6d2230e1c3cfc63c2f568f2105a214e6bf2668bf6ecfa2e0f05c"
+        );
+        let receipt = super::super::Receipt {
+            schema: "codex.external-input-receipt.v1".into(),
+            receipt_id: String::new(),
+            owner_id: "owner".into(),
+            thread_id: "thread".into(),
+            message_id: "message".into(),
+            semantic_sha256: digest,
+            response_item_id: "message".into(),
+            turn_id: "turn".into(),
+            ordinal: 1,
+        };
+        assert_eq!(
+            receipt.digest_id(),
+            "eir1_2b71c1110ad1352db5f49428c9c68da23f7356449519eccb961e3431d783eeb2"
         );
     }
     #[test]
