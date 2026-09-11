@@ -1,5 +1,5 @@
 //! Opt-in stock child ownership inside the existing Management process.
-use anyhow::{ensure, Context};
+use anyhow::{Context, ensure};
 use cutex::agent_management::{StockRuntimeExecutor, StockRuntimeReceipt};
 use cutex::app_server::runtime::AppServerRuntimeLayout;
 use cutex::launch::command::LaunchCommand;
@@ -619,9 +619,13 @@ impl StockRuntimeExecutor for StockExecutor {
                 .status(&record.cutex_session_id)?
                 .context("receiver settings unavailable")?;
             let settings = status.thread_settings.context("receiver settings absent")?;
-            ensure!(settings.pointer("/activePermissionProfile/id").and_then(serde_json::Value::as_str)
-                == Some(receiver_profile(&receipt.review.configuration.sandbox)?),
-                "existing thread active permission profile mismatches reviewed receiver; explicit controller correction required");
+            ensure!(
+                settings
+                    .pointer("/activePermissionProfile/id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(receiver_profile(&receipt.review.configuration.sandbox)?),
+                "existing thread active permission profile mismatches reviewed receiver; explicit controller correction required"
+            );
         }
         if manager
             .agent_bus_bridge_status(&record.cutex_session_id)?
@@ -714,6 +718,13 @@ pub(super) fn verify_stock_process(
         .as_ref()
         .context("stock marker missing")?;
     let bundle = StockBundle::load(contract)?;
+    verify_stock_process_with_bundle(binding, &bundle)
+}
+
+pub(super) fn verify_stock_process_with_bundle(
+    binding: &CutexAppServerRuntimeBinding,
+    bundle: &StockBundle,
+) -> anyhow::Result<()> {
     ensure!(
         binding.schema_sha256 == bundle.schema.sha256.as_str(),
         "stock binding schema mismatch"
@@ -807,8 +818,10 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
         .as_ref()
         .context("stock activation missing")?;
     let bundle = StockBundle::load(contract)?;
-    ensure!(!bundle.common_ingress() || bundle.soon_ingress(),
-        "U+S6 bundle contains only app-server; this slice has no pinned compatible CLI attach artifact");
+    ensure!(
+        !bundle.common_ingress() || bundle.soon_ingress(),
+        "U+S6 bundle contains only app-server; this slice has no pinned compatible CLI attach artifact"
+    );
     verify_stock_process(record, binding)?;
     super::app_server_runtime::verify_exact_live_runtime_claim(record, binding)?;
     ensure!(

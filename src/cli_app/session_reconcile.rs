@@ -37,13 +37,21 @@ pub(crate) fn reconcile_cutex_session_registration(
     let mut store = load_cutex_session_store()?;
     let reviewed =
         cutex::session::reviewed_registration::preserve_reviewed_groups(&store, agent, &host_id)?;
+    let bundle = reviewed
+        .as_ref()
+        .map(|record| {
+            cutex::launch::stock::StockBundle::load(
+                record.explicit_launch.as_ref().expect("validated marker"),
+            )
+        })
+        .transpose()?;
     if let Some(record) = &reviewed {
-        super::stock_lifecycle::verify_stock_process(
-            record,
+        super::stock_lifecycle::verify_stock_process_with_bundle(
             record
                 .app_server_runtime
                 .as_ref()
                 .expect("validated binding"),
+            bundle.as_ref().expect("validated bundle"),
         )?;
     }
     let reconciliation =
@@ -52,12 +60,12 @@ pub(crate) fn reconcile_cutex_session_registration(
         return Ok(());
     }
     if let Some(record) = &reviewed {
-        super::stock_lifecycle::verify_stock_process(
-            record,
+        super::stock_lifecycle::verify_stock_process_with_bundle(
             record
                 .app_server_runtime
                 .as_ref()
                 .expect("validated binding"),
+            bundle.as_ref().expect("validated bundle"),
         )?;
     }
     save_cutex_session_store(&store)?;

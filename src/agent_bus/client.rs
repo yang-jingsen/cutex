@@ -25,23 +25,26 @@ use crate::agent_bus::model::AgentBusUnregisterResponse;
 use crate::agent_bus::model::AgentGroupUpdateMode;
 use crate::agent_bus::model::AgentMessageKind;
 use crate::agent_bus::model::{
-    TaskWorkerActionRequest, TaskWorkerActionResponse, TaskWorkerReconciliationRequest,
-    TaskWorkerReconciliationResponse, TASK_WORKER_ACTION_MAX_BODY_BYTES,
+    TASK_WORKER_ACTION_MAX_BODY_BYTES, TaskWorkerActionRequest, TaskWorkerActionResponse,
+    TaskWorkerReconciliationRequest, TaskWorkerReconciliationResponse,
 };
 use crate::agent_bus::routing::agent_sender_label;
 use crate::agent_bus::service::agent_bus_base_url;
 use crate::agent_bus::service::agent_bus_port;
 use crate::config::env::CUTEX_AGENT_ID_ENV_VAR;
 use crate::config::env::CUTEX_AGENT_NAME_ENV_VAR;
+use crate::http::client::HttpJsonRequest;
 use crate::http::client::http_json_request;
 use crate::http::client::http_local_root_status_ok;
-use crate::http::client::HttpJsonRequest;
 use crate::profiles::model::CodezConfig;
 use crate::role_revision::RuntimeAgentId;
 use crate::task_delivery::validate_task_worker_action_request;
 
 const AGENT_BUS_POLL_WAIT_MS: &str = "2000";
 const AGENT_BUS_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+// Reviewed registration verifies the frozen artifact set before publication.
+// This is one bounded request, never an automatic registration retry.
+const AGENT_REGISTRATION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
 const AGENT_MANAGEMENT_ACTION_TIMEOUT: Duration = Duration::from_secs(120);
 const FEDERATED_AGENT_LIST_HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -70,7 +73,14 @@ impl AgentBusHttpClient {
 
     pub fn register(&self, request: &AgentBusRegisterRequest) -> anyhow::Result<()> {
         let body = serde_json::to_vec(request)?;
-        let response = self.request("POST", "/api/agents/register", Some(&body))?;
+        let response = agent_bus_http_json_with_timeout(
+            &self.base_url,
+            "POST",
+            "/api/agents/register",
+            self.token.as_deref(),
+            Some(&body),
+            AGENT_REGISTRATION_RESPONSE_TIMEOUT,
+        )?;
         require_ok_response(&response, "agent registration")
     }
 
@@ -711,10 +721,12 @@ mod tests {
         assert_eq!(request.content, "hello");
         assert!(request.all_groups);
         assert!(request.all_hosts);
-        assert!(serde_json::to_value(&request)
-            .expect("serialize request")
-            .get("all_hosts")
-            .is_none());
+        assert!(
+            serde_json::to_value(&request)
+                .expect("serialize request")
+                .get("all_hosts")
+                .is_none()
+        );
         assert_eq!(request.kind, AgentBusEnvelopeKind::Message);
         assert_eq!(request.from.as_deref(), Some("sender"));
         assert_eq!(request.from_agent_id.as_deref(), Some("agent-1"));
@@ -755,9 +767,11 @@ mod tests {
                 .and_then(Value::as_str),
             Some("upstream-42")
         );
-        assert!(serialized
-            .get("external_action_id")
-            .is_some_and(Value::is_null));
+        assert!(
+            serialized
+                .get("external_action_id")
+                .is_some_and(Value::is_null)
+        );
     }
 
     #[test]
@@ -982,9 +996,11 @@ mod tests {
                 .expect("acknowledge message"),
             1
         );
-        assert!(client
-            .unregister("runtime id/one")
-            .expect("unregister runtime"));
+        assert!(
+            client
+                .unregister("runtime id/one")
+                .expect("unregister runtime")
+        );
         server.join().expect("test bus server");
     }
 }

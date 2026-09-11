@@ -21,7 +21,11 @@ not hostile same-UID isolation. A caller replaying the exact current owner field
 cannot choose new groups; this is not a new per-request signature protocol.
 Existing seconds-truncated PID birth limitation remains. Bundle verification
 does hash work during registration while the existing roster lock is held; no
-throughput claim or weakened artifact check is made.
+throughput claim or weakened artifact check is made. One verified bundle is
+reused for the two process observations within the same callback, not cached
+across occurrences. The registration HTTP request alone has a bounded120s
+deadline (old5s was insufficient for full artifact verification); all other
+client deadlines and TUI90s remain unchanged. No automatic retry is added.
 
 Base9d108802 / product6e3b815; native8cde/2eab, host/schema and Job unchanged.
 Tests and actual composed outcome will be reported separately, not inferred from

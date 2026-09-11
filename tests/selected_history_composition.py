@@ -148,7 +148,7 @@ def pty_probe(ident,label):
     master,slave=os.openpty();fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',38,160,0,0))
     original=termios.tcgetattr(slave)
     child=subprocess.Popen([str(CUTEX),'session','stock-attach',ident],env=env,cwd=ROOT,stdin=slave,stdout=slave,stderr=slave,start_new_session=True,preexec_fn=lambda:fcntl.ioctl(0,termios.TIOCSCTTY,0))
-    children.append(child);screen=b'';ready=False
+    children.append(child);screen=b'';ready=False;started=time.monotonic()
     forced_exit=False
     after=None
     def consume(part):
@@ -171,12 +171,20 @@ def pty_probe(ident,label):
             if not drain_exit(child,master,consume):
                 forced_exit=True;stop(child)
         after=termios.tcgetattr(slave);restored=after==original
+        plain=re.sub(rb'\x1b\[[0-9;?<>=]*[ -/]*[@-~]',b'',screen)
+        components={'bon_voyage':b'Bon voyage' in plain,'profile_label':label.encode() in plain,
+                    'pink_rgb':b'38;2;246;163;200' in screen}
+        # Bounded static UI observations only; no historic conversation tail.
+        ui_tokens=[b'Loading',b'Reconnecting',b'Connecting',b'Trust',b'trusted',b'Error',b'error',b'Press',b'Bon voyage',label.encode()]
+        safe_tail=[token.decode() for token in ui_tokens if token in plain[-4096:]]
         observation={'ready':ready,'exit_code':child.returncode,'terminal_restored':restored,
                      'exit_signal':-child.returncode if child.returncode is not None and child.returncode<0 else None,
                      'forced_exit':forced_exit,'screen_bytes':len(screen),
                      'terminal_before':json_terminal(original),'terminal_after':json_terminal(after),
                      'screen_sha256':hashlib.sha256(screen).hexdigest(),'model_input_sent':False,
-                     'exit_keys':'Ctrl-C twice','sanitized_owner_errors':error_evidence()}
+                     'exit_keys':'Ctrl-C twice','sanitized_owner_errors':error_evidence(),
+                     'display_components':components,'elapsed_seconds':round(time.monotonic()-started,3),
+                     'bounded_static_ui_tail':safe_tail}
         save('pty-'+ident+'.json',observation)
         os.close(master);os.close(slave)
     assert child.returncode==0 and restored,observation
@@ -213,6 +221,7 @@ def run_probe(row,index):
         if mode.startswith('groups:'):registration_oracle(row,result)
         peer=rpc(Path(result['binding']['endpoint'].removeprefix('unix://')))
         phase='probe-'+str(index)+'-read'
+        read_started=time.monotonic()
         response=peer.call('thread/read',{'threadId':row['native_id'],'includeTurns':True})['thread']
         assert response['id']==row['native_id'] and response['turns']
         types={}
@@ -220,6 +229,8 @@ def run_probe(row,index):
             for item in turn['items']:types[item['type']]=types.get(item['type'],0)+1
         save('read-'+row['native_id']+'.json',{'native_id':response['id'],'turns_read':len(response['turns']),
               'item_types':types,'ready_generation':result['expected_generation'],
+              'rpc_method':'thread/read','elapsed_seconds':round(time.monotonic()-read_started,3),
+              'observed_notification_methods':sorted({e.get('method','unknown') for e in peer.events}),
               'configuration':{k:review['configuration'][k] for k in ('profile_name','inherited','model','reasoning','sandbox','approval')}})
         phase='probe-'+str(index)+'-attach'
         visual=pty_probe(row['durable_id'],row['effective_profile'])
