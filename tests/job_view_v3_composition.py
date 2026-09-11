@@ -15,7 +15,7 @@ changes = {
     "artifacts/visible-only-tui-r1/final-bin": "artifacts/job-view-output-reference-bound-r1/bundle",
     "ROOT/'artifacts/presentation-job-r1/schema.json'": "Path('/mnt/mambo/PersonaProjects/cutex-light-core-r1/artifacts/structured-view-v3-r1/schema-json-stable/codex_app_server_protocol.schemas.json')",
     "CONTROLLER=Path(sys.argv[2]).resolve()\nassert CONTROLLER.is_relative_to(ROOT/'target/debug/deps')": "CONTROLLER=None",
-    "artifacts/presentation-job-r1/default-bin": "artifacts/job-v2-intake-r1",
+    "artifacts/presentation-job-r1/default-bin": "artifacts/job-view-v3-r2",
     "'3d8a73a747cf5b957a7ca0491c28d1517f6d7722'": "'f8c33add01bf9ef8cea04f531fa1319090751cb2'",
     "config['private_job_presentation']={'version':1,'recipients':[durable]}": "config['private_job_presentation']={'version':2,'recipients':[durable]}",
     "current=launch('presentation-launch')": "current=launch_job(globals())",
@@ -31,6 +31,8 @@ for old, new in changes.items():
 context = {}
 step = 0
 approvals = []
+stock_birth = {}
+cleanup = cleanup.replace("if os.getpgid(pid)==pid and", "if process_identity(pid) and process_identity(pid)[0]==stock_birth.get(pid) and os.getpgid(pid)==pid and")
 
 def model_response(self):
     global step
@@ -74,6 +76,7 @@ def model_response(self):
 def launch_job(g):
     import os, socket, struct
     context.update(g)
+    g['HOME'].chmod(0o700)
     binary = Path('/mnt/mambo/PersonaProjects/cutex-job-frozen-completion-facts-v2-r1/artifacts/linux/cutex-job-service')
     assert g['sha'](binary) == 'ba1a8d4f3e0b5f739e666e3f515d40b0c543e9e75953759ff181f1e71b29c521'
     for name in ('job-api','job-grant'):
@@ -94,6 +97,7 @@ def launch_job(g):
     current=g['action'](request)
     assert current['stage']=='ready' and g['action'](request)==current
     g['stock_pids'].append(current['binding']['pid'])
+    stock_birth[current['binding']['pid']]=g['process_identity'](current['binding']['pid'])[0]
     (g['RUN']/'launch.json').write_text(json.dumps(current,indent=2))
     return current
 
@@ -132,8 +136,13 @@ body = r'''
     facts=view['data']; assert facts['actionId']=='v3-private-job' and facts['exitCode']==0
     assert facts['execution']['observedRunDurationMillis']>0
     assert facts['stdout']['observedBytes']==13 and facts['stdout']['retainedBytes']==13
-    # Producer-only outputReference is a deterministic view sentinel, not a fabricated field.
-    assert facts['outputReference'] not in json.dumps(Model.requests)
+    # Normal MCP results may contain the reference. Only the native external
+    # projection must omit view facts; never confuse tool output with a leak.
+    external=[json.loads(i['output']) for req in Model.requests for i in req.get('input',[])
+        if i.get('type')=='function_call_output' and i.get('name')=='external_event']
+    assert external and all(e['text']==text and set(e)=={'source','type','text'} for e in external)
+    assert facts['outputReference'] not in json.dumps(external)
+    assert 'cutex.job-completion.v1' not in json.dumps(external)
     assert '76332d6a6f622d6f7574707574' in json.dumps(Model.requests)
     terminal.wait('Job completed');terminal.wait('Observed run');terminal.wait('v3-private-job')
     terminal.close();terminal=None
