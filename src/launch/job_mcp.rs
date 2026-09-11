@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use super::stock::{StockBundle, VerifiedFile, S6E_CLI_SHA256};
 
-pub const JOB_SHA256: &str = "d98d5e33322c7200eb9b149bc39d99da3bb169c994fe14c7f401d26c06d7b1f2";
+pub const JOB_SHA256: &str = "ba1a8d4f3e0b5f739e666e3f515d40b0c543e9e75953759ff181f1e71b29c521";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -383,6 +383,18 @@ mod tests {
             daemon_start_ticks: 0,
         };
         let mut bad = descriptor.clone();
+        // Correct current bytes pass eligibility and reach file validation;
+        // this is not a claim that the deliberately absent artifact is valid.
+        let error = descriptor.review(&bundle).unwrap_err().to_string();
+        assert!(!error.contains("adapter bytes"), "{error}");
+        bad.adapter.sha256 =
+            file("d98d5e33322c7200eb9b149bc39d99da3bb169c994fe14c7f401d26c06d7b1f2").sha256;
+        assert!(bad
+            .review(&bundle)
+            .unwrap_err()
+            .to_string()
+            .contains("adapter bytes"));
+        bad = descriptor.clone();
         bad.version = 2;
         assert!(bad
             .review(&bundle)
@@ -417,5 +429,21 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("coherent native bundle"));
+    }
+
+    #[test]
+    #[ignore = "requires the exact external accepted Job build manifest"]
+    fn job_manifest_matches_compiled_eligibility() {
+        let path = std::env::var("CUTEX_TEST_JOB_BUILD_MANIFEST").unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            manifest["source"]["commit"],
+            "f7bbe3c42fbf30bfb5fe379c6f6cd5af951991b9"
+        );
+        let artifacts = manifest["artifacts"].as_array().unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0]["path"], "linux/cutex-job-service");
+        assert_eq!(artifacts[0]["sha256"], JOB_SHA256);
     }
 }
