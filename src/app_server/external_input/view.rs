@@ -90,6 +90,14 @@ mod tests {
         assert_eq!(v.canonical_json().unwrap(), "{\"data\":{\"a\":{\"a\":true,\"z\":\"中\"},\"z\":[18446744073709551615,-9223372036854775808]},\"schema\":\"test.v1\"}");
     }
     #[test]
+    fn native_independent_canonical_vector() {
+        let v = view(serde_json::json!({"z":[true,null,7],"a":"🦀\n"}));
+        assert_eq!(
+            v.canonical_json().unwrap(),
+            "{\"data\":{\"a\":\"🦀\\n\",\"z\":[true,null,7]},\"schema\":\"test.v1\"}"
+        );
+    }
+    #[test]
     fn rejects_floats_root_and_resource_excess() {
         assert!(view(serde_json::json!({"n":1.0})).canonical_json().is_err());
         assert!(view(serde_json::json!([])).canonical_json().is_err());
