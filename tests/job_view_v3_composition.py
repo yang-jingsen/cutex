@@ -6,12 +6,15 @@ Run in the existing private bwrap network/PID namespace with a NEW short run.
 """
 from pathlib import Path
 import json
+from job_view_v3_tool_contract import assert_advertised
 
 base_path = Path(__file__).with_name('presentation_boundary.py')
 base = base_path.read_text()
 prefix, old_body = base.split("    control=Control(1);", 1)
 cleanup = "finally:\n" + old_body.rsplit("finally:\n", 1)[1]
 changes = {
+    'model="unknown-private-model"\\n': 'model="gpt-5.6-terra"\\nmodel_reasoning_effort="low"\\n',
+    'unknown-private-model': 'gpt-5.6-terra',
     "artifacts/visible-only-tui-r1/final-bin": "artifacts/job-view-output-reference-bound-r1/bundle",
     "ROOT/'artifacts/presentation-job-r1/schema.json'": "Path('/mnt/mambo/PersonaProjects/cutex-light-core-r1/artifacts/structured-view-v3-r1/schema-json-stable/codex_app_server_protocol.schemas.json')",
     "CONTROLLER=Path(sys.argv[2]).resolve()\nassert CONTROLLER.is_relative_to(ROOT/'target/debug/deps')": "CONTROLLER=None",
@@ -51,6 +54,8 @@ def model_response(self):
         code = 'const r = await tools.mcp__cutex_job__submit('+json.dumps(args)+'); text(r);'
         item = {'type':'custom_tool_call','call_id':'v3-submit','name':'exec','input':code}
     elif n == 1:
+        state=json.loads((g['RUN']/'job-state/state.json').read_text())
+        assert len(state['jobs'])==1 and next(iter(state['jobs'].values()))['request']['actionId']=='v3-private-job', 'no actual Job receipt; refuse fake Submitted'
         item = {'type':'message','id':'v3-submitted','role':'assistant','content':[{'type':'output_text','text':'Submitted'}]}
     elif n == 2:
         # This request must be the naturally admitted completion-triggered turn.
@@ -63,6 +68,8 @@ def model_response(self):
     else:
         assert n == 3, 'unexpected extra model turn/request'
         item = {'type':'message','id':'v3-done','role':'assistant','content':[{'type':'output_text','text':'v3-job-output acknowledged'}]}
+    # Validate the actual received schema, not expected future capabilities.
+    assert_advertised(item, request.get('tools', []))
     events = [{'type':'response.created','response':{'id':f'v3-{n}'}},
               {'type':'response.output_item.done','item':item},
               {'type':'response.completed','response':{'id':f'v3-{n}','usage':{'input_tokens':0,'output_tokens':0,'total_tokens':0}}}]
@@ -111,7 +118,7 @@ body = r'''
     assert Model.calls==0
     # RPC supplies the one user input; real same-owner CLI renders and approves.
     terminal=Terminal()
-    terminal.wait('unknown-private-model')
+    terminal.wait('gpt-5.6-terra')
     r.call('turn/start',{'threadId':thread,'input':[{'type':'text','text':'Run the authorized private Job once, then read stdout on completion.'}]})
     for tool in ('submit','query','read_output'):
         terminal.wait('Allow the cutex_job MCP server to run tool "'+tool+'"?')
