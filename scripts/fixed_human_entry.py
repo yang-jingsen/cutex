@@ -41,7 +41,7 @@ def main(op):
         for event in rpc.events:append(RUN/'human-errors.jsonl',event)
         while True:append(RUN/'human-errors.jsonl',rpc.messages.get())
     elif op=='cleanup':
-        if input('Type CLEAN after exiting the new CLI; stop only pi1/h1 and remove its guest auth: ')!='CLEAN':return
+        if input(f'Type CLEAN after exiting the CLI; stop only {ROOT.name}/h1 and remove its guest auth: ')!='CLEAN':return
         for item in [info['runtime'],info.get('observer'),*reversed(info['services'])]:
             if not item:continue
             if not identity_matches(item):
@@ -57,7 +57,7 @@ def main(op):
             if path.exists():
                 assert not path.is_symlink() and path.stat().st_uid==os.getuid()
                 path.unlink()
-        print('Only pi1/h1 owned processes stopped and exact temporary guest auth removed; history retained; host and hj1 untouched.')
+        print(f'Only {ROOT.name}/h1 owned processes stopped and exact temporary guest auth removed; history retained; host and other fixtures untouched.')
     else:raise RuntimeError('choose attach, observe or cleanup')
 
 
