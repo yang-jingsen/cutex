@@ -62,6 +62,7 @@ fn native_status_changed_hint_is_not_an_ack_and_rejects_control_fields() {
 
 fn envelope() -> Envelope {
     let mut e = Envelope {
+        view: None,
         version: 1,
         owner_id: "owner".into(),
         thread_id: "thread".into(),

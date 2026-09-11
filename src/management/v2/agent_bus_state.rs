@@ -522,13 +522,14 @@ impl AgentBusMessageRepository {
                 "native envelope recipient/message mismatch"
             );
             stored.snapshot.external_input = Some(envelope.clone());
-            store.version = store.version.max(
-                if envelope.message.delivery == crate::app_server::external_input::Delivery::Soon {
-                    4
-                } else {
-                    3
-                },
-            );
+            store.version = store.version.max(if envelope.version == 2 {
+                6
+            } else if envelope.message.delivery == crate::app_server::external_input::Delivery::Soon
+            {
+                4
+            } else {
+                3
+            });
             Ok(envelope)
         })
     }
@@ -917,7 +918,7 @@ fn validate_session_identity(value: &str) -> anyhow::Result<()> {
 
 fn load_store(path: &Path) -> anyhow::Result<AgentBusMessageStore> {
     let store = load_store_unchecked(path)?;
-    if !matches!(store.version, 2 | 3 | 4 | 5) {
+    if !matches!(store.version, 2 | 3 | 4 | 5 | 6) {
         anyhow::bail!("unsupported management v2 agent-bus state version");
     }
     if store.version < 5
@@ -929,6 +930,13 @@ fn load_store(path: &Path) -> anyhow::Result<AgentBusMessageStore> {
         anyhow::bail!("presentation obligation requires Bus state v5");
     }
     for m in store.messages.values() {
+        if let Some(envelope) = &m.snapshot.external_input {
+            anyhow::ensure!(
+                envelope.version != 2 || store.version >= 6,
+                "structured view requires Bus state v6"
+            );
+            envelope.validate()?;
+        }
         if let Some(p) = &m.snapshot.presentation {
             anyhow::ensure!(
                 matches!(p.version, 1 | 2)
@@ -1056,6 +1064,7 @@ mod tests {
             .freeze_external_input(&owner, "jsc_stable", |m| {
                 let mut e = Envelope {
                     version: 1,
+                    view: None,
                     owner_id: owner.clone(),
                     thread_id: "native-test".into(),
                     runtime_generation: 1,
@@ -1251,6 +1260,7 @@ mod tests {
             .freeze_external_input(owner, "jsc_stable", |m| {
                 let mut e = Envelope {
                     version: 1,
+                    view: None,
                     owner_id: owner.into(),
                     thread_id: "native-test".into(),
                     runtime_generation: 1,

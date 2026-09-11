@@ -147,6 +147,44 @@ mod tests {
             "eir1_2b71c1110ad1352db5f49428c9c68da23f7356449519eccb961e3431d783eeb2"
         );
     }
+
+    #[test]
+    fn envelope_versions_omit_legacy_view_and_freeze_null_distinction() {
+        use super::super::{Delivery, Envelope, Message, Source, SourceKind};
+        let mut e = Envelope {
+            version: 1,
+            owner_id: "owner".into(),
+            thread_id: "thread".into(),
+            runtime_generation: 7,
+            message: Message {
+                id: "message".into(),
+                source: Source {
+                    kind: SourceKind::Service,
+                    id: "service-id".into(),
+                },
+                event_type: "opaque.v1".into(),
+                delivery: Delivery::AfterTurn,
+                text: "hello\n世界".into(),
+            },
+            view: None,
+            semantic_sha256: String::new(),
+        };
+        e.semantic_sha256 = e.digest();
+        e.validate().unwrap();
+        assert!(serde_json::to_value(&e).unwrap().get("view").is_none());
+        e.view = Some(view(serde_json::json!({})));
+        assert!(e.validate().is_err());
+        e.version = 2;
+        e.semantic_sha256 = e.digest();
+        e.validate().unwrap();
+        let empty = e.digest();
+        e.view = Some(view(serde_json::json!({"missing":null})));
+        assert_ne!(empty, e.digest());
+        assert!(e.validate().is_err());
+        e.semantic_sha256 = e.digest();
+        e.runtime_generation += 1;
+        e.validate().unwrap();
+    }
     #[test]
     fn rejects_floats_root_and_resource_excess() {
         assert!(view(serde_json::json!({"n":1.0})).canonical_json().is_err());

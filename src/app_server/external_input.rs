@@ -50,6 +50,8 @@ pub struct Envelope {
     pub thread_id: String,
     pub runtime_generation: u64,
     pub message: Message,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<view::StructuredView>,
     pub semantic_sha256: String,
 }
 fn bounded(value: &str, max: usize) -> anyhow::Result<()> {
@@ -85,6 +87,31 @@ fn framed(domain: &[u8], fields: &[&str]) -> Sha256 {
 }
 impl Envelope {
     pub fn digest(&self) -> String {
+        if self.version == 2 {
+            // Invalid views have no digest; validate reports the precise error
+            // before comparison. Do not truncate or normalize invalid data.
+            return view::semantic_digest(
+                [
+                    &self.owner_id,
+                    &self.thread_id,
+                    &self.message.id,
+                    match self.message.source.kind {
+                        SourceKind::Agent => "agent",
+                        SourceKind::Service => "service",
+                    },
+                    &self.message.source.id,
+                    &self.message.event_type,
+                    match self.message.delivery {
+                        Delivery::AfterTurn => "after_turn",
+                        Delivery::Passive => "passive",
+                        Delivery::Soon => "soon",
+                    },
+                    &self.message.text,
+                ],
+                self.view.as_ref(),
+            )
+            .unwrap_or_default();
+        }
         format!(
             "{:x}",
             framed(
@@ -111,7 +138,17 @@ impl Envelope {
         )
     }
     pub fn validate(&self) -> anyhow::Result<()> {
-        ensure!(self.version == 1, "unsupported ExternalInput version");
+        ensure!(
+            matches!(self.version, 1 | 2),
+            "unsupported ExternalInput version"
+        );
+        ensure!(
+            self.version == 2 || self.view.is_none(),
+            "v1 cannot carry structured view"
+        );
+        if let Some(view) = &self.view {
+            view.canonical_json()?;
+        }
         for field in [
             &self.owner_id,
             &self.thread_id,
@@ -642,6 +679,16 @@ impl ExternalInputClient {
     }
     pub fn submit(&self, envelope: &Envelope) -> anyhow::Result<Response> {
         envelope.validate()?;
+        ensure!(
+            envelope.version == 1
+                || self
+                    .client
+                    .initialize_response()
+                    .get("externalInputVersions")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|versions| versions.iter().any(|v| v.as_u64() == Some(2))),
+            "native structured view v2 unsupported; retain frozen item, no downgrade"
+        );
         self.require_delivery(&envelope.message.delivery)?;
         ensure!(
             envelope.owner_id == self.binding.owner_id

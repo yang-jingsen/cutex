@@ -421,6 +421,7 @@ fn envelope(
     };
     let mut e = Envelope {
         version: 1,
+        view: None,
         owner_id: binding.owner_id.clone(),
         thread_id: binding.thread_id.clone(),
         runtime_generation: binding.runtime_generation,
