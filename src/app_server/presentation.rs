@@ -226,11 +226,22 @@ impl PresentationClient {
 pub struct PrivateJobPolicy {
     pub version: u32,
     pub recipients: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<JobTemplate>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobTemplate {
+    Suppress,
+    ServiceSummary,
 }
 impl PrivateJobPolicy {
     pub fn permits(&self, owner: &str) -> anyhow::Result<bool> {
         ensure!(
-            self.version == 1 && !self.recipients.is_empty() && self.recipients.len() <= 32,
+            matches!(self.version, 1 | 2)
+                && (self.version != 1 || self.template.is_none())
+                && !self.recipients.is_empty()
+                && self.recipients.len() <= 32,
             "invalid private Job presentation policy"
         );
         for id in &self.recipients {
@@ -245,6 +256,27 @@ impl PrivateJobPolicy {
             );
         }
         Ok(self.recipients.iter().any(|id| id == owner))
+    }
+    pub fn obligation(
+        &self,
+        message: &crate::agent_bus::model::AgentBusMessage,
+        canonical_sha256: &str,
+    ) -> anyhow::Result<Option<Obligation>> {
+        if !self.permits(message.to_cutex_session_id.as_deref().unwrap_or(""))? {
+            return Ok(None);
+        }
+        if self.version == 1 {
+            return Obligation::job(message, canonical_sha256).map(Some);
+        }
+        match self.template.unwrap_or(JobTemplate::Suppress) {
+            JobTemplate::Suppress => Ok(None),
+            JobTemplate::ServiceSummary => {
+                let obligation = Obligation::job_version(message, canonical_sha256, 2)?;
+                // Missing/blank data is not a summary. No fallback status prose,
+                // extra query, or content-similarity judgment.
+                Ok((!obligation.presentation.body.trim().is_empty()).then_some(obligation))
+            }
+        }
     }
 }
 
@@ -267,6 +299,17 @@ impl Obligation {
         message: &crate::agent_bus::model::AgentBusMessage,
         canonical_sha256: &str,
     ) -> anyhow::Result<Self> {
+        Self::job_version(message, canonical_sha256, 1)
+    }
+    pub(crate) fn job_version(
+        message: &crate::agent_bus::model::AgentBusMessage,
+        canonical_sha256: &str,
+        version: u32,
+    ) -> anyhow::Result<Self> {
+        ensure!(
+            matches!(version, 1 | 2),
+            "unsupported Job presentation template"
+        );
         use crate::agent_bus::model::{
             AgentMessageKind, JobServiceCompletionRequest, JOB_SERVICE_COMPLETION_SCHEMA,
         };
@@ -290,10 +333,15 @@ impl Obligation {
         let status = serde_json::to_value(&m.terminal_status)?;
         let status = status.as_str().context("Job status shape")?;
         let id = format!(
-            "p1_{}",
+            "p{}_{}",
+            version,
             framed(
                 b"cutex:job-presentation:v1\0",
-                &[&m.target_cutex_session_id, &message.id, "1"]
+                &[
+                    &m.target_cutex_session_id,
+                    &message.id,
+                    &version.to_string()
+                ]
             )
         );
         let presentation = Presentation {
@@ -302,13 +350,22 @@ impl Obligation {
                 kind: SourceKind::Service,
                 id: "cutex-job-service".into(),
             },
-            title: "Job 终态通知".into(),
-            body: format!(
-                "Job: {}\n状态：{}\n输出读取状态：未观测。\n摘要（外部数据）：{}",
-                m.job_id,
-                status,
-                m.summary.as_deref().unwrap_or("未提供")
-            ),
+            title: if version == 1 {
+                "Job 终态通知"
+            } else {
+                "Job summary"
+            }
+            .into(),
+            body: if version == 1 {
+                format!(
+                    "Job: {}\n状态：{}\n输出读取状态：未观测。\n摘要（外部数据）：{}",
+                    m.job_id,
+                    status,
+                    m.summary.as_deref().unwrap_or("未提供")
+                )
+            } else {
+                m.summary.unwrap_or_default()
+            },
             format: Format::PlainText,
             references: vec![Reference {
                 kind: ReferenceKind::ExternalInput,
@@ -316,7 +373,7 @@ impl Obligation {
             }],
         };
         Ok(Self {
-            version: 1,
+            version,
             canonical_sha256: canonical_sha256.into(),
             presentation,
             frozen: None,
@@ -348,6 +405,30 @@ mod tests {
             },
         )
         .unwrap()
+    }
+    #[test]
+    fn job_policy_v2_is_explicit_and_old_serialization_unchanged() {
+        let id = "cutex.11111111-1111-4111-8111-111111111111";
+        let legacy = serde_json::json!({"version":1,"recipients":[id]});
+        let policy: PrivateJobPolicy = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(policy).unwrap(), legacy);
+        for (version, template, valid) in [
+            (1, "suppress", false),
+            (1, "service_summary", false),
+            (2, "suppress", true),
+            (2, "service_summary", true),
+            (3, "suppress", false),
+        ] {
+            let p: PrivateJobPolicy = serde_json::from_value(
+                serde_json::json!({"version":version,"recipients":[id],"template":template}),
+            )
+            .unwrap();
+            assert_eq!(p.permits(id).is_ok(), valid);
+        }
+        assert!(serde_json::from_value::<PrivateJobPolicy>(
+            serde_json::json!({"version":2,"recipients":[id],"template":"automatic"})
+        )
+        .is_err());
     }
     #[test]
     fn native_foundation_independent_digest_vector() {
@@ -382,7 +463,8 @@ mod tests {
         assert!(serde_json::from_value::<Receipt>(json).is_err());
         assert!(PrivateJobPolicy {
             version: 2,
-            recipients: vec![]
+            recipients: vec![],
+            template: None,
         }
         .permits("x")
         .is_err());
@@ -427,6 +509,7 @@ mod tests {
         let policy = PrivateJobPolicy {
             version: 1,
             recipients: vec![id.into()],
+            template: None,
         };
         assert!(policy.permits(id).unwrap());
         assert!(!policy.permits("foreign").unwrap());

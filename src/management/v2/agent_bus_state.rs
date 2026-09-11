@@ -221,7 +221,7 @@ impl AgentBusMessageRepository {
                 .as_mut()
                 .context("presentation not requested")?;
             anyhow::ensure!(
-                p.version == 1
+                matches!(p.version, 1 | 2)
                     && m.snapshot.semantic_sha256.as_deref() == Some(&p.canonical_sha256),
                 "presentation canonical conflict"
             );
@@ -375,12 +375,7 @@ impl AgentBusMessageRepository {
         policy: Option<&crate::app_server::presentation::PrivateJobPolicy>,
     ) -> anyhow::Result<bool> {
         let display = match policy {
-            Some(p) if p.permits(&message.to_cutex_session_id)? => {
-                Some(crate::app_server::presentation::Obligation::job(
-                    &message.canonical_envelope,
-                    &message.semantic_sha256,
-                )?)
-            }
+            Some(p) => p.obligation(&message.canonical_envelope, &message.semantic_sha256)?,
             _ => None,
         };
         self.record_queued_internal(message, true, display)
@@ -936,7 +931,7 @@ fn load_store(path: &Path) -> anyhow::Result<AgentBusMessageStore> {
     for m in store.messages.values() {
         if let Some(p) = &m.snapshot.presentation {
             anyhow::ensure!(
-                p.version == 1
+                matches!(p.version, 1 | 2)
                     && m.snapshot.semantic_sha256.as_deref() == Some(&p.canonical_sha256),
                 "invalid presentation obligation"
             );
@@ -944,8 +939,11 @@ fn load_store(path: &Path) -> anyhow::Result<AgentBusMessageStore> {
                 .canonical_envelope
                 .as_ref()
                 .context("presentation canonical absent")?;
-            let expected =
-                crate::app_server::presentation::Obligation::job(canonical, &p.canonical_sha256)?;
+            let expected = crate::app_server::presentation::Obligation::job_version(
+                canonical,
+                &p.canonical_sha256,
+                p.version,
+            )?;
             anyhow::ensure!(
                 expected.presentation == p.presentation,
                 "presentation template/canonical conflict"
@@ -1289,6 +1287,147 @@ mod tests {
             .unwrap();
     }
     #[test]
+    fn presentation_v2_suppression_is_frozen_and_ack_independent() {
+        use crate::app_server::presentation::{JobTemplate, PrivateJobPolicy};
+        let root = std::env::temp_dir().join(format!("presentation-v2-{}", uuid::Uuid::new_v4()));
+        let repo = AgentBusMessageRepository::open(&root).unwrap();
+        let q = presentation_job();
+        let owner = q.to_cutex_session_id.clone();
+        let mut policy = PrivateJobPolicy {
+            version: 2,
+            recipients: vec![owner.clone()],
+            template: None,
+        };
+        assert!(repo
+            .record_queued_private_job(q.clone(), Some(&policy))
+            .unwrap());
+        fixture_a4(&repo, &owner);
+        let before = repo.snapshot_by_message_id("jsc_stable").unwrap().unwrap();
+        assert_eq!(before.state, "delivered");
+        assert!(before.presentation.is_none());
+        policy.template = Some(JobTemplate::ServiceSummary);
+        assert!(!repo.record_queued_private_job(q, Some(&policy)).unwrap());
+        assert_eq!(
+            repo.snapshot_by_message_id("jsc_stable").unwrap().unwrap(),
+            before
+        );
+        assert!(repo.due_presentations(&owner, i64::MAX).unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn presentation_v2_summary_preserves_exact_data_receipt_and_old_versions() {
+        use crate::app_server::presentation::{JobTemplate, Obligation, PrivateJobPolicy};
+        let root =
+            std::env::temp_dir().join(format!("presentation-v2-summary-{}", uuid::Uuid::new_v4()));
+        let repo = AgentBusMessageRepository::open(&root).unwrap();
+        let q = presentation_job();
+        let owner = q.to_cutex_session_id.clone();
+        let mut policy = PrivateJobPolicy {
+            version: 2,
+            recipients: vec![owner.clone()],
+            template: Some(JobTemplate::ServiceSummary),
+        };
+        repo.record_queued_private_job(q.clone(), Some(&policy))
+            .unwrap();
+        fixture_a4(&repo, &owner);
+        let frozen = repo
+            .freeze_presentation(&owner, "jsc_stable", "native-test")
+            .unwrap();
+        assert_eq!(frozen.presentation.title, "Job summary");
+        assert_eq!(frozen.presentation.body, "bounded result data");
+        assert_eq!(frozen.presentation.references[0].id, "jsc_stable");
+        let legacy = Obligation::job(&q.canonical_envelope, &q.semantic_sha256).unwrap();
+        assert_ne!(frozen.presentation.id, legacy.presentation.id);
+        assert!(legacy.presentation.body.contains("输出读取状态：未观测。"));
+        let before = repo.snapshot_by_message_id("jsc_stable").unwrap().unwrap();
+        assert_eq!(before.presentation.as_ref().unwrap().version, 2);
+        // Old v5 writer's template predicate rejects v2, never relabels it v1.
+        assert_ne!(before.presentation.as_ref().unwrap().version, 1);
+        policy.template = Some(JobTemplate::Suppress);
+        assert!(!repo
+            .record_queued_private_job(q.clone(), Some(&policy))
+            .unwrap());
+        assert_eq!(
+            repo.snapshot_by_message_id("jsc_stable").unwrap().unwrap(),
+            before
+        );
+        drop(repo);
+        let repo = AgentBusMessageRepository::open(&root).unwrap();
+        assert_eq!(
+            repo.freeze_presentation(&owner, "jsc_stable", "native-test")
+                .unwrap(),
+            frozen
+        );
+        repo.commit_presentation(&owner, "jsc_stable", &frozen, &frozen, 1)
+            .unwrap();
+        repo.commit_presentation(&owner, "jsc_stable", &frozen, &frozen, 2)
+            .unwrap();
+        let after = repo.snapshot_by_message_id("jsc_stable").unwrap().unwrap();
+        assert_eq!(after.external_input_receipt, before.external_input_receipt);
+        assert_eq!(after.state, "delivered");
+        assert_eq!(
+            after.presentation.as_ref().unwrap().commit_generation,
+            Some(1)
+        );
+        let mut store = load_store(&root.join(AGENT_BUS_STATE_FILE)).unwrap();
+        store
+            .messages
+            .get_mut("jsc_stable")
+            .unwrap()
+            .snapshot
+            .presentation
+            .as_mut()
+            .unwrap()
+            .version = 1;
+        write_private_pretty_json_atomic(
+            &root.join(AGENT_BUS_STATE_FILE),
+            &store,
+            "fixture wrong template version",
+        )
+        .unwrap();
+        assert!(load_store(&root.join(AGENT_BUS_STATE_FILE)).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn presentation_v2_missing_summary_does_not_invent_status_or_query() {
+        use crate::app_server::presentation::{JobTemplate, PrivateJobPolicy};
+        let mut q = presentation_job();
+        let policy = PrivateJobPolicy {
+            version: 2,
+            recipients: vec![q.to_cutex_session_id.clone()],
+            template: Some(JobTemplate::ServiceSummary),
+        };
+        for summary in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!(" \n\t"),
+        ] {
+            q.canonical_envelope.control_payload.as_mut().unwrap()["summary"] = summary;
+            assert!(policy
+                .obligation(&q.canonical_envelope, &q.semantic_sha256)
+                .unwrap()
+                .is_none());
+        }
+        q.canonical_envelope.control_payload.as_mut().unwrap()["summary"] =
+            serde_json::json!("  Exact summary\n第二行  ");
+        assert_eq!(
+            policy
+                .obligation(&q.canonical_envelope, &q.semantic_sha256)
+                .unwrap()
+                .unwrap()
+                .presentation
+                .body,
+            "  Exact summary\n第二行  "
+        );
+        q.canonical_envelope.from = "forged".into();
+        assert!(policy
+            .obligation(&q.canonical_envelope, &q.semantic_sha256)
+            .is_err());
+    }
+
+    #[test]
     fn presentation_obligation_survives_input_ack_reopen_and_exact_receipt_cas() {
         use crate::app_server::presentation::PrivateJobPolicy;
         let root =
@@ -1299,6 +1438,7 @@ mod tests {
         let policy = PrivateJobPolicy {
             version: 1,
             recipients: vec![owner.clone()],
+            template: None,
         };
         assert!(repo
             .record_queued_private_job(q.clone(), Some(&policy))
@@ -1375,6 +1515,7 @@ mod tests {
         let policy = PrivateJobPolicy {
             version: 1,
             recipients: vec![owner.clone()],
+            template: None,
         };
         assert!(!repo.record_queued_private_job(q, Some(&policy)).unwrap());
         assert!(repo
@@ -1408,6 +1549,7 @@ mod tests {
         let policy = PrivateJobPolicy {
             version: 1,
             recipients: vec![owner.clone()],
+            template: None,
         };
         for n in 0..6 {
             let mut q = presentation_job();
