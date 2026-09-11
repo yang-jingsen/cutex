@@ -8,7 +8,7 @@ from pathlib import Path
 
 owner=Path(__file__).resolve().parents[2]
 root=Path(sys.argv[1]).resolve(strict=True)
-assert root.is_relative_to(owner) and root.name.startswith('history-r3-')
+assert root.is_relative_to(owner) and root.name.startswith(('history-r3-','history-groups-'))
 plan=json.loads((owner/'rehearsal-r2-db5WwG/plan.json').read_text())
 home=root/'p0/.cutex/codex-home'
 store=json.loads((root/'p0/.cutex/cutex-sessions.json').read_text())

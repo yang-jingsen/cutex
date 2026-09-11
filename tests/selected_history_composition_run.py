@@ -10,8 +10,8 @@ assert manifest.is_relative_to(root/'artifacts')
 assert hashlib.sha256(manifest.read_bytes()).hexdigest()==expected
 for rel,sha in json.loads(manifest.read_text())['files'].items():assert hashlib.sha256((manifest.parent/rel).read_bytes()).hexdigest()==sha
 mode=sys.argv[4] if len(sys.argv)>4 else 'all'
-assert mode in ('all','registry','probe:cesc-tutor-r1','probe:cute-codex-log-wal-fix-r2','probe:tethys-director-r2','probe:ifm-ema-figures','probe:scpolya-2')
-fixture=pathlib.Path(tempfile.mkdtemp(prefix='history-r3-',dir=root));os.chmod(fixture,0o700)
+assert mode in ('all','registry','probe:cesc-tutor-r1','probe:cute-codex-log-wal-fix-r2','probe:tethys-director-r2','probe:ifm-ema-figures','probe:scpolya-2','groups:cesc-tutor-r1','groups:cute-codex-log-wal-fix-r2')
+fixture=pathlib.Path(tempfile.mkdtemp(prefix='history-groups-' if mode.startswith('groups:') else 'history-r3-',dir=root));os.chmod(fixture,0o700)
 (fixture/'prerequisite').mkdir(mode=0o700)
 cmd=['/usr/bin/bwrap','--die-with-parent','--unshare-net','--unshare-pid','--tmpfs','/']
 for p in ['/usr','/bin','/lib','/lib64','/etc','/mnt']:cmd+=['--ro-bind',p,p]

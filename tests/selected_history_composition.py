@@ -96,6 +96,54 @@ def project_summary(project):
     code,value=api(24871,'/v2/agent-management/projects');assert code==200
     return next(p for p in value['projects'] if p['project_id']==project)
 
+def registration_oracle(row,receipt):
+    """Actual authenticated Bus requests; no authoritative store edits."""
+    def api(port,path,body=None,token=BUS):
+        assert port==24870 and path in ('/api/agents?all_groups=true','/api/agents/register')
+        c=http.client.HTTPConnection('127.0.0.1',port,timeout=180)
+        c.request('POST' if body is not None else 'GET',path,None if body is None else json.dumps(body),
+                  {'Authorization':'Bearer '+token,'Content-Type':'application/json'})
+        r=c.getresponse();data=r.read();status=r.status;c.close()
+        # Actual outer Bus errors are text/plain, unlike Management JSON.
+        return status,json.loads(data) if status==200 else {'error':redact(data.decode(errors='replace'))}
+    code,agents=api(24870,'/api/agents?all_groups=true',token=BUS);assert code==200
+    agent=next(a for a in agents if a['id']==receipt['runtime_agent_id'])
+    fields={'id':'id','name':'name','baseName':'base_name','threadName':'thread_name','pathKey':'path_key',
+            'sessionId':'session_id','profile':'profile','cwd':'cwd','pid':'pid','hostId':'host_id',
+            'groups':'groups','registrationClass':'registration_class'}
+    request={k:agent.get(v) for k,v in fields.items()}
+    before=store()['sessions'][row['durable_id']]
+    assert before['agent_groups']==row['groups'] and agent['groups']==row['groups']
+    assert before['revision']==receipt['review']['subject']['revision']
+    code,_=api(24870,'/api/agents/register',request,token=BUS);assert code==200
+    outcomes=[]
+    for name,changes,token in [
+        ('wrong-token',{},'invalid-private-token'),
+        ('forged-group',{'groups':['forged-privilege']},BUS),
+        ('wrong-pid',{'pid':os.getpid()},BUS),
+        ('stale-runtime',{'id':'stock.private-stale'},BUS),
+        ('foreign-thread',{'sessionId':'019f4b34-82e6-7f72-9027-000000000001'},BUS),
+        ('foreign-host',{'hostId':'foreign'},BUS),
+    ]:
+        code,value=api(24870,'/api/agents/register',{**request,**changes},token=token)
+        assert code>=400,(name,code)
+        outcomes.append({'case':name,'http':code,'error':redact(json.dumps(value))})
+    after=store()['sessions'][row['durable_id']]
+    for field in ('revision','agent_groups','runtime_generation','current_runtime_agent_id','app_server_runtime'):
+        assert before[field]==after[field],field
+    code,agents=api(24870,'/api/agents?all_groups=true',token=BUS);assert code==200
+    current=next(a for a in agents if a['id']==receipt['runtime_agent_id'])
+    assert current['groups']==row['groups']
+    ordinary={**request,'id':'private-unmarked','sessionId':None,'groups':['ordinary'],
+              'pid':os.getpid(),'registrationClass':'ephemeral'}
+    code,_=api(24870,'/api/agents/register',ordinary,token=BUS);assert code==200
+    code,agents=api(24870,'/api/agents?all_groups=true',token=BUS);assert code==200
+    ordinary_result=next(a for a in agents if a['id']=='private-unmarked')
+    assert 'ordinary' in ordinary_result['groups'] and len(ordinary_result['groups'])==2
+    save('registration-oracle.json',{'formal_name':row['formal_name'],'revision_before':before['revision'],
+        'revision_after':after['revision'],'groups':after['agent_groups'],'generation':after['runtime_generation'],
+        'ready':receipt['stage'],'exact_replay':True,'negatives':outcomes,'unmarked_default_added':True})
+
 def pty_probe(ident,label):
     master,slave=os.openpty();fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',38,160,0,0))
     original=termios.tcgetattr(slave)
@@ -162,6 +210,7 @@ def run_probe(row,index):
         result=action({'operation':'run','action_id':'probe-run-'+str(index),'review':review})
         assert result['stage']=='ready',(result['stage'],result.get('error'))
         pid=result['binding']['pid'];birth=identity(pid);owned.append((pid,birth))
+        if mode.startswith('groups:'):registration_oracle(row,result)
         peer=rpc(Path(result['binding']['endpoint'].removeprefix('unix://')))
         phase='probe-'+str(index)+'-read'
         response=peer.call('thread/read',{'threadId':row['native_id'],'includeTurns':True})['thread']
@@ -234,7 +283,7 @@ def registry():
 try:
     mode=sys.argv[2] if len(sys.argv)>2 else 'all'
     if mode in ('all','registry'):registry()
-    representatives=['cesc-tutor-r1','cute-codex-log-wal-fix-r2','tethys-director-r2','ifm-ema-figures'] if mode=='all' else ([mode.removeprefix('probe:')] if mode.startswith('probe:') else [])
+    representatives=['cesc-tutor-r1','cute-codex-log-wal-fix-r2','tethys-director-r2','ifm-ema-figures'] if mode=='all' else ([mode.split(':',1)[1]] if mode.startswith(('probe:','groups:')) else [])
     rows=PLAN['rows']
     proof=[]
     for index,name in enumerate(representatives):
