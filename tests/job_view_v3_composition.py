@@ -6,7 +6,9 @@ Run in the existing private bwrap network/PID namespace with a NEW short run.
 """
 from pathlib import Path
 import json
-from job_view_v3_tool_contract import assert_advertised
+from job_view_v4_protocol import response_events, fresh_prompt
+from job_view_v4_driver import Driver
+import time
 
 base_path = Path(__file__).with_name('presentation_boundary.py')
 base = base_path.read_text()
@@ -32,7 +34,8 @@ for old, new in changes.items():
     prefix = prefix.replace(old, new)
 
 context = {}
-step = 0
+driver = None
+interaction_started = None
 approvals = []
 stock_birth = {}
 fixture_error = {}
@@ -48,41 +51,16 @@ def safe_model_response(self):
         self.send_error(400, 'private fixture assertion failed; no fallback')
 
 def model_response(self):
-    global step
+    global driver
     g = context
     request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
     assert self.path == '/v1/responses'
     g['Model'].requests.append(request)
     g['Model'].calls += 1
-    assert g['Model'].calls <= 8, 'finite fake protocol budget exceeded'
-    n = step
-    step += 1
-    if n == 0:
-        args = {'actionId':'v3-private-job', 'argv':['/bin/sh','-c',
-            'printf v3-job-output; /usr/bin/python3 -c "import time; time.sleep(0.2)"'],
-            'cwd':str(g['RUN'])}
-        code = 'const r = await tools.mcp__cutex_job__submit('+json.dumps(args)+'); text(r);'
-        item = {'type':'custom_tool_call','call_id':'v3-submit','name':'exec','input':code}
-    elif n == 1:
-        state=json.loads((g['RUN']/'job-state/state.json').read_text())
-        assert len(state['jobs'])==1 and next(iter(state['jobs'].values()))['request']['actionId']=='v3-private-job', 'no actual Job receipt; refuse fake Submitted'
-        item = {'type':'message','id':'v3-submitted','role':'assistant','content':[{'type':'output_text','text':'Submitted'}]}
-    elif n == 2:
-        # This request must be the naturally admitted completion-triggered turn.
-        assert 'Job completed.' in json.dumps(request), 'no actual completion input'
-        state = json.loads((g['RUN']/'job-state/state.json').read_text())
-        assert len(state['jobs']) == 1
-        jid = next(iter(state['jobs']))
-        code = 'const q = await tools.mcp__cutex_job__query({jobId:'+json.dumps(jid)+'}); text(q); const r = await tools.mcp__cutex_job__read_output({jobId:'+json.dumps(jid)+',stream:"stdout"}); text(r);'
-        item = {'type':'custom_tool_call','call_id':'v3-output','name':'exec','input':code}
-    else:
-        assert n == 3, 'unexpected extra model turn/request'
-        item = {'type':'message','id':'v3-done','role':'assistant','content':[{'type':'output_text','text':'v3-job-output acknowledged'}]}
-    # Validate the actual received schema, not expected future capabilities.
-    assert_advertised(item, request.get('tools', []))
-    events = [{'type':'response.created','response':{'id':f'v3-{n}'}},
-              {'type':'response.output_item.done','item':item},
-              {'type':'response.completed','response':{'id':f'v3-{n}','usage':{'input_tokens':0,'output_tokens':0,'total_tokens':0}}}]
+    assert g['Model'].calls <= 16 and time.monotonic()-interaction_started < 180, 'interaction budget'
+    if driver is None: driver=Driver(g)
+    item=driver.next(request)
+    events=response_events(item,request,f'jv4-response-{g["Model"].calls}')
     body = ''.join('event: '+e['type']+'\ndata: '+json.dumps(e)+'\n\n' for e in events).encode()
     self.send_response(200)
     self.send_header('Content-Type','text/event-stream')
@@ -132,10 +110,22 @@ body = r'''
     prompt='Run the authorized private Job once, then read stdout on completion.'
     os.write(terminal.master,b'\x1b[200~'+prompt.encode()+b'\x1b[201~')
     terminal.wait(prompt)
+    interaction_started=time.monotonic()
     os.write(terminal.master,b'\r')
-    for tool in ('submit','query','read_output'):
-        terminal.wait('Allow the cutex_job MCP server to run tool "'+tool+'"?')
-        os.write(terminal.master,b'\r');approvals.append(tool)
+    approval_position=len(terminal.screen)
+    while not driver or driver.phase!='done':
+        def new_approval_or_done():
+            assert time.monotonic()-interaction_started<180, 'interaction budget'
+            plain=re.sub(rb'\x1b\[[0-9;?<>=]*[ -/]*[@-~]',b'',terminal.screen[approval_position:])
+            match=re.search(rb'Allow the cutex_job MCP server to run tool "([a-z_]+)"\?',plain)
+            if match: return match[1].decode()
+            return 'done' if driver and driver.phase=='done' else None
+        tool=wait_for(new_approval_or_done,180)
+        if tool=='done': break
+        approval_position=len(terminal.screen)
+        assert tool in ('submit','query','read_output'), 'unexpected approval'
+        if tool not in approvals:
+            os.write(terminal.master,b'\r');approvals.append(tool)
     terminal.wait('v3-job-output acknowledged')
     state=wait_for(lambda:json.loads((RUN/'job-state/state.json').read_text()) if (RUN/'job-state/state.json').exists() else None)
     assert len(state['jobs'])==1
@@ -176,7 +166,8 @@ body = r'''
     assert replay==timeline
     terminal=Terminal();terminal.wait('Job completed');terminal.wait('Observed run');terminal.close();terminal=None
     assert json.dumps(snapshot(envlp['message']['id'])['externalInputReceipt'],sort_keys=True)==before
-    assert Model.calls==4 and len(json.loads((RUN/'job-state/state.json').read_text())['jobs'])==1
+    assert driver.phase=='done' and driver.submit_count==driver.output_count==1 and Model.calls<=16
+    assert len(json.loads((RUN/'job-state/state.json').read_text())['jobs'])==1
     (RUN/'PASS.json').write_text(json.dumps({'durable':durable,'thread':thread,'jobId':jid,'job':job,'snapshot':snap,
         'modelRequests':Model.calls,'approvals':approvals,'reconnectReplay':True,'actualCodeModeJob':True,
         'grantInjection':False,'network':'private network namespace + pre-connect tripwire'},ensure_ascii=False,indent=2))
