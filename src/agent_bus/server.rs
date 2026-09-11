@@ -35,8 +35,7 @@ use crate::agent_bus::model::AgentBusPollResponse;
 use crate::agent_bus::model::AgentBusSendRequest;
 use crate::agent_bus::model::AgentBusUnregisterRequest;
 use crate::agent_bus::model::{
-    JobServiceCompletionQuery, JobServiceCompletionReceipt, JobServiceCompletionRequest,
-    JOB_SERVICE_COMPLETION_MAX_BODY_BYTES,
+    JobServiceCompletionQuery, JobServiceCompletionReceipt, JOB_SERVICE_COMPLETION_MAX_BODY_BYTES,
 };
 use crate::agent_bus::model::{
     TaskServiceActionOutcome, TaskServiceActionResponse, TaskServiceActionResponseSchema,
@@ -2879,7 +2878,7 @@ pub struct AgentBusRequestHandlers {
     pub job_service_completion: fn(
         &Arc<Mutex<AgentBusState>>,
         &crate::agent_bus::identity::JobServiceSystemPrincipal,
-        JobServiceCompletionRequest,
+        crate::agent_bus::job_completion::IncomingCompletion,
     ) -> anyhow::Result<JobServiceCompletionReceipt>,
     pub job_service_completion_query: fn(
         &crate::agent_bus::identity::JobServiceSystemPrincipal,
@@ -3153,8 +3152,9 @@ pub fn handle_agent_bus_request(
                     b"Job Service completion request exceeds route limit",
                 );
             }
-            let payload: JobServiceCompletionRequest = serde_json::from_slice(&request.body)
-                .context("strict Job Service completion parsing failed")?;
+            let payload: crate::agent_bus::job_completion::IncomingCompletion =
+                serde_json::from_slice(&request.body)
+                    .context("strict Job Service completion parsing failed")?;
             let principal = crate::agent_bus::identity::job_service_system_principal();
             let response = (handlers.job_service_completion)(state, &principal, payload)?;
             write_json_response(stream, 200, "OK", &serde_json::to_value(response)?)
@@ -9679,9 +9679,12 @@ mod tests {
         fn accepted(
             _state: &Arc<Mutex<AgentBusState>>,
             principal: &crate::agent_bus::identity::JobServiceSystemPrincipal,
-            request: JobServiceCompletionRequest,
+            request: crate::agent_bus::job_completion::IncomingCompletion,
         ) -> anyhow::Result<JobServiceCompletionReceipt> {
             assert!(principal.authenticate());
+            let crate::agent_bus::job_completion::IncomingCompletion::V1(request) = request else {
+                anyhow::bail!("expected v1 fixture")
+            };
             Ok(JobServiceCompletionReceipt {
                 schema: crate::agent_bus::model::JOB_SERVICE_COMPLETION_SCHEMA.to_string(),
                 status: "committed".to_string(),

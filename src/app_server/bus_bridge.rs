@@ -61,6 +61,14 @@ const INTER_AGENT_STATUS_SCHEMA: &str = "cutex/inter-agent-delivery-status/v1";
 #[path = "bus_bridge_external.rs"]
 mod external;
 
+#[cfg(test)]
+pub(crate) fn projected_external_envelope(
+    message: &AgentBusMessage,
+    binding: &crate::launch::stock::ExternalInputBinding,
+) -> anyhow::Result<crate::app_server::external_input::Envelope> {
+    external::envelope(message, binding)
+}
+
 pub(crate) fn validate_external_recovery_target(
     message: &AgentBusMessage,
     owner: &str,
@@ -795,6 +803,20 @@ fn deliver_polled_messages(
     };
     let mut prepared = Vec::new();
     for message in messages {
+        if message.control_type.as_deref() == Some(crate::agent_bus::job_completion::SCHEMA_V2) {
+            // A legacy submitter would put the canonical mechanical snapshot
+            // into model input. Leave it pending, with no transport ACK.
+            mark_error(
+                status,
+                "Job v2 requires reviewed ExternalInput v2 owner; pending without downgrade".into(),
+            );
+            agent_bus_message_repository()?.record_external_input_error(
+                &message.id,
+                "Job v2 requires reviewed ExternalInput v2 owner; no legacy fallback",
+            )?;
+            outcome.retained_pending = true;
+            continue;
+        }
         if pending_acks.contains(&message.id) {
             continue;
         }
@@ -1372,6 +1394,25 @@ fn job_service_inter_agent_params(
     message: &AgentBusMessage,
 ) -> anyhow::Result<ThreadInterAgentMessageParams> {
     use crate::agent_bus::model::{JobServiceCompletionRequest, JOB_SERVICE_COMPLETION_SCHEMA};
+
+    if message.control_type.as_deref() == Some(crate::agent_bus::job_completion::SCHEMA_V2) {
+        let frozen = crate::agent_bus::job_completion::FrozenProjection::from_message(message)?;
+        anyhow::ensure!(
+            frozen.request.target_cutex_session_id == recipient_cutex_session_id,
+            "Job v2 recipient mismatch"
+        );
+        return Ok(ThreadInterAgentMessageParams {
+            thread_id: thread_id.into(),
+            message_id: model_visible_message_id(&message.id),
+            author: agent_path_for_bus_label("cutex-job-service"),
+            author_metadata: Some(system_participant("Cutex Job Service")),
+            recipient: "/root".into(),
+            recipient_metadata,
+            other_recipients: Vec::new(),
+            content: message.content.clone(),
+            delivery_mode: crate::agent_bus::delivery::AgentDeliveryMode::AfterTurn,
+        });
+    }
 
     if message.from != "cutex-job-service"
         || message.from_cutex_session_id.is_some()

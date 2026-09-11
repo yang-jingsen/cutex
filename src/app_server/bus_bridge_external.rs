@@ -318,7 +318,7 @@ fn fresh_task_projection(
     Ok(())
 }
 
-fn envelope(
+pub(super) fn envelope(
     message: &AgentBusMessage,
     binding: &crate::launch::stock::ExternalInputBinding,
 ) -> anyhow::Result<Envelope> {
@@ -402,6 +402,32 @@ fn envelope(
         AgentMessageKind::JobServiceSystem => {
             // Existing protected projection validates dedicated service provenance.
             job_service_inter_agent_params(&binding.thread_id, &binding.owner_id, None, message)?;
+            if message.control_type.as_deref() == Some(crate::agent_bus::job_completion::SCHEMA_V2)
+            {
+                let frozen =
+                    crate::agent_bus::job_completion::FrozenProjection::from_message(message)?;
+                let mut e = Envelope {
+                    version: frozen.native_version,
+                    owner_id: binding.owner_id.clone(),
+                    thread_id: binding.thread_id.clone(),
+                    runtime_generation: binding.runtime_generation,
+                    message: Message {
+                        id: message.id.clone(),
+                        source: Source {
+                            kind: SourceKind::Service,
+                            id: "cutex-job-service".into(),
+                        },
+                        event_type: "job_completion".into(),
+                        delivery,
+                        text: frozen.model_text,
+                    },
+                    view: Some(frozen.view),
+                    semantic_sha256: String::new(),
+                };
+                e.semantic_sha256 = e.digest();
+                e.validate()?;
+                return Ok(e);
+            }
             let m: crate::agent_bus::model::JobServiceCompletionRequest = serde_json::from_value(
                 message
                     .control_payload

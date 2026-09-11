@@ -6,6 +6,75 @@ use serde::{Deserialize, Serialize};
 
 pub const SCHEMA_V2: &str = "cutex.job_service.completion.v2";
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum IncomingCompletion {
+    V1(super::model::JobServiceCompletionRequest),
+    V2(CompletionV2),
+}
+
+/// Frozen once at canonical acceptance, before any native occurrence is bound.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FrozenProjection {
+    pub version: u32,
+    pub native_version: u32,
+    pub request: CompletionV2,
+    pub model_text: String,
+    pub view: StructuredView,
+}
+impl FrozenProjection {
+    pub fn new(request: CompletionV2) -> anyhow::Result<Self> {
+        request.validate()?;
+        Ok(Self {
+            version: 1,
+            native_version: 2,
+            model_text: request.model_text(),
+            view: request.view()?,
+            request,
+        })
+    }
+    pub fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.version == 1 && self.native_version == 2,
+            "unsupported frozen Job projection"
+        );
+        self.request.validate()?;
+        // Version1 is immutable; a future formatter must use a new version.
+        ensure!(
+            self.model_text == self.request.model_text() && self.view == self.request.view()?,
+            "frozen Job projection conflict"
+        );
+        Ok(())
+    }
+    pub fn from_message(message: &super::model::AgentBusMessage) -> anyhow::Result<Self> {
+        ensure!(
+            message.sender_kind == super::model::AgentMessageKind::JobServiceSystem
+                && message.from == "cutex-job-service"
+                && message.from_cutex_session_id.is_none()
+                && message.control_type.as_deref() == Some(SCHEMA_V2)
+                && message.delivery_mode == super::delivery::AgentDeliveryMode::AfterTurn,
+            "invalid protected Job v2 provenance"
+        );
+        let frozen: Self = serde_json::from_value(
+            message
+                .control_payload
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("missing frozen Job v2"))?,
+        )?;
+        frozen.validate()?;
+        ensure!(
+            message.to_cutex_session_id.as_deref()
+                == Some(frozen.request.target_cutex_session_id.as_str())
+                && message.external_message_id.as_deref() == Some(frozen.request.event_id.as_str())
+                && message.external_action_id.as_deref() == Some(frozen.request.job_id.as_str())
+                && message.content == serde_json::to_string(&frozen)?,
+            "Job v2 canonical identity/content conflict"
+        );
+        Ok(frozen)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CompletionV2 {

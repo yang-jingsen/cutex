@@ -265,6 +265,16 @@ impl PrivateJobPolicy {
         if !self.permits(message.to_cutex_session_id.as_deref().unwrap_or(""))? {
             return Ok(None);
         }
+        if message.control_type.as_deref() == Some(crate::agent_bus::job_completion::SCHEMA_V2) {
+            crate::agent_bus::job_completion::FrozenProjection::from_message(message)?;
+            ensure!(
+                self.version == 2,
+                "Job v2 requires presentation policy v2; legacy notice intent is not reinterpreted"
+            );
+            // The v2 producer has no independent summary field. Neither
+            // suppress nor service_summary invents a second status notice.
+            return Ok(None);
+        }
         if self.version == 1 {
             return Obligation::job(message, canonical_sha256).map(Some);
         }

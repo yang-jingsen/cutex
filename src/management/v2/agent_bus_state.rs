@@ -445,8 +445,15 @@ impl AgentBusMessageRepository {
                     }),
                 )?;
             }
-            if presentation.is_some() {
-                store.version = 5;
+            if message.canonical_envelope.control_type.as_deref()
+                == Some(crate::agent_bus::job_completion::SCHEMA_V2)
+            {
+                crate::agent_bus::job_completion::FrozenProjection::from_message(
+                    &message.canonical_envelope,
+                )?;
+                store.version = store.version.max(6);
+            } else if presentation.is_some() {
+                store.version = store.version.max(5);
             }
             store.messages.insert(
                 message.message_id.clone(),
@@ -761,6 +768,13 @@ impl AgentBusMessageRepository {
             .and_then(|stored| stored.snapshot.semantic_sha256))
     }
 
+    pub fn canonical_control_type(&self, message_id: &str) -> anyhow::Result<Option<String>> {
+        let stored = self
+            .get(message_id)?
+            .context("canonical record disappeared")?;
+        Ok(stored.canonical_envelope.and_then(|m| m.control_type))
+    }
+
     pub(crate) fn canonical_message(&self, message_id: &str) -> anyhow::Result<AgentBusMessage> {
         self.get(message_id)?
             .and_then(|stored| stored.canonical_envelope)
@@ -930,12 +944,22 @@ fn load_store(path: &Path) -> anyhow::Result<AgentBusMessageStore> {
         anyhow::bail!("presentation obligation requires Bus state v5");
     }
     for m in store.messages.values() {
+        if let Some(canonical) = &m.canonical_envelope {
+            if canonical.control_type.as_deref()
+                == Some(crate::agent_bus::job_completion::SCHEMA_V2)
+            {
+                anyhow::ensure!(store.version >= 6, "frozen Job view requires Bus state v6");
+                crate::agent_bus::job_completion::FrozenProjection::from_message(canonical)?;
+            }
+        }
         if let Some(envelope) = &m.snapshot.external_input {
             anyhow::ensure!(
                 envelope.version != 2 || store.version >= 6,
                 "structured view requires Bus state v6"
             );
-            envelope.validate()?;
+            if envelope.version == 2 {
+                envelope.validate()?;
+            }
         }
         if let Some(p) = &m.snapshot.presentation {
             anyhow::ensure!(
@@ -1253,6 +1277,160 @@ mod tests {
             "summary":"bounded result data"
         }));
         q
+    }
+    #[test]
+    fn job_v2_canonical_freeze_reopen_tamper_and_store_version() {
+        use crate::agent_bus::job_completion::{CompletionV2, FrozenProjection, SCHEMA_V2};
+        let root = std::env::temp_dir().join(format!(
+            "jv{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let repository = AgentBusMessageRepository::open(&root).unwrap();
+        let mut q = system_queued_message("");
+        let request: CompletionV2 = serde_json::from_value(json!({
+            "schema":SCHEMA_V2,"eventId":"event-1","jobId":"job-1","jobRevision":1,
+            "terminalStatus":"exited","resultSha256":"a".repeat(64),"targetCutexSessionId":q.to_cutex_session_id,
+            "facts":{"factsVersion":1,"actionId":"human-job", "stdout":{"retainedBytes":0,"observedBytes":0,"truncated":false},"stderr":{"retainedBytes":0,"observedBytes":0,"truncated":false}},"outputReference":"job-output:job-1"
+        })).unwrap();
+        let projection = FrozenProjection::new(request).unwrap();
+        q.content = serde_json::to_string(&projection).unwrap();
+        q.canonical_envelope.content = q.content.clone();
+        q.canonical_envelope.control_type = Some(SCHEMA_V2.into());
+        q.canonical_envelope.control_payload = Some(serde_json::to_value(&projection).unwrap());
+        let params = crate::app_server::bus_bridge::inter_agent_params(
+            "",
+            &q.to_cutex_session_id,
+            &q.to_cutex_session_id,
+            &q.canonical_envelope,
+        )
+        .unwrap();
+        q.semantic_sha256 = crate::app_server::bus_bridge::inter_agent_semantic_sha256(&params);
+        let owner = q.to_cutex_session_id.clone();
+        assert!(repository.record_queued_isolated(q.clone()).unwrap());
+        assert!(!repository.record_queued_isolated(q.clone()).unwrap());
+        let binding = crate::launch::stock::ExternalInputBinding {
+            version: 1,
+            owner_id: owner.clone(),
+            thread_id: "native-test".into(),
+            runtime_generation: 1,
+            canonical_byte_limit: Default::default(),
+        };
+        let envelope = repository
+            .freeze_external_input(&owner, "jsc_stable", |m| {
+                crate::app_server::bus_bridge::projected_external_envelope(m, &binding)
+            })
+            .unwrap();
+        assert_eq!(envelope.version, 2);
+        assert_eq!(envelope.message.text.matches("job-1").count(), 1);
+        assert!(!envelope.message.text.contains("outputReference"));
+        assert_eq!(envelope.view.as_ref().unwrap(), &projection.view);
+        #[cfg(unix)]
+        {
+            // Real transport to a fake consumer; not native A4/model proof.
+            use crate::app_server::client::{
+                AppServerClient, AppServerClientOptions, AppServerEndpoint,
+            };
+            use std::os::unix::net::UnixListener;
+            let path = root.join("rpc");
+            assert!(path.as_os_str().len() < 104, "private socket preflight");
+            let listener = UnixListener::bind(&path).unwrap();
+            let expected = serde_json::to_value(&envelope).unwrap();
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut ws = tungstenite::accept(stream).unwrap();
+                let read =
+                    |ws: &mut tungstenite::WebSocket<std::os::unix::net::UnixStream>| -> Value {
+                        serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap()
+                    };
+                let init = read(&mut ws);
+                assert_eq!(init["method"], "initialize");
+                ws.send(tungstenite::Message::Text(json!({"id":init["id"],"result":{"userAgent":"private-fake-consumer","externalInputVersions":[1,2]}}).to_string().into())).unwrap();
+                assert_eq!(read(&mut ws)["method"], "initialized");
+                let request = read(&mut ws);
+                assert_eq!(request["method"], "thread/externalInput/submit");
+                assert_eq!(request["params"], expected);
+                assert!(request["params"]["message"].get("view").is_none());
+                assert!(!request["params"]["message"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("job-output:"));
+                ws.send(tungstenite::Message::Text(
+                    json!({"id":request["id"],"result":{"observed":true}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            });
+            let mut options =
+                AppServerClientOptions::new(AppServerEndpoint::UnixSocket { socket_path: path });
+            options.request_timeout = std::time::Duration::from_secs(5);
+            let client = AppServerClient::connect(options).unwrap();
+            assert_eq!(
+                client
+                    .handle()
+                    .request(
+                        "thread/externalInput/submit",
+                        serde_json::to_value(&envelope).unwrap()
+                    )
+                    .unwrap()["observed"],
+                true
+            );
+            drop(client);
+            server.join().unwrap();
+        }
+        let reopened = AgentBusMessageRepository::open(&root).unwrap();
+        assert_eq!(
+            reopened
+                .freeze_external_input(&owner, "jsc_stable", |_| panic!(
+                    "must not reproject on recovery"
+                ))
+                .unwrap(),
+            envelope
+        );
+        let mut forged = q.canonical_envelope.clone();
+        forged.from_cutex_session_id = Some(owner.clone());
+        let mut wrong_owner = binding.clone();
+        wrong_owner.owner_id = "cutex.22222222-2222-4222-8222-222222222222".into();
+        assert!(crate::app_server::bus_bridge::projected_external_envelope(
+            &q.canonical_envelope,
+            &wrong_owner
+        )
+        .is_err());
+        let mut changed_projection = q.canonical_envelope.clone();
+        changed_projection.control_payload.as_mut().unwrap()["modelText"] =
+            "changed after acceptance".into();
+        assert!(crate::app_server::bus_bridge::projected_external_envelope(
+            &changed_projection,
+            &binding
+        )
+        .is_err());
+        assert!(
+            crate::app_server::bus_bridge::projected_external_envelope(&forged, &binding).is_err()
+        );
+        for template in [
+            crate::app_server::presentation::JobTemplate::Suppress,
+            crate::app_server::presentation::JobTemplate::ServiceSummary,
+        ] {
+            let policy = crate::app_server::presentation::PrivateJobPolicy {
+                version: 2,
+                recipients: vec![owner.clone()],
+                template: Some(template),
+            };
+            assert!(policy
+                .obligation(&q.canonical_envelope, &q.semantic_sha256)
+                .unwrap()
+                .is_none());
+        }
+        let path = root.join(AGENT_BUS_STATE_FILE);
+        let mut stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored["version"], 6);
+        stored["version"] = 5.into();
+        fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+        assert!(reopened.snapshot_by_message_id("jsc_stable").is_err());
+        fs::remove_dir_all(root).unwrap();
     }
     fn fixture_a4(repository: &AgentBusMessageRepository, owner: &str) {
         use crate::app_server::external_input::*;

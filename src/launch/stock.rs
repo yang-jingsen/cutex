@@ -50,6 +50,14 @@ pub fn validate_ingress_capability(schema: &str, init: &serde_json::Value) -> an
         );
         if schema == S6E_SCHEMA_SHA256 {
             ensure!(
+                init.get("externalInputVersions")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|versions| [1, 2]
+                        .iter()
+                        .all(|v| versions.iter().any(|item| item.as_u64() == Some(*v)))),
+                "reviewed structured-view bundle omitted v1/v2 submit capability"
+            );
+            ensure!(
                 init.get("presentationVersion")
                     .and_then(serde_json::Value::as_u64)
                     == Some(1),
@@ -787,6 +795,22 @@ mod tests {
         for (field, value) in [
             (
                 "native_patch_commit",
+                "cc4a080df1df4433f6fd67fee9c1c4fa4a42baab",
+            ),
+            (
+                "cli",
+                "52b868441c65cf12370ffbd7dea30d972b801f875b7e3d69b41ce2a0501fd2a9",
+            ),
+            (
+                "executable",
+                "df95936f3f0d1ff62efb978fee32b85e45da0f7f3166de7606cce3b49fb12018",
+            ),
+            (
+                "schema",
+                "77e75b7fc47c9b8a9caacf5a7d31c040c6520679a9833f1c2b0e55937ed39c27",
+            ),
+            (
+                "native_patch_commit",
                 "3d8a73a747cf5b957a7ca0491c28d1517f6d7722",
             ),
             (
@@ -877,7 +901,8 @@ mod tests {
         assert!(validate_ingress_capability(S6E_SCHEMA_SHA256, &legacy).is_err());
         assert!(validate_ingress_capability(S6E_SCHEMA_SHA256, &serde_json::json!({"externalInputVersion":1,"externalInputDeliveries":["after_turn","passive"]})).is_err());
         assert!(validate_ingress_capability(S6E_SCHEMA_SHA256, &serde_json::json!({"externalInputVersion":1,"externalInputDeliveries":["after_turn","passive","soon"]})).is_err());
-        assert!(validate_ingress_capability(S6E_SCHEMA_SHA256, &serde_json::json!({"externalInputVersion":1,"presentationVersion":1,"externalInputDeliveries":["after_turn","passive","soon"]})).is_ok());
+        assert!(validate_ingress_capability(S6E_SCHEMA_SHA256, &serde_json::json!({"externalInputVersion":1,"presentationVersion":1,"externalInputDeliveries":["after_turn","passive","soon"]})).is_err());
+        assert!(validate_ingress_capability(S6E_SCHEMA_SHA256, &serde_json::json!({"externalInputVersion":1,"externalInputVersions":[1,2],"presentationVersion":1,"externalInputDeliveries":["after_turn","passive","soon"]})).is_ok());
         assert!(validate_ingress_capability(
             S6E_SCHEMA_SHA256,
             &serde_json::json!({"externalInputVersion":2,"externalInputDeliveries":["soon"]})
