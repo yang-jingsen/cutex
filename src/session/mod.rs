@@ -16,6 +16,7 @@ pub mod projection;
 pub mod routing;
 pub mod runtime_defaults;
 pub mod runtime_reconciliation;
+pub mod reviewed_registration;
 pub mod service;
 pub mod start_quick_actions;
 pub mod status_projection;

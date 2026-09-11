@@ -2860,7 +2860,7 @@ pub fn notify_agent_bus_message_available() {
 
 #[derive(Clone, Copy)]
 pub struct AgentBusRequestHandlers {
-    pub reconcile_registration_agent: fn(&AgentBusAgent) -> anyhow::Result<()>,
+    pub reconcile_registration_agent: fn(&mut AgentBusAgent) -> anyhow::Result<()>,
     pub reconcile_agent: fn(&AgentBusAgent) -> anyhow::Result<()>,
     pub redrive_ordinary_messages: fn(&Arc<Mutex<AgentBusState>>) -> anyhow::Result<usize>,
     pub send_payload_response:
@@ -4841,8 +4841,8 @@ fn task_worker_sender(
 
 fn register_agent_with_reconciliation(
     state: &Arc<Mutex<AgentBusState>>,
-    agent: AgentBusAgent,
-    reconcile_registration_agent: impl FnOnce(&AgentBusAgent) -> anyhow::Result<()>,
+    mut agent: AgentBusAgent,
+    reconcile_registration_agent: impl FnOnce(&mut AgentBusAgent) -> anyhow::Result<()>,
     persist_registry: impl FnOnce(&AgentBusState) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     // The registration callback does not re-enter Agent Bus. Keeping the state
@@ -4855,7 +4855,7 @@ fn register_agent_with_reconciliation(
         .map_err(|_| anyhow!("agent bus state lock poisoned"))?;
     #[cfg(feature = "stock-launch-test-hook")]
     crate::app_server::private_restart_phase("bus.register.reconcile.begin");
-    reconcile_registration_agent(&agent)?;
+    reconcile_registration_agent(&mut agent)?;
     #[cfg(feature = "stock-launch-test-hook")]
     crate::app_server::private_restart_phase("bus.register.reconcile.end");
     state.agents.insert(agent.id.clone(), agent.clone());
@@ -8122,7 +8122,7 @@ mod tests {
 
     fn task_route_handlers() -> AgentBusRequestHandlers {
         AgentBusRequestHandlers {
-            reconcile_registration_agent: counted_noop_reconcile,
+            reconcile_registration_agent: |agent| counted_noop_reconcile(agent),
             reconcile_agent: counted_noop_reconcile,
             redrive_ordinary_messages: |_| Ok(0),
             send_payload_response: counted_unreachable_send,

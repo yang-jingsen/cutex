@@ -705,7 +705,7 @@ impl StockRuntimeExecutor for StockExecutor {
     }
 }
 
-fn verify_stock_process(
+pub(super) fn verify_stock_process(
     record: &CutexSessionRecord,
     binding: &CutexAppServerRuntimeBinding,
 ) -> anyhow::Result<()> {

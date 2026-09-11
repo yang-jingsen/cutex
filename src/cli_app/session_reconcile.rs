@@ -29,14 +29,36 @@ pub(crate) fn reconcile_cutex_session_from_agent(agent: &AgentBusAgent) -> anyho
     Ok(())
 }
 
-pub(crate) fn reconcile_cutex_session_registration(agent: &AgentBusAgent) -> anyhow::Result<()> {
+pub(crate) fn reconcile_cutex_session_registration(
+    agent: &mut AgentBusAgent,
+) -> anyhow::Result<()> {
     let timestamp = Utc::now().to_rfc3339();
     let host_id = current_host_name();
     let mut store = load_cutex_session_store()?;
+    let reviewed =
+        cutex::session::reviewed_registration::preserve_reviewed_groups(&store, agent, &host_id)?;
+    if let Some(record) = &reviewed {
+        super::stock_lifecycle::verify_stock_process(
+            record,
+            record
+                .app_server_runtime
+                .as_ref()
+                .expect("validated binding"),
+        )?;
+    }
     let reconciliation =
         reconcile_cutex_session_store_for_registration(&mut store, agent, &host_id, &timestamp)?;
     if !reconciliation.store_fence_required {
         return Ok(());
+    }
+    if let Some(record) = &reviewed {
+        super::stock_lifecycle::verify_stock_process(
+            record,
+            record
+                .app_server_runtime
+                .as_ref()
+                .expect("validated binding"),
+        )?;
     }
     save_cutex_session_store(&store)?;
     if let Some(outcome) = reconciliation.outcome {
