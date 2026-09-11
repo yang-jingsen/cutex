@@ -495,8 +495,14 @@ pub(super) fn deliver_presentations(
             )?;
             let receipt = match c.status(&frozen)? {
                 Some(r) => r,
-                None => c.append(&frozen)?,
+                None => {
+                    #[cfg(all(unix, feature = "stock-launch-test-hook"))]
+                    before_commit_test_gate(&message, "before_presentation_append")?;
+                    c.append(&frozen)?
+                }
             };
+            #[cfg(all(unix, feature = "stock-launch-test-hook"))]
+            before_commit_test_gate(&message, "after_presentation_append")?;
             let _mutation = management
                 .try_lock_delivery_mutations()?
                 .context("lifecycle transition in progress")?;

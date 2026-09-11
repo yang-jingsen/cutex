@@ -22,14 +22,14 @@ pub const S6_EXECUTABLE_SHA256: &str =
     "b70d48151c9deb76a9c0ab14a820c582f2bc12a73bbb1512fee9b2f1bec9fa60";
 pub const S6_SCHEMA_SHA256: &str =
     "00e035e34ac1034ee34473f8f68b7704d6058c5b180ff4f4b6cad9fadab3a86d";
-// Exact accepted provider item-ID repair; the S6e wire schema is unchanged. Older
+// Exact accepted durable-presentation CLI/server family. Older
 // bundle receipts remain historical facts, not permission to launch old bytes.
-pub const S6E_COMMIT: &str = "ca580a783fc1ab34613be4f81ceab96ef4d393a2";
+pub const S6E_COMMIT: &str = "3d8a73a747cf5b957a7ca0491c28d1517f6d7722";
 pub const S6E_EXECUTABLE_SHA256: &str =
-    "cac03d6d1b77e4d3681a2d71b25435a537bc257807c28ea0f5aff491c622b69d";
-pub const S6E_CLI_SHA256: &str = "9e887b3a3439154fc00f8bb2a44b0f534ba33c587a5aa0f2aed354b7842bef15";
+    "df95936f3f0d1ff62efb978fee32b85e45da0f7f3166de7606cce3b49fb12018";
+pub const S6E_CLI_SHA256: &str = "d97f8d4f32377b22066d25dd545b79b32bb9cacb8b501f9db9a21c290504ad60";
 pub const S6E_SCHEMA_SHA256: &str =
-    "459861225d5bfb73bb4c3896edb489169637424be410be346f955a39596da7e9";
+    "77e75b7fc47c9b8a9caacf5a7d31c040c6520679a9833f1c2b0e55937ed39c27";
 
 pub fn is_private_native_schema(hash: &str) -> bool {
     matches!(
@@ -47,6 +47,12 @@ pub fn validate_ingress_capability(schema: &str, init: &serde_json::Value) -> an
             "reviewed native owner omitted ExternalInput v1 capability"
         );
         if schema == S6E_SCHEMA_SHA256 {
+            ensure!(
+                init.get("presentationVersion")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(1),
+                "reviewed presentation bundle omitted presentation v1 capability"
+            );
             ensure!(
                 init.get("externalInputDeliveries")
                     .and_then(serde_json::Value::as_array)
@@ -779,6 +785,22 @@ mod tests {
         for (field, value) in [
             (
                 "native_patch_commit",
+                "ca580a783fc1ab34613be4f81ceab96ef4d393a2",
+            ),
+            (
+                "executable",
+                "cac03d6d1b77e4d3681a2d71b25435a537bc257807c28ea0f5aff491c622b69d",
+            ),
+            (
+                "cli",
+                "9e887b3a3439154fc00f8bb2a44b0f534ba33c587a5aa0f2aed354b7842bef15",
+            ),
+            (
+                "schema",
+                "459861225d5bfb73bb4c3896edb489169637424be410be346f955a39596da7e9",
+            ),
+            (
+                "native_patch_commit",
                 "0c425b5f9fca90835fd2b4377a1bca212532f66c",
             ),
             (
@@ -844,7 +866,8 @@ mod tests {
         assert!(validate_ingress_capability(S6_SCHEMA_SHA256, &legacy).is_ok());
         assert!(validate_ingress_capability(S6E_SCHEMA_SHA256, &legacy).is_err());
         assert!(validate_ingress_capability(S6E_SCHEMA_SHA256, &serde_json::json!({"externalInputVersion":1,"externalInputDeliveries":["after_turn","passive"]})).is_err());
-        assert!(validate_ingress_capability(S6E_SCHEMA_SHA256, &serde_json::json!({"externalInputVersion":1,"externalInputDeliveries":["after_turn","passive","soon"]})).is_ok());
+        assert!(validate_ingress_capability(S6E_SCHEMA_SHA256, &serde_json::json!({"externalInputVersion":1,"externalInputDeliveries":["after_turn","passive","soon"]})).is_err());
+        assert!(validate_ingress_capability(S6E_SCHEMA_SHA256, &serde_json::json!({"externalInputVersion":1,"presentationVersion":1,"externalInputDeliveries":["after_turn","passive","soon"]})).is_ok());
         assert!(validate_ingress_capability(
             S6E_SCHEMA_SHA256,
             &serde_json::json!({"externalInputVersion":2,"externalInputDeliveries":["soon"]})
