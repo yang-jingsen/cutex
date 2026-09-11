@@ -5,7 +5,7 @@ from pathlib import Path
 root=Path(sys.argv[1]).resolve(strict=True)
 source=Path(__file__).resolve().parents[1]
 script=source/'scripts/selected_history_rehearsal.py'
-plan=root/'plan.json'
+plan=Path(sys.argv[2]).resolve(strict=True) if len(sys.argv)>2 else root/'plan.json'
 def run(destination):
     return subprocess.run([sys.executable,'-B',str(script),'apply',str(plan),str(destination)],capture_output=True)
 facts=[]
@@ -29,5 +29,13 @@ assert run(partial).returncode!=0
 after={str(p.relative_to(partial)):hashlib.sha256(p.read_bytes()).hexdigest() for p in partial.rglob('*') if p.is_file()}
 assert before==after
 facts.append('interrupted preparation retained; replay refuses and preserves bytes')
+raced=root/'raced'
+commands=[sys.executable,'-B','-c',code,str(script.parent),str(plan),str(raced)]
+racers=[subprocess.Popen(commands,stdout=subprocess.PIPE,stderr=subprocess.PIPE) for _ in range(2)]
+errors=[p.communicate(timeout=30)[1] for p in racers]
+assert sum(b'test interruption' in error for error in errors)==1
+assert sum(b'FileExistsError' in error for error in errors)==1
+assert len(list((raced/'prefixes').iterdir()))==1 and not (raced/'prepared.json').exists()
+facts.append('two concurrent creators: one exclusive winner; loser does not overwrite')
 (root/'filesystem-oracle.json').write_text(json.dumps({'pass':facts,'unexpected_runtime_attempts':0},indent=2))
 print('Filesystem subprocess oracle:',len(facts),'passed')

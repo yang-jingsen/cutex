@@ -4,8 +4,10 @@ source=pathlib.Path(__file__).resolve().parents[1];root=source.parent
 input_root=pathlib.Path(sys.argv[1]).resolve(strict=True)
 assert input_root.is_relative_to(root) and (input_root/'prepared.json').is_file()
 plan=json.loads((input_root/'plan.json').read_text())
-manifest=root/'artifacts/selected-projection-r3/build-manifest.json'
-assert hashlib.sha256(manifest.read_bytes()).hexdigest()=='3bc284978dc2e5cb61c3b1021ca24bd87c3adbe7f338dceeada97d92786098e3'
+manifest=pathlib.Path(sys.argv[2]).resolve(strict=True) if len(sys.argv)>2 else root/'artifacts/selected-projection-r3/build-manifest.json'
+expected=sys.argv[3] if len(sys.argv)>3 else '3bc284978dc2e5cb61c3b1021ca24bd87c3adbe7f338dceeada97d92786098e3'
+assert manifest.is_relative_to(root/'artifacts')
+assert hashlib.sha256(manifest.read_bytes()).hexdigest()==expected
 for rel,sha in json.loads(manifest.read_text())['files'].items():assert hashlib.sha256((manifest.parent/rel).read_bytes()).hexdigest()==sha
 fixture=pathlib.Path(tempfile.mkdtemp(prefix='history-r2-',dir=root));os.chmod(fixture,0o700)
 (fixture/'prerequisite').mkdir(mode=0o700)
