@@ -6,6 +6,8 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub mod view;
+
 use super::client::{AppServerClient, AppServerClientOptions, AppServerEndpoint, AppServerEvent};
 use crate::agent_management::{ExplicitLaunchActionReceipt, StockRuntimeStage};
 use crate::launch::stock::{ExternalInputBinding, StockBundle};
