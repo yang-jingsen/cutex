@@ -231,6 +231,7 @@ impl AgentManagementProvider {
         runtime: &mut dyn StockRuntimeExecutor,
     ) -> anyhow::Result<StockRuntimeReceipt> {
         tasks.with_archive_read_fence(|tasks| -> anyhow::Result<_> {
+            review.configuration.validate_job_requirement(review.job_mcp.is_some())?;
             let id = &review.subject.cutex_session_id;
             let sessions = load_cutex_session_store_from_path(path)?;
             let mut receipt =
@@ -772,13 +773,25 @@ mod review_digest_tests {
                 serde_json::to_vec(&got).unwrap(),
                 serde_json::to_vec(&receipt).unwrap()
             );
-            for field in ["digest_version", "configuration", "subject"] {
+            for field in [
+                "digest_version",
+                "configuration",
+                "subject",
+                "selected_projection",
+            ] {
                 let mut changed = review.clone();
                 match field {
                     "digest_version" => {
                         changed.digest_version = RuntimeReviewDigestVersion::SemanticV2
                     }
                     "configuration" => changed.configuration.model = "different".into(),
+                    "selected_projection" => {
+                        changed.configuration.selected_projection = Some(serde_json::from_value(json!({
+                            "version":2,"route":"chatgpt_file",
+                            "auth":{"path":"/private/auth.json","parent_device":1,"parent_inode":2,"owner":3,"account":"a".repeat(64),"api_file":null},
+                            "settings":{},"catalog":null,"requires_job":false
+                        })).unwrap());
+                    }
                     _ => {
                         changed.subject.authority_sha256 =
                             crate::role_revision::Sha256::new("f".repeat(64)).unwrap()

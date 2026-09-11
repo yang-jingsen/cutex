@@ -143,16 +143,32 @@ mod linux {
         log: &Path,
         lease: &File,
     ) -> anyhow::Result<GatedChild> {
+        spawn_with_secret(launch, cwd, log, lease, None)
+    }
+    pub fn spawn_with_secret(
+        launch: &LaunchCommand,
+        cwd: &str,
+        log: &Path,
+        lease: &File,
+        secret: Option<&cutex::launch::selected_profile::ApiKey>,
+    ) -> anyhow::Result<GatedChild> {
         let executable = CString::new(launch.program.as_bytes())?;
         let args: Vec<CString> = std::iter::once(&launch.program)
             .chain(&launch.args)
             .map(|s| CString::new(s.as_bytes()))
             .collect::<Result<_, _>>()?;
-        let env: Vec<CString> = launch
+        let mut env: Vec<CString> = launch
             .envs
             .iter()
             .map(|(k, v)| CString::new(format!("{k}={v}")))
             .collect::<Result<_, _>>()?;
+        if let Some(secret) = secret {
+            ensure!(
+                !launch.envs.iter().any(|(k, _)| k == "OPENAI_API_KEY"),
+                "conflicting API credential source"
+            );
+            env.push(secret.as_exec_env()?);
+        }
         let mut argv: Vec<_> = args.iter().map(|s| s.as_ptr()).collect();
         argv.push(std::ptr::null());
         let mut envp: Vec<_> = env.iter().map(|s| s.as_ptr()).collect();
@@ -260,6 +276,15 @@ mod unsupported {
         _: &str,
         _: &std::path::Path,
         _: &std::fs::File,
+    ) -> anyhow::Result<GatedChild> {
+        anyhow::bail!("stock publication requires Linux")
+    }
+    pub fn spawn_with_secret(
+        _: &cutex::launch::command::LaunchCommand,
+        _: &str,
+        _: &std::path::Path,
+        _: &std::fs::File,
+        _: Option<&cutex::launch::selected_profile::ApiKey>,
     ) -> anyhow::Result<GatedChild> {
         anyhow::bail!("stock publication requires Linux")
     }

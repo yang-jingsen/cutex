@@ -256,6 +256,8 @@ impl AgentManagementProvider {
                             job.review(&crate::launch::stock::StockBundle::load(&r.contract)?)
                         })
                         .transpose()?;
+                    r.configuration
+                        .validate_job_requirement(r.job_mcp.is_some())?;
                     Ok(serde_json::to_value(r)?)
                 }),
             ExplicitLaunchRequest::Run { .. } => {

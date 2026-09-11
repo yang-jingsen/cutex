@@ -13,4 +13,5 @@ pub mod job_mcp;
 pub mod profile;
 pub mod program;
 pub mod runtime;
+pub mod selected_profile;
 pub mod stock;

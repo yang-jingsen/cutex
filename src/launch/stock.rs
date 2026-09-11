@@ -24,14 +24,14 @@ pub const S6_SCHEMA_SHA256: &str =
     "00e035e34ac1034ee34473f8f68b7704d6058c5b180ff4f4b6cad9fadab3a86d";
 // Exact accepted durable-presentation CLI/server family. Older
 // bundle receipts remain historical facts, not permission to launch old bytes.
-pub const S6E_COMMIT: &str = "f8c33add01bf9ef8cea04f531fa1319090751cb2";
-// Coherent CLI-only child; server bytes remain built from its accepted parent.
-pub const S6E_SERVER_COMMIT: &str = "b8e9cc3a1bc6e88a1d9bd7454e886882f58b9fb8";
+pub const S6E_COMMIT: &str = "2eab060b191a0fe59e22b28785d02d76eafb7fc4";
+// Coherent accepted auth/legacy-reader family, not a descendant allowlist.
+pub const S6E_SERVER_COMMIT: &str = "2eab060b191a0fe59e22b28785d02d76eafb7fc4";
 pub const S6E_EXECUTABLE_SHA256: &str =
-    "7bc7f3d73a80981b1d77b0af40a685cfebec5258527156a8801e601cbe098dee";
-pub const S6E_CLI_SHA256: &str = "b830757173395acbb648c6d067bac235817802ed8c3a96d65e39014411f4e1a4";
+    "15c72a6bd476a60af9ba99cfbc0672a8376e8bb447cda2f1745e72aef2070c49";
+pub const S6E_CLI_SHA256: &str = "8173b51cb89961a34f4586207429c9ea28e619b86bdcc32bfb5e3c7ea68972cc";
 pub const S6E_SCHEMA_SHA256: &str =
-    "c2a54d598c816cfd402829b3855ecbfdd7857c6dbad51d95564f6dcc7fbd1d12";
+    "3fc006075408b0a001f9cb3f706625c0161e083ab0691d6be6116622b434f1d3";
 
 pub fn is_private_native_schema(hash: &str) -> bool {
     matches!(
@@ -324,10 +324,20 @@ impl StockBundle {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SharedConfig {
+    cutex_projection_version: Option<super::selected_profile::Version>,
     #[serde(default)]
     projects: BTreeMap<String, Trust>,
     analytics: Option<Analytics>,
     notice: Option<Notice>,
+    model: Option<String>,
+    model_reasoning_effort: Option<String>,
+    plan_mode_reasoning_effort: Option<String>,
+    sandbox_mode: Option<String>,
+    approvals_reviewer: Option<String>,
+    service_tier: Option<String>,
+    shell_environment_policy: Option<super::selected_profile::ShellPolicy>,
+    skills: Option<super::selected_profile::Skills>,
+    tui: Option<super::selected_profile::Tui>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -358,6 +368,59 @@ pub fn validate_shared_config(raw: &str) -> anyhow::Result<()> {
         config.analytics.is_none_or(|a| !a.enabled),
         "stock private analytics must be disabled"
     );
+    // These exact nonsecret defaults are bound by the reviewed shared-config
+    // hash. Owner launch always supplies effective model/sandbox/approval.
+    ensure!(
+        config.cutex_projection_version.is_some()
+            || (config.model.is_none()
+                && config.model_reasoning_effort.is_none()
+                && config.plan_mode_reasoning_effort.is_none()
+                && config.sandbox_mode.is_none()
+                && config.approvals_reviewer.is_none()
+                && config.service_tier.is_none()
+                && config.shell_environment_policy.is_none()
+                && config.skills.is_none()
+                && config.tui.is_none()),
+        "shared selected defaults require explicit projection version2"
+    );
+    ensure!(
+        config
+            .model
+            .as_deref()
+            .is_none_or(|m| matches!(m, "gpt-6-astra" | "gpt-5.6-sol" | "gpt-5.6-terra")),
+        "unsupported shared model default"
+    );
+    for effort in [
+        config.model_reasoning_effort.as_deref(),
+        config.plan_mode_reasoning_effort.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        ensure!(
+            matches!(
+                effort,
+                "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+            ),
+            "unsupported shared reasoning default"
+        );
+    }
+    ensure!(
+        config
+            .sandbox_mode
+            .as_deref()
+            .is_none_or(|s| matches!(s, "read-only" | "workspace-write" | "danger-full-access")),
+        "unsupported shared sandbox"
+    );
+    super::selected_profile::Settings {
+        approvals_reviewer: config.approvals_reviewer,
+        service_tier: config.service_tier,
+        shell_environment_policy: config.shell_environment_policy,
+        skills: config.skills,
+        tui: config.tui,
+        ..Default::default()
+    }
+    .validate()?;
     if let Some(notice) = config.notice {
         ensure!(
             notice
@@ -383,6 +446,8 @@ pub fn canonical(path: &Path) -> anyhow::Result<()> {
 #[serde(deny_unknown_fields)]
 pub struct StockConfiguration {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_projection: Option<super::selected_profile::Projection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aemeath_auth: Option<super::aemeath_auth::ReviewedAemeathAuth>,
     pub profile_name: String,
     pub profile_id: String,
@@ -407,7 +472,33 @@ pub struct DummyProvider {
     pub supports_websockets: bool,
 }
 impl StockConfiguration {
+    pub fn validate_job_requirement(&self, present: bool) -> anyhow::Result<()> {
+        ensure!(
+            self.selected_projection
+                .as_ref()
+                .is_none_or(|p| !p.requires_job || present),
+            "selected profile requires an explicit reviewed coherent Job descriptor"
+        );
+        Ok(())
+    }
     pub fn validate_auth_home(&self, home: &Path) -> anyhow::Result<()> {
+        if let Some(projection) = &self.selected_projection {
+            ensure!(
+                self.aemeath_auth.is_none(),
+                "conflicting reviewed auth modes"
+            );
+            projection.validate()?;
+            if projection
+                .settings
+                .plugins
+                .get("sample@debug")
+                .is_some_and(|p| p.enabled)
+            {
+                ensure!(!home.join("plugins/cache/debug/sample").try_exists()?,
+                    "sample@debug installation changed; only preserved missing-plugin diagnostic reviewed");
+            }
+            return Ok(());
+        }
         match &self.aemeath_auth {
             Some(auth) => {
                 ensure!(
@@ -560,12 +651,66 @@ fn configuration_for_selection(
         "unsupported stock account/runtime/options"
     );
     let files = crate::profiles::materialize::materialized_account_files(account)?;
+    canonical(&files.config_path)?;
+    let raw = std::fs::read_to_string(&files.config_path)?;
+    let mode: toml::Value =
+        toml::from_str(&raw).map_err(|_| anyhow::anyhow!("invalid profile configuration"))?;
+    if mode
+        .get("cutex_provider_mode")
+        .and_then(toml::Value::as_str)
+        == Some("selected_profile_v2")
+    {
+        let (projection, model, reasoning) = super::selected_profile::Config::parse(&raw)?.review(
+            &account.id,
+            files.auth_path.clone(),
+            selected_model,
+            selected_reasoning,
+        )?;
+        let sandbox = sandbox.context("explicit selected sandbox required")?;
+        let approval = approval.context("explicit selected approval required")?;
+        validate_selected_permissions(permission, &sandbox, &approval)?;
+        let chatgpt = projection.route == super::selected_profile::Route::ChatgptFile;
+        use sha2::Digest;
+        let profile_sha256 = file_sha256(&files.config_path)?;
+        ensure!(
+            format!("{:x}", sha2::Sha256::digest(raw.as_bytes())) == profile_sha256.as_str(),
+            "selected profile changed during review"
+        );
+        return Ok(StockConfiguration {
+            selected_projection: Some(projection),
+            aemeath_auth: None,
+            profile_name: name.clone(),
+            profile_id: account.id.clone(),
+            inherited,
+            profile_sha256,
+            account_sha256: Sha256::new(format!(
+                "{:x}",
+                sha2::Sha256::digest(serde_json::to_vec(account)?)
+            ))
+            .map_err(|_| anyhow::anyhow!("invalid selected account digest"))?,
+            model,
+            reasoning,
+            model_provider: if chatgpt { "openai" } else { "GLM" }.into(),
+            provider: DummyProvider {
+                name: if chatgpt { "OpenAI" } else { "GLM" }.into(),
+                base_url: if chatgpt {
+                    super::aemeath_auth::ENDPOINT
+                } else {
+                    super::selected_profile::GLM_ENDPOINT
+                }
+                .into(),
+                wire_api: "responses".into(),
+                requires_openai_auth: chatgpt,
+                supports_websockets: chatgpt,
+            },
+            sandbox,
+            approval,
+        });
+    }
     ensure!(
         !files.auth_path.try_exists()?,
         "stock private subset does not consume profile auth files"
     );
-    canonical(&files.config_path)?;
-    let raw = std::fs::read_to_string(&files.config_path)?;
     let profile: ProfileConfig = toml::from_str(&raw)
         .map_err(|_| anyhow::anyhow!("unsupported stock profile configuration"))?;
     let (provider, aemeath_auth) = match profile.cutex_provider_mode {
@@ -663,6 +808,7 @@ fn configuration_for_selection(
     );
     use sha2::Digest;
     Ok(StockConfiguration {
+        selected_projection: None,
         aemeath_auth,
         profile_name: name.clone(),
         profile_id: account.id.clone(),
@@ -680,6 +826,30 @@ fn configuration_for_selection(
         sandbox,
         approval,
     })
+}
+
+fn validate_selected_permissions(
+    permission: Option<&str>,
+    sandbox: &str,
+    approval: &str,
+) -> anyhow::Result<()> {
+    ensure!(
+        matches!(approval, "never" | "on-request" | "untrusted"),
+        "unsupported selected approval"
+    );
+    let expected = match permission {
+        Some("full-access" | "danger-full-access" | ":danger-full-access" | "danger") => {
+            "danger-full-access"
+        }
+        Some("read-only" | ":read-only" | "readonly" | "read") => "read-only",
+        Some("workspace" | ":workspace" | "workspace-write") => "workspace-write",
+        _ => anyhow::bail!("unknown selected permission alias"),
+    };
+    ensure!(
+        sandbox == expected,
+        "inconsistent selected sandbox and permission alias"
+    );
+    Ok(())
 }
 
 pub fn validate_native(
@@ -752,6 +922,58 @@ pub fn validate_native(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selected_permission_aliases_preserve_effective_policy() {
+        for (alias, sandbox) in [
+            (":danger-full-access", "danger-full-access"),
+            ("danger-full-access", "danger-full-access"),
+            (":read-only", "read-only"),
+        ] {
+            for approval in ["never", "on-request"] {
+                assert!(validate_selected_permissions(Some(alias), sandbox, approval).is_ok());
+            }
+            assert!(validate_selected_permissions(Some(alias), "guessed", "never").is_err());
+        }
+        assert!(
+            validate_selected_permissions(Some("unknown"), "danger-full-access", "never").is_err()
+        );
+        assert!(validate_selected_permissions(Some(":read-only"), "read-only", "always").is_err());
+    }
+    #[test]
+    fn selected_shared_version_is_explicit_and_unknowns_stay_closed() {
+        let raw="cutex_projection_version=2\nmodel='gpt-5.6-sol'\nmodel_reasoning_effort='max'\nsandbox_mode='danger-full-access'\napprovals_reviewer='user'\n[shell_environment_policy]\nexclude=['CODEX_AUTH_FILE']\n";
+        assert!(validate_shared_config(raw).is_ok());
+        assert!(validate_shared_config(&raw.replace("cutex_projection_version=2\n", "")).is_err());
+        assert!(validate_shared_config(&raw.replace("version=2", "version=3")).is_err());
+        assert!(
+            validate_shared_config(&format!("{raw}\n[mcp_servers.other]\ncommand='bad'\n"))
+                .is_err()
+        );
+    }
+    #[test]
+    #[ignore = "requires the task-owned accepted native manifest"]
+    fn accepted_auth_manifest_matches_compiled_pins() {
+        let path=Path::new("/mnt/mambo/PersonaProjects/cutex-light-core-r1/artifacts/independent-auth-file-r1/build-manifest.json");
+        let bytes = std::fs::read(path).expect("accepted immutable native manifest");
+        use sha2::Digest;
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(&bytes)),
+            "6392a1e686be1940aa51d2a944e89300d6fde852c988f45684cf8b439ed5678c"
+        );
+        let m: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(m["source_commit"], S6E_COMMIT);
+        for (name, expected) in [
+            ("bundle/codex", S6E_CLI_SHA256),
+            ("bundle/codex-app-server", S6E_EXECUTABLE_SHA256),
+            ("bundle/codex-code-mode-host", STOCK_HOST_SHA256),
+            (
+                "bundle/codex_app_server_protocol.schemas.json",
+                S6E_SCHEMA_SHA256,
+            ),
+        ] {
+            assert_eq!(m["files"][name]["sha256"], expected);
+        }
+    }
     #[test]
     fn exact_s6_bundle_identity_not_boolean_capability() {
         let file = |hash: &str| VerifiedFile {

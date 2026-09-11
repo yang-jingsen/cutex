@@ -96,6 +96,7 @@ fn option(
 fn configured(
     mut launch: LaunchCommand,
     profile: &cutex::launch::stock::StockConfiguration,
+    owner: bool,
 ) -> anyhow::Result<LaunchCommand> {
     launch = option(launch, "model", &profile.model)?;
     launch = option(launch, "model_provider", &profile.model_provider)?;
@@ -106,7 +107,9 @@ fn configured(
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
         "unsupported stock provider key"
     );
-    if profile.aemeath_auth.is_some() {
+    if let Some(projection) = &profile.selected_projection {
+        launch = launch.args(projection.native_args(owner)?);
+    } else if profile.aemeath_auth.is_some() {
         launch = option(launch, "cli_auth_credentials_store", "file")?;
     } else {
         launch = option(
@@ -191,6 +194,7 @@ pub(super) fn bootstrap_native(
         let launch = configured(
             clean_launch(&bundle.executable.path, &review.native_home)?,
             &review.configuration,
+            true,
         )?;
         let launch = option(
             launch,
@@ -200,6 +204,11 @@ pub(super) fn bootstrap_native(
         .arg("--listen")
         .arg(format!("unix://{}", socket.display()));
         let mut command = launch.to_command();
+        if let Some(projection) = &review.configuration.selected_projection {
+            if let Some(secret) = projection.secret()? {
+                secret.apply(&mut command);
+            }
+        }
         let mut log_options = std::fs::OpenOptions::new();
         log_options.write(true).create_new(true);
         #[cfg(unix)]
@@ -433,6 +442,7 @@ impl StockRuntimeExecutor for StockExecutor {
                 &receipt.review.contract.native_home,
             )?,
             profile,
+            true,
         )?;
         if bundle.soon_ingress() {
             launch = option(
@@ -497,7 +507,13 @@ impl StockRuntimeExecutor for StockExecutor {
             .join("stock.stderr.log");
         // One gated setsid child, without contacting systemd. It cannot exec
         // native stock until its binding has committed. This is not a cgroup.
-        self.child = Some(super::stock_publication::spawn(
+        let secret = profile
+            .selected_projection
+            .as_ref()
+            .map(|p| p.secret())
+            .transpose()?
+            .flatten();
+        self.child = Some(super::stock_publication::spawn_with_secret(
             &launch,
             cutex::session::service::cutex_session_launch_cwd(record),
             &log,
@@ -506,6 +522,7 @@ impl StockRuntimeExecutor for StockExecutor {
                 .as_ref()
                 .context("publication lease missing")?
                 .1,
+            secret.as_ref(),
         )?);
         let child = self.child.as_mut().expect("spawned owned child");
         let mut binding = layout.binding(
@@ -827,7 +844,7 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
         "-c",
         "tui.resume_cwd=\"current\"",
     ]);
-    let mut launch = configured(launch, &ready.review.configuration)?;
+    let mut launch = configured(launch, &ready.review.configuration, false)?;
     if bundle.soon_ingress() {
         launch = option(
             launch,

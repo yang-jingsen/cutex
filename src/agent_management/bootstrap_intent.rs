@@ -318,6 +318,8 @@ impl BootstrapIntentReview {
             "bootstrap home is not authoritative native home"
         );
         self.configuration.validate_auth_home(&self.native_home)?;
+        self.configuration
+            .validate_job_requirement(self.job_mcp.is_some())?;
         let bundle = StockBundle::load_references(
             &self.native_home,
             &self.bundle_manifest,
