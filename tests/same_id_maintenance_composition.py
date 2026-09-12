@@ -35,13 +35,13 @@ try:
     # No SQL writes or copied authority DB. Close the only owner normally.
     phase='source-catalog'
     source_owner=owner([SERVER,'--auth-file',CONF/'profiles'/IDS['aemeath']/'auth.json',
-        '-c','cli_auth_credentials_store="file"','-c','default_permissions=":full-access"',
+        '-c','cli_auth_credentials_store="file"','-c','default_permissions='+json.dumps(':'+row['sandbox']),
         '--listen','unix:///p/source.sock'],'source-native')
     wait_socket(Path('/p/source.sock'),source_owner)
     source_peer=rpc(Path('/p/source.sock'))
     response=source_peer.call('thread/resume',{'threadId':row['native_id'],'path':str(path),
         'model':row['model'],'cwd':row['cwd'],'approvalPolicy':'never',
-        'permissions':':full-access','excludeTurns':True})
+        'permissions':':'+row['sandbox'],'excludeTurns':True})
     assert response['thread']['id']==row['native_id']
     source_peer.sock.close();peers.remove(source_peer)
     source_owner.send_signal(signal.SIGTERM);source_owner.wait(timeout=30)
@@ -86,7 +86,10 @@ try:
         'destination':'/p/new-home','bundle':bundle,'expires_at_unix':int(time.time())+3600,'job_mcp':descriptor}}
     status,_=api(24871,'/v2/agent-management/explicit-launch',request,token=BUS)
     assert status in (401,403),'Agent credential obtained Human maintenance authority'
-    review=action(request);save('review.json',review)
+    save('review-request.json',request)
+    review=json.loads(cli('session','stock','--request',ROOT/'review-request.json',
+        '--management-url','http://127.0.0.1:24871/'))
+    save('review.json',review)
     bad=copy.deepcopy(review);bad['subject']['revision']+=1
     status,_=api(24871,'/v2/agent-management/explicit-launch',{'operation':'maintenance_apply','review':bad})
     assert status!=200 and not Path('/p/new-home').exists()
@@ -135,5 +138,10 @@ finally:
     for pid,birth in owned:
         if identity(pid)==birth:os.kill(pid,signal.SIGTERM)
     for child in reversed(children):stop(child)
+    result['owned_child_exit_codes']=[p.returncode for p in children]
+    source_log=ROOT/'source-native.log'
+    if code and source_log.exists():
+        result['source_native_errors']=[redact(line) for line in source_log.read_text(errors='replace').splitlines()
+            if line.startswith('Error:') or ' ERROR ' in line][-8:]
     save('PASS.json' if code==0 else 'FAIL.json',result)
 sys.exit(code)
