@@ -28,12 +28,57 @@ pub struct MaintenanceCatalog {
 }
 
 fn catalog_metadata(home: &Path, native: &str) -> anyhow::Result<MaintenanceCatalog> {
+    catalog_metadata_in(home, native, &std::env::temp_dir())
+}
+
+fn catalog_metadata_in(
+    home: &Path,
+    native: &str,
+    parent: &Path,
+) -> anyhow::Result<MaintenanceCatalog> {
+    let db = MigrationFile::capture(&home.join("state_5.sqlite"), MAX_HISTORY)?;
+    let wal_path = home.join("state_5.sqlite-wal");
+    let wal = match std::fs::symlink_metadata(&wal_path) {
+        Ok(_) => Some(MigrationFile::capture(&wal_path, MAX_HISTORY)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    let parent_fd = files::directory(&parent, false)?;
+    let child = format!("cutex-catalog-{}", uuid::Uuid::new_v4());
+    let scratch = parent.join(&child);
+    ensure!(
+        !scratch.starts_with(home) && !home.starts_with(&scratch),
+        "catalog scratch/source overlap"
+    );
+    let held = files::mkdir(&parent_fd, &child)?;
+    let result = (|| {
+        db.copy_to(&held, "state_5.sqlite")?;
+        if let Some(wal) = &wal {
+            wal.copy_to(&held, "state_5.sqlite-wal")?;
+        }
+        let result = read_catalog_copy(&scratch, native, wal.as_ref().map_or(0, |w| w.length))?;
+        db.validate()?;
+        if let Some(wal) = &wal {
+            wal.validate()?;
+        } else {
+            ensure!(
+                matches!(std::fs::symlink_metadata(&wal_path),Err(e) if e.kind()==std::io::ErrorKind::NotFound),
+                "source WAL appeared during capture"
+            );
+        }
+        Ok(result)
+    })();
+    files::remove_catalog_scratch(&parent, &child, &held)?;
+    result
+}
+
+fn read_catalog_copy(
+    home: &Path,
+    native: &str,
+    wal_bytes: u64,
+) -> anyhow::Result<MaintenanceCatalog> {
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};
-    let wal = home.join("state_5.sqlite-wal");
-    if wal.try_exists()? {
-        ensure!(MigrationFile::capture(&wal,MAX_HISTORY)?.length==0,"source catalog has pending WAL; finish supported source-owner shutdown/checkpoint outside migration, never ignore WAL");
-    }
     // Existing system Python's sqlite reader, no dependency installation or
     // native build. Isolated mode excludes user site, PYTHONPATH and startup.
     let mut child = Command::new("/usr/bin/python3")
@@ -44,7 +89,7 @@ fn catalog_metadata(home: &Path, native: &str) -> anyhow::Result<MaintenanceCata
         .stderr(Stdio::null())
         .spawn()?;
     let request = serde_json::to_vec(
-        &serde_json::json!({"path":home.join("state_5.sqlite"),"native_id":native}),
+        &serde_json::json!({"path":home.join("state_5.sqlite"),"native_id":native,"wal_bytes":wal_bytes}),
     )?;
     let mut input = child.stdin.take().context("catalog stdin")?;
     input.write_all(&request)?;
@@ -965,6 +1010,61 @@ fn materialize(review: &MaintenanceReview) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::DirBuilderExt;
+    #[test]
+    fn maintenance_wal_committed_view_and_corruption_are_independent() {
+        let root = std::env::temp_dir().join(format!("maintenance-wal-{}", uuid::Uuid::new_v4()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let code = r#"
+import sqlite3,sys,shutil,pathlib,os
+os.umask(0o077)
+r=pathlib.Path(sys.argv[1]); w=r/'writer';w.mkdir(mode=0o700)
+c=sqlite3.connect(w/'state_5.sqlite')
+c.execute('pragma journal_mode=wal');c.execute('pragma wal_autocheckpoint=0')
+c.execute('create table threads(id text,rollout_path text,memory_mode text,history_mode text)')
+c.execute("insert into threads values('native','/private/history','enabled','legacy')");c.commit()
+c.execute('pragma wal_checkpoint(TRUNCATE)')
+c.execute("update threads set history_mode='paginated'");c.commit()
+for f in ('state_5.sqlite','state_5.sqlite-wal'):shutil.copyfile(w/f,r/f)
+c.close()
+# Independent baseline proves the new field exists in WAL, not base DB.
+d=sqlite3.connect('file:'+str(r/'state_5.sqlite')+'?immutable=1',uri=True)
+assert d.execute('select history_mode from threads').fetchone()==('legacy',)
+d.close()
+"#;
+        assert!(std::process::Command::new("/usr/bin/python3")
+            .args(["-I", "-S", "-c", code])
+            .arg(&root)
+            .env_clear()
+            .status()
+            .unwrap()
+            .success());
+        let db = MigrationFile::capture(&root.join("state_5.sqlite"), MAX_CONFIG).unwrap();
+        let wal = MigrationFile::capture(&root.join("state_5.sqlite-wal"), MAX_CONFIG).unwrap();
+        assert_eq!(
+            catalog_metadata(&root, "native").unwrap().history_mode,
+            "paginated"
+        );
+        assert!(
+            catalog_metadata_in(&root, "native", &root).is_err(),
+            "source-overlapping scratch accepted"
+        );
+        assert_eq!(MigrationFile::capture(&db.path, MAX_CONFIG).unwrap(), db);
+        assert_eq!(MigrationFile::capture(&wal.path, MAX_CONFIG).unwrap(), wal);
+        assert!(!root.join("state_5.sqlite-shm").exists());
+        let mut bytes = std::fs::read(&wal.path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&wal.path, &bytes).unwrap();
+        assert!(
+            catalog_metadata(&root, "native").is_err(),
+            "corrupt committed WAL silently ignored"
+        );
+        assert_eq!(std::fs::read(&wal.path).unwrap(), bytes);
+        assert!(!root.join("state_5.sqlite-shm").exists());
+    }
     /// Private process setup only, absent from default shipped binaries. Uses
     /// the real provider API and the already-created project's actual seat;
     /// it neither writes authoritative JSON nor fabricates a transport ACK.

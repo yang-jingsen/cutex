@@ -48,7 +48,7 @@ try:
     assert source_owner.returncode==0,'source owner did not exit normally'
     assert sha(path)==row['history']['sha256'],'source prefix changed without model turn'
     wal=NATIVE/'state_5.sqlite-wal'
-    assert not wal.exists() or wal.stat().st_size==0,'source WAL pending; no migration checkpoint workaround'
+    source_wal_bytes=wal.stat().st_size if wal.exists() else 0
     phase='existing-authority'
     adopt(row)
     cli('session','defaults','set',row['durable_id'],'--runtime-backend','cute-alden')

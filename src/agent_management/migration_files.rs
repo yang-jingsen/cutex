@@ -270,6 +270,54 @@ pub(super) fn write_new(parent: &File, child: &str, bytes: &[u8]) -> anyhow::Res
     Ok(())
 }
 
+/// Only the fixed SQLite scratch names created in an exclusive owned directory.
+/// No recursive deletion, symlink traversal, or source-path cleanup.
+pub(super) fn remove_catalog_scratch(
+    parent: &Path,
+    child: &str,
+    held: &File,
+) -> anyhow::Result<()> {
+    let parent_fd = directory(parent, false)?;
+    let current = open_at(
+        &parent_fd,
+        child.as_ref(),
+        libc::O_RDONLY | libc::O_DIRECTORY,
+        0,
+    )?;
+    ensure!(
+        (current.metadata()?.dev(), current.metadata()?.ino())
+            == (held.metadata()?.dev(), held.metadata()?.ino()),
+        "scratch directory replaced; retained"
+    );
+    for filename in [
+        "state_5.sqlite",
+        "state_5.sqlite-wal",
+        "state_5.sqlite-shm",
+        "state_5.sqlite-journal",
+    ] {
+        let path = parent.join(child).join(filename);
+        match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+            Ok(m) => ensure!(
+                m.is_file() && m.uid() == unsafe { libc::geteuid() },
+                "unexpected scratch child; retained"
+            ),
+        }
+        let c = name(filename.as_ref())?;
+        ensure!(
+            unsafe { libc::unlinkat(held.as_raw_fd(), c.as_ptr(), 0) } == 0,
+            "owned scratch unlink failed"
+        );
+    }
+    let c = name(child.as_ref())?;
+    ensure!(
+        unsafe { libc::unlinkat(parent_fd.as_raw_fd(), c.as_ptr(), libc::AT_REMOVEDIR) } == 0,
+        "scratch not empty or removal failed; retained"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

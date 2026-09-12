@@ -49,9 +49,11 @@ overwrite, rollback, role transfer or claim clearing.
 - Management project authority and Task seats/assignments remain intact and are
   fenced across review/apply/start. Active tasks do not grant ordinary lifecycle
   permission; only the sealed, action-bound Human maintenance path can proceed.
-- Source catalog must have no pending WAL. `/usr/bin/python3` with standard
-  `sqlite3` is a read-only prerequisite. The migration never checkpoints or
-  repairs the original catalog; finish supported source-owner shutdown first.
+- `/usr/bin/python3` with standard `sqlite3` is required. Verified DB and WAL
+  are copied into an exclusive disposable directory; SQLite resolves committed
+  metadata there. Original catalog bytes are never checkpointed or repaired,
+  and source SHM is never copied. A corrupt, changing or not fully recognized
+  WAL (including unsupported trailing frames) refuses continuation.
 - New native home is exclusive, private, source-disjoint. Original histories,
   profiles and auth files are not rewritten. Auth custody preparation is a
   separate release prerequisite; migration does not copy credentials.
