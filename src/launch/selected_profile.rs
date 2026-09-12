@@ -649,6 +649,28 @@ impl Projection {
         }
         Ok(args)
     }
+    /// Maintenance moves the native user skill root but not the original
+    /// profile. Preserve exact enabled/disabled intent at the copied location.
+    /// No path is discovered from names or rendered text.
+    pub fn migrated_native_args(
+        &self,
+        owner: bool,
+        source_home: &Path,
+        destination: &Path,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut args = self.native_args(owner)?;
+        if let Some(skills) = &self.settings.skills {
+            let mut mapped = skills.clone();
+            for skill in &mut mapped.config {
+                if let Ok(relative) = skill.path.strip_prefix(source_home.join("skills")) {
+                    skill.path = destination.join("skills").join(relative);
+                }
+            }
+            let value = toml::Value::try_from(&mapped)?;
+            args.extend(["-c".into(), format!("skills={value}")]);
+        }
+        Ok(args)
+    }
     pub fn validate(&self) -> anyhow::Result<()> {
         self.settings.validate()?;
         let wants_status = self

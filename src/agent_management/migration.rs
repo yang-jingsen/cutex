@@ -1,0 +1,1118 @@
+//! One-shot, authenticated Human maintenance of the fixed selected cohort.
+//! This is not an Agent lifecycle privilege or a second authority store.
+use super::migration_files as files;
+pub use super::migration_files::MigrationFile;
+use super::*;
+use crate::launch::stock::{StockBundle, StockConfiguration, VerifiedFile};
+use crate::management::control_plane::HumanManagementPrincipal;
+use crate::role_revision::{CutexSessionId, Sha256};
+use crate::session::model::{CutexSessionRecord, CutexSessionRuntimeBackend};
+use crate::session::store::{
+    load_cutex_session_store_from_path, save_locked_session_store, with_locked_session_store,
+};
+use anyhow::{ensure, Context};
+use serde::{Deserialize, Serialize};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+
+const MAX_HISTORY: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_CONFIG: u64 = 4 * 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceCatalog {
+    pub native_id: String,
+    pub rollout_path: PathBuf,
+    pub memory_mode: String,
+    pub history_mode: String,
+}
+
+fn catalog_metadata(home: &Path, native: &str) -> anyhow::Result<MaintenanceCatalog> {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+    let wal = home.join("state_5.sqlite-wal");
+    if wal.try_exists()? {
+        ensure!(MigrationFile::capture(&wal,MAX_HISTORY)?.length==0,"source catalog has pending WAL; finish supported source-owner shutdown/checkpoint outside migration, never ignore WAL");
+    }
+    // Existing system Python's sqlite reader, no dependency installation or
+    // native build. Isolated mode excludes user site, PYTHONPATH and startup.
+    let mut child = Command::new("/usr/bin/python3")
+        .args(["-I", "-S", "-c", include_str!("migration_catalog.py")])
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let request = serde_json::to_vec(
+        &serde_json::json!({"path":home.join("state_5.sqlite"),"native_id":native}),
+    )?;
+    let mut input = child.stdin.take().context("catalog stdin")?;
+    input.write_all(&request)?;
+    drop(input);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            // This exact child handle is owned by this invocation only.
+            child.kill()?;
+            child.wait()?;
+            anyhow::bail!("native catalog reader deadline; no migration");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    ensure!(status.success(),"native catalog reader failed; requires supported state_5 schema and /usr/bin/python3 sqlite3");
+    let mut bytes = Vec::new();
+    child
+        .stdout
+        .take()
+        .context("catalog stdout")?
+        .take(8193)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= 8192,
+        "native catalog response bound exceeded"
+    );
+    let result: MaintenanceCatalog = serde_json::from_slice(&bytes)?;
+    ensure!(
+        result.native_id == native
+            && result.memory_mode == "enabled"
+            && matches!(result.history_mode.as_str(), "legacy" | "paginated"),
+        "selected catalog semantics changed/unsupported; not silently reconstructed"
+    );
+    Ok(result)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceReviewRequest {
+    pub action_id: AgentActionId,
+    pub cutex_session_id: CutexSessionId,
+    pub destination: PathBuf,
+    pub bundle: StockBundle,
+    pub expires_at_unix: i64,
+    #[serde(default)]
+    pub job_mcp: Option<crate::launch::job_mcp::JobMcpDescriptor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceReview {
+    pub version: u32,
+    pub action_id: AgentActionId,
+    pub subject: ExplicitLaunchSubject,
+    pub expires_at_unix: i64,
+    pub preserve_offline: bool,
+    pub source_home: PathBuf,
+    pub history: MigrationFile,
+    pub shared: MigrationFile,
+    pub catalog_files: Vec<MigrationFile>,
+    pub catalog: MaintenanceCatalog,
+    /// Only native's established noncredential skill/memory roots. Not a home
+    /// clone, profile import or arbitrary plugin/config copy operation.
+    pub assets: Vec<MigrationFile>,
+    pub destination_parent_device: u64,
+    pub destination_parent_inode: u64,
+    pub contract: ExplicitLaunchContract,
+    pub bundle: StockBundle,
+    pub shared_projection: String,
+    pub configuration: StockConfiguration,
+    pub job_mcp: Option<crate::launch::job_mcp::ReviewedJobMcp>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenancePhase {
+    Preparing,
+    Prepared,
+    Applied,
+    Activated,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceReceipt {
+    pub review: MaintenanceReview,
+    pub phase: MaintenancePhase,
+    pub runtime_review: Option<StockRuntimeReview>,
+    pub error: Option<String>,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct MaintenanceStatus {
+    pub state: &'static str,
+    pub migration: Option<MaintenanceReceipt>,
+    pub runtime: Option<StockRuntimeReceipt>,
+}
+
+/// Sealed in this module, borrowed only by the genuine Human start entry.
+/// Neither request JSON nor an Agent credential can construct this permit.
+pub(super) struct MaintenancePermit<'a> {
+    receipt: &'a MaintenanceReceipt,
+}
+impl MaintenancePermit<'_> {
+    pub(super) fn validate(
+        &self,
+        path: &Path,
+        action: &AgentActionId,
+        review: &StockRuntimeReview,
+        state: &AgentManagementSnapshot,
+        tasks: &crate::task_service::TaskServiceSnapshot,
+        seats: &crate::seat::SeatOccupancySnapshot,
+    ) -> anyhow::Result<()> {
+        let receipt = self.receipt;
+        let original = &receipt.review;
+        ensure!(
+            receipt.phase == MaintenancePhase::Applied
+                && !original.preserve_offline
+                && original.expires_at_unix > chrono::Utc::now().timestamp(),
+            "maintenance start unavailable/expired; offline intent is preserved"
+        );
+        ensure!(
+            receipt.runtime_review.as_ref() == Some(review)
+                && *action == runtime_action(&original.action_id)?
+                && !review.restart,
+            "maintenance runtime action/review mismatch"
+        );
+        let store = load_cutex_session_store_from_path(path)?;
+        ensure!(
+            matches!(store.explicit_launch_receipts.get(original.action_id.as_str()),Some(ExplicitLaunchActionReceipt::Maintenance(r)) if r==receipt),
+            "maintenance permit is not the committed Human receipt"
+        );
+        let (project, digest) =
+            authority_digest(state, tasks, seats, &original.subject.cutex_session_id)?;
+        ensure!(
+            Some(project) == original.subject.current_project_id
+                && digest == original.subject.authority_sha256,
+            "maintenance authority/task mutation; no continuation"
+        );
+        materialize(original)?;
+        Ok(())
+    }
+}
+fn runtime_action(action: &AgentActionId) -> anyhow::Result<AgentActionId> {
+    AgentActionId::new(format!(
+        "maintenance-start-{}",
+        bytes_digest(action.as_str().as_bytes()).as_str()
+    ))
+    .map_err(|_| anyhow::anyhow!("maintenance action invalid"))
+}
+
+#[derive(Deserialize)]
+struct Selection {
+    rows: Vec<SelectedSubject>,
+}
+#[derive(Deserialize)]
+struct SelectedSubject {
+    durable_id: String,
+    native_id: String,
+    formal_name: String,
+    project_id: String,
+    classification: String,
+    status: String,
+}
+fn selected(id: &CutexSessionId) -> anyhow::Result<SelectedSubject> {
+    let selection: Selection =
+        serde_json::from_str(include_str!("../../docs/project-recent14-candidates.json"))?;
+    let selected: Vec<_> = selection
+        .rows
+        .into_iter()
+        .filter(|r| r.classification == "selected")
+        .collect();
+    ensure!(selected.len() == 34, "compiled migration cohort invalid");
+    selected
+        .into_iter()
+        .find(|r| r.durable_id == id.as_str())
+        .context("target outside fixed selected34; damaged/retired/unassigned are excluded")
+}
+
+pub(super) fn record_digest(record: &CutexSessionRecord) -> anyhow::Result<Sha256> {
+    let mut value = serde_json::to_value(record)?;
+    let object = value.as_object_mut().context("record object")?;
+    object.remove("last_seen_at");
+    object.remove("updated_at");
+    Ok(super::store::request_sha256(&value)?)
+}
+
+fn offline(record: &CutexSessionRecord) -> anyhow::Result<()> {
+    ensure!(
+        !record.is_retired()
+            && record.agent_enabled
+            && record.registration_class
+                == crate::agent_bus::model::AgentRegistrationClass::Persistent,
+        "migration requires active persistent durable Agent"
+    );
+    ensure!(!crate::session::archive::record_has_runtime_claim(record) && record.pending_launch_id.is_none(),
+        "migration target must be offline with no owner, pending launch or unresolved claim; no automatic stop");
+    ensure!(
+        crate::runtime::lifecycle::cutex_session_host_is_local(
+            &record.host_id,
+            &crate::platform::host::current_host_name()
+        ),
+        "migration target not local"
+    );
+    Ok(())
+}
+
+/// Hash only the target project and its semantic task state, not store sequence,
+/// delivery/watchdog telemetry, unrelated projects or session heartbeats.
+pub(super) fn authority_digest(
+    state: &AgentManagementSnapshot,
+    tasks: &crate::task_service::TaskServiceSnapshot,
+    seats: &crate::seat::SeatOccupancySnapshot,
+    id: &CutexSessionId,
+) -> anyhow::Result<(ProjectId, Sha256)> {
+    let agent = state
+        .agents
+        .get(id)
+        .context("managed migration target missing")?;
+    ensure!(agent.retired_at.is_none(), "retired target cannot migrate");
+    let project = super::projects::current_project_id(state, agent)
+        .context("migration requires current project")?;
+    let authority = state
+        .projects
+        .get(&project)
+        .context("project authority absent")?;
+    ensure!(
+        !state.project_tombstones.contains_key(&project)
+            && state
+                .project_states
+                .get(&project)
+                .is_none_or(|p| p.lifecycle == ProjectLifecycle::Active),
+        "project inactive"
+    );
+    ensure!(
+        seats.active_director_transfer.is_none()
+            && !seats
+                .active_project_director_transfers
+                .contains_key(&project),
+        "authority transfer in progress"
+    );
+    if let Some(seat) = seats.project_director_occupancies.get(&project) {
+        ensure!(
+            seat.occupant_cutex_session == authority.authorized_director_session
+                && seats
+                    .project_director_states
+                    .get(&project)
+                    .is_none_or(|s| *s == crate::seat::ProjectDirectorSeatState::Active),
+            "Management/Task Director authority disagreement"
+        );
+    }
+    let assignments: std::collections::BTreeMap<_, _> = tasks
+        .assignments
+        .iter()
+        .filter(|(_, a)| a.project_id.as_ref() == Some(&project) || a.assignee_cutex_session == *id)
+        .collect();
+    let attempts: std::collections::BTreeMap<_, _> = tasks
+        .attempts
+        .iter()
+        .filter(|(a, _)| assignments.contains_key(a))
+        .collect();
+    let revisions: Vec<_> = tasks
+        .task_revisions
+        .iter()
+        .filter(|(task, _)| assignments.values().any(|a| &a.task_id == *task))
+        .collect();
+    let workflows: Vec<_> = tasks
+        .workflows
+        .iter()
+        .filter(|(wid, w)| {
+            w.project_id.as_ref() == Some(&project)
+                || revisions
+                    .iter()
+                    .any(|(_, rs)| rs.values().any(|r| &r.workflow_id == *wid))
+        })
+        .collect();
+    let directed: Vec<_> = state
+        .projects
+        .iter()
+        .filter(|(_, p)| p.authorized_director_session == *id)
+        .collect();
+    let operators: Vec<_> = state
+        .operator_grants
+        .iter()
+        .filter_map(|(p, grants)| {
+            grants
+                .get(id)
+                .map(|g| (p, g, state.operator_grant_revisions.get(p)))
+        })
+        .collect();
+    let other_seats: Vec<_> = seats
+        .project_director_occupancies
+        .iter()
+        .filter(|(_, s)| s.occupant_cutex_session == *id)
+        .collect();
+    ensure!(
+        !directed
+            .iter()
+            .any(|(p, _)| seats.active_project_director_transfers.contains_key(*p))
+            && !other_seats
+                .iter()
+                .any(|(p, _)| seats.active_project_director_transfers.contains_key(*p)),
+        "target role authority transfer in progress"
+    );
+    let digest = super::store::request_sha256(&(
+        agent,
+        state.current_project_memberships.get(id),
+        authority,
+        state.project_states.get(&project),
+        state.operator_grants.get(&project),
+        state.operator_grant_revisions.get(&project),
+        &seats.occupancies,
+        seats.project_director_occupancies.get(&project),
+        seats.project_director_states.get(&project),
+        assignments,
+        attempts,
+        revisions,
+        (workflows, directed, operators, other_seats),
+    ))?;
+    Ok((project, digest))
+}
+
+fn history(home: &Path, native: &str) -> anyhow::Result<MigrationFile> {
+    let mut pending = vec![home.join("sessions")];
+    let mut found = Vec::new();
+    while let Some(dir) = pending.pop() {
+        files::directory(&dir, false)?;
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            ensure!(!ty.is_symlink(), "symlink in source history tree");
+            if ty.is_dir() {
+                pending.push(entry.path());
+            } else if entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(&format!("{native}.jsonl"))
+            {
+                found.push(entry.path());
+            }
+        }
+    }
+    ensure!(found.len() == 1, "source native history missing/ambiguous");
+    let file = MigrationFile::capture(&found[0], MAX_HISTORY)?;
+    let metadata: serde_json::Value = serde_json::from_slice(&file.first_line(1024 * 1024)?)?;
+    ensure!(
+        metadata["type"] == "session_meta" && metadata["payload"]["id"] == native,
+        "source native metadata identity mismatch"
+    );
+    Ok(file)
+}
+
+fn assets(home: &Path) -> anyhow::Result<Vec<MigrationFile>> {
+    let mut pending = Vec::new();
+    let mut result = Vec::new();
+    let mut total = 0u64;
+    for name in ["skills", "memories"] {
+        let path = home.join(name);
+        if path.try_exists()? {
+            pending.push(path)
+        }
+    }
+    while let Some(dir) = pending.pop() {
+        files::directory(&dir, false)?;
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            ensure!(
+                !ty.is_symlink(),
+                "migration skills/memories symlink requires explicit asset decision"
+            );
+            if ty.is_dir() {
+                pending.push(entry.path());
+            } else {
+                let file = MigrationFile::capture(&entry.path(), 32 * 1024 * 1024)?;
+                total = total
+                    .checked_add(file.length)
+                    .context("asset size overflow")?;
+                ensure!(
+                    result.len() < 2048 && total <= 128 * 1024 * 1024,
+                    "migration asset inventory exceeds bounded scope"
+                );
+                result.push(file);
+            }
+        }
+    }
+    result.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(result)
+}
+
+pub(crate) fn validate_migration_home(
+    record: &CutexSessionRecord,
+    sessions: &crate::session::model::CutexSessionStore,
+    contract: &ExplicitLaunchContract,
+) -> anyhow::Result<()> {
+    ensure!(
+        record.explicit_launch.as_ref() == Some(contract) && contract.version == 3,
+        "migration marker mismatch"
+    );
+    let action = contract
+        .migration_action_id
+        .as_ref()
+        .context("migration action missing")?;
+    let Some(ExplicitLaunchActionReceipt::Maintenance(receipt)) =
+        sessions.explicit_launch_receipts.get(action.as_str())
+    else {
+        anyhow::bail!("committed Human migration receipt absent")
+    };
+    ensure!(
+        matches!(
+            receipt.phase,
+            MaintenancePhase::Applied | MaintenancePhase::Activated
+        ) && receipt.review.contract == *contract
+            && receipt.review.subject.cutex_session_id.as_str() == record.cutex_session_id,
+        "migration receipt/home owner mismatch"
+    );
+    let parent = files::directory(
+        contract
+            .native_home
+            .parent()
+            .context("migration parent missing")?,
+        true,
+    )?;
+    ensure!(
+        (parent.metadata()?.dev(), parent.metadata()?.ino())
+            == (
+                receipt.review.destination_parent_device,
+                receipt.review.destination_parent_inode
+            ),
+        "migration home parent changed"
+    );
+    files::directory(&contract.native_home, true)?;
+    Ok(())
+}
+
+fn projected_shared(input: &[u8]) -> anyhow::Result<String> {
+    let mut value: toml::Value = toml::from_str(std::str::from_utf8(input)?)?;
+    let table = value
+        .as_table_mut()
+        .context("shared config table required")?;
+    ensure!(
+        !table.contains_key("cutex_projection_version")
+            || table["cutex_projection_version"].as_integer() == Some(2),
+        "unknown shared projection version"
+    );
+    table.insert("cutex_projection_version".into(), toml::Value::Integer(2));
+    let raw = toml::to_string(&value)?;
+    crate::launch::stock::validate_shared_config(&raw)?;
+    Ok(raw)
+}
+fn bytes_digest(bytes: &[u8]) -> Sha256 {
+    use sha2::Digest;
+    Sha256::new(format!("{:x}", sha2::Sha256::digest(bytes))).expect("sha256 hex")
+}
+
+impl AgentManagementProvider {
+    pub fn start_maintenance(
+        &self,
+        human: &HumanManagementPrincipal,
+        path: &Path,
+        action: &AgentActionId,
+        tasks: &crate::task_service::TaskServiceProvider,
+        runtime: &mut dyn StockRuntimeExecutor,
+    ) -> anyhow::Result<MaintenanceReceipt> {
+        let _execution = super::provider::provider_execution_lock()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("maintenance execution lock"))?;
+        let _mutation = self.store().lock_mutations()?;
+        let mut receipt = self
+            .maintenance_receipt(human, path, action)?
+            .context("maintenance action not applied")?;
+        if receipt.phase == MaintenancePhase::Activated {
+            return Ok(receipt);
+        }
+        ensure!(
+            receipt.phase == MaintenancePhase::Applied,
+            "maintenance preparation incomplete; use original apply/status"
+        );
+        let review = receipt
+            .runtime_review
+            .clone()
+            .context("maintenance runtime review absent")?;
+        let permit = MaintenancePermit { receipt: &receipt };
+        let result = self.execute_stock_runtime_maintenance_locked(
+            path,
+            &runtime_action(action)?,
+            &review,
+            tasks,
+            runtime,
+            &permit,
+        )?;
+        if result.stage == StockRuntimeStage::Ready {
+            receipt.phase = MaintenancePhase::Activated;
+            receipt.error = None;
+        } else {
+            receipt.error = result.error;
+        }
+        save_maintenance(path, &receipt)?;
+        Ok(receipt)
+    }
+    pub fn maintenance_status(
+        &self,
+        human: &HumanManagementPrincipal,
+        path: &Path,
+        action: &AgentActionId,
+    ) -> anyhow::Result<MaintenanceStatus> {
+        let migration = self.maintenance_receipt(human, path, action)?;
+        let store = load_cutex_session_store_from_path(path)?;
+        let runtime = match store
+            .explicit_launch_receipts
+            .get(runtime_action(action)?.as_str())
+        {
+            None => None,
+            Some(ExplicitLaunchActionReceipt::Runtime(r)) => Some(r.clone()),
+            Some(_) => anyhow::bail!("maintenance runtime action domain conflict"),
+        };
+        let state = match migration.as_ref().map(|r| r.phase) {
+            None => "not_started",
+            Some(MaintenancePhase::Preparing) => "preparing",
+            Some(MaintenancePhase::Prepared) => "prepared",
+            Some(MaintenancePhase::Applied) => "applied",
+            Some(MaintenancePhase::Activated) => "activated",
+        };
+        Ok(MaintenanceStatus {
+            state,
+            migration,
+            runtime,
+        })
+    }
+    fn maintenance_receipt(
+        &self,
+        _human: &HumanManagementPrincipal,
+        path: &Path,
+        action: &AgentActionId,
+    ) -> anyhow::Result<Option<MaintenanceReceipt>> {
+        let store = load_cutex_session_store_from_path(path)?;
+        match store.explicit_launch_receipts.get(action.as_str()) {
+            None => Ok(None),
+            Some(ExplicitLaunchActionReceipt::Maintenance(r)) => Ok(Some(r.clone())),
+            Some(_) => anyhow::bail!("maintenance action conflicts with existing action domain"),
+        }
+    }
+
+    pub fn apply_maintenance(
+        &self,
+        human: &HumanManagementPrincipal,
+        path: &Path,
+        review: &MaintenanceReview,
+        tasks: &crate::task_service::TaskServiceProvider,
+    ) -> anyhow::Result<MaintenanceReceipt> {
+        let _execution = super::provider::provider_execution_lock()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("maintenance execution lock"))?;
+        let _mutation = self.store().lock_mutations()?;
+        self.director_seats.with_notification_snapshot(|seats|tasks.with_archive_read_fence(|task_state| -> anyhow::Result<_> {
+            let mut receipt=if let Some(prior)=self.maintenance_receipt(human,path,&review.action_id)? {
+                ensure!(&prior.review==review,"maintenance action changed semantics");
+                if matches!(prior.phase,MaintenancePhase::Applied|MaintenancePhase::Activated){return Ok(prior)}
+                prior
+            } else {MaintenanceReceipt{review:review.clone(),phase:MaintenancePhase::Preparing,runtime_review:None,error:None}};
+            let state=self.store().snapshot()?;
+            let sessions=load_cutex_session_store_from_path(path)?;
+            ensure!(!sessions.explicit_launch_receipts.values().any(|r|matches!(r,ExplicitLaunchActionReceipt::Maintenance(r) if r.review.subject.cutex_session_id==review.subject.cutex_session_id && r.review.action_id!=review.action_id)),"target already has a migration action; use original status/recovery, not duplicate materialization");
+            let record=sessions.sessions.get(review.subject.cutex_session_id.as_str()).context("maintenance target absent")?;
+            validate_review(review,record,&state,task_state,seats)?;
+            if !sessions.explicit_launch_receipts.contains_key(review.action_id.as_str()) {
+                save_maintenance(path,&receipt)?;
+            }
+            // No deletion or overwrite, even when the previous creator died.
+            // A complete filesystem marker permits exact replay; an incomplete
+            // destination is retained and requires an explicit recovery decision.
+            if let Err(error)=materialize(review) {
+                receipt.error=Some(format!("materialization incomplete: {error:#}; partial destination retained, do not overwrite"));
+                save_maintenance(path,&receipt)?;
+                return Err(error)
+            }
+            receipt.phase=MaintenancePhase::Prepared; receipt.error=None;
+            save_maintenance(path,&receipt)?;
+            with_locked_session_store(path,|store| {
+                let record=store.sessions.get(review.subject.cutex_session_id.as_str()).context("maintenance target absent")?;
+                validate_review(review,record,&state,task_state,seats)?;
+                ensure!(store.sessions.values().filter(|r|r.codex_session_id==record.codex_session_id).count()==1,"native identity became ambiguous");
+                let mut next=record.clone();
+                next.runtime_backend=CutexSessionRuntimeBackend::Host;
+                next.explicit_launch=Some(review.contract.clone());
+                next.revision=next.revision.checked_add(1).context("durable revision exhausted")?;
+                next.updated_at=chrono::Utc::now().to_rfc3339();
+                let mut subject=review.subject.clone();
+                subject.revision=next.revision;
+                subject.durable_sha256=record_digest(&next)?;
+                receipt.runtime_review=Some(StockRuntimeReview{digest_version:RuntimeReviewDigestVersion::SemanticV2,subject,contract:review.contract.clone(),configuration:review.configuration.clone(),restart:false,job_mcp:review.job_mcp.clone(),receiver_canonical_byte_limit:Default::default()});
+                receipt.phase=MaintenancePhase::Applied;
+                store.sessions.insert(next.cutex_session_id.clone(),next);
+                store.explicit_launch_receipts.insert(review.action_id.to_string(),ExplicitLaunchActionReceipt::Maintenance(receipt.clone()));
+                save_locked_session_store(path,store)
+            })?;
+            Ok(receipt)
+        }).map_err(|e|anyhow::anyhow!("maintenance task fence: {e}"))?)?
+    }
+
+    pub fn review_maintenance(
+        &self,
+        _human: &HumanManagementPrincipal,
+        path: &Path,
+        request: &MaintenanceReviewRequest,
+        tasks: &crate::task_service::TaskServiceProvider,
+    ) -> anyhow::Result<MaintenanceReview> {
+        let _mutation = self.store().lock_mutations()?;
+        self.director_seats.with_notification_snapshot(|seats|tasks.with_archive_read_fence(|task_state| -> anyhow::Result<_> {
+            let expected=selected(&request.cutex_session_id)?;
+            let state=self.store().snapshot()?;
+            let (project,authority)=authority_digest(&state,task_state,seats,&request.cutex_session_id)?;
+            let sessions=load_cutex_session_store_from_path(path)?;
+            ensure!(!sessions.explicit_launch_receipts.contains_key(request.action_id.as_str()),"migration action already exists; use status/exact apply replay");
+            ensure!(!sessions.explicit_launch_receipts.values().any(|r|matches!(r,ExplicitLaunchActionReceipt::Maintenance(r) if r.review.subject.cutex_session_id==request.cutex_session_id)),"target already has migration evidence; use original action/status");
+            let record=sessions.sessions.get(request.cutex_session_id.as_str()).context("durable target absent")?;
+            offline(record)?;
+            ensure!(record.explicit_launch.is_none() && record.runtime_backend==CutexSessionRuntimeBackend::CuteAlden,"migration requires unmarked existing K owner");
+            ensure!(record.codex_session_id.as_deref()==Some(&expected.native_id) && project.as_str()==expected.project_id && record.formal_agent_name.as_deref()==Some(&expected.formal_name),"fixed cohort identity/project/name drift");
+            ensure!(sessions.sessions.values().filter(|r|r.codex_session_id==record.codex_session_id).count()==1,"native mapping ambiguous");
+            let now=chrono::Utc::now().timestamp();
+            ensure!(request.expires_at_unix>now && request.expires_at_unix<=now+86400,"maintenance expiry must be within 24 hours");
+            let source_home=crate::config::paths::host_codex_home_dir()?;
+            files::directory(&source_home,false)?;
+            let destination=&request.destination;
+            ensure!(destination.is_absolute() && !destination.starts_with(&source_home) && !source_home.starts_with(destination),"destination must be source-disjoint");
+            let parent=files::directory(destination.parent().context("destination parent")?,true)?;
+            ensure!(destination.file_name().is_some() && !destination.try_exists()? && std::fs::symlink_metadata(destination).is_err(),"fresh exclusive destination required");
+            let shared=MigrationFile::capture(&source_home.join("config.toml"),MAX_CONFIG)?;
+            ensure!(request.bundle.shared_config.path==shared.path && request.bundle.shared_config.sha256==shared.sha256,"bundle must reference current source shared config");
+            request.bundle.validate_components()?;
+            ensure!(request.bundle.soon_ingress(),"maintenance requires exact accepted coherent bundle");
+            let shared_projection=projected_shared(&shared.read_bounded(MAX_CONFIG)?)?;
+            let mut bundle=request.bundle.clone();
+            bundle.shared_config=VerifiedFile{path:destination.join("config.toml"),sha256:bytes_digest(shared_projection.as_bytes())};
+            let contract=ExplicitLaunchContract{version:3,migration_action_id:Some(request.action_id.clone()),native_id:expected.native_id.clone(),native_home:destination.clone(),bundle_manifest:destination.join("bundle.json"),bundle_sha256:bytes_digest(&serde_json::to_vec(&bundle)?)};
+            let configuration=crate::launch::stock::migration_configuration(record)?;
+            let job_mcp=request.job_mcp.as_ref().map(|j|j.review(&request.bundle)).transpose()?;
+            configuration.validate_job_requirement(job_mcp.is_some())?;
+            let mut catalog_files=Vec::new();
+            for file in ["state_5.sqlite","state_5.sqlite-wal"] {
+                let catalog=source_home.join(file);
+                if catalog.try_exists()? {catalog_files.push(MigrationFile::capture(&catalog,MAX_HISTORY)?);}
+            }
+            ensure!(!catalog_files.is_empty(),"source native catalog evidence missing");
+            let catalog=catalog_metadata(&source_home,&expected.native_id)?;
+            for file in &catalog_files{file.validate()?;}
+            let history=history(&source_home,&expected.native_id)?;
+            ensure!(catalog.rollout_path==history.path,"catalog/rollout mapping disagreement");
+            Ok(MaintenanceReview{version:1,action_id:request.action_id.clone(),subject:ExplicitLaunchSubject{cutex_session_id:request.cutex_session_id.clone(),formal_name:expected.formal_name,durable_sha256:record_digest(record)?,authority_sha256:authority,current_project_id:Some(project),revision:record.revision,runtime_generation:record.runtime_generation},expires_at_unix:request.expires_at_unix,preserve_offline:expected.status!="online-observed",history,assets:assets(&source_home)?,source_home,shared,catalog_files,catalog,destination_parent_device:parent.metadata()?.dev(),destination_parent_inode:parent.metadata()?.ino(),contract,bundle,shared_projection,configuration,job_mcp})
+        }).map_err(|e|anyhow::anyhow!("maintenance task fence: {e}"))?)?
+    }
+}
+
+fn save_maintenance(path: &Path, receipt: &MaintenanceReceipt) -> anyhow::Result<()> {
+    with_locked_session_store(path, |store| {
+        if let Some(previous) = store
+            .explicit_launch_receipts
+            .get(receipt.review.action_id.as_str())
+        {
+            ensure!(
+                matches!(previous,ExplicitLaunchActionReceipt::Maintenance(r) if r.review==receipt.review),
+                "maintenance action conflict"
+            );
+        }
+        store.explicit_launch_receipts.insert(
+            receipt.review.action_id.to_string(),
+            ExplicitLaunchActionReceipt::Maintenance(receipt.clone()),
+        );
+        save_locked_session_store(path, store)
+    })
+}
+
+fn validate_review(
+    review: &MaintenanceReview,
+    record: &CutexSessionRecord,
+    state: &AgentManagementSnapshot,
+    tasks: &crate::task_service::TaskServiceSnapshot,
+    seats: &crate::seat::SeatOccupancySnapshot,
+) -> anyhow::Result<()> {
+    ensure!(
+        review.version == 1
+            && review.expires_at_unix > chrono::Utc::now().timestamp()
+            && review.expires_at_unix <= chrono::Utc::now().timestamp() + 86400,
+        "maintenance review expired/unknown version"
+    );
+    let expected = selected(&review.subject.cutex_session_id)?;
+    offline(record)?;
+    ensure!(
+        record.explicit_launch.is_none()
+            && record.runtime_backend == CutexSessionRuntimeBackend::CuteAlden
+            && record.cutex_session_id == expected.durable_id
+            && record.codex_session_id.as_deref() == Some(&expected.native_id)
+            && record.formal_agent_name.as_deref() == Some(&expected.formal_name),
+        "maintenance source identity changed"
+    );
+    ensure!(
+        record_digest(record)? == review.subject.durable_sha256
+            && record.revision == review.subject.revision
+            && record.runtime_generation == review.subject.runtime_generation,
+        "maintenance source configuration/claim stale"
+    );
+    let (project, digest) =
+        authority_digest(state, tasks, seats, &review.subject.cutex_session_id)?;
+    ensure!(
+        project.as_str() == expected.project_id
+            && Some(project) == review.subject.current_project_id
+            && digest == review.subject.authority_sha256,
+        "maintenance authority/task state changed"
+    );
+    ensure!(
+        review.preserve_offline == (expected.status != "online-observed"),
+        "original offline intent changed"
+    );
+    ensure!(
+        review.source_home == crate::config::paths::host_codex_home_dir()?
+            && review.shared.path == review.source_home.join("config.toml"),
+        "source home/configuration changed"
+    );
+    ensure!(
+        review.contract.version == 3
+            && review.contract.migration_action_id.as_ref() == Some(&review.action_id)
+            && review.contract.native_id == expected.native_id,
+        "maintenance contract identity/version mismatch"
+    );
+    let destination = &review.contract.native_home;
+    ensure!(
+        !destination.starts_with(&review.source_home)
+            && !review.source_home.starts_with(destination),
+        "source/destination overlap"
+    );
+    let parent = files::directory(
+        destination.parent().context("destination parent missing")?,
+        true,
+    )?;
+    ensure!(
+        (parent.metadata()?.dev(), parent.metadata()?.ino())
+            == (
+                review.destination_parent_device,
+                review.destination_parent_inode
+            ),
+        "destination parent changed"
+    );
+    ensure!(
+        review.contract.bundle_manifest == destination.join("bundle.json")
+            && review.bundle.shared_config.path == destination.join("config.toml"),
+        "destination bundle path mismatch"
+    );
+    ensure!(
+        bytes_digest(&serde_json::to_vec(&review.bundle)?) == review.contract.bundle_sha256
+            && bytes_digest(review.shared_projection.as_bytes())
+                == review.bundle.shared_config.sha256,
+        "migration bundle/projection tampered"
+    );
+    ensure!(
+        projected_shared(&review.shared.read_bounded(MAX_CONFIG)?)? == review.shared_projection,
+        "shared configuration changed"
+    );
+    let mut source_bundle = review.bundle.clone();
+    source_bundle.shared_config = VerifiedFile {
+        path: review.shared.path.clone(),
+        sha256: review.shared.sha256.clone(),
+    };
+    source_bundle.validate_components()?;
+    ensure!(source_bundle.soon_ingress(), "unsupported migration bundle");
+    ensure!(
+        crate::launch::stock::migration_configuration(record)? == review.configuration,
+        "effective projection/auth custody changed"
+    );
+    review
+        .configuration
+        .validate_job_requirement(review.job_mcp.is_some())?;
+    if let Some(job) = &review.job_mcp {
+        job.validate(&source_bundle)?;
+    }
+    ensure!(
+        history(&review.source_home, &expected.native_id)? == review.history,
+        "source history changed/missing/ambiguous"
+    );
+    let mut catalog = Vec::new();
+    for name in ["state_5.sqlite", "state_5.sqlite-wal"] {
+        let path = review.source_home.join(name);
+        if path.try_exists()? {
+            catalog.push(MigrationFile::capture(&path, MAX_HISTORY)?);
+        }
+    }
+    ensure!(
+        !catalog.is_empty() && catalog == review.catalog_files,
+        "source catalog changed"
+    );
+    ensure!(
+        catalog_metadata(&review.source_home, &expected.native_id)? == review.catalog
+            && review.catalog.rollout_path == review.history.path,
+        "source catalog semantics changed"
+    );
+    for file in &catalog {
+        file.validate()?;
+    }
+    ensure!(
+        assets(&review.source_home)? == review.assets,
+        "skills/memories source changed"
+    );
+    Ok(())
+}
+
+fn materialize(review: &MaintenanceReview) -> anyhow::Result<()> {
+    let destination = &review.contract.native_home;
+    let parent = files::directory(destination.parent().context("destination parent")?, true)?;
+    ensure!(
+        (parent.metadata()?.dev(), parent.metadata()?.ino())
+            == (
+                review.destination_parent_device,
+                review.destination_parent_inode
+            ),
+        "destination parent changed"
+    );
+    let complete = serde_json::to_vec(
+        &serde_json::json!({"version":1,"review_sha256":super::store::request_sha256(review)?}),
+    )?;
+    if destination.try_exists()? {
+        files::directory(destination, true)?;
+        let marker =
+            MigrationFile::capture(&destination.join("migration-complete.json"), MAX_CONFIG)?;
+        ensure!(
+            marker.read_bounded(MAX_CONFIG)? == complete,
+            "partial/conflicting destination; original retained, automatic overwrite forbidden"
+        );
+    } else {
+        let root = files::mkdir(
+            &parent,
+            destination
+                .file_name()
+                .context("destination filename")?
+                .to_str()
+                .context("destination UTF8")?,
+        )?;
+        let sessions = files::mkdir(&root, "sessions")?;
+        review.history.copy_to(
+            &sessions,
+            review
+                .history
+                .path
+                .file_name()
+                .context("history name")?
+                .to_str()
+                .context("history UTF8 name")?,
+        )?;
+        for asset in &review.assets {
+            let relative = asset.path.strip_prefix(&review.source_home)?;
+            let mut directory = root.try_clone()?;
+            let mut current = destination.clone();
+            for component in relative.parent().context("asset parent")?.components() {
+                let std::path::Component::Normal(name) = component else {
+                    anyhow::bail!("asset relative path invalid")
+                };
+                current.push(name);
+                directory = if current.try_exists()? {
+                    files::directory(&current, true)?
+                } else {
+                    files::mkdir(&directory, name.to_str().context("asset path UTF8")?)?
+                };
+            }
+            asset.copy_to(
+                &directory,
+                relative
+                    .file_name()
+                    .context("asset filename")?
+                    .to_str()
+                    .context("asset filename UTF8")?,
+            )?;
+        }
+        files::write_new(&root, "config.toml", review.shared_projection.as_bytes())?;
+        files::write_new(&root, "bundle.json", &serde_json::to_vec(&review.bundle)?)?;
+        files::write_new(&root, "migration-complete.json", &complete)?;
+        let current = files::directory(destination, true)?;
+        ensure!(
+            (root.metadata()?.dev(), root.metadata()?.ino())
+                == (current.metadata()?.dev(), current.metadata()?.ino()),
+            "destination replaced during materialization"
+        );
+    }
+    let copied = MigrationFile::capture(
+        &destination.join("sessions").join(
+            review
+                .history
+                .path
+                .file_name()
+                .context("history filename")?,
+        ),
+        MAX_HISTORY,
+    )?;
+    ensure!(
+        copied.sha256 == review.history.sha256
+            && copied.length == review.history.length
+            && (copied.device, copied.inode) != (review.history.device, review.history.inode),
+        "history not an independent exact copy"
+    );
+    for source in &review.assets {
+        let target = MigrationFile::capture(
+            &destination.join(source.path.strip_prefix(&review.source_home)?),
+            32 * 1024 * 1024,
+        )?;
+        ensure!(
+            target.sha256 == source.sha256
+                && target.length == source.length
+                && target.executable == source.executable
+                && (target.device, target.inode) != (source.device, source.inode),
+            "copied skill/memory asset changed"
+        );
+    }
+    StockBundle::load(&review.contract)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::DirBuilderExt;
+    /// Private process setup only, absent from default shipped binaries. Uses
+    /// the real provider API and the already-created project's actual seat;
+    /// it neither writes authoritative JSON nor fabricates a transport ACK.
+    #[test]
+    #[ignore = "invoked only inside the explicit /p private namespace fixture"]
+    fn maintenance_seed_existing_task() {
+        use crate::task_service::*;
+        let home = std::env::var("HOME").unwrap();
+        assert!(home.starts_with("/p/") && Path::new("/p/.migration-private-fixture").is_file());
+        let input: serde_json::Value =
+            serde_json::from_slice(&std::fs::read("/p/task-seed.json").unwrap()).unwrap();
+        let id = CutexSessionId::new(input["id"].as_str().unwrap().to_string()).unwrap();
+        let project = ProjectId::new(input["project"].as_str().unwrap().to_string()).unwrap();
+        let management = AgentManagementProvider::open_default().unwrap();
+        let state = management.store().snapshot().unwrap();
+        assert_eq!(state.projects[&project].authorized_director_session, id);
+        assert!(super::super::archive::guard(&state, &id).is_err());
+        let seats = management.director_seats.query().unwrap();
+        let seat = &seats.project_director_occupancies[&project];
+        assert_eq!(seat.occupant_cutex_session, id);
+        let principal =
+            AuthenticatedPrincipal::seated_session(id.clone(), seat.seat_id.clone(), seat.epoch)
+                .unwrap();
+        let provider = TaskServiceProvider::open(
+            crate::task_delivery::provider_adapter::default_task_service_provider_root().unwrap(),
+        )
+        .unwrap();
+        if input["verify"] == true {
+            let before: serde_json::Value =
+                serde_json::from_slice(&std::fs::read("/p/task-seed-result.json").unwrap())
+                    .unwrap();
+            let snapshot = provider.query().unwrap();
+            let digest = authority_digest(&state, &snapshot, &seats, &id).unwrap().1;
+            assert_eq!(
+                serde_json::to_value(digest).unwrap(),
+                before["authority_before"]
+            );
+            std::fs::write(
+                "/p/task-verified.json",
+                b"{\"authority_and_task_semantics_unchanged\":true}",
+            )
+            .unwrap();
+            return;
+        }
+        let contract =
+            "Private pre-existing unclosed maintenance assignment; no dispatch or execution proof.";
+        let create:CreateProjectRevisionRequest=serde_json::from_value(serde_json::json!({"schema":"cutex/task-service-action/v3","action_id":"maintenance-fixture-create","project_id":project,"workflow_id":"maintenance-fixture-workflow","task_id":"maintenance-fixture-task","task_revision":1,"contract_sha256":bytes_digest(contract.as_bytes()),"opaque_contract":contract,"completion_policy":{"kind":"director_acceptance","authority_seat_id":seat.seat_id}})).unwrap();
+        provider
+            .create_project_revision(&principal, &create, None)
+            .unwrap();
+        let assignment:AssignProjectAndDispatchRequest=serde_json::from_value(serde_json::json!({"schema":"cutex/task-service-action/v3","action_id":"maintenance-fixture-assign","project_id":project,"assignment_id":"maintenance-fixture-assignment","task_id":"maintenance-fixture-task","task_revision":1,"assignee_cutex_session":id,"send_attempt_id":"maintenance-fixture-send","external_message_id":"maintenance-fixture-input"})).unwrap();
+        provider
+            .assign_project_and_dispatch(&principal, &assignment, 1, contract)
+            .unwrap();
+        let snapshot = provider.query().unwrap();
+        assert_ne!(
+            snapshot.assignments[&assignment.assignment_id].state,
+            AssignmentState::Closed
+        );
+        std::fs::write("/p/task-seed-result.json",serde_json::to_vec_pretty(&serde_json::json!({"principal":"derived from actual private project seat","assignment_id":assignment.assignment_id,"state":"awaiting_ack","dispatch_executed":false,"model_calls":0,"authority_before":authority_digest(&state,&snapshot,&seats,&id).unwrap().1})).unwrap()).unwrap();
+    }
+    #[test]
+    fn maintenance_selected34_is_finite_and_offline_is_not_reselected() {
+        let selection: Selection =
+            serde_json::from_str(include_str!("../../docs/project-recent14-candidates.json"))
+                .unwrap();
+        let mut included = 0;
+        let mut offline = 0;
+        for row in selection.rows {
+            let id = CutexSessionId::new(row.durable_id.clone()).unwrap();
+            let result = selected(&id);
+            if row.classification == "selected" {
+                let target = result.unwrap();
+                included += 1;
+                offline += usize::from(target.status != "online-observed");
+                assert_eq!(target.native_id, row.native_id);
+                assert_eq!(target.project_id, row.project_id);
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        assert_eq!((included, offline), (34, 16));
+    }
+    #[test]
+    fn maintenance_semantic_record_ignores_only_observation_times() {
+        let base = CutexSessionRecord::new(
+            "cutex.test".into(),
+            Some(uuid::Uuid::new_v4().to_string()),
+            "private".into(),
+            "/private".into(),
+            None,
+        )
+        .unwrap();
+        let digest = record_digest(&base).unwrap();
+        let mut other = base.clone();
+        other.last_seen_at = Some("2030-01-01T00:00:00Z".into());
+        other.updated_at = "2030-01-01T00:00:00Z".into();
+        assert_eq!(record_digest(&other).unwrap(), digest);
+        for field in ["revision", "runtime_generation", "runtime_pid"] {
+            let mut value = serde_json::to_value(&base).unwrap();
+            value[field] = serde_json::json!(42);
+            let record: CutexSessionRecord = serde_json::from_value(value).unwrap();
+            assert_ne!(record_digest(&record).unwrap(), digest);
+        }
+        other = base.clone();
+        other.agent_groups.push("changed".into());
+        assert_ne!(record_digest(&other).unwrap(), digest);
+    }
+    #[test]
+    fn maintenance_unknown_fields_and_versions_do_not_gain_authority() {
+        assert!(serde_json::from_value::<ExplicitLaunchRequest>(
+            serde_json::json!({"operation":"maintenance_start","action_id":"test","human":true})
+        )
+        .is_err());
+        assert!(serde_json::from_value::<ExplicitLaunchActionReceipt>(
+            serde_json::json!({"kind":"maintenance_v2","receipt":{}})
+        )
+        .is_err());
+        let raw = "[mcp_servers.injected]\ncommand='bad'\n";
+        assert!(projected_shared(raw.as_bytes()).is_err());
+        assert!(projected_shared(b"cutex_projection_version=999\n").is_err());
+    }
+    #[test]
+    fn maintenance_catalog_is_real_read_only_and_pending_wal_refuses() {
+        let root = std::env::temp_dir().join(format!("migration-catalog-{}", uuid::Uuid::new_v4()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let db = root.join("state_5.sqlite");
+        let code="import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('create table threads(id text, rollout_path text, memory_mode text, history_mode text)'); c.execute('insert into threads values(?,?,?,?)',('native','/private/history','enabled','paginated')); c.commit(); c.close()";
+        assert!(std::process::Command::new("/usr/bin/python3")
+            .args(["-I", "-S", "-c", code])
+            .arg(&db)
+            .env_clear()
+            .status()
+            .unwrap()
+            .success());
+        let before = MigrationFile::capture(&db, MAX_CONFIG).unwrap();
+        assert_eq!(
+            catalog_metadata(&root, "native").unwrap().history_mode,
+            "paginated"
+        );
+        assert_eq!(MigrationFile::capture(&db, MAX_CONFIG).unwrap(), before);
+        assert!(!root.join("state_5.sqlite-shm").exists());
+        assert!(catalog_metadata(&root, "wrong").is_err());
+        std::fs::write(root.join("state_5.sqlite-wal"), b"uncheckpointed").unwrap();
+        assert!(catalog_metadata(&root, "native").is_err());
+        assert_eq!(MigrationFile::capture(&db, MAX_CONFIG).unwrap(), before);
+    }
+}

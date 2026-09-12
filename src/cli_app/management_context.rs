@@ -52,6 +52,21 @@ fn explicit_launch_action(
         let tasks = cutex::task_service::TaskServiceProvider::open(
             cutex::task_delivery::provider_adapter::default_task_service_provider_root()?,
         )?;
+        #[cfg(target_os = "linux")]
+        if let cutex::agent_management::ExplicitLaunchRequest::MaintenanceStart { action_id } =
+            request
+        {
+            let mut runtime = super::stock_lifecycle::StockExecutor::default();
+            return Ok(serde_json::to_value(
+                management_agent_provider()?.start_maintenance(
+                    principal,
+                    &cutex::session::store::cutex_sessions_path()?,
+                    action_id,
+                    &tasks,
+                    &mut runtime,
+                )?,
+            )?);
+        }
         if let cutex::agent_management::ExplicitLaunchRequest::Run { action_id, review } = request {
             let mut runtime = super::stock_lifecycle::StockExecutor::default();
             return Ok(serde_json::to_value(

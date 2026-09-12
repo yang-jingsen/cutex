@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 #[serde(deny_unknown_fields)]
 pub struct ExplicitLaunchContract {
     pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration_action_id: Option<AgentActionId>,
     pub native_id: String,
     pub native_home: PathBuf,
     pub bundle_manifest: PathBuf,
@@ -19,9 +21,11 @@ pub struct ExplicitLaunchContract {
 impl ExplicitLaunchContract {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            matches!(self.version, 1 | 2),
+            matches!(self.version, 1 | 2 | 3),
             "unsupported explicit launch contract version"
         );
+        anyhow::ensure!((self.version == 3) == self.migration_action_id.is_some(),
+            "migration contract requires explicit action; legacy contracts cannot carry maintenance authority");
         anyhow::ensure!(
             uuid::Uuid::parse_str(&self.native_id)?.to_string() == self.native_id,
             "exact native UUID required"
@@ -70,6 +74,7 @@ fn explicit_launch_versions_require_unchanged_manifest_evidence() {
     std::fs::write(&manifest, b"private evidence").unwrap();
     let mut contract = ExplicitLaunchContract {
         version: 1,
+        migration_action_id: None,
         native_id: uuid::Uuid::new_v4().to_string(),
         native_home: root.clone(),
         bundle_manifest: manifest.clone(),
@@ -119,10 +124,28 @@ pub enum ExplicitLaunchActionReceipt {
     Bootstrap(BootstrapAdoptionReceipt),
     Activation(ExplicitLaunchReceipt),
     Runtime(StockRuntimeReceipt),
+    #[cfg(target_os = "linux")]
+    Maintenance(MaintenanceReceipt),
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExplicitLaunchRequest {
+    #[cfg(target_os = "linux")]
+    MaintenanceReview {
+        request: MaintenanceReviewRequest,
+    },
+    #[cfg(target_os = "linux")]
+    MaintenanceApply {
+        review: MaintenanceReview,
+    },
+    #[cfg(target_os = "linux")]
+    MaintenanceStatus {
+        action_id: AgentActionId,
+    },
+    #[cfg(target_os = "linux")]
+    MaintenanceStart {
+        action_id: AgentActionId,
+    },
     ReviewBootstrap {
         request: AgentManagementRequest,
         native_home: PathBuf,
@@ -166,6 +189,22 @@ impl AgentManagementProvider {
         tasks: &crate::task_service::TaskServiceProvider,
     ) -> anyhow::Result<serde_json::Value> {
         match request {
+            #[cfg(target_os = "linux")]
+            ExplicitLaunchRequest::MaintenanceReview { request } => Ok(serde_json::to_value(
+                self.review_maintenance(_principal, path, request, tasks)?,
+            )?),
+            #[cfg(target_os = "linux")]
+            ExplicitLaunchRequest::MaintenanceApply { review } => Ok(serde_json::to_value(
+                self.apply_maintenance(_principal, path, review, tasks)?,
+            )?),
+            #[cfg(target_os = "linux")]
+            ExplicitLaunchRequest::MaintenanceStatus { action_id } => Ok(serde_json::to_value(
+                self.maintenance_status(_principal, path, action_id)?,
+            )?),
+            #[cfg(target_os = "linux")]
+            ExplicitLaunchRequest::MaintenanceStart { .. } => {
+                anyhow::bail!("Human maintenance executor required")
+            }
             ExplicitLaunchRequest::ReviewBootstrap {
                 request,
                 native_home,
@@ -267,6 +306,10 @@ impl AgentManagementProvider {
                 cutex_session_id,
                 contract,
             } => {
+                anyhow::ensure!(
+                    contract.migration_action_id.is_none() && contract.version != 3,
+                    "migration requires dedicated Human maintenance entry"
+                );
                 let _mutation = self.store().lock_mutations()?;
                 tasks.with_archive_read_fence(|tasks| -> anyhow::Result<_> {
                     let state = self.store().snapshot()?;
@@ -316,6 +359,10 @@ impl AgentManagementProvider {
                 })?
             }
             ExplicitLaunchRequest::Activate { action_id, review } => {
+                anyhow::ensure!(
+                    review.contract.migration_action_id.is_none() && review.contract.version != 3,
+                    "migration requires dedicated Human maintenance entry"
+                );
                 let _execution = super::provider::provider_execution_lock()
                     .lock()
                     .map_err(|_| anyhow::anyhow!("execution lock unavailable"))?;

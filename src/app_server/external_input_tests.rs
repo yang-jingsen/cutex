@@ -16,6 +16,7 @@ fn pinned_artifact_fence_detects_same_length_write_and_symlink_replacement() {
     };
     let contract = crate::agent_management::ExplicitLaunchContract {
         version: 1,
+        migration_action_id: None,
         native_id: "native".into(),
         native_home: root.clone(),
         bundle_manifest: path.clone(),

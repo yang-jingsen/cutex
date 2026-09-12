@@ -230,7 +230,39 @@ impl AgentManagementProvider {
         tasks: &crate::task_service::TaskServiceProvider,
         runtime: &mut dyn StockRuntimeExecutor,
     ) -> anyhow::Result<StockRuntimeReceipt> {
-        tasks.with_archive_read_fence(|tasks| -> anyhow::Result<_> {
+        self.execute_stock_runtime_inner(path, action_id, review, tasks, runtime, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn execute_stock_runtime_maintenance_locked(
+        &self,
+        path: &Path,
+        action_id: &AgentActionId,
+        review: &StockRuntimeReview,
+        tasks: &crate::task_service::TaskServiceProvider,
+        runtime: &mut dyn StockRuntimeExecutor,
+        permit: &super::migration::MaintenancePermit<'_>,
+    ) -> anyhow::Result<StockRuntimeReceipt> {
+        self.execute_stock_runtime_inner(path, action_id, review, tasks, runtime, Some(permit))
+    }
+
+    fn execute_stock_runtime_inner(
+        &self,
+        path: &Path,
+        action_id: &AgentActionId,
+        review: &StockRuntimeReview,
+        tasks: &crate::task_service::TaskServiceProvider,
+        runtime: &mut dyn StockRuntimeExecutor,
+        #[cfg(target_os = "linux")] maintenance: Option<&super::migration::MaintenancePermit<'_>>,
+        #[cfg(not(target_os = "linux"))] _maintenance: Option<&()>,
+    ) -> anyhow::Result<StockRuntimeReceipt> {
+        // Seated Task actions acquire seat then Task. Preserve that order for
+        // maintenance, while ordinary stock retains its existing guard path.
+        let mut operation = |#[allow(unused_variables)] seats: Option<
+            &crate::seat::SeatOccupancySnapshot,
+        >|
+         -> anyhow::Result<_> {
+            tasks.with_archive_read_fence(|tasks| -> anyhow::Result<_> {
             review.configuration.validate_job_requirement(review.job_mcp.is_some())?;
             let id = &review.subject.cutex_session_id;
             let sessions = load_cutex_session_store_from_path(path)?;
@@ -276,12 +308,18 @@ impl AgentManagementProvider {
                     }
                 };
             let state = self.store().snapshot()?;
-            super::archive::guard(&state, id)?;
-            no_task(tasks, id)?;
-            anyhow::ensure!(
-                self.archive_authority_digest(&state, id)? == review.subject.authority_sha256,
-                "stock authority changed"
-            );
+            #[cfg(target_os="linux")]
+            let maintenance_validated=if let Some(permit)=maintenance {
+                permit.validate(path,action_id,review,&state,tasks,seats.ok_or_else(||anyhow::anyhow!("maintenance seat fence absent"))?)?;
+                true
+            } else {false};
+            #[cfg(not(target_os="linux"))]
+            let maintenance_validated=false;
+            if !maintenance_validated {
+                super::archive::guard(&state, id)?;
+                no_task(tasks, id)?;
+                anyhow::ensure!(self.archive_authority_digest(&state,id)?==review.subject.authority_sha256,"stock authority changed");
+            }
             let record = sessions
                 .sessions
                 .get(id.as_str())
@@ -521,7 +559,16 @@ impl AgentManagementProvider {
                 save_locked_session_store(path, store)
             })?;
             Ok(receipt)
-        })?
+            })?
+        };
+        #[cfg(target_os = "linux")]
+        if maintenance.is_some() {
+            return self
+                .director_seats
+                .with_notification_snapshot(|seats| operation(Some(seats)))
+                .map_err(|e| anyhow::anyhow!("maintenance seat fence: {e}"))?;
+        }
+        operation(None)
     }
 }
 fn save_receipt(path: &Path, receipt: &StockRuntimeReceipt) -> anyhow::Result<()> {

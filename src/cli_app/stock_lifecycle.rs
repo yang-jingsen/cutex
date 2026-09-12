@@ -1,5 +1,5 @@
 //! Opt-in stock child ownership inside the existing Management process.
-use anyhow::{Context, ensure};
+use anyhow::{ensure, Context};
 use cutex::agent_management::{StockRuntimeExecutor, StockRuntimeReceipt};
 use cutex::app_server::runtime::AppServerRuntimeLayout;
 use cutex::launch::command::LaunchCommand;
@@ -97,6 +97,7 @@ fn configured(
     mut launch: LaunchCommand,
     profile: &cutex::launch::stock::StockConfiguration,
     owner: bool,
+    migration_home: Option<&std::path::Path>,
 ) -> anyhow::Result<LaunchCommand> {
     launch = option(launch, "model", &profile.model)?;
     launch = option(launch, "model_provider", &profile.model_provider)?;
@@ -108,7 +109,15 @@ fn configured(
         "unsupported stock provider key"
     );
     if let Some(projection) = &profile.selected_projection {
-        launch = launch.args(projection.native_args(owner)?);
+        launch = launch.args(if let Some(home) = migration_home {
+            projection.migrated_native_args(
+                owner,
+                &cutex::config::paths::host_codex_home_dir()?,
+                home,
+            )?
+        } else {
+            projection.native_args(owner)?
+        });
     } else if profile.aemeath_auth.is_some() {
         launch = option(launch, "cli_auth_credentials_store", "file")?;
     } else {
@@ -195,6 +204,7 @@ pub(super) fn bootstrap_native(
             clean_launch(&bundle.executable.path, &review.native_home)?,
             &review.configuration,
             true,
+            None,
         )?;
         let launch = option(
             launch,
@@ -443,6 +453,8 @@ impl StockRuntimeExecutor for StockExecutor {
             )?,
             profile,
             true,
+            (receipt.review.contract.version == 3)
+                .then_some(receipt.review.contract.native_home.as_path()),
         )?;
         if bundle.soon_ingress() {
             launch = option(
@@ -857,7 +869,12 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
         "-c",
         "tui.resume_cwd=\"current\"",
     ]);
-    let mut launch = configured(launch, &ready.review.configuration, false)?;
+    let mut launch = configured(
+        launch,
+        &ready.review.configuration,
+        false,
+        (contract.version == 3).then_some(contract.native_home.as_path()),
+    )?;
     if let Some(status) = ready
         .review
         .configuration
@@ -946,6 +963,7 @@ mod ingress_guard_tests {
         // Missing referenced evidence is deliberately NOT permission to fall back.
         record.explicit_launch = Some(cutex::agent_management::ExplicitLaunchContract {
             version: 1,
+            migration_action_id: None,
             native_id: native,
             native_home: home.root().into(),
             bundle_manifest: home.root().join("missing-bundle.json"),

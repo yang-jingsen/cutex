@@ -50,6 +50,7 @@ impl BootstrapExecutionPermit<'_> {
         let key = format!("bootstrap-adopt:{}", digest.as_str());
         let contract = ExplicitLaunchContract {
             version: 2,
+            migration_action_id: None,
             native_id: native.to_owned(),
             native_home: self.intent.native_home.clone(),
             bundle_manifest: self.intent.bundle_manifest.clone(),

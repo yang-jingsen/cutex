@@ -10,7 +10,13 @@ mod bootstrap_intent;
 mod durable_adoption;
 mod durable_import;
 mod explicit_launch;
+#[cfg(target_os = "linux")]
+mod migration;
+#[cfg(target_os = "linux")]
+mod migration_files;
 mod model;
+#[cfg(target_os = "linux")]
+pub use migration::*;
 mod projects;
 mod provider;
 mod stock_runtime;

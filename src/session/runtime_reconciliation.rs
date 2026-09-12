@@ -367,6 +367,7 @@ mod tests {
         record.formal_agent_name = Some("Exact formal Agent".into());
         record.explicit_launch = Some(crate::agent_management::ExplicitLaunchContract {
             version: 999,
+            migration_action_id: None,
             native_id: "stock-reconcile".into(),
             native_home: "/unavailable".into(),
             bundle_manifest: "/unavailable/bundle".into(),

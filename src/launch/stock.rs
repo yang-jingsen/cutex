@@ -260,7 +260,7 @@ impl StockBundle {
             &contract.bundle_manifest,
             &contract.bundle_sha256,
         )?;
-        ensure!(contract.version == if bundle.soon_ingress() { 2 } else { 1 },
+        ensure!(contract.version == if bundle.soon_ingress() { if contract.migration_action_id.is_some() {3} else {2} } else { 1 },
             "new coherent Soon bundle requires explicit version-2 activation; old markers cannot opt in");
         Ok(bundle)
     }
@@ -281,6 +281,18 @@ impl StockBundle {
         );
         let bundle: Self = serde_json::from_slice(&std::fs::read(manifest)?)
             .context("invalid stock bundle manifest")?;
+        bundle.validate_components()?;
+        ensure!(
+            bundle.shared_config.path == native_home.join("config.toml"),
+            "wrong shared config/home"
+        );
+        validate_shared_config(&std::fs::read_to_string(&bundle.shared_config.path)?)?;
+        Ok(bundle)
+    }
+
+    /// Identical artifact fences, before a migration's shared config exists.
+    pub(crate) fn validate_components(&self) -> anyhow::Result<()> {
+        let bundle = self;
         ensure!(cfg!(target_os = "linux"), "stock subset requires Linux");
         bundle.validate_identity()?;
         if let Some(cli) = &bundle.cli {
@@ -309,15 +321,10 @@ impl StockBundle {
                     .join("codex-code-mode-host"),
             "stock companion must be beside executable"
         );
-        ensure!(
-            bundle.shared_config.path == native_home.join("config.toml"),
-            "wrong shared config/home"
-        );
         let schema: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&bundle.schema.path)?)?;
         ensure!(schema.is_object(), "invalid stock protocol schema");
-        validate_shared_config(&std::fs::read_to_string(&bundle.shared_config.path)?)?;
-        Ok(bundle)
+        Ok(())
     }
 }
 
@@ -550,6 +557,27 @@ enum ProviderMode {
 }
 
 pub fn current_configuration(record: &CutexSessionRecord) -> anyhow::Result<StockConfiguration> {
+    configuration_for_record(
+        record,
+        record
+            .explicit_launch
+            .as_ref()
+            .is_some_and(|c| c.version == 3 && c.migration_action_id.is_some()),
+    )
+}
+
+/// Only maintenance review calls this before installing the explicit v3 marker.
+/// The original profile and independent auth path remain authoritative.
+pub(crate) fn migration_configuration(
+    record: &CutexSessionRecord,
+) -> anyhow::Result<StockConfiguration> {
+    configuration_for_record(record, true)
+}
+
+fn configuration_for_record(
+    record: &CutexSessionRecord,
+    migration: bool,
+) -> anyhow::Result<StockConfiguration> {
     ensure!(
         record.default_cli_args.is_empty(),
         "stock does not accept arbitrary durable CLI overrides"
@@ -566,6 +594,7 @@ pub fn current_configuration(record: &CutexSessionRecord) -> anyhow::Result<Stoc
         approval,
         record.model_defaults.as_ref(),
         record.reasoning_defaults.as_ref(),
+        migration,
     )
 }
 
@@ -585,6 +614,7 @@ pub fn bootstrap_configuration(
         Some(spec.approval_policy.clone()),
         Some(&spec.model),
         Some(&spec.reasoning),
+        false,
     )
 }
 
@@ -595,6 +625,7 @@ fn configuration_for_selection(
     approval: Option<String>,
     selected_model: Option<&String>,
     selected_reasoning: Option<&String>,
+    migration: bool,
 ) -> anyhow::Result<StockConfiguration> {
     use crate::profiles::model::{AccountsStore, CliKind, RuntimeConfig};
     let config = crate::config::store::load_codez_config_checked()?;
@@ -666,13 +697,30 @@ fn configuration_for_selection(
     let raw = std::fs::read_to_string(&files.config_path)?;
     let mode: toml::Value =
         toml::from_str(&raw).map_err(|_| anyhow::anyhow!("invalid profile configuration"))?;
-    if mode
-        .get("cutex_provider_mode")
-        .and_then(toml::Value::as_str)
-        == Some("selected_profile_v2")
+    if migration
+        || mode
+            .get("cutex_provider_mode")
+            .and_then(toml::Value::as_str)
+            == Some("selected_profile_v2")
     {
-        let (mut projection, model, reasoning) = super::selected_profile::Config::parse(&raw)?
-            .review(
+        let projected_raw = if migration {
+            let mut value = mode.clone();
+            let table = value.as_table_mut().context("profile table required")?;
+            ensure!(
+                !table.contains_key("cutex_provider_mode")
+                    || table["cutex_provider_mode"].as_str() == Some("selected_profile_v2"),
+                "conflicting original provider mode"
+            );
+            table.insert(
+                "cutex_provider_mode".into(),
+                toml::Value::String("selected_profile_v2".into()),
+            );
+            toml::to_string(&value)?
+        } else {
+            raw.clone()
+        };
+        let (mut projection, model, reasoning) =
+            super::selected_profile::Config::parse(&projected_raw)?.review(
                 &account.id,
                 files.auth_path.clone(),
                 selected_model,
@@ -900,10 +948,17 @@ pub fn validate_native(
             == 1,
         "ambiguous durable/native mapping"
     );
-    ensure!(
-        crate::config::paths::host_codex_home_dir()?.canonicalize()? == contract.native_home,
-        "stock home is not authoritative native home"
-    );
+    if contract.version == 3 {
+        #[cfg(target_os = "linux")]
+        crate::agent_management::validate_migration_home(record, sessions, contract)?;
+        #[cfg(not(target_os = "linux"))]
+        anyhow::bail!("maintenance home unsupported on this platform");
+    } else {
+        ensure!(
+            crate::config::paths::host_codex_home_dir()?.canonicalize()? == contract.native_home,
+            "stock home is not authoritative native home"
+        );
+    }
     current_configuration(record)?.validate_auth_home(&contract.native_home)?;
     let mut found = Vec::new();
     let mut pending = vec![contract.native_home.join("sessions")];
@@ -1210,6 +1265,7 @@ mod tests {
         assert!(crate::agent_management::require_default_launch(&record).is_ok());
         record.explicit_launch = Some(ExplicitLaunchContract {
             version: 999,
+            migration_action_id: None,
             native_id: record.codex_session_id.clone().unwrap(),
             native_home: "/private".into(),
             bundle_manifest: "/private/bundle".into(),
