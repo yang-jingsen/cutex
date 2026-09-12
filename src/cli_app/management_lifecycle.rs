@@ -1605,7 +1605,7 @@ pub(crate) fn stop_cutex_session_runtime_for_entry_fenced(
         anyhow::bail!("runtime_stop_unsupported: no local cute-alden/runtime pid recorded");
     }
 
-    let mut stopped = scope_stop.stopped;
+    let mut pids_stopped = true;
     let mut forced = scope_stop.forced;
     let mut details = Vec::new();
     if let Some(detail) = turn_stop_detail {
@@ -1619,10 +1619,17 @@ pub(crate) fn stop_cutex_session_runtime_for_entry_fenced(
     }
     for pid in target.pids.iter().copied() {
         let outcome = terminate_process_and_wait(pid, force)?;
-        stopped &= outcome.stopped;
+        pids_stopped &= outcome.stopped;
         forced |= outcome.forced;
         details.push(format!("{pid}:{}", outcome.detail));
     }
+    // The PID fallback can finish termination after the first scope wait timed
+    // out. Reobserve the whole scope before deciding whether to retain claims.
+    let stopped = pids_stopped
+        && (scope_stop.stopped
+            || cutex::runtime::process_scope::managed_agent_scope_is_absent(
+                &record.cutex_session_id,
+            )?);
     if stopped {
         if let Some(binding) = app_server_binding.as_ref() {
             match cleanup_runtime_binding_files(binding) {

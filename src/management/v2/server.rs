@@ -70,6 +70,24 @@ pub fn handle_v2_request(
         .split('?')
         .next()
         .unwrap_or(request.path.as_str());
+    // Runtime Stop is an exact-target Human operation. The ordinary bridge
+    // bearer retains its visible-only lookup; only the dedicated root bearer
+    // can stop a hidden durable session. Never apply this exception to reads,
+    // online, native requests, or arbitrary Cutex mutations.
+    if authenticated_owner_runtime_stop(request, agent_management_admin_token) {
+        let repository = management_v2_repository()?;
+        materialize_active_stream_reset(repository, context)?;
+        let session_id = cutex_request_session_id_from_path(path)
+            .expect("authenticated owner stop has an exact session path");
+        return handle_cutex_request(
+            stream,
+            request,
+            context,
+            repository,
+            &session_id,
+            Some(&crate::management::control_plane::HumanManagementPrincipal::authenticated()),
+        );
+    }
     if path.starts_with("/v2/projects/") {
         let project_id = match owner_task_project_from_path(path) {
             Some(project_id) => project_id,
@@ -150,6 +168,20 @@ pub fn handle_v2_request(
     let repository = management_v2_repository()?;
     materialize_active_stream_reset(repository, context)?;
     handle_v2_request_with_repository(stream, request, repository, context, None)
+}
+
+fn authenticated_owner_runtime_stop(request: &SimpleHttpRequest, root: Option<&str>) -> bool {
+    let path = request.path.split('?').next().unwrap_or(&request.path);
+    request.method == "POST"
+        && cutex_request_session_id_from_path(path).is_some()
+        && root.is_some()
+        && require_service_bridge_token(request, root, "Human runtime Stop").is_ok()
+        && validate_cutex_request_body(&request.body)
+            .is_ok_and(|request| runtime_stop_method(&request.method))
+}
+
+fn runtime_stop_method(method: &str) -> bool {
+    matches!(method, "cutex/runtime/offline" | "cutex/runtime/close")
 }
 
 fn v2_required_token<'a>(
@@ -456,7 +488,14 @@ fn handle_v2_request_with_repository(
         ("POST", path) if cutex_request_session_id_from_path(path).is_some() => {
             let cutex_session_id =
                 cutex_request_session_id_from_path(path).expect("matched cutex request path");
-            handle_cutex_request(stream, request, context, repository, &cutex_session_id)
+            handle_cutex_request(
+                stream,
+                request,
+                context,
+                repository,
+                &cutex_session_id,
+                None,
+            )
         }
         ("GET", path) if bootstrap_session_id_from_path(path).is_some() => {
             let cutex_session_id =
@@ -2153,6 +2192,7 @@ fn handle_cutex_request(
     context: ManagementRequestContext,
     event_repository: &EventRepository,
     cutex_session_id: &str,
+    owner: Option<&crate::management::control_plane::HumanManagementPrincipal>,
 ) -> anyhow::Result<()> {
     let request_lock = cutex_request_lock(cutex_session_id)?;
     let _request_guard = request_lock
@@ -2176,7 +2216,9 @@ fn handle_cutex_request(
             context.load_runtime_status,
             event_repository,
         )?
-    } else if request_may_resolve_hidden_session(&cutex_request.method) {
+    } else if request_may_resolve_hidden_session(&cutex_request.method)
+        || (owner.is_some() && runtime_stop_method(&cutex_request.method))
+    {
         session_resource_including_hidden(
             cutex_session_id,
             &registry,

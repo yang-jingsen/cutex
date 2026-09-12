@@ -12,6 +12,7 @@ pub mod im_bridge;
 pub mod list_projection;
 pub mod metadata;
 pub mod model;
+pub mod offline_reconciliation;
 pub mod projection;
 pub mod routing;
 pub mod runtime_defaults;

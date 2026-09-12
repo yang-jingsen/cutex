@@ -11,7 +11,7 @@ use cutex::management::remote::{
     ensure_management_remote_tunnel, management_api_healthy, management_http_json_with_timeout,
 };
 use cutex::management::service::{
-    management_api_token, management_base_url, DEFAULT_MANAGEMENT_PORT,
+    management_api_token, management_base_url, management_root_credential, DEFAULT_MANAGEMENT_PORT,
     DEFAULT_MANAGEMENT_REMOTE_TUNNEL_PORT, MANAGEMENT_BRIDGE_ID,
 };
 use cutex::platform::host::current_host_name;
@@ -364,6 +364,7 @@ fn cmd_session_lifecycle_action_with_payload_and_output(
         "params": params,
     }))?;
     let (base_url, token) = management_endpoint_for_record(&config, record)?;
+    let token = lifecycle_request_credential(&config, method, token)?;
     let encoded_session_id =
         url::form_urlencoded::byte_serialize(record.cutex_session_id.as_bytes())
             .collect::<String>();
@@ -399,6 +400,18 @@ fn cmd_session_lifecycle_action_with_payload_and_output(
         print_management_v2_lifecycle_response(&response);
     }
     Ok(response)
+}
+
+fn lifecycle_request_credential(
+    config: &CodezConfig,
+    method: &str,
+    ordinary: Option<String>,
+) -> anyhow::Result<Option<String>> {
+    if matches!(method, "cutex/runtime/offline" | "cutex/runtime/close") {
+        Ok(Some(management_root_credential(config, None)?.to_string()))
+    } else {
+        Ok(ordinary)
+    }
 }
 
 fn launch_profile_from_payload(payload: &serde_json::Value) -> anyhow::Result<Option<String>> {
@@ -733,6 +746,40 @@ fn host_foreground_app_server_layout(
 mod tests {
     use super::{launch_profile_from_payload, runtime_close_is_complete, LifecycleResponseOutput};
     use serde_json::json;
+
+    #[test]
+    fn owner_stop_cli_uses_root_credential_without_bus_fallback() {
+        let mut config = cutex::profiles::model::CodezConfig {
+            management_api_token: Some(cutex::profiles::model::ManagementApiToken::new(
+                "private-root",
+            )),
+            agent_bus_token: Some("ordinary-bus".into()),
+            ..Default::default()
+        };
+        for method in ["cutex/runtime/offline", "cutex/runtime/close"] {
+            assert_eq!(
+                super::lifecycle_request_credential(&config, method, Some("ordinary-bus".into()))
+                    .unwrap(),
+                Some("private-root".into())
+            );
+        }
+        assert_eq!(
+            super::lifecycle_request_credential(
+                &config,
+                "cutex/runtime/online",
+                Some("ordinary-bus".into())
+            )
+            .unwrap(),
+            Some("ordinary-bus".into())
+        );
+        config.management_api_token = None;
+        assert!(super::lifecycle_request_credential(
+            &config,
+            "cutex/runtime/offline",
+            Some("ordinary-bus".into())
+        )
+        .is_err());
+    }
 
     #[test]
     fn lifecycle_launch_profile_payload_is_optional_and_trimmed() {

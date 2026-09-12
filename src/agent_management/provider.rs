@@ -166,6 +166,27 @@ pub trait AgentLifecycle: Send + Sync {
             "lifecycle provider cannot fence the historical runtime occurrence",
         ))
     }
+    /// Capture before offline, or conservatively reconstruct a legacy timeout
+    /// occurrence from its exact successful PID receipt and original window.
+    fn capture_offline_occurrence(
+        &self,
+        _id: &CutexSessionId,
+        _legacy_timeout: Option<(&crate::role_revision::Rfc3339, &[u32])>,
+    ) -> Result<Option<RuntimeOccurrenceFence>, LifecycleFailure> {
+        Ok(None)
+    }
+    /// Clear only the captured occurrence after authoritative physical absence.
+    /// Must also accept its already-cleared form for crash recovery.
+    fn reconcile_offline_scope_timeout(
+        &self,
+        _id: &CutexSessionId,
+        _expected: &RuntimeOccurrenceFence,
+    ) -> Result<RuntimeOccurrenceFence, LifecycleFailure> {
+        Err(LifecycleFailure::outcome_unknown(
+            "scope_timeout_reconciliation_unavailable",
+            "the lifecycle adapter cannot prove the timed-out occurrence absent",
+        ))
+    }
     fn adopt_native(
         &self,
         native_session_id: &str,
@@ -1003,6 +1024,70 @@ impl AgentManagementProvider {
         let Some(action) = snapshot.actions.get(&request.action_id) else {
             return Ok(HistoricalBootstrapContinuation::None);
         };
+        if let Some(pids) = offline_scope_timeout_candidate(action) {
+            let AgentOperation::Offline { cutex_session_id } = &request.operation else {
+                return Ok(HistoricalBootstrapContinuation::None);
+            };
+            let fail = |error: LifecycleFailure| {
+                reconciliation_fence_response(
+                    action,
+                    "unavailable",
+                    &format!("{}: {}", error.code, error.detail),
+                )
+            };
+            let agent = self
+                .active_agent(&request.project_id, cutex_session_id)
+                .map_err(|error| {
+                    reconciliation_fence_response(action, "ambiguous", &error.to_string())
+                })?;
+            let before = lifecycle.observe(cutex_session_id).map_err(fail)?;
+            validate_managed_observation_identity(&agent, &before).map_err(|error| {
+                reconciliation_fence_response(action, "ambiguous", &error.to_string())
+            })?;
+            let expected = match action.historical_runtime_occurrence_fence.clone() {
+                Some(fence) => fence,
+                None => lifecycle
+                    .capture_offline_occurrence(cutex_session_id, Some((&action.created_at, &pids)))
+                    .map_err(fail)?
+                    .ok_or_else(|| {
+                        reconciliation_fence_response(
+                            action,
+                            "unavailable",
+                            "exact original scope timeout occurrence is unavailable",
+                        )
+                    })?,
+            };
+            // Preserve the original occurrence before clearing it. The existing
+            // field is readable by older binaries; no store schema is added.
+            self.store
+                .with_state(true, |mut state| {
+                    let current = state
+                        .actions
+                        .get_mut(&request.action_id)
+                        .ok_or(AgentManagementError::InvalidStore)?;
+                    if current.historical_runtime_occurrence_fence.as_ref() == Some(&expected) {
+                        return Ok((state, (), false));
+                    }
+                    current.historical_runtime_occurrence_fence = Some(expected.clone());
+                    Ok((state, (), true))
+                })
+                .map_err(|error| error_response(&request.action_id, error))?;
+            let absent = lifecycle
+                .reconcile_offline_scope_timeout(cutex_session_id, &expected)
+                .map_err(fail)?;
+            if !absent.is_proven_absent()
+                || absent.runtime_generation != expected.runtime_generation
+            {
+                return Err(reconciliation_fence_response(
+                    action,
+                    "ambiguous",
+                    "scope timeout reconciliation returned a changed or live occurrence",
+                ));
+            }
+            return Ok(HistoricalBootstrapContinuation::RetryLifecycleAfterOffline(
+                absent,
+            ));
+        }
         if legacy_offline_revision_conflict_candidate(action) {
             let cutex_session_id = match &request.operation {
                 AgentOperation::Offline { cutex_session_id }
@@ -1149,6 +1234,7 @@ impl AgentManagementProvider {
                 || legacy_pre_sid_retry_candidate(existing)
                 || legacy_ambiguous_sid_recovery_candidate(existing)
                 || legacy_offline_revision_conflict_candidate(existing)
+                || offline_scope_timeout_candidate(existing).is_some()
             {
                 let seats = self.director_seats.query().map_err(seat_authority_error)?;
                 let role = authorize_operation(
@@ -1279,7 +1365,9 @@ impl AgentManagementProvider {
                     if let HistoricalBootstrapContinuation::RetryLifecycleAfterOffline(fence) =
                         &historical_continuation
                     {
-                        if !legacy_offline_revision_conflict_candidate(&existing) {
+                        if !legacy_offline_revision_conflict_candidate(&existing)
+                            && offline_scope_timeout_candidate(&existing).is_none()
+                        {
                             return Ok(match existing.response {
                                 Some(response) => {
                                     (state, (BeginAction::Replay(response), None), false)
@@ -1499,6 +1587,23 @@ impl AgentManagementProvider {
                 )
             }
             AgentOperation::Offline { cutex_session_id } => {
+                // Validate target ownership before recording any occurrence.
+                self.active_agent(&request.project_id, cutex_session_id)?;
+                if action.historical_runtime_occurrence_fence.is_none() {
+                    if let Some(fence) = lifecycle
+                        .capture_offline_occurrence(cutex_session_id, None)
+                        .map_err(lifecycle_error)?
+                    {
+                        self.store.with_state(true, |mut state| {
+                            state
+                                .actions
+                                .get_mut(&request.action_id)
+                                .ok_or(AgentManagementError::InvalidStore)?
+                                .historical_runtime_occurrence_fence = Some(fence);
+                            Ok((state, (), true))
+                        })?;
+                    }
+                }
                 let (agent, observation) = self.offline_existing(
                     request,
                     cutex_session_id,
@@ -3490,6 +3595,42 @@ fn legacy_offline_revision_conflict_candidate(action: &AgentActionRecord) -> boo
         )
 }
 
+fn offline_scope_timeout_candidate(action: &AgentActionRecord) -> Option<Vec<u32>> {
+    if action.operation != AgentOperationKind::Offline
+        || action.phase != AgentActionPhase::OwnerActionRequired
+    {
+        return None;
+    }
+    let AgentManagementOutcome::OwnerActionRequired { failure } =
+        &action.response.as_ref()?.outcome
+    else {
+        return None;
+    };
+    let detail = failure
+        .detail
+        .strip_prefix("owner_action_required: ")
+        .unwrap_or(&failure.detail);
+    let detail = detail
+        .strip_prefix("session_offline_failed: scope_terminate_timeout,")?
+        .strip_suffix(" (external outcome unknown)")?;
+    let mut pids = Vec::new();
+    for item in detail.split(',') {
+        let (pid, result) = item.split_once(':')?;
+        if !matches!(result, "terminated" | "process_already_exited") {
+            return None;
+        }
+        let pid = pid
+            .parse::<u32>()
+            .ok()
+            .filter(|pid| *pid != 0 && *pid <= i32::MAX as u32)?;
+        if pids.contains(&pid) {
+            return None;
+        }
+        pids.push(pid);
+    }
+    (!pids.is_empty()).then_some(pids)
+}
+
 fn offline_revision_conflict_detail_matches(detail: &str) -> bool {
     let detail = detail
         .strip_prefix("owner_action_required: ")
@@ -4241,6 +4382,10 @@ mod tests {
     #[derive(Default)]
     struct FakeState {
         log: Vec<String>,
+        scope_timeout_path: Option<std::path::PathBuf>,
+        scope_timeout_child: Option<std::process::Child>,
+        scope_absence_unknown: bool,
+        scope_fail_after_cleanup: bool,
         next_agent: u64,
         known_sid_bootstrap_failure: Option<String>,
         definite_pre_sid_bootstrap_failures: usize,
@@ -4478,6 +4623,75 @@ mod tests {
     }
 
     impl AgentLifecycle for FakeLifecycle {
+        fn capture_offline_occurrence(
+            &self,
+            id: &CutexSessionId,
+            legacy: Option<(&crate::role_revision::Rfc3339, &[u32])>,
+        ) -> Result<Option<RuntimeOccurrenceFence>, LifecycleFailure> {
+            let state = self.state.lock().unwrap();
+            let Some(path) = &state.scope_timeout_path else {
+                return Ok(None);
+            };
+            let store = crate::session::store::load_cutex_session_store_from_path(path).unwrap();
+            let record = &store.sessions[id.as_str()];
+            match legacy {
+                Some((started, pids)) => {
+                    crate::session::offline_reconciliation::legacy_timeout_occurrence(
+                        record,
+                        started.as_str(),
+                        pids,
+                    )
+                    .map(Some)
+                    .map_err(|e| {
+                        LifecycleFailure::outcome_unknown("legacy_scope_fence", e.to_string())
+                    })
+                }
+                None => Ok(Some(
+                    crate::session::offline_reconciliation::durable_offline_occurrence(record),
+                )),
+            }
+        }
+
+        fn reconcile_offline_scope_timeout(
+            &self,
+            id: &CutexSessionId,
+            expected: &RuntimeOccurrenceFence,
+        ) -> Result<RuntimeOccurrenceFence, LifecycleFailure> {
+            let mut state = self.state.lock().unwrap();
+            let path = state
+                .scope_timeout_path
+                .as_ref()
+                .expect("scope fixture path");
+            let result = crate::session::offline_reconciliation::reconcile_offline_occurrence(
+                path,
+                id.as_str(),
+                "private-host",
+                expected,
+                |_| {
+                    anyhow::ensure!(
+                        !state.scope_absence_unknown,
+                        "scope observation unavailable"
+                    );
+                    crate::session::offline_reconciliation::prove_processes_and_endpoint_absent(
+                        expected,
+                    )
+                },
+            )
+            .map_err(|e| {
+                LifecycleFailure::outcome_unknown("scope_absence_failed", e.to_string())
+            })?;
+            let observed = state.agents.get_mut(id).unwrap();
+            observed.app_server_runtime = false;
+            observed.runtime_agent_ids.clear();
+            observed.agent_bus_endpoint_ids.clear();
+            if std::mem::take(&mut state.scope_fail_after_cleanup) {
+                return Err(LifecycleFailure::outcome_unknown(
+                    "injected_process_loss",
+                    "after cleanup before action completion",
+                ));
+            }
+            Ok(result)
+        }
         fn prepare_private_cwd(&self, spec: &ManagedAgentSpec) -> Result<(), LifecycleFailure> {
             self.state
                 .lock()
@@ -4740,6 +4954,15 @@ mod tests {
                     .push(format!("lifecycle:offline:{}", cutex_session_id.as_str()));
             }
             let mut state = self.state.lock().unwrap();
+            if let Some(mut child) = state.scope_timeout_child.take() {
+                let pid = child.id();
+                child.kill().unwrap();
+                child.wait().unwrap();
+                return Err(LifecycleFailure::outcome_unknown(
+                    "session_offline_failed",
+                    format!("scope_terminate_timeout,{pid}:terminated"),
+                ));
+            }
             state
                 .log
                 .push(format!("offline:{}", cutex_session_id.as_str()));
@@ -6447,6 +6670,165 @@ mod tests {
             original
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scope_timeout_dead_child_replay_completes_once_and_preserves_failure() {
+        use crate::session::model::{CutexSessionRecord, CutexSessionStore};
+        use crate::session::store::save_cutex_session_store_to_path;
+        for legacy in [false, true] {
+            let root = root("scope-timeout-real-child");
+            let provider = AgentManagementProvider::open(&root).unwrap();
+            bind(&provider, "bind", "cutex.director", None);
+            let lifecycle = FakeLifecycle::default();
+            let created = created_agent(&completed(provider.execute(
+                &invocation("cutex.director"),
+                &create_request("create", "worker", AgentStartMode::BootstrapOnly),
+                &lifecycle,
+            )));
+            let child = std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let path = root.join("sessions.json");
+            let mut record = CutexSessionRecord::new(
+                created.cutex_session_id.as_str().into(),
+                Some(created.native_session_id.clone()),
+                "private-host".into(),
+                root.to_string_lossy().into(),
+                None,
+            )
+            .unwrap();
+            record.registration_class = crate::agent_bus::model::AgentRegistrationClass::Persistent;
+            record.runtime_generation = 1;
+            record.runtime_pid = Some(pid);
+            record.exposed_to_backend = false;
+            record.app_server_runtime = Some(crate::session::model::CutexAppServerRuntimeBinding {
+                transport: crate::session::model::CutexAppServerTransport::UnixSocket,
+                endpoint: format!("unix://{}/gone.sock", root.display()),
+                pid,
+                runtime_dir: root.to_string_lossy().into(),
+                launched_profile: None,
+                launch_profile_source: None,
+                auth_token_path: None,
+                diagnostic_journal_path: String::new(),
+                schema_version: "test".into(),
+                schema_sha256: "test".into(),
+                started_at: "2026-01-01T00:00:00Z".into(),
+            });
+            let mut store = CutexSessionStore::default();
+            store
+                .sessions
+                .insert(created.cutex_session_id.as_str().into(), record);
+            save_cutex_session_store_to_path(&path, &store).unwrap();
+            {
+                let mut state = lifecycle.state.lock().unwrap();
+                state.scope_timeout_path = Some(path.clone());
+                state.scope_timeout_child = Some(child);
+            }
+            let request = AgentManagementRequest {
+                schema: AgentManagementSchema::V1,
+                action_id: action("offline-timeout"),
+                project_id: Some(project()),
+                operation: AgentOperation::Offline {
+                    cutex_session_id: created.cutex_session_id.clone(),
+                },
+            };
+            let first = provider.execute(&invocation("cutex.director"), &request, &lifecycle);
+            let AgentManagementOutcome::OwnerActionRequired { failure } = first.outcome else {
+                panic!("expected scope timeout")
+            };
+            assert!(failure.detail.contains("scope_terminate_timeout"));
+            assert!(!crate::platform::process::process_is_running(pid));
+            if legacy {
+                provider
+                    .store()
+                    .with_state(true, |mut state| {
+                        state
+                            .actions
+                            .get_mut(&request.action_id)
+                            .unwrap()
+                            .historical_runtime_occurrence_fence = None;
+                        Ok((state, (), true))
+                    })
+                    .unwrap();
+            }
+            let bytes = std::fs::read(&path).unwrap();
+            lifecycle.state.lock().unwrap().scope_absence_unknown = true;
+            assert!(!matches!(
+                provider
+                    .execute(&invocation("cutex.director"), &request, &lifecycle)
+                    .outcome,
+                AgentManagementOutcome::Complete { .. }
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            lifecycle.state.lock().unwrap().scope_absence_unknown = false;
+            let mut changed =
+                crate::session::store::load_cutex_session_store_from_path(&path).unwrap();
+            changed
+                .sessions
+                .get_mut(created.cutex_session_id.as_str())
+                .unwrap()
+                .runtime_generation += 1;
+            save_cutex_session_store_to_path(&path, &changed).unwrap();
+            let drift_bytes = std::fs::read(&path).unwrap();
+            assert!(!matches!(
+                provider
+                    .execute(&invocation("cutex.director"), &request, &lifecycle)
+                    .outcome,
+                AgentManagementOutcome::Complete { .. }
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), drift_bytes);
+            changed
+                .sessions
+                .get_mut(created.cutex_session_id.as_str())
+                .unwrap()
+                .runtime_generation = 1;
+            save_cutex_session_store_to_path(&path, &changed).unwrap();
+            let mut altered = request.clone();
+            altered.operation = AgentOperation::Restart {
+                cutex_session_id: created.cutex_session_id.clone(),
+            };
+            assert!(!matches!(
+                provider
+                    .execute(&invocation("cutex.director"), &altered, &lifecycle)
+                    .outcome,
+                AgentManagementOutcome::Complete { .. }
+            ));
+            assert!(!matches!(
+                provider
+                    .execute(&invocation("cutex.other"), &request, &lifecycle)
+                    .outcome,
+                AgentManagementOutcome::Complete { .. }
+            ));
+            lifecycle.state.lock().unwrap().scope_fail_after_cleanup = true;
+            assert!(!matches!(
+                provider
+                    .execute(&invocation("cutex.director"), &request, &lifecycle)
+                    .outcome,
+                AgentManagementOutcome::Complete { .. }
+            ));
+            let cleared = std::fs::read(&path).unwrap();
+            let done = provider.execute(&invocation("cutex.director"), &request, &lifecycle);
+            assert!(
+                matches!(done.outcome, AgentManagementOutcome::Complete { .. }),
+                "{done:?}"
+            );
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(bytes, cleared, "crash recovery must not clear twice");
+            assert_eq!(
+                provider.execute(&invocation("cutex.director"), &request, &lifecycle),
+                done
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            let snapshot = provider.store().snapshot().unwrap();
+            assert_eq!(snapshot.failure_events[&failure.event_id], failure);
+            let current = crate::session::store::load_cutex_session_store_from_path(&path).unwrap();
+            assert!(!current.sessions[created.cutex_session_id.as_str()].exposed_to_backend);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

@@ -216,6 +216,28 @@ pub fn managed_agent_scope_control_group(cutex_session_id: &str) -> anyhow::Resu
     }
 }
 
+/// Authoritative absence check for recovery of a *known systemd scope*.
+/// Unlike the launch fallback probe, unavailable systemd is not absence.
+pub fn managed_agent_scope_is_absent(cutex_session_id: &str) -> anyhow::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        match current_systemd_scope_support(false) {
+            SystemdScopeSupport::Available => Ok(query_scope_state(
+                &managed_agent_scope_unit_name(cutex_session_id),
+            )?
+            .is_none_or(|state| !state.populated)),
+            SystemdScopeSupport::Unavailable(reason) => {
+                anyhow::bail!("managed Agent scope observation unavailable: {reason}")
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = cutex_session_id;
+        anyhow::bail!("systemd scope recovery is unsupported on this platform")
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn managed_agent_scope_control_group(
     _cutex_session_id: &str,

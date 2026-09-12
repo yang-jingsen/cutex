@@ -691,10 +691,10 @@ pub struct AgentRuntimeObservation {
 
 /// Provider-owned identity for one durable runtime occurrence.
 ///
-/// Historical actions that predate this evidence may only acquire an
-/// all-absent fence after every authoritative runtime source has been checked.
-/// The fence is then committed with the reopened action and compared again
-/// immediately before any lifecycle effect.
+/// Offline captures this before stopping. A historical scope timeout can
+/// reconstruct it only from its exact successful PID receipt and a binding
+/// predating the original action. Recovery proves physical absence and clears
+/// that exact claim before reopening the action with an all-absent fence.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeOccurrenceFence {
@@ -783,9 +783,9 @@ pub struct AgentActionRecord {
     /// It consumes this bit durably before permitting one launch attempt.
     #[serde(default)]
     pub native_bootstrap_retryable: bool,
-    /// Exact provider-owned occurrence fence committed before reopening a
-    /// historical lifecycle action. Missing legacy evidence never authorizes
-    /// an effect by itself.
+    /// Offline's original occurrence, or the all-absent fence committed before
+    /// reopening a reconciled lifecycle action. Missing legacy evidence never
+    /// authorizes an effect by itself.
     #[serde(default)]
     pub historical_runtime_occurrence_fence: Option<RuntimeOccurrenceFence>,
     #[serde(default)]

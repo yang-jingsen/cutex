@@ -14,9 +14,51 @@ mod linux {
     use cutex::runtime::lifecycle::spawn_managed_agent_runtime_launch;
     use cutex::runtime::process_scope::{
         managed_agent_process_isolation, managed_agent_scope_control_group,
-        terminate_managed_agent_scope, ManagedAgentProcessIsolation,
+        managed_agent_scope_is_absent, terminate_managed_agent_scope, ManagedAgentProcessIsolation,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn scope_timeout_can_be_reobserved_absent_after_child_finishes() {
+        let id = format!("cutex.scope-timeout-proof-{}", Uuid::new_v4().simple());
+        if let ManagedAgentProcessIsolation::Direct { reason } =
+            managed_agent_process_isolation(&id)
+        {
+            eprintln!("SKIPPED real scope timeout proof: {reason}");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "cutex-scope-timeout-proof-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir(&root).unwrap();
+        let log = root.join("child.log");
+        let launch = LaunchCommand::new("sh").args([
+            "-c",
+            "trap 'sleep 3; exit 0' TERM; printf 'ready\\n'; while :; do sleep 1; done",
+        ]);
+        let mut child =
+            spawn_managed_agent_runtime_launch(&id, &launch, root.to_str().unwrap(), &log).unwrap();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            wait_for_log(&log, "ready", Duration::from_secs(5));
+            assert!(!managed_agent_scope_is_absent(&id).unwrap());
+            let timeout = terminate_managed_agent_scope(&id, false).unwrap();
+            assert_eq!(timeout.detail, "scope_terminate_timeout");
+            assert!(!timeout.stopped);
+            child.wait().unwrap();
+            assert!(managed_agent_scope_is_absent(&id).unwrap());
+            assert!(managed_agent_scope_is_absent(&id).unwrap());
+        }));
+        let _ = terminate_managed_agent_scope(&id, true);
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        fs::remove_dir_all(root).unwrap();
+        if let Err(error) = result {
+            resume_unwind(error);
+        }
+    }
 
     #[test]
     fn managed_agent_scope_isolates_crashes_and_preserves_lifecycle() {

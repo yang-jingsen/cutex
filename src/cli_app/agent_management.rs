@@ -647,6 +647,74 @@ impl CutexAgentLifecycle {
 }
 
 impl AgentLifecycle for CutexAgentLifecycle {
+    fn capture_offline_occurrence(
+        &self,
+        id: &CutexSessionId,
+        legacy_timeout: Option<(&Rfc3339, &[u32])>,
+    ) -> Result<Option<RuntimeOccurrenceFence>, LifecycleFailure> {
+        let record = load_record(id)?;
+        let fence = match legacy_timeout {
+            Some((started, pids)) => {
+                cutex::session::offline_reconciliation::legacy_timeout_occurrence(
+                    &record,
+                    started.as_str(),
+                    pids,
+                )
+                .map_err(unknown("scope_timeout_occurrence_unknown"))?
+            }
+            None => cutex::session::offline_reconciliation::durable_offline_occurrence(&record),
+        };
+        Ok(Some(fence))
+    }
+
+    fn reconcile_offline_scope_timeout(
+        &self,
+        id: &CutexSessionId,
+        expected: &RuntimeOccurrenceFence,
+    ) -> Result<RuntimeOccurrenceFence, LifecycleFailure> {
+        let path = cutex::session::store::cutex_sessions_path()
+            .map_err(unknown("scope_timeout_store_unavailable"))?;
+        cutex::session::offline_reconciliation::reconcile_offline_occurrence(
+            &path,
+            id.as_str(),
+            &cutex::platform::host::current_host_name(),
+            expected,
+            |current| {
+                anyhow::ensure!(
+                    cutex::runtime::process_scope::managed_agent_scope_is_absent(id.as_str())?,
+                    "original Agent scope is still populated"
+                );
+                cutex::session::offline_reconciliation::prove_processes_and_endpoint_absent(
+                    expected,
+                )?;
+                let entry = coding_registration_from_cutex_session_record(current)
+                    .context("original Agent native identity unavailable")?;
+                let config = cutex::config::store::load_codez_config();
+                anyhow::ensure!(
+                    management_lifecycle::try_live_agents_for_management_entry(&config, &entry)?
+                        .is_empty(),
+                    "Agent Bus still contains the runtime"
+                );
+                anyhow::ensure!(
+                    super::app_server_runtime::runtime_manager()
+                        .status(id.as_str())?
+                        .is_none(),
+                    "app-server manager still owns a runtime"
+                );
+                if let Some(name) = expected.alden_session_name.as_deref() {
+                    anyhow::ensure!(
+                        !cute_alden_sessions()?
+                            .iter()
+                            .any(|session| session.name.as_deref() == Some(name)),
+                        "cute-alden runtime still exists"
+                    );
+                }
+                Ok(())
+            },
+        )
+        .map_err(unknown("scope_timeout_reconciliation_failed"))
+    }
+
     fn bootstrap_reviewed(
         &self,
         permit: &cutex::agent_management::BootstrapExecutionPermit<'_>,

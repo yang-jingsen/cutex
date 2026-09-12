@@ -1401,6 +1401,139 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn owner_hidden_stop_http_preserves_visibility_and_rejects_other_callers() {
+        use cutex::http::server::SimpleHttpRequest;
+        use std::io::Read;
+        let _fixture = ProductionHandlerFixture::new();
+        let id = "cutex.hidden-owner-stop";
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let reaper = thread::spawn(move || child.wait().unwrap());
+        let mut record = CutexSessionRecord::new(
+            id.into(),
+            Some("01a07ffa-acfb-79d1-84e7-08be95d39b50".into()),
+            cutex::platform::host::current_host_name(),
+            _fixture.home.root().to_string_lossy().into(),
+            None,
+        )
+        .unwrap();
+        record.registration_class = cutex::agent_bus::model::AgentRegistrationClass::Persistent;
+        record.runtime_generation = 1;
+        record.runtime_pid = Some(pid);
+        record.exposed_to_backend = false;
+        let mut store = CutexSessionStore::default();
+        store.sessions.insert(id.into(), record);
+        save_cutex_session_store(&store).unwrap();
+        let route = |method: &str, path: &str, token: &str, body: serde_json::Value| {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            let client = thread::spawn(move || {
+                let mut socket = std::net::TcpStream::connect(address).unwrap();
+                let mut response = String::new();
+                socket.read_to_string(&mut response).unwrap();
+                response
+            });
+            let (mut socket, _) = listener.accept().unwrap();
+            let request = SimpleHttpRequest {
+                method: method.into(),
+                path: path.into(),
+                headers: [("authorization".into(), format!("Bearer {token}"))]
+                    .into_iter()
+                    .collect(),
+                body: serde_json::to_vec(&body).unwrap(),
+            };
+            cutex::management::v2::server::handle_v2_request(
+                &mut socket,
+                &request,
+                Some("bridge-test"),
+                Some("seat-test"),
+                Some("root-test"),
+                &[],
+                management_request_context(),
+            )
+            .unwrap();
+            drop(socket);
+            client.join().unwrap()
+        };
+        let path = format!("/v2/sessions/{id}/cutex/requests");
+        let stop = |request_id: &str, method: &str| json!({"requestId":request_id,"method":method,"params":{"expectedRuntimeGeneration":1,"force":false}});
+        let before = fs::read(cutex::session::store::cutex_sessions_path().unwrap()).unwrap();
+        for (token, status) in [("wrong", "401"), ("bridge-test", "404")] {
+            let response = route(
+                "POST",
+                &path,
+                token,
+                stop("denied", "cutex/runtime/offline"),
+            );
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status}")),
+                "{response}"
+            );
+            assert_eq!(
+                fs::read(cutex::session::store::cutex_sessions_path().unwrap()).unwrap(),
+                before
+            );
+        }
+        let visible = route("GET", "/v2/sessions", "bridge-test", json!({}));
+        assert!(!visible.contains(id), "{visible}");
+        let response = route(
+            "POST",
+            &path,
+            "root-test",
+            stop("owner-stop", "cutex/runtime/offline"),
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("\"status\":\"offline\""), "{response}");
+        reaper.join().unwrap();
+        let current = load_cutex_session_store().unwrap();
+        assert!(!current.sessions[id].exposed_to_backend);
+        assert!(current.sessions[id].runtime_pid.is_none());
+        assert!(!route("GET", "/v2/sessions", "bridge-test", json!({})).contains(id));
+        assert!(route(
+            "GET",
+            &format!("/v2/sessions/{id}"),
+            "bridge-test",
+            json!({})
+        )
+        .starts_with("HTTP/1.1 404"));
+        assert!(route(
+            "POST",
+            &path,
+            "root-test",
+            stop("owner-close", "cutex/runtime/close")
+        )
+        .starts_with("HTTP/1.1 200"));
+        for foreign in [true, false] {
+            let mut current = load_cutex_session_store().unwrap();
+            let record = current.sessions.get_mut(id).unwrap();
+            if foreign {
+                record.host_id = "foreign-host".into();
+            } else {
+                record.host_id = cutex::platform::host::current_host_name();
+                record.retired_at = Some("2026-09-01T00:00:00Z".into());
+                record.archive_state = cutex::session::model::CutexSessionArchiveState::Retired;
+            }
+            save_cutex_session_store(&current).unwrap();
+            let before = fs::read(cutex::session::store::cutex_sessions_path().unwrap()).unwrap();
+            let response = route(
+                "POST",
+                &path,
+                "root-test",
+                stop("foreign-retired", "cutex/runtime/offline"),
+            );
+            assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+            assert_eq!(
+                fs::read(cutex::session::store::cutex_sessions_path().unwrap()).unwrap(),
+                before
+            );
+        }
+    }
+
     fn save_resolvable_profile(account: &StoredAccount) {
         save_store(&AccountsStore {
             version: 3,
