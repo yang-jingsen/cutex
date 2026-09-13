@@ -11,11 +11,12 @@ use cutex::management::control_plane::{
     HumanManagementProjectMutationReceipt, HumanManagementProjectMutationRequest,
     HumanManagementTaskQueryRequest, HumanManagementTaskQueryResponse,
 };
-use cutex::management::remote::management_http_json;
+use cutex::management::remote::management_http_json_with_timeout;
 use cutex::management::service::{
     management_base_url, management_root_credential, DEFAULT_MANAGEMENT_PORT,
 };
 use cutex::profiles::model::CodezConfig;
+use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub(super) struct ManagementControlClient {
@@ -29,7 +30,7 @@ impl ManagementControlClient {
         cutex_session_id: cutex::role_revision::CutexSessionId,
         restart: bool,
     ) -> anyhow::Result<cutex::agent_management::StockRuntimeReview> {
-        self.request(
+        self.request_with_timeout(
             "POST",
             "/v2/agent-management/explicit-launch",
             Some(&serde_json::to_vec(
@@ -40,6 +41,7 @@ impl ManagementControlClient {
                     job_mcp: None,
                 },
             )?),
+            Duration::from_secs(120),
         )
     }
 
@@ -48,12 +50,13 @@ impl ManagementControlClient {
         action_id: cutex::agent_management::AgentActionId,
         review: cutex::agent_management::StockRuntimeReview,
     ) -> anyhow::Result<cutex::agent_management::StockRuntimeReceipt> {
-        self.request(
+        self.request_with_timeout(
             "POST",
             "/v2/agent-management/explicit-launch",
             Some(&serde_json::to_vec(
                 &cutex::agent_management::ExplicitLaunchRequest::Run { action_id, review },
             )?),
+            Duration::from_secs(120),
         )
     }
 
@@ -187,8 +190,24 @@ impl ManagementControlClient {
         path: &str,
         body: Option<&[u8]>,
     ) -> anyhow::Result<T> {
-        let value =
-            management_http_json(&self.base_url, method, path, Some(&self.root_bearer), body)?;
+        self.request_with_timeout(method, path, body, Duration::from_secs(5))
+    }
+
+    fn request_with_timeout<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        timeout: Duration,
+    ) -> anyhow::Result<T> {
+        let value = management_http_json_with_timeout(
+            &self.base_url,
+            method,
+            path,
+            Some(&self.root_bearer),
+            body,
+            timeout,
+        )?;
         serde_json::from_value(value)
             .map_err(|error| anyhow::anyhow!("invalid Management control response: {error}"))
     }
@@ -198,6 +217,33 @@ impl ManagementControlClient {
 mod tests {
     use super::*;
     use cutex::profiles::model::ManagementApiToken;
+
+    #[test]
+    fn runtime_request_waits_for_response_beyond_old_five_second_limit() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = ManagementControlClient::test_endpoint(
+            format!("http://{}", listener.local_addr().unwrap()),
+            "test-root".into(),
+        );
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            socket.read(&mut request).unwrap();
+            std::thread::sleep(Duration::from_millis(5500));
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"stage\":\"ready\"}").unwrap();
+        });
+        let result: serde_json::Value = client
+            .request_with_timeout(
+                "POST",
+                "/v2/agent-management/explicit-launch",
+                None,
+                Duration::from_secs(120),
+            )
+            .unwrap();
+        assert_eq!(result["stage"], "ready");
+        server.join().unwrap();
+    }
 
     #[test]
     fn configured_client_uses_only_dedicated_management_root() {

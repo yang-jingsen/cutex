@@ -46,6 +46,37 @@ impl Drop for StockExecutor {
     }
 }
 
+fn launch_tmpdir(configured: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
+    if let Some(path) = configured.filter(|path| !path.is_empty()) {
+        return Ok(path.into());
+    }
+    let path = cutex::config::paths::runtime_dir()?.join("stock-tmp");
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(&path)
+        .context("failed to create runtime temporary directory")?;
+    let metadata = std::fs::symlink_metadata(&path)?;
+    ensure!(
+        metadata.is_dir(),
+        "runtime temporary path must be a directory"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ensure!(
+            metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0,
+            "runtime temporary directory must be private and owned"
+        );
+    }
+    Ok(path)
+}
+
 fn clean_launch(
     program: &std::path::Path,
     home: &std::path::Path,
@@ -62,12 +93,14 @@ fn clean_launch(
                 anyhow::anyhow!("non-UTF8 environment key cannot be safely scrubbed")
             })?);
     }
-    for key in ["HOME", "TMPDIR"] {
+    for key in ["HOME"] {
         launch = launch.env(
             key,
             std::env::var(key).with_context(|| format!("private {key} required"))?,
         );
     }
+    let tmp = launch_tmpdir(std::env::var("TMPDIR").ok().as_deref())?;
+    launch = launch.env("TMPDIR", tmp.to_str().context("TMPDIR must be UTF-8")?);
     #[cfg(feature = "stock-launch-test-hook")]
     if std::env::var("CUTEX_STOCK_TEST_GUARDED_NATIVE").as_deref() == Ok("1") {
         // Explicit S7/S6f same-host-UID fixture only. Default builds have no
@@ -932,6 +965,24 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
 
 #[cfg(all(test, target_os = "linux"))]
 mod ingress_guard_tests {
+    #[test]
+    fn foreground_tmpdir_defaults_without_shell_export_and_honors_override() {
+        let home = crate::cli_app::test_home::IsolatedTestHome::new("stock-tmp").unwrap();
+        let tmp = super::launch_tmpdir(None).unwrap();
+        assert_eq!(tmp, home.root().join(".cutex/runtime/stock-tmp"));
+        assert!(tmp.is_dir());
+        assert_eq!(super::launch_tmpdir(Some("")).unwrap(), tmp);
+        assert_eq!(
+            super::launch_tmpdir(Some("/custom/tmp")).unwrap(),
+            std::path::PathBuf::from("/custom/tmp")
+        );
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(tmp).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
     #[test]
     fn coherent_receiver_profiles_are_explicit_and_unknown_is_not_full_access() {
         for (sandbox, expected) in [
