@@ -462,6 +462,7 @@ pub fn submit_mcp_control(
         "/api/agent-management/v1/actions"
             | "/api/messages/send"
             | "/api/task/v2/worker-prepare"
+            | "/api/task/v2/query"
             | "/api/task/v2/actions"
             | "/api/task/v2/director-action"
             | "/api/task/v2/terminal-semantic"
@@ -704,6 +705,30 @@ mod tests {
     use crate::agent_bus::model::AgentRegistrationClass;
     use crate::http::server::read_simple_http_request;
     use crate::http::server::write_json_response;
+
+    #[test]
+    fn mcp_contract_query_reaches_http_with_occurrence_and_full_response() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = json!({"schema":"cutex/task-service-query/v2","query":{"operation":"read_contract","body":{"assignment_id":"assignment-1"}}});
+        let response = json!({"outcome":{"kind":"contract","body":{"opaque_contract":"完整合同\n".repeat(10000)}}});
+        let expected_request = body.clone();
+        let expected_response = response.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_simple_http_request(&mut stream).unwrap();
+            assert_eq!(request.path, "/api/task/v2/query");
+            assert_eq!(request.headers["x-cutex-mcp-generation"], "3");
+            assert_eq!(request.headers["x-cutex-agent-id"], "stock.worker");
+            assert_eq!(serde_json::from_slice::<Value>(&request.body).unwrap(), expected_request);
+            write_json_response(&mut stream, 200, "OK", &expected_response).unwrap();
+        });
+        let result = submit_mcp_control(port, "private-test-token", &RuntimeAgentId::new("stock.worker").unwrap(),
+            &crate::agent_bus::mcp::CallerFence { thread_id:"11111111-1111-4111-8111-111111111111".into(), generation:3 },
+            "/api/task/v2/query", &body).unwrap();
+        assert_eq!(result, response);
+        server.join().unwrap();
+    }
 
     #[test]
     fn agent_message_send_request_sets_agent_wire_fields() {
