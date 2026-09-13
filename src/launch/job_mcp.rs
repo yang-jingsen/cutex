@@ -105,10 +105,6 @@ impl JobMcpDescriptor {
             "unsupported Job adapter bytes"
         );
         ensure!(
-            self.launcher.sha256.as_str() == S6E_CLI_SHA256,
-            "unsupported Job launcher pairing"
-        );
-        ensure!(
             bundle.cli.as_ref() == Some(&self.launcher),
             "Job launcher must equal reviewed native CLI"
         );
@@ -490,7 +486,7 @@ mod tests {
             .review(&bundle)
             .unwrap_err()
             .to_string()
-            .contains("launcher pairing"));
+            .contains("equal reviewed native CLI"));
         bad = descriptor.clone();
         bad.launcher.path = "/another-private-launcher".into();
         assert!(bad

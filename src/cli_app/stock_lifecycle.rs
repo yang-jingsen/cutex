@@ -77,7 +77,7 @@ fn launch_tmpdir(configured: Option<&str>) -> anyhow::Result<std::path::PathBuf>
     Ok(path)
 }
 
-fn clean_launch(
+pub(super) fn clean_launch(
     program: &std::path::Path,
     home: &std::path::Path,
 ) -> anyhow::Result<LaunchCommand> {
@@ -142,7 +142,7 @@ fn clean_launch(
         .env("LANG", "C.UTF-8")
         .env("TERM", "xterm-256color"))
 }
-fn option(
+pub(super) fn option(
     launch: LaunchCommand,
     key: &str,
     value: impl serde::Serialize,
@@ -152,7 +152,7 @@ fn option(
     Ok(launch.arg("-c").arg(format!("{key}={value}")))
 }
 
-fn configured(
+pub(super) fn configured(
     mut launch: LaunchCommand,
     profile: &cutex::launch::stock::StockConfiguration,
     owner: bool,
@@ -194,7 +194,7 @@ fn configured(
     option(launch, "analytics.enabled", false)
 }
 
-fn receiver_profile(sandbox: &str) -> anyhow::Result<&'static str> {
+pub(super) fn receiver_profile(sandbox: &str) -> anyhow::Result<&'static str> {
     match sandbox {
         "read-only" => Ok(":read-only"),
         "workspace-write" => Ok(":workspace"),
@@ -509,7 +509,7 @@ impl StockRuntimeExecutor for StockExecutor {
             )?,
             profile,
             true,
-            (receipt.review.contract.version == 3)
+            (matches!(receipt.review.contract.version, 3 | 4))
                 .then_some(receipt.review.contract.native_home.as_path()),
         )?;
         if bundle.soon_ingress() {
@@ -929,7 +929,7 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
         launch,
         &ready.review.configuration,
         false,
-        (contract.version == 3).then_some(contract.native_home.as_path()),
+        matches!(contract.version, 3 | 4).then_some(contract.native_home.as_path()),
     )?;
     if let Some(status) = ready
         .review

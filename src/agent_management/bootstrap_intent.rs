@@ -330,8 +330,8 @@ impl BootstrapIntentReview {
             job.validate(&bundle)?;
         }
         anyhow::ensure!(
-            bundle.version == 3 && bundle.soon_ingress(),
-            "bootstrap requires the exact reviewed coherent bundle3"
+            bundle.soon_ingress(),
+            "bootstrap requires a compatible local runtime bundle"
         );
         anyhow::ensure!(
             crate::launch::stock::bootstrap_configuration(spec)? == self.configuration,

@@ -1,4 +1,4 @@
-//! Deliberately restricted stock-U Linux launch inputs. No discovery/fallback.
+//! Manifest-selected Linux runtime artifacts with checked file integrity and protocol compatibility.
 use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -224,16 +224,31 @@ impl StockBundle {
             || self.soon_ingress()
     }
     pub fn soon_ingress(&self) -> bool {
-        self.version == 3
-            && self.native_patch_commit.as_deref() == Some(S6E_COMMIT)
-            && self.executable.sha256.as_str() == S6E_EXECUTABLE_SHA256
-            && self.schema.sha256.as_str() == S6E_SCHEMA_SHA256
-            && self
-                .cli
-                .as_ref()
-                .is_some_and(|c| c.sha256.as_str() == S6E_CLI_SHA256)
+        self.local_deployment()
+            || (self.version == 3
+                && self.native_patch_commit.as_deref() == Some(S6E_COMMIT)
+                && self.executable.sha256.as_str() == S6E_EXECUTABLE_SHA256
+                && self.schema.sha256.as_str() == S6E_SCHEMA_SHA256
+                && self
+                    .cli
+                    .as_ref()
+                    .is_some_and(|c| c.sha256.as_str() == S6E_CLI_SHA256))
+    }
+
+    /// Version 4 selects locally installed build bytes, rather than a compiled
+    /// allowlist of source commits. The protocol remains explicitly supported;
+    /// every selected file is still hashed by validate_components.
+    fn local_deployment(&self) -> bool {
+        self.version == 4 && self.cli.is_some() && self.schema.sha256.as_str() == S6E_SCHEMA_SHA256
     }
     fn validate_identity(&self) -> anyhow::Result<()> {
+        if self.version == 4 {
+            ensure!(
+                self.local_deployment(),
+                "local runtime deployment requires CLI and supported protocol schema"
+            );
+            return Ok(());
+        }
         ensure!(
             self.upstream_commit == STOCK_COMMIT,
             "unsupported native upstream source"
@@ -260,7 +275,7 @@ impl StockBundle {
             &contract.bundle_manifest,
             &contract.bundle_sha256,
         )?;
-        ensure!(contract.version == if bundle.soon_ingress() { if contract.migration_action_id.is_some() {3} else {2} } else { 1 },
+        ensure!(contract.version == if contract.version == 4 && bundle.version == 4 {4} else if bundle.soon_ingress() { if contract.migration_action_id.is_some() {3} else {2} } else { 1 },
             "new coherent Soon bundle requires explicit version-2 activation; old markers cannot opt in");
         Ok(bundle)
     }
@@ -562,7 +577,7 @@ pub fn current_configuration(record: &CutexSessionRecord) -> anyhow::Result<Stoc
         record
             .explicit_launch
             .as_ref()
-            .is_some_and(|c| c.version == 3 && c.migration_action_id.is_some()),
+            .is_some_and(|c| c.version == 4 || (c.version == 3 && c.migration_action_id.is_some())),
     )
 }
 
@@ -583,10 +598,6 @@ fn configuration_for_record(
         "stock does not accept arbitrary durable CLI overrides"
     );
     let (sandbox, approval) = crate::runtime::args::effective_runtime_permission_defaults(record);
-    ensure!(
-        record.approval_policy.is_some(),
-        "explicit stock approval policy required"
-    );
     configuration_for_selection(
         record.profile.as_ref(),
         record.permission_defaults.as_deref(),
@@ -615,6 +626,19 @@ pub fn bootstrap_configuration(
         Some(&spec.model),
         Some(&spec.reasoning),
         false,
+    )
+}
+
+/// Human new-agent defaults resolve the installed profile without inventing an identity.
+pub fn local_configuration() -> anyhow::Result<StockConfiguration> {
+    configuration_for_selection(
+        None,
+        Some("danger-full-access"),
+        Some("danger-full-access".into()),
+        Some("never".into()),
+        None,
+        None,
+        true,
     )
 }
 
@@ -948,7 +972,16 @@ pub fn validate_native(
             == 1,
         "ambiguous durable/native mapping"
     );
-    if contract.version == 3 {
+    if contract.version == 4 {
+        ensure!(
+            contract.native_home
+                == crate::config::paths::runtime_dir()?
+                    .join("light/agents")
+                    .join(&contract.native_id)
+                    .canonicalize()?,
+            "local runtime home does not match saved identity"
+        );
+    } else if contract.version == 3 {
         #[cfg(target_os = "linux")]
         crate::agent_management::validate_migration_home(record, sessions, contract)?;
         #[cfg(not(target_os = "linux"))]
@@ -1052,6 +1085,34 @@ mod tests {
             assert_eq!(m["files"][name]["sha256"], expected);
         }
     }
+    #[test]
+    fn local_deployment_accepts_rebuilt_bytes_but_requires_supported_protocol() {
+        let file = |hash: &str| VerifiedFile {
+            path: "/private/file".into(),
+            sha256: Sha256::new(hash.to_string()).unwrap(),
+        };
+        let mut bundle = StockBundle {
+            version: 4,
+            upstream_commit: "local-upstream".into(),
+            native_patch_commit: Some("local-fix".into()),
+            executable: file(&"a".repeat(64)),
+            cli: Some(file(&"b".repeat(64))),
+            code_mode_host: file(&"c".repeat(64)),
+            facade: file(&"d".repeat(64)),
+            schema: file(S6E_SCHEMA_SHA256),
+            shared_config: file(&"e".repeat(64)),
+        };
+        bundle.validate_identity().unwrap();
+        assert!(bundle.common_ingress() && bundle.soon_ingress());
+        // Artifact eligibility is not successful integrity validation.
+        assert!(bundle.validate_components().is_err());
+        bundle.schema = file(S6_SCHEMA_SHA256);
+        assert!(bundle.validate_identity().is_err());
+        bundle.schema = file(S6E_SCHEMA_SHA256);
+        bundle.cli = None;
+        assert!(bundle.validate_identity().is_err());
+    }
+
     #[test]
     fn exact_s6_bundle_identity_not_boolean_capability() {
         let file = |hash: &str| VerifiedFile {

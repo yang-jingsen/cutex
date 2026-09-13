@@ -270,7 +270,8 @@ pub fn adopt_cutex_session(
         .sessions
         .get_mut(&key)
         .ok_or_else(|| anyhow::anyhow!("cutex session disappeared while adopting: {key}"))?;
-    if record.registration_class != AgentRegistrationClass::Persistent {
+    let newly_managed = record.registration_class != AgentRegistrationClass::Persistent;
+    if newly_managed {
         record.runtime_backend = default_managed_session_runtime_backend();
     }
     apply_managed_session_defaults(
@@ -281,6 +282,28 @@ pub fn adopt_cutex_session(
         options.expose_to_im,
         options.pin,
     );
+    #[cfg(target_os = "linux")]
+    if newly_managed
+        && record.explicit_launch.is_none()
+        && crate::runtime::lifecycle::cutex_session_host_is_local(
+            &record.host_id,
+            &crate::platform::host::current_host_name(),
+        )
+    {
+        if let Some(deployment) = crate::launch::local_deployment::LocalDeployment::selected()? {
+            let mut candidate = record.clone();
+            deployment.adopt(&mut candidate, store)?;
+            *store
+                .sessions
+                .get_mut(&key)
+                .expect("existing adoption record") = candidate;
+        }
+    }
+    let record = store
+        .sessions
+        .get_mut(&key)
+        .expect("existing adoption record");
+
     record.bump_durable_revision()?;
     record.updated_at = chrono::Utc::now().to_rfc3339();
     Ok(CutexSessionAdoptOutcome {

@@ -76,3 +76,5 @@ pub(crate) use app::run;
 pub(crate) fn json_process_error(error: &anyhow::Error) -> Option<serde_json::Value> {
     session_archive::json_process_error(error)
 }
+
+mod light_new;

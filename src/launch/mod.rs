@@ -10,6 +10,7 @@ pub mod command;
 pub mod docker;
 pub mod env;
 pub mod job_mcp;
+pub mod local_deployment;
 pub mod profile;
 pub mod program;
 pub mod runtime;

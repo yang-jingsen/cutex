@@ -21,7 +21,7 @@ pub struct ExplicitLaunchContract {
 impl ExplicitLaunchContract {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            matches!(self.version, 1 | 2 | 3),
+            matches!(self.version, 1 | 2 | 3 | 4),
             "unsupported explicit launch contract version"
         );
         anyhow::ensure!((self.version == 3) == self.migration_action_id.is_some(),
