@@ -33,3 +33,10 @@ Undo compares only fields changed by its original action. Later independent
 configuration edits and runtime updates survive. If one of those same fields has
 changed, undo reports a conflict instead of overwriting the newer value. The user
 can still explicitly set any desired replacement value through a new action.
+
+Previously migrated agents retain their version-3 home contract when selecting a
+version-4 local package. Recurring launches use the committed migration receipt
+only to establish the durable owner, native ID, and native home. They validate the
+currently selected package separately. Historical package hashes and parent
+filesystem inode/device numbers no longer freeze post-migration repairs or block
+a restored filesystem. Initial migration materialization checks remain unchanged.

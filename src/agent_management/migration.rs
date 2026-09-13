@@ -539,25 +539,26 @@ pub(crate) fn validate_migration_home(
         matches!(
             receipt.phase,
             MaintenancePhase::Applied | MaintenancePhase::Activated
-        ) && receipt.review.contract == *contract
+        ) && receipt.review.contract.native_id == contract.native_id
+            && receipt.review.contract.native_home == contract.native_home
+            && receipt.review.contract.migration_action_id == contract.migration_action_id
+            && receipt.review.action_id == *action
             && receipt.review.subject.cutex_session_id.as_str() == record.cutex_session_id,
         "migration receipt/home owner mismatch"
     );
-    let parent = files::directory(
+    // The committed receipt establishes ownership, not a permanent freeze on
+    // package selection. Human configuration may select a rebuilt bundle while
+    // retaining the same native history. The current bundle is validated by
+    // StockBundle::load; historical package bytes are not launch authority.
+    // Likewise a restored filesystem can have new device/inode numbers. Check
+    // current private directory ownership instead of the migration-time inode.
+    files::directory(
         contract
             .native_home
             .parent()
             .context("migration parent missing")?,
         true,
     )?;
-    ensure!(
-        (parent.metadata()?.dev(), parent.metadata()?.ino())
-            == (
-                receipt.review.destination_parent_device,
-                receipt.review.destination_parent_inode
-            ),
-        "migration home parent changed"
-    );
     files::directory(&contract.native_home, true)?;
     Ok(())
 }
@@ -1235,6 +1236,90 @@ fn materialize(review: &MaintenanceReview) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::DirBuilderExt;
+    fn home_fixture() -> (PathBuf, CutexSessionRecord, crate::session::model::CutexSessionStore) {
+        use serde_json::json;
+        let parent = std::env::temp_dir().join(format!("migration-home-{}", uuid::Uuid::new_v4()));
+        std::fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
+        let home = parent.join("native-home");
+        std::fs::DirBuilder::new().mode(0o700).create(&home).unwrap();
+        let native = uuid::Uuid::new_v4().to_string();
+        let action = AgentActionId::new("original-migration").unwrap();
+        let mut record = CutexSessionRecord::new("cutex.migrated".into(), Some(native.clone()),
+            "local".into(), parent.to_str().unwrap().into(), None).unwrap();
+        let contract = ExplicitLaunchContract { version: 3, migration_action_id: Some(action.clone()),
+            native_id: native.clone(), native_home: home.clone(), bundle_manifest: home.join("old-bundle.json"),
+            bundle_sha256: bytes_digest(b"old bundle") };
+        record.explicit_launch = Some(contract.clone());
+        let file = json!({"path":home.join("old-file"),"sha256":"a".repeat(64)});
+        let migration_file = json!({"path":home.join("old-file"),"device":1,"inode":2,"length":3,
+            "executable":false,"modified_seconds":0,"modified_nanos":0,"changed_seconds":0,"changed_nanos":0,"sha256":"a".repeat(64)});
+        let receipt: MaintenanceReceipt = serde_json::from_value(json!({
+            "phase":"activated","runtime_review":null,"error":null,
+            "review":{
+                "version":1,"action_id":action,
+                "subject":{"cutex_session_id":record.cutex_session_id,"formal_name":"migrated",
+                    "durable_sha256":"a".repeat(64),"authority_sha256":"b".repeat(64),"current_project_id":null,"revision":0,"runtime_generation":0},
+                "expires_at_unix":1,"preserve_offline":true,"source_home":"/old/source",
+                "history":migration_file,"shared":migration_file,"catalog_files":[],"assets":[],
+                "catalog":{"native_id":native,"rollout_path":"/old/rollout","memory_mode":"enabled","history_mode":"legacy"},
+                "destination_parent_device":0,"destination_parent_inode":0,"contract":contract,
+                "bundle":{"version":3,"upstream_commit":"old-upstream","native_patch_commit":"old-build",
+                    "executable":file,"cli":file,"code_mode_host":file,"facade":file,"schema":file,"shared_config":file},
+                "shared_projection":"old configuration",
+                "configuration":{"profile_name":"alpha","profile_id":"profile","inherited":false,
+                    "profile_sha256":"c".repeat(64),"account_sha256":"d".repeat(64),"model":"model","reasoning":null,
+                    "model_provider":"private","provider":{"name":"private","base_url":"http://127.0.0.1:1/v1",
+                    "wire_api":"responses","requires_openai_auth":false,"supports_websockets":false},
+                    "sandbox":"read-only","approval":"on-request"},"job_mcp":null
+            }
+        })).unwrap();
+        let mut sessions = crate::session::model::CutexSessionStore::default();
+        sessions.sessions.insert(record.cutex_session_id.clone(), record.clone());
+        sessions.explicit_launch_receipts.insert(action.as_str().into(), ExplicitLaunchActionReceipt::Maintenance(receipt));
+        (parent, record, sessions)
+    }
+
+    #[test]
+    fn migrated_home_accepts_new_package_and_restored_directory_identity() {
+        let (parent, mut record, sessions) = home_fixture();
+        // Historical inode values are intentionally stale, and package evidence
+        // changes without moving native identity or copying its history again.
+        let mut contract = record.explicit_launch.clone().unwrap();
+        contract.bundle_manifest = parent.join("new-package.json");
+        contract.bundle_sha256 = bytes_digest(b"new package");
+        record.explicit_launch = Some(contract.clone());
+        assert!(validate_migration_home(&record, &sessions, &contract).is_ok());
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn migrated_home_still_requires_committed_owner_and_private_current_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let (parent, record, sessions) = home_fixture();
+        let original = record.explicit_launch.clone().unwrap();
+        for field in ["native_id", "native_home", "owner"] {
+            let mut record = record.clone();
+            let mut contract = original.clone();
+            match field {
+                "native_id" => contract.native_id = uuid::Uuid::new_v4().to_string(),
+                "native_home" => contract.native_home = parent.join("another-home"),
+                "owner" => record.cutex_session_id = "cutex.another-agent".into(),
+                _ => unreachable!(),
+            }
+            record.explicit_launch = Some(contract.clone());
+            assert!(validate_migration_home(&record, &sessions, &contract).is_err());
+        }
+        let mut uncommitted: crate::session::model::CutexSessionStore =
+            serde_json::from_value(serde_json::to_value(&sessions).unwrap()).unwrap();
+        if let Some(ExplicitLaunchActionReceipt::Maintenance(receipt)) = uncommitted.explicit_launch_receipts.values_mut().next() {
+            receipt.phase = MaintenancePhase::Prepared;
+        }
+        assert!(validate_migration_home(&record, &uncommitted, &original).is_err());
+        std::fs::set_permissions(&original.native_home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(validate_migration_home(&record, &sessions, &original).is_err());
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
     #[test]
     fn maintenance_wal_committed_view_and_corruption_are_independent() {
         let root = std::env::temp_dir().join(format!("maintenance-wal-{}", uuid::Uuid::new_v4()));
