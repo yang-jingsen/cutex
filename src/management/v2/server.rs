@@ -204,6 +204,7 @@ fn agent_management_admin_path(path: &str) -> bool {
         path,
         "/v2/agent-management/authority"
             | "/v2/agent-management/explicit-launch"
+            | "/v2/agent-management/human-config"
             | "/v2/agent-management/native-recovery"
             | "/v2/agent-management/durable-candidates"
             | "/v2/agent-management/durable-import"
@@ -469,6 +470,9 @@ fn handle_v2_request_with_repository(
         }
         ("POST", "/v2/agent-management/project-mutations") => {
             handle_management_project_mutation(stream, request, context)
+        }
+        ("POST", "/v2/agent-management/human-config") => {
+            super::human_config::handle(stream, request)
         }
         ("POST", "/v2/task-service/human-recovery") => {
             super::human_tasks::handle(stream, request)
@@ -4320,6 +4324,7 @@ mod tests {
     fn human_management_projects_tasks_and_writes_require_the_dedicated_root_credential() {
         for path in [
             "/v2/agent-management/native-recovery",
+            "/v2/agent-management/human-config",
             "/v2/agent-management/durable-candidates",
             "/v2/agent-management/durable-import",
             "/v2/agent-management/projects",

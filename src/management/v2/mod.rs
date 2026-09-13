@@ -4,6 +4,7 @@ pub mod activity;
 pub mod agent_bus_state;
 pub mod archive;
 pub mod contract_validation;
+mod human_config;
 mod human_tasks;
 pub mod integration_events;
 pub mod model;

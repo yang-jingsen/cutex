@@ -10,6 +10,8 @@ mod bootstrap_intent;
 mod durable_adoption;
 mod durable_import;
 mod explicit_launch;
+mod human_config;
+pub use human_config::*;
 mod human_runtime;
 pub use human_runtime::*;
 #[cfg(target_os = "linux")]
