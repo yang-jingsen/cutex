@@ -67,6 +67,22 @@ fn explicit_launch_action(
                 )?,
             )?);
         }
+        #[cfg(target_os = "linux")]
+        if let cutex::agent_management::ExplicitLaunchRequest::MaintenanceRecoveryStart {
+            request,
+        } = request
+        {
+            let mut runtime = super::stock_lifecycle::StockExecutor::default();
+            return Ok(serde_json::to_value(
+                management_agent_provider()?.recover_start_maintenance(
+                    principal,
+                    &cutex::session::store::cutex_sessions_path()?,
+                    request,
+                    &tasks,
+                    &mut runtime,
+                )?,
+            )?);
+        }
         if let cutex::agent_management::ExplicitLaunchRequest::Run { action_id, review } = request {
             let mut runtime = super::stock_lifecycle::StockExecutor::default();
             return Ok(serde_json::to_value(

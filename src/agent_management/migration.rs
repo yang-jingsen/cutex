@@ -3,10 +3,12 @@
 use super::migration_files as files;
 pub use super::migration_files::MigrationFile;
 use super::*;
-use crate::launch::stock::{StockBundle, StockConfiguration, VerifiedFile};
+use crate::launch::stock::{current_configuration, StockBundle, StockConfiguration, VerifiedFile};
 use crate::management::control_plane::HumanManagementPrincipal;
 use crate::role_revision::{CutexSessionId, Sha256};
-use crate::session::model::{CutexSessionRecord, CutexSessionRuntimeBackend};
+use crate::session::model::{
+    CutexSessionRecord, CutexSessionRuntimeBackend, CutexSessionUserAction,
+};
 use crate::session::store::{
     load_cutex_session_store_from_path, save_locked_session_store, with_locked_session_store,
 };
@@ -183,6 +185,20 @@ pub struct MaintenanceReceipt {
     pub runtime_review: Option<StockRuntimeReview>,
     pub error: Option<String>,
 }
+
+/// Human-sealed continuation for an already-applied maintenance migration whose
+/// frozen runtime confirmation was invalidated after a UI selection write. This
+/// does not create a new migration, identity, home or runtime action.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceRecoveryStartRequest {
+    pub action_id: AgentActionId,
+    pub frozen_durable_sha256: Sha256,
+    pub observed_durable_sha256: Sha256,
+    pub observed_last_user_selected_at: Option<String>,
+    pub observed_last_user_action: Option<CutexSessionUserAction>,
+    pub expires_at_unix: i64,
+}
 #[derive(Clone, Debug, Serialize)]
 pub struct MaintenanceStatus {
     pub state: &'static str,
@@ -194,6 +210,7 @@ pub struct MaintenanceStatus {
 /// Neither request JSON nor an Agent credential can construct this permit.
 pub(super) struct MaintenancePermit<'a> {
     receipt: &'a MaintenanceReceipt,
+    recovery: Option<&'a MaintenanceRecoveryStartRequest>,
 }
 impl MaintenancePermit<'_> {
     pub(super) fn validate(
@@ -213,10 +230,28 @@ impl MaintenancePermit<'_> {
                 && original.expires_at_unix > chrono::Utc::now().timestamp(),
             "maintenance start unavailable/expired; offline intent is preserved"
         );
+        let frozen = receipt
+            .runtime_review
+            .as_ref()
+            .context("maintenance frozen runtime review absent")?;
+        if let Some(recovery) = self.recovery {
+            ensure!(
+                recovery.action_id == original.action_id
+                    && recovery.frozen_durable_sha256 == frozen.subject.durable_sha256
+                    && recovery.observed_durable_sha256 == review.subject.durable_sha256,
+                "maintenance recovery digest/action mismatch"
+            );
+            let mut expected = frozen.clone();
+            expected.subject.durable_sha256 = recovery.observed_durable_sha256.clone();
+            ensure!(
+                expected == *review,
+                "maintenance recovery changed more than the durable confirmation"
+            );
+        } else {
+            ensure!(frozen == review, "maintenance runtime review mismatch");
+        }
         ensure!(
-            receipt.runtime_review.as_ref() == Some(review)
-                && *action == runtime_action(&original.action_id)?
-                && !review.restart,
+            *action == runtime_action(&original.action_id)? && !review.restart,
             "maintenance runtime action/review mismatch"
         );
         let store = load_cutex_session_store_from_path(path)?;
@@ -574,7 +609,10 @@ impl AgentManagementProvider {
             .runtime_review
             .clone()
             .context("maintenance runtime review absent")?;
-        let permit = MaintenancePermit { receipt: &receipt };
+        let permit = MaintenancePermit {
+            receipt: &receipt,
+            recovery: None,
+        };
         let result = self.execute_stock_runtime_maintenance_locked(
             path,
             &runtime_action(action)?,
@@ -591,6 +629,193 @@ impl AgentManagementProvider {
         }
         save_maintenance(path, &receipt)?;
         Ok(receipt)
+    }
+
+    /// Recover the original deterministic maintenance start after a rejected
+    /// generic UI action changed the explicitly observed user-selection fields.
+    /// The Human request seals both the old and complete current record digests;
+    /// all identity, authority, configuration, claim and runtime fences remain.
+    pub fn recover_start_maintenance(
+        &self,
+        human: &HumanManagementPrincipal,
+        path: &Path,
+        request: &MaintenanceRecoveryStartRequest,
+        tasks: &crate::task_service::TaskServiceProvider,
+        runtime: &mut dyn StockRuntimeExecutor,
+    ) -> anyhow::Result<MaintenanceReceipt> {
+        let _execution = super::provider::provider_execution_lock()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("maintenance execution lock"))?;
+        let _mutation = self.store().lock_mutations()?;
+        ensure!(
+            request.expires_at_unix > chrono::Utc::now().timestamp()
+                && request.expires_at_unix <= chrono::Utc::now().timestamp() + 600,
+            "maintenance recovery approval expired/too broad"
+        );
+        let mut receipt = self
+            .maintenance_receipt(human, path, &request.action_id)?
+            .context("maintenance action not applied")?;
+        if receipt.phase == MaintenancePhase::Activated {
+            return Ok(receipt);
+        }
+        ensure!(
+            receipt.phase == MaintenancePhase::Applied,
+            "maintenance preparation incomplete; use original apply/status"
+        );
+        let frozen = receipt
+            .runtime_review
+            .clone()
+            .context("maintenance runtime review absent")?;
+        ensure!(
+            frozen.digest_version == RuntimeReviewDigestVersion::SemanticV2
+                && frozen.subject.durable_sha256 == request.frozen_durable_sha256,
+            "maintenance recovery frozen digest mismatch"
+        );
+        let runtime_action = runtime_action(&request.action_id)?;
+        let sessions = load_cutex_session_store_from_path(path)?;
+        let mut review = frozen.clone();
+        review.subject.durable_sha256 = request.observed_durable_sha256.clone();
+        match sessions
+            .explicit_launch_receipts
+            .get(runtime_action.as_str())
+        {
+            Some(ExplicitLaunchActionReceipt::Runtime(prior)) => ensure!(
+                prior.review == review,
+                "maintenance recovery conflicts with existing runtime action"
+            ),
+            Some(_) => anyhow::bail!("maintenance recovery runtime action domain conflict"),
+            None => {
+                let record = sessions
+                    .sessions
+                    .get(frozen.subject.cutex_session_id.as_str())
+                    .context("maintenance recovery target absent")?;
+                ensure!(
+                    !crate::session::archive::record_has_runtime_claim(record)
+                        && record.revision == frozen.subject.revision
+                        && record.runtime_generation == frozen.subject.runtime_generation
+                        && record.explicit_launch.as_ref() == Some(&frozen.contract)
+                        && current_configuration(record)? == frozen.configuration,
+                    "maintenance recovery target/configuration/claim changed"
+                );
+                ensure!(
+                    record.last_user_selected_at == request.observed_last_user_selected_at
+                        && record.last_user_action == request.observed_last_user_action
+                        && record.last_user_selected_at.as_deref()
+                            == Some(record.updated_at.as_str()),
+                    "maintenance recovery UI observation changed/unproven"
+                );
+                ensure!(
+                    frozen.digest_version.digest(record)? == request.observed_durable_sha256,
+                    "maintenance recovery current digest mismatch"
+                );
+            }
+        }
+        let permit = MaintenancePermit {
+            receipt: &receipt,
+            recovery: Some(request),
+        };
+        let result = self.execute_stock_runtime_maintenance_locked(
+            path,
+            &runtime_action,
+            &review,
+            tasks,
+            runtime,
+            &permit,
+        )?;
+        if result.stage == StockRuntimeStage::Ready {
+            receipt.phase = MaintenancePhase::Activated;
+            receipt.error = None;
+        } else {
+            receipt.error = result.error;
+        }
+        save_maintenance(path, &receipt)?;
+        Ok(receipt)
+    }
+
+    /// Produce the short-lived, exact Human review consumed by
+    /// `recover_start_maintenance`. Review is read-only and refuses any target
+    /// with an owner, claim, runtime journal, configuration or authority drift.
+    pub fn review_start_maintenance_recovery(
+        &self,
+        human: &HumanManagementPrincipal,
+        path: &Path,
+        action: &AgentActionId,
+        tasks: &crate::task_service::TaskServiceProvider,
+    ) -> anyhow::Result<MaintenanceRecoveryStartRequest> {
+        let _mutation = self.store().lock_mutations()?;
+        let receipt = self
+            .maintenance_receipt(human, path, action)?
+            .context("maintenance action not applied")?;
+        ensure!(
+            receipt.phase == MaintenancePhase::Applied,
+            "maintenance recovery requires an applied, inactive migration"
+        );
+        let frozen = receipt
+            .runtime_review
+            .as_ref()
+            .context("maintenance runtime review absent")?;
+        ensure!(
+            frozen.digest_version == RuntimeReviewDigestVersion::SemanticV2,
+            "maintenance recovery requires the affected semantic-v2 confirmation"
+        );
+        let sessions = load_cutex_session_store_from_path(path)?;
+        ensure!(
+            !sessions
+                .explicit_launch_receipts
+                .contains_key(runtime_action(action)?.as_str()),
+            "maintenance recovery runtime action already exists; use status/exact replay"
+        );
+        let record = sessions
+            .sessions
+            .get(frozen.subject.cutex_session_id.as_str())
+            .context("maintenance recovery target absent")?;
+        ensure!(
+            !crate::session::archive::record_has_runtime_claim(record)
+                && record.revision == frozen.subject.revision
+                && record.runtime_generation == frozen.subject.runtime_generation
+                && record.explicit_launch.as_ref() == Some(&frozen.contract)
+                && current_configuration(record)? == frozen.configuration,
+            "maintenance recovery target/configuration/claim changed"
+        );
+        ensure!(
+            record.last_user_selected_at.is_some()
+                && record.last_user_action.is_some()
+                && record.last_user_selected_at.as_deref() == Some(record.updated_at.as_str()),
+            "maintenance recovery lacks exact UI selection write evidence"
+        );
+        let observed = frozen.digest_version.digest(record)?;
+        ensure!(
+            observed != frozen.subject.durable_sha256,
+            "maintenance frozen confirmation is current; use ordinary maintenance_start"
+        );
+        let state = self.store().snapshot()?;
+        let authority_result = self.director_seats.with_notification_snapshot(|seats| {
+            tasks
+                .with_archive_read_fence(|task_state| -> anyhow::Result<()> {
+                    let (project, digest) = authority_digest(
+                        &state,
+                        task_state,
+                        seats,
+                        &receipt.review.subject.cutex_session_id,
+                    )?;
+                    ensure!(
+                        Some(project) == receipt.review.subject.current_project_id
+                            && digest == receipt.review.subject.authority_sha256,
+                        "maintenance recovery authority/task mutation"
+                    );
+                    Ok(())
+                })
+                .map_err(|e| anyhow::anyhow!("maintenance recovery task fence: {e}"))?
+        })?;
+        authority_result?;
+        Ok(MaintenanceRecoveryStartRequest {
+            action_id: action.clone(),
+            frozen_durable_sha256: frozen.subject.durable_sha256.clone(),
+            observed_durable_sha256: observed,
+            observed_last_user_selected_at: record.last_user_selected_at.clone(),
+            observed_last_user_action: record.last_user_action,
+            expires_at_unix: chrono::Utc::now().timestamp() + 600,
+        })
     }
     pub fn maintenance_status(
         &self,
@@ -1183,6 +1408,43 @@ d.close()
             serde_json::json!({"kind":"maintenance_v2","receipt":{}})
         )
         .is_err());
+        let review: ExplicitLaunchRequest = serde_json::from_value(serde_json::json!({
+            "operation":"maintenance_recovery_review",
+            "action_id":"migration-action"
+        }))
+        .unwrap();
+        assert!(matches!(
+            review,
+            ExplicitLaunchRequest::MaintenanceRecoveryReview { .. }
+        ));
+        let recovery: ExplicitLaunchRequest = serde_json::from_value(serde_json::json!({
+            "operation":"maintenance_recovery_start",
+            "request":{
+                "action_id":"migration-action",
+                "frozen_durable_sha256":"1111111111111111111111111111111111111111111111111111111111111111",
+                "observed_durable_sha256":"2222222222222222222222222222222222222222222222222222222222222222",
+                "observed_last_user_selected_at":"2026-09-13T08:22:39Z",
+                "observed_last_user_action":"online",
+                "expires_at_unix":1789326408
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            recovery,
+            ExplicitLaunchRequest::MaintenanceRecoveryStart { .. }
+        ));
+        assert!(serde_json::from_value::<ExplicitLaunchRequest>(serde_json::json!({
+            "operation":"maintenance_recovery_start",
+            "request":{
+                "action_id":"migration-action",
+                "frozen_durable_sha256":"1111111111111111111111111111111111111111111111111111111111111111",
+                "observed_durable_sha256":"2222222222222222222222222222222222222222222222222222222222222222",
+                "observed_last_user_selected_at":"2026-09-13T08:22:39Z",
+                "observed_last_user_action":"online",
+                "expires_at_unix":1789326408,
+                "skip_fences":true
+            }
+        })).is_err());
         let raw = "[mcp_servers.injected]\ncommand='bad'\n";
         assert!(projected_shared(raw.as_bytes()).is_err());
         assert!(projected_shared(b"cutex_projection_version=999\n").is_err());

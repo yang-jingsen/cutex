@@ -61,7 +61,10 @@ impl RuntimeReviewDigestVersion {
     fn is_legacy(&self) -> bool {
         *self == Self::FullRecordV1
     }
-    fn digest(&self, record: &CutexSessionRecord) -> anyhow::Result<crate::role_revision::Sha256> {
+    pub(super) fn digest(
+        &self,
+        record: &CutexSessionRecord,
+    ) -> anyhow::Result<crate::role_revision::Sha256> {
         match self {
             Self::FullRecordV1 => Ok(super::store::request_sha256(record)?),
             Self::SemanticV2 => {

@@ -146,6 +146,14 @@ pub enum ExplicitLaunchRequest {
     MaintenanceStart {
         action_id: AgentActionId,
     },
+    #[cfg(target_os = "linux")]
+    MaintenanceRecoveryReview {
+        action_id: AgentActionId,
+    },
+    #[cfg(target_os = "linux")]
+    MaintenanceRecoveryStart {
+        request: MaintenanceRecoveryStartRequest,
+    },
     ReviewBootstrap {
         request: AgentManagementRequest,
         native_home: PathBuf,
@@ -202,7 +210,14 @@ impl AgentManagementProvider {
                 self.maintenance_status(_principal, path, action_id)?,
             )?),
             #[cfg(target_os = "linux")]
-            ExplicitLaunchRequest::MaintenanceStart { .. } => {
+            ExplicitLaunchRequest::MaintenanceRecoveryReview { action_id } => {
+                Ok(serde_json::to_value(
+                    self.review_start_maintenance_recovery(_principal, path, action_id, tasks)?,
+                )?)
+            }
+            #[cfg(target_os = "linux")]
+            ExplicitLaunchRequest::MaintenanceStart { .. }
+            | ExplicitLaunchRequest::MaintenanceRecoveryStart { .. } => {
                 anyhow::bail!("Human maintenance executor required")
             }
             ExplicitLaunchRequest::ReviewBootstrap {
