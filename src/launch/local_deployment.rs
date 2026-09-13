@@ -46,6 +46,13 @@ impl LocalDeployment {
         )
     }
 
+    pub fn source_home() -> anyhow::Result<PathBuf> {
+        match Self::selected()? {
+            Some(deployment) => Ok(deployment.native_home),
+            None => crate::config::paths::host_codex_home_dir(),
+        }
+    }
+
     pub fn selected() -> anyhow::Result<Option<Self>> {
         let path = crate::config::paths::runtime_dir()?.join("light/deployment.json");
         Self::read(&path)

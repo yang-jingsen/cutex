@@ -160,7 +160,7 @@ pub(super) fn adopt_saved(
     use cutex::catalog::CatalogEndpoint;
     let launch = super::session_native_workflow::NativeLaunch {
         cwd: cwd.into(),
-        native_home: cutex::config::paths::host_codex_home_dir()?,
+        native_home: LocalDeployment::source_home()?,
         profile: None,
         model: None,
     };
