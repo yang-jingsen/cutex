@@ -114,11 +114,19 @@ pub(super) fn session_tui_actions_for_record(
     if record.explicit_launch.is_some() {
         let mut actions = Vec::new();
         if record.app_server_launch_claim_id.is_some() {
+            if runtime_known {
+                push_action(
+                    &mut actions,
+                    SessionTuiAction::CloseRuntime,
+                    "Stop the recorded runtime before recovering its interrupted start",
+                    true,
+                );
+            }
             push_action(
                 &mut actions,
                 SessionTuiAction::RecoverRuntime,
                 "Clear the interrupted start only after checking that its process is gone",
-                true,
+                !runtime_known,
             );
             return actions;
         }

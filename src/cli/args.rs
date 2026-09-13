@@ -1561,6 +1561,27 @@ pub enum HumanCommand {
     },
     /// Start a managed native agent using its current configuration
     Start { id: String },
+    /// Stop an agent; optionally cancel its assigned work too
+    Stop {
+        id: String,
+        #[arg(long)]
+        cancel_tasks: bool,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Restart an agent; --cancel-tasks also abandons its assigned work
+    Restart {
+        id: String,
+        #[arg(long)]
+        cancel_tasks: bool,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Task recovery independent of Director seats
+    Tasks {
+        #[command(subcommand)]
+        command: HumanTaskCommand,
+    },
     /// Attach to a running agent without restarting it
     Attach { id: String },
     /// Existing session configuration and lifecycle commands
@@ -1572,5 +1593,27 @@ pub enum HumanCommand {
     Management {
         #[command(subcommand)]
         command: ManagementCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HumanTaskCommand {
+    /// List assignment records across projects
+    List {
+        #[arg(long)]
+        assignee: Option<String>,
+    },
+    /// Cancel assignment bookkeeping; use human stop --cancel-tasks to stop its agent too
+    Cancel {
+        assignment: String,
+        #[arg(long)]
+        action_id: Option<String>,
+    },
+    /// Close the old assignment and create a fresh one for another agent
+    Reassign {
+        assignment: String,
+        assignee: String,
+        #[arg(long)]
+        action_id: Option<String>,
     },
 }

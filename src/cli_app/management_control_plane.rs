@@ -25,6 +25,17 @@ pub(super) struct ManagementControlClient {
 }
 
 impl ManagementControlClient {
+    pub(super) fn human_tasks(
+        &self,
+        request: &cutex::management::control_plane::HumanTaskRecoveryRequest,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.request(
+            "POST",
+            "/v2/task-service/human-recovery",
+            Some(&serde_json::to_vec(request)?),
+        )
+    }
+
     pub(super) fn runtime_action_status(
         &self,
         action_id: cutex::agent_management::AgentActionId,
@@ -325,6 +336,7 @@ mod tests {
             action_id: action.clone(),
             state: "succeeded".into(),
             receipt: Some(receipt.clone()),
+            recovery: None,
         })
         .unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

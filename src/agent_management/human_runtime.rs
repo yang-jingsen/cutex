@@ -24,6 +24,8 @@ pub struct RuntimeActionStatus {
     pub action_id: AgentActionId,
     pub state: String,
     pub receipt: Option<StockRuntimeReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<HumanRuntimeRecovery>,
 }
 
 fn recovery_path(path: &Path, action: &AgentActionId) -> anyhow::Result<PathBuf> {
@@ -43,6 +45,24 @@ impl AgentManagementProvider {
         path: &Path,
         action: &AgentActionId,
     ) -> anyhow::Result<RuntimeActionStatus> {
+        match std::fs::read(recovery_path(path, action)?) {
+            Ok(bytes) => {
+                let recovery: HumanRuntimeRecovery = serde_json::from_slice(&bytes)?;
+                return Ok(RuntimeActionStatus {
+                    action_id: action.clone(),
+                    state: if recovery.completed {
+                        "succeeded"
+                    } else {
+                        "in_progress"
+                    }
+                    .into(),
+                    receipt: None,
+                    recovery: Some(recovery),
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         let sessions = load_cutex_session_store_from_path(path)?;
         let receipt = match sessions.explicit_launch_receipts.get(action.as_str()) {
             Some(ExplicitLaunchActionReceipt::Runtime(r)) => Some(r.clone()),
@@ -59,6 +79,7 @@ impl AgentManagementProvider {
             action_id: action.clone(),
             state: state.into(),
             receipt,
+            recovery: None,
         })
     }
 
@@ -270,6 +291,9 @@ mod tests {
             )
             .unwrap();
         assert!(done.completed);
+        let recovery_status = f.provider.runtime_action_status(&f.path, &action).unwrap();
+        assert_eq!(recovery_status.state, "succeeded");
+        assert_eq!(recovery_status.recovery, Some(done.clone()));
         let after = load_cutex_session_store_from_path(&f.path).unwrap();
         let r = &after.sessions[f.id.as_str()];
         assert!(r.app_server_launch_claim_id.is_none());
