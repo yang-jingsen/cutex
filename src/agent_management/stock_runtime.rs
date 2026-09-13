@@ -158,7 +158,7 @@ impl AgentManagementProvider {
             let state = self.store().snapshot()?;
             let project = super::archive::runtime_guard(&state, id)
                 .map_err(|e| anyhow::anyhow!("explicit stock runtime/project guard: {e}"))?;
-            no_task(tasks, id)?;
+            runtime_task_guard(tasks, id, restart)?;
             let sessions = load_cutex_session_store_from_path(path)?;
             let record = sessions
                 .sessions
@@ -320,7 +320,7 @@ impl AgentManagementProvider {
             let maintenance_validated=false;
             if !maintenance_validated {
                 super::archive::runtime_guard(&state, id)?;
-                no_task(tasks, id)?;
+                runtime_task_guard(tasks, id, review.restart)?;
                 anyhow::ensure!(self.runtime_authority_digest(&state,id)?==review.subject.authority_sha256,"stock authority changed");
             }
             let record = sessions
@@ -594,16 +594,21 @@ fn active(record: &CutexSessionRecord, id: &CutexSessionId) -> anyhow::Result<()
     );
     Ok(())
 }
-fn no_task(
+fn runtime_task_guard(
     tasks: &crate::task_service::TaskServiceSnapshot,
     id: &CutexSessionId,
+    restart: bool,
 ) -> anyhow::Result<()> {
+    // Starting an offline agent restores its ability to finish assigned work.
+    // The execution path separately proves absence of an existing runtime.
+    // Restart still stops a process and retains the active-task protection.
     anyhow::ensure!(
-        !tasks
-            .assignments
-            .values()
-            .any(|a| &a.assignee_cutex_session == id
-                && a.state != crate::task_service::AssignmentState::Closed),
+        !restart
+            || !tasks
+                .assignments
+                .values()
+                .any(|a| &a.assignee_cutex_session == id
+                    && a.state != crate::task_service::AssignmentState::Closed),
         "stock runtime protected by active task"
     );
     Ok(())
@@ -653,6 +658,30 @@ mod review_digest_tests {
             "configuration":{"profile_name":"alpha","profile_id":"private-profile","inherited":false,"profile_sha256":"c".repeat(64),"account_sha256":"d".repeat(64),"model":"private-model","reasoning":null,"model_provider":"private","provider":{"name":"private","base_url":"http://127.0.0.1:1/v1","wire_api":"responses","requires_openai_auth":false,"supports_websockets":false},"sandbox":"read-only","approval":"on-request"},
             "restart":true
         })).unwrap()
+    }
+
+    #[test]
+    fn offline_start_allows_assigned_work_but_restart_preserves_task_guard() {
+        let id = CutexSessionId::new("cutex.worker".to_string()).unwrap();
+        let mut tasks: crate::task_service::TaskServiceSnapshot = serde_json::from_value(json!({
+            "schema":"cutex/task-service-store/v3", "journal_sequence":0,
+            "journal_sha256":"0".repeat(64), "task_revisions":{},
+            "assignments":{"assignment-1":{
+                "assignment_id":"assignment-1", "task_id":"task-1", "task_revision":1,
+                "assignee_cutex_session":"cutex.worker", "state":"active", "local_revision":1,
+                "created_at":"2026-09-13T00:00:00Z", "acknowledged_at":null,
+                "active_attempt":null,"retry_authorization":null,"closure":null
+            }},
+            "attempts":{},"send_attempts":{},"workflows":{},"receipts":{},"prepared_worker_actions":{}
+        })).unwrap();
+        runtime_task_guard(&tasks, &id, false).unwrap();
+        assert!(runtime_task_guard(&tasks, &id, true).is_err());
+        let other = CutexSessionId::new("cutex.other".to_string()).unwrap();
+        runtime_task_guard(&tasks, &other, true).unwrap();
+        for assignment in tasks.assignments.values_mut() {
+            assignment.state = crate::task_service::AssignmentState::Closed;
+        }
+        runtime_task_guard(&tasks, &id, true).unwrap();
     }
 
     #[test]
