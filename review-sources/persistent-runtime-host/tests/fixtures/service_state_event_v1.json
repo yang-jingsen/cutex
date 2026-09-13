@@ -1,0 +1,17 @@
+{
+  "protocol": {
+    "major": 1,
+    "minor": 0
+  },
+  "subscription_id": "subscription-0001",
+  "event": {
+    "sequence": 42,
+    "timestamp_ms": 1789000000123,
+    "type": "service_state_changed",
+    "service_id": "web",
+    "run_id": "run-0007",
+    "desired_state": "running",
+    "observed_state": "running",
+    "health": "healthy"
+  }
+}

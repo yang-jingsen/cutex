@@ -1,0 +1,26 @@
+{
+  "protocol": {
+    "major": 1,
+    "minor": 0
+  },
+  "capabilities": [
+    "service.registry.v1",
+    "service.control.v1",
+    "operations.v1",
+    "events.subscribe.v1",
+    "logs.read.v1",
+    "mutations.idempotency.v1",
+    "mutations.expected_revision.v1"
+  ],
+  "request_id": "request-new-major",
+  "status": "error",
+  "error": {
+    "code": "unsupported_protocol",
+    "message": "protocol major 2 is not supported; this host supports major 1",
+    "retryable": false,
+    "details": {
+      "received_major": 2,
+      "supported_major": 1
+    }
+  }
+}

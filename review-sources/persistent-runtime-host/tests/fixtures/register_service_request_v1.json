@@ -1,0 +1,57 @@
+{
+  "protocol": {
+    "major": 1,
+    "minor": 0
+  },
+  "capabilities": [
+    "future.client.capability"
+  ],
+  "request_id": "request-register-web-1",
+  "request": {
+    "method": "RegisterService",
+    "params": {
+      "definition": {
+        "id": "web",
+        "display_name": "Example Web",
+        "description": "Golden fixture service",
+        "executable": "/opt/prh/bin/example-web",
+        "arguments": [
+          "--listen",
+          "127.0.0.1:4310"
+        ],
+        "working_directory": "/var/lib/prh/example-web",
+        "environment": {
+          "RUST_LOG": "info"
+        },
+        "start_policy": "manual",
+        "restart_policy": {
+          "mode": "bounded_on_failure",
+          "max_restarts": 3,
+          "window_ms": 60000,
+          "backoff_ms": 250
+        },
+        "dependencies": [
+          "database"
+        ],
+        "readiness_probe": {
+          "kind": "tcp",
+          "host": "127.0.0.1",
+          "port": 4310,
+          "interval_ms": 500,
+          "timeout_ms": 100
+        },
+        "shutdown_policy": {
+          "graceful_timeout_ms": 5000,
+          "force_kill_timeout_ms": 2000
+        },
+        "metadata": {
+          "owner": "example"
+        }
+      },
+      "mutation": {
+        "idempotency_key": "register-web-20260907",
+        "expected_revision": 7
+      }
+    }
+  }
+}
