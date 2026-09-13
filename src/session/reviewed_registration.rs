@@ -7,8 +7,9 @@ use crate::session::model::{CutexSessionRecord, CutexSessionStore};
 /// Called only behind the authenticated service registration route, before its
 /// store CAS and roster publication. The caller must additionally verify the
 /// returned exact native process/bundle before committing. Ordinary registration
-/// remains unchanged. The current revision pins the reviewed durable groups;
-/// a genuine group/configuration edit must obtain a new runtime review.
+/// remains unchanged. A pending launch pins its reviewed revision. A Ready
+/// owner can re-register after durable configuration edits, provided its exact
+/// process, binding, runtime identity, and current group projection still match.
 pub fn preserve_reviewed_groups(
     store: &CutexSessionStore,
     agent: &mut AgentBusAgent,
@@ -80,7 +81,8 @@ pub fn preserve_reviewed_groups(
                 == Some(receipt.review.contract.native_id.as_str())
             && agent.session_id == record.codex_session_id
             && record.explicit_launch.as_ref() == Some(&receipt.review.contract)
-            && record.revision == receipt.review.subject.revision
+            && (receipt.stage == StockRuntimeStage::Ready
+                || record.revision == receipt.review.subject.revision)
             && record.app_server_runtime.as_ref() == Some(binding)
             && record.runtime_pid == Some(binding.pid)
             && agent.pid == binding.pid
@@ -220,6 +222,31 @@ mod tests {
     }
 
     #[test]
+    fn ready_owner_reconnect_survives_configuration_revision_but_not_owner_change() {
+        let (mut store, mut agent) = fixture();
+        let record = store.sessions.get_mut("cutex.test").unwrap();
+        record.app_server_launch_claim_id = None;
+        record.runtime_generation = 1;
+        record.current_runtime_agent_id = Some(agent.id.clone());
+        record.revision += 2;
+        if let ExplicitLaunchActionReceipt::Runtime(receipt) = store
+            .explicit_launch_receipts
+            .get_mut("reviewed-register")
+            .unwrap()
+        {
+            receipt.stage = StockRuntimeStage::Ready;
+        }
+        preserve_reviewed_groups(&store, &mut agent, "private").unwrap();
+        agent.groups = normalize_registered_agent_groups(agent.groups, None, "/private");
+        store
+            .sessions
+            .get_mut("cutex.test")
+            .unwrap()
+            .runtime_generation += 1;
+        assert!(preserve_reviewed_groups(&store, &mut agent, "private").is_err());
+    }
+
+    #[test]
     fn reviewed_registration_rejects_forged_owner_group_and_stale_state() {
         for case in 0..10 {
             let (mut store, mut agent) = fixture();
@@ -253,11 +280,9 @@ mod tests {
             .unwrap()
             .explicit_launch = None;
         let before = agent.groups.clone();
-        assert!(
-            preserve_reviewed_groups(&store, &mut agent, "private")
-                .unwrap()
-                .is_none()
-        );
+        assert!(preserve_reviewed_groups(&store, &mut agent, "private")
+            .unwrap()
+            .is_none());
         assert_eq!(agent.groups, before);
         assert!(before.len() > 2);
     }
