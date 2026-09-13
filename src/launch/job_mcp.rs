@@ -42,6 +42,58 @@ pub struct ReviewedJobMcp {
 }
 
 impl JobMcpDescriptor {
+    /// A new runtime review binds the saved configuration to the currently
+    /// listening daemon. Execution still validates that exact new occurrence.
+    pub fn review_current(&self, bundle: &StockBundle) -> anyhow::Result<ReviewedJobMcp> {
+        self.current_occurrence()?.review(bundle)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn current_occurrence(&self) -> anyhow::Result<Self> {
+        use std::os::fd::AsRawFd;
+        let endpoint = private_object(&self.endpoint, true)?;
+        let socket = std::os::unix::net::UnixStream::connect(&self.endpoint)
+            .context("configured Job endpoint unavailable")?;
+        let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of_val(&peer) as libc::socklen_t;
+        ensure!(
+            unsafe {
+                libc::getsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_PEERCRED,
+                    (&mut peer as *mut libc::ucred).cast(),
+                    &mut len,
+                )
+            } == 0
+                && peer.pid > 0
+                && peer.uid == unsafe { libc::geteuid() },
+            "configured Job peer identity unavailable"
+        );
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", peer.pid))?;
+        let mut current = self.clone();
+        current.daemon_pid = peer.pid as u32;
+        current.daemon_start_ticks = stat
+            .rsplit_once(')')
+            .context("invalid Job process identity")?
+            .1
+            .split_whitespace()
+            .nth(19)
+            .context("missing Job birth identity")?
+            .parse()?;
+        current.validate_peer()?;
+        ensure!(
+            private_object(&self.endpoint, true)? == endpoint,
+            "Job endpoint changed during occurrence resolution"
+        );
+        Ok(current)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn current_occurrence(&self) -> anyhow::Result<Self> {
+        anyhow::bail!("reviewed Job MCP currently supports Linux only")
+    }
+
     pub fn review(&self, bundle: &StockBundle) -> anyhow::Result<ReviewedJobMcp> {
         ensure!(self.version == 1, "unsupported Job MCP descriptor version");
         ensure!(
@@ -266,8 +318,10 @@ mod tests {
     fn job_mcp_real_socket_peer_fences_pid_birth_and_executable() {
         let root = std::env::temp_dir().join(format!("job-peer-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let endpoint = root.join("job.sock");
         let listener = std::os::unix::net::UnixListener::bind(&endpoint).unwrap();
+        std::fs::set_permissions(&endpoint, std::fs::Permissions::from_mode(0o600)).unwrap();
         let exe = std::fs::read_link("/proc/self/exe").unwrap();
         let file = VerifiedFile {
             path: exe.clone(),
@@ -299,6 +353,28 @@ mod tests {
         d.daemon_start_ticks = birth;
         d.daemon_pid += 1;
         assert!(d.validate_peer().is_err());
+        // A new review may rediscover a restarted daemon, but an already-issued
+        // descriptor remains stale and must still fail execution validation.
+        let refreshed = d.current_occurrence().unwrap();
+        assert_eq!(refreshed.daemon_pid, std::process::id());
+        assert_eq!(refreshed.daemon_start_ticks, birth);
+        assert_eq!(refreshed.adapter, d.adapter);
+        assert!(d.validate_peer().is_err());
+        refreshed.validate_peer().unwrap();
+        let mut changed = d.clone();
+        changed.adapter.sha256 = crate::role_revision::Sha256::new("0".repeat(64)).unwrap();
+        assert!(changed
+            .current_occurrence()
+            .unwrap_err()
+            .to_string()
+            .contains("bytes mismatch"));
+        changed.adapter = d.adapter.clone();
+        changed.adapter.path = root.join("unexpected-executable");
+        assert!(changed
+            .current_occurrence()
+            .unwrap_err()
+            .to_string()
+            .contains("path mismatch"));
         drop(listener);
         std::fs::remove_dir_all(root).unwrap();
     }

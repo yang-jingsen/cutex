@@ -304,12 +304,16 @@ impl AgentManagementProvider {
                         "unchanged stock is registration-only; receiver ingress policy unsupported"
                     );
                     r.receiver_canonical_byte_limit = receiver_canonical_byte_limit.clone();
-                    r.job_mcp = job_mcp
-                        .as_ref()
-                        .map(|job| {
-                            job.review(&crate::launch::stock::StockBundle::load(&r.contract)?)
-                        })
-                        .transpose()?;
+                    let bundle = crate::launch::stock::StockBundle::load(&r.contract)?;
+                    r.job_mcp = if let Some(job) = job_mcp.as_ref() {
+                        Some(job.review(&bundle)?)
+                    } else {
+                        let sessions =
+                            crate::session::store::load_cutex_session_store_from_path(path)?;
+                        saved_runtime_job(&sessions, cutex_session_id, &r.contract)
+                            .map(|job| job.descriptor.review_current(&bundle))
+                            .transpose()?
+                    };
                     r.configuration
                         .validate_job_requirement(r.job_mcp.is_some())?;
                     Ok(serde_json::to_value(r)?)
@@ -498,4 +502,44 @@ fn validate_activation(
         "persistent identity required"
     );
     Ok(())
+}
+
+/// Reuse configuration from the most recent completed launch of this contract,
+/// falling back to its migration receipt. Occurrence evidence is refreshed only
+/// when creating a new review; persisted receipts remain unchanged.
+fn saved_runtime_job<'a>(
+    sessions: &'a crate::session::model::CutexSessionStore,
+    id: &CutexSessionId,
+    contract: &ExplicitLaunchContract,
+) -> Option<&'a crate::launch::job_mcp::ReviewedJobMcp> {
+    let latest = sessions
+        .explicit_launch_receipts
+        .values()
+        .filter_map(|receipt| match receipt {
+            ExplicitLaunchActionReceipt::Runtime(r)
+                if &r.review.subject.cutex_session_id == id
+                    && &r.review.contract == contract
+                    && r.stage == StockRuntimeStage::Ready =>
+            {
+                Some(r)
+            }
+            _ => None,
+        })
+        .max_by_key(|r| r.expected_generation);
+    if let Some(runtime) = latest {
+        return runtime.review.job_mcp.as_ref();
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(ExplicitLaunchActionReceipt::Maintenance(receipt)) = contract
+        .migration_action_id
+        .as_ref()
+        .and_then(|action| sessions.explicit_launch_receipts.get(action.as_str()))
+    {
+        return receipt
+            .runtime_review
+            .as_ref()
+            .and_then(|r| r.job_mcp.as_ref())
+            .or(receipt.review.job_mcp.as_ref());
+    }
+    None
 }

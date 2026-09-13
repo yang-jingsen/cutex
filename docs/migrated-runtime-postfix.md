@@ -1,0 +1,7 @@
+# Migrated runtime startup after service restart
+
+Migrated explicit-launch agents use the regular TUI Start/Restart review and Run actions. A caller does not need to reconstruct the Job descriptor from migration scripts. When `review_runtime` omits `job_mcp`, Management reuses the Job configuration from the latest Ready runtime receipt for the same agent and launch contract, or from that contract's maintenance receipt. It discovers the current Unix-socket peer and creates a new review against the configured executable, bundle, and credential paths.
+
+An explicit `job_mcp` overrides the saved configuration. Saved receipts are immutable evidence, not a requirement that a daemon survive reboot. Current occurrence discovery happens only during a new review; Run continues to validate the reviewed PID, birth marker, executable and custody objects to catch changes between confirmation and execution. A changed deployment configuration may still require an explicit descriptor.
+
+Known separate restrictions: active Task assignments currently block stock runtime review/execution; archived projects require restoration; unresolved launch claims require recovery/replay. The task restriction applies to starting an offline agent as well as restarting one and should be split in a lifecycle-focused follow-up. Starting or attaching does not archive or rotate a Director; the current runtime guard already treats these separately.
