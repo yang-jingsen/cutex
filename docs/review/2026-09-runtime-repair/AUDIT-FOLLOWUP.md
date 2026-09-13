@@ -29,7 +29,7 @@
 - 存储回归将无关历史 attempt 内容设为不可解码，单任务查询、精确重放、正常 worker 状态动作、Human Cancel/Reassign 仍通过；4096 个 preparation 所属 attempt 失效后，新任务仍可 prepare。
 - 有界/旧式 thread resume 响应的活动 turn 解析及 WebSocket interrupt 路径回归通过。
 
-最终源码回归：库 882 通过 / 4 忽略；CLI 572 通过 / 4 忽略，跳过既有 `archive_view_is_secret_free_and_offline`。全部单线程执行。中间检查发现的 v2 schema 指纹和响应 fixture 已同步修正；一次并行重编译删除正在运行的测试二进制导致的子进程 ENOENT，在停止并行编译后完整重跑通过。最终候选实际验收和部署结果随后补记。此前失败的中间候选从未部署到生产。
+最终源码回归：库 882 通过 / 4 忽略；CLI 572 通过 / 4 忽略，跳过既有 `archive_view_is_secret_free_and_offline`。全部单线程执行。中间检查发现的 v2 schema 指纹和响应 fixture 已同步修正；一次并行重编译删除正在运行的测试二进制导致的子进程 ENOENT，在停止并行编译后完整重跑通过。最终候选和部署验收已完成，见下文。此前失败的中间候选从未部署到生产。
 
 ## 保留的边界
 
@@ -43,3 +43,11 @@
 
 - `create-pro-review-worker-r3-20260914-v1` 仍在 `native_session_captured`，没有最终 response；修复部署后重试原 action 和原请求，继续已捕获的 native session，不另建同名 worker。
 - `online-gpu-worker-pro-review-20260914-v1` 已持久化最终 `owner_action_required` 回执。精确重放仍应返回这条历史结果；修复部署后以新的 action ID 请求同一个既有 worker Online。不要为恢复该 worker 新建 Agent，也不要篡改历史失败回执。
+
+## 最终部署
+
+本机已部署代码 `792f4983941287b032ce3b2115d0fe3f846aa486`，发布目录 `release-review-r18`，二进制 SHA-256 `8e2341bcaf3d4e0390ec47971ac465304f16eb1519ea366c77b75c69a9c089ba`。最终二进制实际通过 New/Start、原生 TUI `animations=false`、运行中退休、停止后退休、Restore、localhost Stop、sandbox alias 和陈旧 PID 误杀防护；隔离服务与凭据清理完成。陈旧 PID fixture 原先错误复用了另一个 occurrence 的停止日志，新版正确拒绝；为陈旧 binding 分配独立测试目录后预期清理行为通过。
+
+CLI、Agent Bus、Management 均更新。部署后 392 个既有身份保留，4 个存活 native owner 的 PID/出生时间/代次不变、心跳前进；两服务 active、NRestarts=0。任务库 quick_check=ok，current/receipts/events 为 2/1/1，部署前后相同；本轮没有清空数据。`human doctor` 和 `human tasks list` 返回成功。cute-codex bundle 未替换。
+
+这些结果证明本轮对应修复及服务更新通过验收，不代表长期模型/Job 业务链已全量验证。已有 TUI 进程需退出列表后重新运行 `cutex` 才加载新版前台。
