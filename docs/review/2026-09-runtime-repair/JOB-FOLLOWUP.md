@@ -24,3 +24,7 @@
 `create-pro-review-worker-r4-20260914-v1` 实际仍在 configured，最终 response 为 null；虽然调用结果显示 owner_action_required，原 action 可续接。修复部署后重试同一个 action ID 和原请求，不必改 profile、增加 descriptor 或新建 r5。
 
 r3 的 v1 action 仍有独立的 native_session_captured 预留；以 v2 创建同名同目录被拒是保留原创建身份的幂等约束。已有 r4 后不应同时恢复 r3 来制造重复 worker。本轮不删除或重写这些生产历史，也不自动派发实验。
+
+## 部署结果
+
+代码 `38704a9c07ea16cbeb10c5edb3e220eed4343239` 已部署到 `release-job-r19`。CLI/Bus/Management 已更新，393 个身份及 4 个存活 native owner 保留，PID/出生时间/代次不变、心跳前进。两服务 active、NRestarts=0；Task 数据没有清空，quick_check=ok，current/receipts/events 仍为 2/1/1。生产 r4 原创建 action 未代替 Director 执行；实验仍由原负责人按原合同派发。
