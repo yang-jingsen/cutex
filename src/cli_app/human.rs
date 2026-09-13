@@ -67,10 +67,18 @@ pub(super) fn run_command(command: HumanCommand) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&deployment)?);
         }
         HumanCommand::Config { command } => run_config(command)?,
-        HumanCommand::Action { action_id } => {
-            let result = ManagementControlClient::connect()?
-                .runtime_action_status(AgentActionId::new(action_id)?)?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
+        HumanCommand::Action { action_id, resume } => {
+            let client = ManagementControlClient::connect()?;
+            let action_id = AgentActionId::new(action_id)?;
+            let result = client.runtime_action_status(action_id.clone())?;
+            if resume {
+                let receipt = result
+                    .receipt
+                    .context("no runtime start receipt to resume")?;
+                print_runtime_result(client.run_stock_runtime(action_id, receipt.review)?)?;
+            } else {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
         }
         HumanCommand::Recover { id, action_id } => {
             println!(
@@ -98,7 +106,7 @@ pub(super) fn run_command(command: HumanCommand) -> anyhow::Result<()> {
             } else {
                 let action = super::stock_lifecycle::ReviewedStockRuntimeAction::review(&id, true)?;
                 eprintln!("Action: {}", action.action_id.as_str());
-                println!("{}", serde_json::to_string_pretty(&action.execute()?)?);
+                print_runtime_result(action.execute()?)?;
             }
         }
         HumanCommand::Attach { id } => super::stock_lifecycle::attach(&resolve_id(&id)?)?,
@@ -113,7 +121,7 @@ pub(super) fn run_command(command: HumanCommand) -> anyhow::Result<()> {
             let action = super::stock_lifecycle::ReviewedStockRuntimeAction::review(&id, false)?;
             eprintln!("Action: {}", action.action_id.as_str());
             let receipt = action.execute()?;
-            println!("{}", serde_json::to_string_pretty(&receipt)?);
+            print_runtime_result(receipt)?;
         }
         HumanCommand::Session { command } => super::session::run_command(command)?,
         HumanCommand::Management { command } => super::management::run_command(command)?,
@@ -225,6 +233,14 @@ mod tests {
     #[test]
     fn human_stop_and_task_transfer_parse_without_agent_identity_flags() {
         assert!(matches!(
+            Cli::try_parse_from(["cutex", "human", "action", "existing-action", "--resume"])
+                .unwrap()
+                .command,
+            Some(CommandKind::Human {
+                command: HumanCommand::Action { resume: true, .. }
+            })
+        ));
+        assert!(matches!(
             Cli::try_parse_from([
                 "cutex",
                 "human",
@@ -335,5 +351,15 @@ fn run_config(command: HumanConfigCommand) -> anyhow::Result<()> {
         "{}",
         serde_json::to_string_pretty(&ManagementControlClient::connect()?.human_config(&request)?)?
     );
+    Ok(())
+}
+
+fn print_runtime_result(
+    receipt: cutex::agent_management::StockRuntimeReceipt,
+) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(&receipt)?);
+    ensure!(receipt.stage == cutex::agent_management::StockRuntimeStage::Ready && receipt.error.is_none(),
+        "runtime readiness incomplete; inspect with cutex human action {}; after fixing the cause, resume the same action with cutex human action {} --resume",
+        receipt.action_id.as_str(),receipt.action_id.as_str());
     Ok(())
 }

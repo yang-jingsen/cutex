@@ -1571,7 +1571,11 @@ pub enum HumanCommand {
         command: HumanConfigCommand,
     },
     /// Inspect the result of an existing runtime action; never starts another
-    Action { action_id: String },
+    Action {
+        action_id: String,
+        #[arg(long)]
+        resume: bool,
+    },
     /// Clear an interrupted start after proving its process no longer exists
     Recover {
         id: String,

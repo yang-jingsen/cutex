@@ -17,6 +17,7 @@ cutex human restart NAME --cancel-tasks
 cutex human stop NAME --force --cancel-tasks
 cutex human recover NAME
 cutex human action ACTION_ID
+cutex human action ACTION_ID --resume
 cutex human tasks list --assignee NAME
 cutex human tasks cancel ASSIGNMENT_ID
 cutex human tasks reassign ASSIGNMENT_ID NEW_OWNER --action-id TRANSFER_ID
@@ -61,4 +62,6 @@ endpoint for these commands without starting another service. Credentials still
 come from the caller's configured home. This also supports isolated local repair
 and testing. Do not submit a second start merely because its HTTP response was
 lost: the client queries the original action and reports its action ID if the
-result remains unknown.
+result remains unknown. After fixing a missing dependency, `human action ID --resume`
+replays that same action and reuses any published process. A receipt short of Ready
+returns a nonzero CLI exit status.
