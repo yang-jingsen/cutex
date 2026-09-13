@@ -748,13 +748,7 @@ fn online_management_v2_session(
         if let Some(binding) = &record.app_server_runtime {
             super::stock_lifecycle::verify_stock_process(record, binding)?;
             super::app_server_runtime::verify_exact_live_runtime_claim(record, binding)?;
-            return super::stock_lifecycle::matching_ready_receipt(record, &store)
-                .cloned()
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "runtime has no matching Ready receipt; use cutex human recover {key}"
-                    )
-                });
+            return super::stock_lifecycle::reconnect_ready_runtime(record, &store);
         }
         let review: StockRuntimeReview = serde_json::from_value(explicit_launch_action(
             owner,

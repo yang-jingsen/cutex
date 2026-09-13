@@ -816,10 +816,20 @@ pub(crate) fn adopt_persisted_runtimes(
             continue;
         };
         if record.explicit_launch.is_some() {
-            summary.failures.push(format!(
-                "{}: explicit stock recovery required; owner unchanged",
-                record.cutex_session_id
-            ));
+            if record.is_retired()
+                || !cutex_session_host_is_local(&record.host_id, current_host)
+                || record.app_server_runtime.is_none()
+            {
+                summary.skipped = summary.skipped.saturating_add(1);
+            } else {
+                match super::stock_lifecycle::reconnect_ready_runtime(&record, &store) {
+                    Ok(_) => summary.adopted = summary.adopted.saturating_add(1),
+                    Err(error) => summary.failures.push(format!(
+                        "{}: native reconnect failed; owner unchanged: {error:#}",
+                        record.cutex_session_id
+                    )),
+                }
+            }
             continue;
         }
         match classify_persisted_runtime_adoption(&record, current_host, process_is_running) {

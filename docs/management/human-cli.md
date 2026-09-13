@@ -113,9 +113,10 @@ owner, then run the returned command in a terminal. `openVisibleTerminal` cannot
 transfer a caller's terminal through HTTP, so this path emits the existing
 foreground-required event when terminal access is requested.
 
-An Agent Bus bearer is not a Human Management bearer. For a native Agent the old
-runtime endpoint returns `human_runtime_route_required`, with the exact Human
-endpoint and CLI command. A human may delegate those commands to an agent using
+An Agent Bus bearer is not a Human Management bearer. It does not authorize native lifecycle operations. If an ordinary bridge
+credential reaches the legacy mutation handler, `human_runtime_route_required`
+provides the exact Human endpoint and CLI command; otherwise authentication
+rejects the request before dispatch. A human may delegate those commands to an agent using
 the already configured Human credential. No additional approval token is needed.
 
 Visibility controls list exposure, not Human ownership: an authenticated Human

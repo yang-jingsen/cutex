@@ -108,6 +108,36 @@ pub(super) fn matching_ready_receipt<'a>(
         })
 }
 
+/// Reattach the Management bridge to a proven existing owner without launching
+/// a process, advancing its generation, or replaying a completed start action.
+pub(super) fn reconnect_ready_runtime(
+    record: &CutexSessionRecord,
+    sessions: &cutex::session::model::CutexSessionStore,
+) -> anyhow::Result<StockRuntimeReceipt> {
+    ensure!(!record.is_retired(), "cannot reconnect an archived agent");
+    ensure!(
+        record.app_server_launch_claim_id.is_none(),
+        "unresolved runtime claim requires recovery"
+    );
+    ensure!(
+        cutex::runtime::lifecycle::cutex_session_host_is_local(
+            &record.host_id,
+            &cutex::platform::host::current_host_name()
+        ),
+        "runtime belongs to another host"
+    );
+    let receipt = matching_ready_receipt(record, sessions)
+        .context("runtime has no matching Ready receipt; use human recovery")?;
+    let binding = record
+        .app_server_runtime
+        .as_ref()
+        .context("runtime binding missing")?;
+    verify_stock_process(record, binding)?;
+    super::app_server_runtime::verify_exact_live_runtime_claim(record, binding)?;
+    StockExecutor::default().connect(record, receipt)?;
+    Ok(receipt.clone())
+}
+
 #[derive(Default)]
 pub(super) struct StockExecutor {
     child: Option<super::stock_publication::GatedChild>,
