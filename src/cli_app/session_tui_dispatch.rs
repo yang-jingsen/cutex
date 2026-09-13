@@ -347,7 +347,10 @@ fn execute_dispatch_plan(
                 receipt.stage == cutex::agent_management::StockRuntimeStage::Ready
                     && receipt.error.is_none()
                     && receipt.binding.is_some(),
-                "stock runtime action did not reach Ready; replay the same reviewed action"
+                "Runtime startup incomplete ({:?}): {}. Resume this action with: cutex human action {} --resume",
+                receipt.stage,
+                receipt.error.as_deref().unwrap_or("runtime binding is missing"),
+                receipt.action_id
             );
             session::record_cutex_session_user_action(&key, CutexSessionUserAction::Online)?;
             super::stock_lifecycle::attach(&id)

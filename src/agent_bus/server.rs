@@ -243,7 +243,7 @@ impl TaskWorkerActionHost {
             crate::task_service::TaskServiceProvider::open(task_service_root.join("provider-v2"))
                 .map_err(|error| anyhow!("failed to open Task Service provider v2: {error}"))?;
         provider
-            .recover()
+            .initialize()
             .map_err(|error| anyhow!("failed to recover Task Service provider v2: {error}"))?;
         let watchdog = Arc::new(crate::task_service::TaskStaleWatchdog::open(
             task_service_root.join("watchdog-v1"),

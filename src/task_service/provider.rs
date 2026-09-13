@@ -1219,6 +1219,17 @@ impl TaskServiceProvider {
         self.with_store_lock(true, |lock| recover_locked(&self.root, lock))
     }
 
+    /// Restore normal service from the validated current checkpoint. Full-chain
+    /// auditing remains available through `recover`; missing or stale checkpoints
+    /// retain the complete recovery fallback.
+    pub fn initialize(&self) -> Result<TaskServiceSnapshot, ProviderError> {
+        let _process = self
+            .process_lock
+            .lock()
+            .map_err(|_| ProviderError::PersistenceUnavailable)?;
+        self.with_store_lock(true, |lock| recover_checkpoint_locked(&self.root, lock))
+    }
+
     pub fn query(&self) -> Result<TaskServiceSnapshot, ProviderError> {
         self.query_cancellable(|| false)
     }
@@ -5162,6 +5173,13 @@ mod tests {
         let tail_len = tail.complete_record.as_ref().unwrap().len() as u64;
         assert!(journal_len > tail_len * 20, "{journal_len} <= {tail_len}");
 
+        let startup_started = Instant::now();
+        assert_eq!(
+            fixture.provider.initialize().unwrap(),
+            fixture.provider.query().unwrap()
+        );
+        assert!(startup_started.elapsed() < MAX_QUERY_DURATION);
+
         let query_started = Instant::now();
         let before = fixture.provider.query().unwrap();
         assert!(query_started.elapsed() < MAX_QUERY_DURATION);
@@ -5183,6 +5201,8 @@ mod tests {
 
         assert_eq!(fixture.provider.query().unwrap(), expected);
         assert!(!fixture.provider.root.join(STORE_FILE).exists());
+        assert_eq!(fixture.provider.initialize().unwrap(), expected);
+        assert!(fixture.provider.root.join(STORE_FILE).exists());
         fixture.start("checkpoint-recovered-start");
         assert!(fixture.provider.root.join(STORE_FILE).exists());
         assert_eq!(
@@ -5208,6 +5228,10 @@ mod tests {
 
         assert_eq!(fixture.provider.query(), Err(ProviderError::InvalidStore));
         assert_eq!(fixture.provider.recover(), Err(ProviderError::InvalidStore));
+        assert_eq!(
+            fixture.provider.initialize(),
+            Err(ProviderError::InvalidStore)
+        );
     }
 
     fn write_legacy_store(root: &Path, mut state: TaskServiceSnapshot) -> TaskServiceSnapshot {
