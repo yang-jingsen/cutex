@@ -141,6 +141,11 @@ pub struct ManagementRequestContext {
     pub flush_user_input_queue: ManagementUserInputQueueFlusher,
     pub load_bootstrap_state: ManagementBootstrapStateLoader,
     pub mutate_session: ManagementSessionMutationHandler,
+    pub online_session: fn(
+        Option<&crate::management::control_plane::HumanManagementPrincipal>,
+        &str,
+        serde_json::Value,
+    ) -> Result<serde_json::Value, UserInputExecutionError>,
     pub retry_release_rotation: ManagementReleaseRotationRetryHandler,
     pub request_release_rotation: ManagementReleaseRotationRequestHandler,
     pub bind_project_authority: ManagementProjectAuthorityHandler,

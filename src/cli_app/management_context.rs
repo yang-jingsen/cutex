@@ -30,6 +30,7 @@ pub(crate) fn management_request_context() -> ManagementRequestContext {
         flush_user_input_queue: flush_management_user_input_queue,
         load_bootstrap_state: load_management_bootstrap_state,
         mutate_session: mutate_management_v2_session,
+        online_session: online_management_v2_session,
         retry_release_rotation: super::rotation::handle_release_rotation_retry,
         request_release_rotation: super::rotation::execute_release_rotation,
         bind_project_authority: super::agent_management::bind_project_authority,
@@ -342,7 +343,7 @@ impl cutex::agent_management::ProjectTaskInspector for ManagementProjectTaskInsp
         let root = cutex::task_delivery::provider_adapter::default_task_service_provider_root()
             .map_err(|_| cutex::agent_management::AgentManagementError::PersistenceUnavailable)?;
         let snapshot = cutex::task_service::TaskServiceProvider::open(root)
-            .and_then(|provider| provider.query())
+            .and_then(|provider| provider.query_live())
             .map_err(|_| cutex::agent_management::AgentManagementError::PersistenceUnavailable)?;
         Ok(snapshot.assignments.values().any(|assignment| {
             assignment.project_id.as_ref() == Some(project_id)
@@ -662,6 +663,157 @@ pub(crate) fn mutate_archive_session(
     params: serde_json::Value,
 ) -> Result<serde_json::Value, cutex::management::v2::user_input::UserInputExecutionError> {
     mutate_management_v2_session(cutex_session_id, method, params)
+}
+
+fn online_management_v2_session(
+    owner: Option<&cutex::management::control_plane::HumanManagementPrincipal>,
+    id: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, cutex::management::v2::user_input::UserInputExecutionError> {
+    use cutex::agent_management::{
+        ExplicitLaunchRequest, StockRuntimeReceipt, StockRuntimeReview, StockRuntimeStage,
+    };
+    let store = load_cutex_session_store().map_err(session_mutation_persistence_error)?;
+    let key = cutex::session::service::cutex_session_key_for_user_id(&store, id)
+        .ok_or_else(|| session_mutation_invalid("cutex session not found"))?;
+    if store.sessions[&key].explicit_launch.is_none() {
+        return mutate_management_v2_session(id, "cutex/runtime/online", params);
+    }
+    let owner = owner.ok_or_else(|| native_online_route_error(&key))?;
+    let _guard = MANAGEMENT_V2_SESSION_MUTATION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| session_mutation_invalid("management v2 session mutation lock poisoned"))?;
+    let current = load_cutex_session_store().map_err(session_mutation_persistence_error)?;
+    let generation = current
+        .sessions
+        .get(&key)
+        .ok_or_else(|| session_mutation_invalid("agent disappeared"))?
+        .runtime_generation;
+    if params
+        .get("expectedRuntimeGeneration")
+        .and_then(serde_json::Value::as_u64)
+        != Some(generation)
+    {
+        return Err(cutex::management::v2::user_input::UserInputExecutionError {
+            stage: "route".into(),
+            code: "revision_conflict".into(),
+            message: "runtime generation changed; reload the session before retrying".into(),
+            retryable: true,
+            outcome_unknown: false,
+            details: serde_json::json!({"currentRuntimeGeneration": generation, "expectedRuntimeGeneration": params.get("expectedRuntimeGeneration"), "resyncRequired": true}),
+        });
+    }
+    let operation = || -> anyhow::Result<StockRuntimeReceipt> {
+        let store = load_cutex_session_store()?;
+        let record = store
+            .sessions
+            .get(&key)
+            .ok_or_else(|| anyhow::anyhow!("agent disappeared"))?;
+        anyhow::ensure!(
+            params
+                .get("expectedRuntimeGeneration")
+                .and_then(serde_json::Value::as_u64)
+                == Some(record.runtime_generation),
+            "runtime generation changed; reload the session before retrying"
+        );
+        anyhow::ensure!(
+            !record.is_retired(),
+            "restore the archived Agent before starting it"
+        );
+        anyhow::ensure!(
+            cutex::runtime::lifecycle::cutex_session_host_is_local(
+                &record.host_id,
+                &cutex::platform::host::current_host_name()
+            ),
+            "manage this runtime on its owning host"
+        );
+        anyhow::ensure!(params.get("launchProfile").is_none(), "native runtime uses its saved profile; use cutex session profile set {key} PROFILE before starting");
+        if let Some(claim) = &record.app_server_launch_claim_id {
+            let action = store
+                .explicit_launch_receipts
+                .values()
+                .find_map(|receipt| match receipt {
+                    cutex::agent_management::ExplicitLaunchActionReceipt::Runtime(receipt)
+                        if receipt.review.subject.cutex_session_id.as_str() == key
+                            && &receipt.claim_id == claim =>
+                    {
+                        Some(receipt.action_id.as_str())
+                    }
+                    _ => None,
+                })
+                .unwrap_or("<original-action-id>");
+            anyhow::bail!("previous start is unresolved; inspect cutex human action {action} and resume that same action, or use cutex human recover {key}");
+        }
+        if let Some(binding) = &record.app_server_runtime {
+            super::stock_lifecycle::verify_stock_process(record, binding)?;
+            super::app_server_runtime::verify_exact_live_runtime_claim(record, binding)?;
+            return super::stock_lifecycle::matching_ready_receipt(record, &store)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "runtime has no matching Ready receipt; use cutex human recover {key}"
+                    )
+                });
+        }
+        let review: StockRuntimeReview = serde_json::from_value(explicit_launch_action(
+            owner,
+            &ExplicitLaunchRequest::ReviewRuntime {
+                cutex_session_id: cutex::role_revision::CutexSessionId::new(key.clone())
+                    .map_err(|_| anyhow::anyhow!("invalid durable Agent ID"))?,
+                restart: false,
+                receiver_canonical_byte_limit: Default::default(),
+                job_mcp: None,
+            },
+        )?)?;
+        let action_id = cutex::agent_management::AgentActionId::new(format!(
+            "api-runtime-{}",
+            uuid::Uuid::new_v4()
+        ))?;
+        serde_json::from_value(explicit_launch_action(
+            owner,
+            &ExplicitLaunchRequest::Run { action_id, review },
+        )?)
+        .map_err(Into::into)
+    };
+    let receipt = operation().map_err(runtime_mutation_error)?;
+    if receipt.stage != StockRuntimeStage::Ready || receipt.error.is_some() {
+        return Err(cutex::management::v2::user_input::UserInputExecutionError {
+            stage: "runtime".into(),
+            code: "runtime_readiness_incomplete".into(),
+            message: format!(
+                "inspect cutex human action {} and resume that same action with --resume",
+                receipt.action_id.as_str()
+            ),
+            retryable: false,
+            outcome_unknown: false,
+            details: serde_json::json!({"actionId": receipt.action_id, "receipt": receipt}),
+        });
+    }
+    let store = load_cutex_session_store().map_err(session_mutation_persistence_error)?;
+    let record = &store.sessions[&key];
+    let mut result = serde_json::json!({"runtimeGeneration": record.runtime_generation, "runtimeAgentId": record.current_runtime_agent_id, "status": "online", "actionId": receipt.action_id, "attachCommand": format!("cutex session takeover {key}")});
+    if params
+        .get("openVisibleTerminal")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+    {
+        result["foregroundRequiredReason"] = serde_json::json!(
+            "native runtime is online; attach from a terminal using attachCommand"
+        );
+    }
+    Ok(result)
+}
+
+fn native_online_route_error(
+    id: &str,
+) -> cutex::management::v2::user_input::UserInputExecutionError {
+    cutex::management::v2::user_input::UserInputExecutionError {
+        stage: "authorization".into(), code: "human_runtime_route_required".into(),
+        message: "repeat cutex/runtime/online using the existing Human Management bearer, or use the Human explicit-launch endpoint".into(),
+        retryable: false, outcome_unknown: false,
+        details: serde_json::json!({"endpoint": "/v2/agent-management/explicit-launch", "operations": ["review_runtime", "run"], "command": format!("cutex human start {id}"), "attachCommand": format!("cutex session takeover {id}")}),
+    }
 }
 
 fn mutate_management_v2_runtime(
@@ -1403,6 +1555,22 @@ pub(crate) fn load_app_server_runtime_status(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_online_without_human_bearer_returns_exact_supported_routes() {
+        let error = super::native_online_route_error("cutex.example");
+        assert_eq!(error.code, "human_runtime_route_required");
+        assert!(!error.retryable);
+        assert!(!error.outcome_unknown);
+        assert_eq!(
+            error.details["endpoint"],
+            "/v2/agent-management/explicit-launch"
+        );
+        assert_eq!(error.details["command"], "cutex human start cutex.example");
+        assert_eq!(
+            error.details["attachCommand"],
+            "cutex session takeover cutex.example"
+        );
+    }
     use super::*;
     use crate::cli_app::test_home::IsolatedTestHome;
     use cutex::agent_bus::model::{AgentBusAgent, AgentBusRegisterRequest};

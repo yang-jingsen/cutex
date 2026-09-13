@@ -31,7 +31,7 @@ pub(super) fn handle(stream: &mut TcpStream, request: &SimpleHttpRequest) -> any
         )?;
         match payload {
             HumanTaskRecoveryRequest::Query { assignee } => {
-                let snapshot = provider.query()?;
+                let snapshot = provider.query_live()?;
                 let assignments = snapshot
                     .assignments
                     .into_values()

@@ -68,6 +68,9 @@ pub(crate) fn record_cutex_session_user_action(
 pub(crate) fn cmd_session_takeover(id: &str) -> anyhow::Result<()> {
     let store = load_cutex_session_store()?;
     if let Some(key) = cutex_session_key_for_user_id(&store, id) {
+        if store.sessions[&key].explicit_launch.is_some() {
+            return super::stock_lifecycle::attach(&key);
+        }
         cutex::agent_management::require_default_launch(&store.sessions[&key])?;
     }
     let trimmed = id.trim();
@@ -219,6 +222,13 @@ pub(crate) fn cmd_session_close_and_restart_with_profile(
     let store = load_cutex_session_store()?;
     let key =
         cutex_session_key_for_user_id(&store, id).ok_or_else(|| anyhow!("unknown session"))?;
+    if store.sessions[&key].explicit_launch.is_some() {
+        validate_managed_launch_overrides(&store.sessions[&key], None, launch_profile)?;
+        let receipt = super::stock_lifecycle::online(&key, true)?;
+        let response = serde_json::to_value(receipt)?;
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        return Ok(response);
+    }
     cutex::agent_management::require_default_launch(&store.sessions[&key])?;
     cmd_session_close_and_wait_with_guard(id, LifecycleResponseOutput::Print, true)
         .context("Failed to close runtime before restart; restart was not attempted")?;
@@ -319,6 +329,16 @@ fn cmd_session_lifecycle_action_with_payload_and_output(
         .sessions
         .get(&key)
         .ok_or_else(|| anyhow!("cutex session disappeared while preparing lifecycle request"))?;
+    if action_type == "session.online" && record.explicit_launch.is_some() {
+        let profile = launch_profile_from_payload(&payload)?;
+        validate_managed_launch_overrides(record, None, profile.as_deref())?;
+        let receipt = super::stock_lifecycle::online(&key, false)?;
+        let response = serde_json::to_value(receipt)?;
+        if output.should_print() {
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
+        return Ok(response);
+    }
     if action_type == "session.online" {
         cutex::agent_management::require_default_launch(record)?;
     }
@@ -439,9 +459,15 @@ fn management_endpoint_for_record(
     let current_host = current_host_name();
     if cutex_session_host_is_local(&record.host_id, &current_host) {
         if let Ok(base_url) = std::env::var("CUTEX_MANAGEMENT_URL") {
-            let url=url::Url::parse(&base_url)?;
-            anyhow::ensure!(url.scheme()=="http" && url.host_str().is_some() && url.username().is_empty() && url.password().is_none(), "CUTEX_MANAGEMENT_URL must be an http endpoint without embedded credentials");
-            return Ok((base_url,token.map(str::to_string)));
+            let url = url::Url::parse(&base_url)?;
+            anyhow::ensure!(
+                url.scheme() == "http"
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none(),
+                "CUTEX_MANAGEMENT_URL must be an http endpoint without embedded credentials"
+            );
+            return Ok((base_url, token.map(str::to_string)));
         }
         if !management_api_healthy(DEFAULT_MANAGEMENT_PORT, token) {
             cutex::management::launch::ensure_management_api_running(
@@ -525,11 +551,26 @@ pub(crate) fn cmd_session_resume_foreground_with_profile(
     cmd_session_resume_foreground_inner(record, cwd_override, launch_profile)
 }
 
+fn validate_managed_launch_overrides(
+    record: &CutexSessionRecord,
+    cwd: Option<&str>,
+    profile: Option<&str>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(profile.is_none(), "one-launch profile overrides are unavailable for managed runtimes; choose the saved profile with cutex session profile set {} <profile>", record.cutex_session_id);
+    anyhow::ensure!(cwd.is_none_or(|cwd| cwd == cutex_session_launch_cwd(record)), "managed runtime cwd belongs to its saved configuration; update it with cutex human config set {} cwd=<path>", record.cutex_session_id);
+    Ok(())
+}
+
 fn cmd_session_resume_foreground_inner(
     record: &CutexSessionRecord,
     cwd_override: Option<&str>,
     launch_profile: Option<&str>,
 ) -> anyhow::Result<()> {
+    if record.explicit_launch.is_some() {
+        validate_managed_launch_overrides(record, cwd_override, launch_profile)?;
+        super::stock_lifecycle::online(&record.cutex_session_id, false)?;
+        return super::stock_lifecycle::attach(&record.cutex_session_id);
+    }
     cutex::agent_management::require_default_launch(record)?;
     if record.is_retired() {
         anyhow::bail!(
@@ -751,6 +792,27 @@ fn host_foreground_app_server_layout(
 mod tests {
     use super::{launch_profile_from_payload, runtime_close_is_complete, LifecycleResponseOutput};
     use serde_json::json;
+
+    #[test]
+    fn managed_foreground_preserves_saved_cwd_and_profile_intent() {
+        let record = cutex::session::model::CutexSessionRecord::new(
+            "cutex.route-test".into(),
+            Some("route-test".into()),
+            "local".into(),
+            "/saved/work".into(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            super::validate_managed_launch_overrides(&record, Some("/saved/work"), None).is_ok()
+        );
+        let error = super::validate_managed_launch_overrides(&record, Some("/other/work"), None)
+            .unwrap_err();
+        assert!(error.to_string().contains("human config set"));
+        let error = super::validate_managed_launch_overrides(&record, None, Some("other-profile"))
+            .unwrap_err();
+        assert!(error.to_string().contains("session profile set"));
+    }
 
     #[test]
     fn owner_stop_cli_uses_root_credential_without_bus_fallback() {

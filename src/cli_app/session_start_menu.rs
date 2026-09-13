@@ -35,7 +35,19 @@ pub(super) fn start_session_menu_choices(
             choices.push(menu_choice(
                 StartSessionMenuAction::StockAttach,
                 None,
-                "attach exact ready stock owner",
+                "attach to running Agent",
+            ));
+        }
+        if record.app_server_runtime.is_none() && record.app_server_launch_claim_id.is_none() {
+            choices.push(menu_choice(
+                StartSessionMenuAction::Foreground,
+                None,
+                "start and attach",
+            ));
+            choices.push(menu_choice(
+                StartSessionMenuAction::Online,
+                None,
+                "start in background",
             ));
         }
         choices.extend([
@@ -231,10 +243,11 @@ mod tests {
     }
 
     #[test]
-    fn stock_menu_never_offers_generic_start_resume_or_repair_routes() {
+    fn managed_native_menu_uses_normal_start_and_existing_owner_attach() {
         let offline = start_session_menu_choices(&stock_record(false), false, false);
-        assert_eq!(offline.len(), 2);
-        assert_eq!(offline[0].action, StartSessionMenuAction::Edit);
+        assert_eq!(offline.len(), 4);
+        assert_eq!(offline[0].action, StartSessionMenuAction::Foreground);
+        assert_eq!(offline[1].action, StartSessionMenuAction::Online);
 
         let online = start_session_menu_choices(&stock_record(true), false, false);
         assert_eq!(online[0].action, StartSessionMenuAction::StockAttach);

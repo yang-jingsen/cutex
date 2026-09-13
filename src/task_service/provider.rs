@@ -9,10 +9,10 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, TryLockError};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use chrono::SecondsFormat;
 use fs2::FileExt;
@@ -31,8 +31,7 @@ pub const TASK_SERVICE_WORKER_CONTEXT_SCHEMA: &str = "cutex/task-service-worker-
 pub const TASK_SERVICE_WORKER_PREPARE_SCHEMA: &str = "cutex/task-service-worker-prepare/v2";
 pub const TASK_SERVICE_PROVIDER_RECEIPT_SCHEMA: &str = "cutex/task-service-receipt/v2";
 pub const TASK_SERVICE_PROVIDER_CONTRACT_JSON: &str = include_str!("task-service-provider-v2.json");
-const STORE_FILE: &str = "task-service-provider-v2.json";
-const JOURNAL_FILE: &str = "task-service-provider-v2.events.jsonl";
+mod storage;
 const LOCK_FILE: &str = "task-service-provider-v2.lock";
 const ZERO_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const MAX_CONTRACT_BYTES: usize = 1024 * 1024;
@@ -43,7 +42,6 @@ const MAX_WATCH_LIMIT: usize = 1000;
 const MAX_PREPARED_WORKER_ACTIONS: usize = 4096;
 const MAX_QUERY_DURATION: Duration = Duration::from_secs(2);
 const QUERY_LOCK_RETRY: Duration = Duration::from_millis(5);
-const QUERY_READ_CHUNK_BYTES: usize = 64 * 1024;
 
 macro_rules! provider_id {
     ($name:ident, $invalid:literal) => {
@@ -1131,36 +1129,6 @@ impl TaskServiceSnapshot {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct PersistedJournalRecord {
-    schema: ProviderStoreSchema,
-    sequence: u64,
-    previous_event_sha256: Sha256,
-    event_sha256: Sha256,
-    operation: String,
-    occurred_at: Rfc3339,
-    resulting_state: TaskServiceSnapshot,
-    /// Recovery-only evidence of the exact historical hash shape. This field
-    /// is never part of the persisted journal record itself.
-    #[serde(skip)]
-    completion_notifications_was_present: bool,
-}
-
-#[derive(Debug)]
-struct JournalTail {
-    complete_record: Option<Vec<u8>>,
-    complete_len: u64,
-    file_len: u64,
-    modified: Option<SystemTime>,
-}
-
-#[derive(Debug)]
-struct SnapshotImage {
-    bytes: Vec<u8>,
-    modified: Option<SystemTime>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct WatchEvent {
     pub sequence: u64,
     pub event_sha256: Sha256,
@@ -1212,26 +1180,40 @@ impl TaskServiceProvider {
     }
 
     pub fn recover(&self) -> Result<TaskServiceSnapshot, ProviderError> {
-        let _process = self
-            .process_lock
-            .lock()
-            .map_err(|_| ProviderError::PersistenceUnavailable)?;
-        self.with_store_lock(true, |lock| recover_locked(&self.root, lock))
+        self.query()
     }
 
-    /// Restore normal service from the validated current checkpoint. Full-chain
-    /// auditing remains available through `recover`; missing or stale checkpoints
-    /// retain the complete recovery fallback.
+    /// Restore current state without expanding historical idempotency results.
     pub fn initialize(&self) -> Result<TaskServiceSnapshot, ProviderError> {
-        let _process = self
-            .process_lock
-            .lock()
-            .map_err(|_| ProviderError::PersistenceUnavailable)?;
-        self.with_store_lock(true, |lock| recover_checkpoint_locked(&self.root, lock))
+        self.with_query_store(&mut || false, |store, deadline, cancelled| {
+            store.initialize()?;
+            store.load_live_cancellable(deadline, cancelled)
+        })
     }
 
+    /// Compatibility snapshot, including exact historical action receipts.
     pub fn query(&self) -> Result<TaskServiceSnapshot, ProviderError> {
         self.query_cancellable(|| false)
+    }
+
+    /// Normal application reads need current tasks, not all historical results.
+    pub fn query_live(&self) -> Result<TaskServiceSnapshot, ProviderError> {
+        self.with_query_store(&mut || false, |store, deadline, cancelled| {
+            store.load_live_cancellable(deadline, cancelled)
+        })
+    }
+
+    pub fn query_live_cancellable(
+        &self,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<TaskServiceSnapshot, ProviderError> {
+        self.with_query_store(&mut cancelled, |store, deadline, cancelled| {
+            store.load_live_cancellable(deadline, cancelled)
+        })
+    }
+
+    pub fn receipt(&self, action_id: &ActionId) -> Result<Option<ProviderReceipt>, ProviderError> {
+        self.with_query_store(&mut || false, |store, _, _| store.receipt(action_id))
     }
 
     /// Application lifecycle guard. No Task protocol/state change; serializes
@@ -1246,10 +1228,10 @@ impl TaskServiceProvider {
             .process_lock
             .lock()
             .map_err(|_| ProviderError::PersistenceUnavailable)?;
-        self.with_store_lock(true, |lock| {
+        self.with_store_lock(true, |_lock| {
             #[cfg(feature = "stock-launch-test-hook")]
             crate::app_server::private_restart_phase("task.archive_fence.acquired");
-            let state = recover_checkpoint_locked(&self.root, lock)?;
+            let state = storage::Store::open(&self.root)?.load_live()?;
             let result = operation(&state);
             #[cfg(feature = "stock-launch-test-hook")]
             crate::app_server::private_restart_phase("task.archive_fence.operation.end");
@@ -1257,38 +1239,15 @@ impl TaskServiceProvider {
         })
     }
 
-    /// Captures the atomic snapshot and authenticated journal tail under a
-    /// bounded lock, then releases every provider lock before parsing and
-    /// validation. Old or interrupted stores fall back to a bounded full-chain
-    /// copy. The cancellation probe is intended for HTTP disconnect/timeout
-    /// checks and never changes provider state.
+    /// The database transaction gives a consistent read; cancellation and the
+    /// deadline are checked while decoding rows, without copying event history.
     pub fn query_cancellable(
         &self,
         mut cancelled: impl FnMut() -> bool,
     ) -> Result<TaskServiceSnapshot, ProviderError> {
-        let deadline = Instant::now() + MAX_QUERY_DURATION;
-        let (snapshot, tail) = self.capture_checkpoint_for_query(deadline, &mut cancelled)?;
-        if let Some(snapshot) = snapshot {
-            if query_stopped(deadline, &mut cancelled) {
-                return Err(ProviderError::PersistenceUnavailable);
-            }
-            if let Ok(state) = serde_json::from_slice::<TaskServiceSnapshot>(&snapshot.bytes) {
-                if let Ok(state) = recover_checkpoint(state, snapshot.modified, &tail) {
-                    if query_stopped(deadline, &mut cancelled) {
-                        return Err(ProviderError::PersistenceUnavailable);
-                    }
-                    return Ok(state);
-                }
-            }
-        }
-
-        // Missing, stale, or inconsistent checkpoints remain compatible with
-        // pre-checkpoint and crash-interrupted stores. The fallback copies a
-        // consistent journal image and validates the complete chain without
-        // holding either provider lock.
-        let journal = self.capture_journal_for_query(deadline, &mut cancelled)?;
-        let records = read_journal_bytes(&journal, deadline, &mut cancelled)?;
-        recover_records(records, deadline, &mut cancelled)
+        self.with_query_store(&mut cancelled, |store, deadline, cancelled| {
+            store.load_full_cancellable(deadline, cancelled)
+        })
     }
 
     pub fn query_assignee(
@@ -1296,7 +1255,7 @@ impl TaskServiceProvider {
         principal: &AuthenticatedPrincipal,
     ) -> Result<AssigneeTaskServiceSnapshot, ProviderError> {
         let session = principal.session_id()?;
-        let state = self.query()?;
+        let state = self.query_live()?;
         let mut assignments = BTreeMap::new();
         let mut attempts = BTreeMap::new();
         for (assignment_id, assignment) in &state.assignments {
@@ -1353,23 +1312,8 @@ impl TaskServiceProvider {
                 "invalid_watch_cursor_or_limit",
             ));
         }
-        let _process = self
-            .process_lock
-            .lock()
-            .map_err(|_| ProviderError::PersistenceUnavailable)?;
-        self.with_store_lock(false, |_lock| {
-            let (records, _) = read_journal(&self.root)?;
-            Ok(records
-                .into_iter()
-                .filter(|record| record.sequence > after_sequence)
-                .take(limit)
-                .map(|record| WatchEvent {
-                    sequence: record.sequence,
-                    event_sha256: record.event_sha256,
-                    operation: record.operation,
-                    occurred_at: record.occurred_at,
-                })
-                .collect())
+        self.with_query_store(&mut || false, |store, _, _| {
+            store.watch(after_sequence, limit)
         })
     }
 
@@ -2007,7 +1951,7 @@ impl TaskServiceProvider {
         request: &WorkerContextRequest,
     ) -> Result<WorkerContext, ProviderError> {
         let session = principal.session_id()?;
-        let state = self.query()?;
+        let state = self.query_live()?;
         let assignment = assignment(&state, &request.assignment_id)?;
         if &assignment.assignee_cutex_session != session {
             return Err(ProviderError::Unauthorized);
@@ -2032,9 +1976,11 @@ impl TaskServiceProvider {
             .process_lock
             .lock()
             .map_err(|_| ProviderError::PersistenceUnavailable)?;
-        self.with_store_lock(true, |lock| {
-            let mut state = recover_checkpoint_locked(&self.root, lock)?;
-            if let Some(receipt) = state.receipts.get(&action_id) {
+        self.with_store_lock(true, |_lock| {
+            let store = storage::Store::open(&self.root)?;
+            let before = store.load_live()?;
+            let mut state = before.clone();
+            if let Some(receipt) = store.receipt(&action_id)? {
                 let digest = worker_request_digest(
                     request.action.operation(),
                     principal,
@@ -2084,7 +2030,7 @@ impl TaskServiceProvider {
                     .get_mut(&action_id)
                     .ok_or(ProviderError::InvalidStore)?;
                 current.context = envelope.context.clone();
-                append_and_snapshot(&self.root, state, "refresh_worker_action", now())?;
+                store.commit(&before, &mut state, "refresh_worker_action", now())?;
                 return Ok(WorkerPrepareOutcome::Prepared(envelope));
             }
 
@@ -2117,7 +2063,7 @@ impl TaskServiceProvider {
                     prepared_at: prepared_at.clone(),
                 },
             );
-            append_and_snapshot(&self.root, state, "prepare_worker_action", prepared_at)?;
+            store.commit(&before, &mut state, "prepare_worker_action", prepared_at)?;
             Ok(WorkerPrepareOutcome::Prepared(envelope))
         })
     }
@@ -2796,9 +2742,11 @@ impl TaskServiceProvider {
             .process_lock
             .lock()
             .map_err(|_| ProviderError::PersistenceUnavailable)?;
-        self.with_store_lock(true, |lock| {
-            let mut state = recover_checkpoint_locked(&self.root, lock)?;
-            if let Some(receipt) = state.receipts.get(action_id) {
+        self.with_store_lock(true, |_lock| {
+            let store = storage::Store::open(&self.root)?;
+            let before = store.load_live()?;
+            let mut state = before.clone();
+            if let Some(receipt) = store.receipt(action_id)? {
                 return if receipt.request_sha256 == request_sha256 {
                     Ok(receipt.clone())
                 } else {
@@ -2825,7 +2773,7 @@ impl TaskServiceProvider {
                 result,
             };
             state.receipts.insert(action_id.clone(), receipt.clone());
-            append_and_snapshot(&self.root, state, operation, now)?;
+            store.commit(&before, &mut state, operation, now)?;
             Ok(receipt)
         })
     }
@@ -2850,11 +2798,16 @@ impl TaskServiceProvider {
         operation(&lock)
     }
 
-    fn capture_journal_for_query(
+    fn with_query_store<T>(
         &self,
-        deadline: Instant,
         cancelled: &mut dyn FnMut() -> bool,
-    ) -> Result<Vec<u8>, ProviderError> {
+        operation: impl FnOnce(
+            &mut storage::Store,
+            Instant,
+            &mut dyn FnMut() -> bool,
+        ) -> Result<T, ProviderError>,
+    ) -> Result<T, ProviderError> {
+        let deadline = Instant::now() + MAX_QUERY_DURATION;
         let _process = loop {
             if query_stopped(deadline, cancelled) {
                 return Err(ProviderError::PersistenceUnavailable);
@@ -2867,11 +2820,10 @@ impl TaskServiceProvider {
                 }
             }
         };
-        let path = self.root.join(LOCK_FILE);
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true);
         set_private_open_options(&mut options);
-        let lock = options.open(path)?;
+        let lock = options.open(self.root.join(LOCK_FILE))?;
         loop {
             if query_stopped(deadline, cancelled) {
                 return Err(ProviderError::PersistenceUnavailable);
@@ -2882,64 +2834,8 @@ impl TaskServiceProvider {
                 Err(error) => return Err(error.into()),
             }
         }
-        let mut journal = match File::open(self.root.join(JOURNAL_FILE)) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error.into()),
-        };
-        let mut bytes = Vec::new();
-        let mut chunk = [0_u8; QUERY_READ_CHUNK_BYTES];
-        loop {
-            if query_stopped(deadline, cancelled) {
-                return Err(ProviderError::PersistenceUnavailable);
-            }
-            let read = journal.read(&mut chunk)?;
-            if read == 0 {
-                break;
-            }
-            bytes.extend_from_slice(&chunk[..read]);
-        }
-        Ok(bytes)
-    }
-
-    fn capture_checkpoint_for_query(
-        &self,
-        deadline: Instant,
-        cancelled: &mut dyn FnMut() -> bool,
-    ) -> Result<(Option<SnapshotImage>, JournalTail), ProviderError> {
-        let _process = loop {
-            if query_stopped(deadline, cancelled) {
-                return Err(ProviderError::PersistenceUnavailable);
-            }
-            match self.process_lock.try_lock() {
-                Ok(guard) => break guard,
-                Err(TryLockError::WouldBlock) => std::thread::sleep(QUERY_LOCK_RETRY),
-                Err(TryLockError::Poisoned(_)) => {
-                    return Err(ProviderError::PersistenceUnavailable)
-                }
-            }
-        };
-        let path = self.root.join(LOCK_FILE);
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
-        set_private_open_options(&mut options);
-        let lock = options.open(path)?;
-        loop {
-            if query_stopped(deadline, cancelled) {
-                return Err(ProviderError::PersistenceUnavailable);
-            }
-            match lock.try_lock_exclusive() {
-                Ok(()) => break,
-                Err(error) if lock_is_contended(&error) => std::thread::sleep(QUERY_LOCK_RETRY),
-                Err(error) => return Err(error.into()),
-            }
-        }
-
-        let snapshot =
-            read_optional_file_bounded(&self.root.join(STORE_FILE), deadline, cancelled)?;
-        let mut stopped = || query_stopped(deadline, cancelled);
-        let tail = read_journal_tail(&self.root, &mut stopped)?;
-        Ok((snapshot, tail))
+        let mut store = storage::Store::open(&self.root)?;
+        operation(&mut store, deadline, cancelled)
     }
 }
 
@@ -3861,563 +3757,12 @@ fn hex_sha256(bytes: &[u8]) -> Sha256 {
     Sha256::new(encoded).expect("sha256")
 }
 
-#[derive(Serialize)]
-struct JournalHashMaterial<'a> {
-    schema: ProviderStoreSchema,
-    sequence: u64,
-    previous_event_sha256: &'a Sha256,
-    operation: &'a str,
-    occurred_at: &'a Rfc3339,
-    resulting_state: &'a TaskServiceSnapshot,
-}
-
-/// Exact TaskServiceSnapshot serialization used before the completion outbox
-/// field existed. Historical event hashes commit to this field set and order.
-#[derive(Serialize)]
-struct LegacyTaskServiceSnapshotHashMaterial<'a> {
-    schema: ProviderStoreSchema,
-    journal_sequence: u64,
-    journal_sha256: &'a Sha256,
-    task_revisions: &'a BTreeMap<TaskId, BTreeMap<TaskRevision, TaskRevisionRecord>>,
-    assignments: &'a BTreeMap<AssignmentId, Assignment>,
-    attempts: &'a BTreeMap<AssignmentId, BTreeMap<AttemptNumber, Attempt>>,
-    send_attempts: &'a BTreeMap<SendAttemptId, SendAttempt>,
-    workflows: &'a BTreeMap<WorkflowId, Workflow>,
-    receipts: &'a BTreeMap<ActionId, ProviderReceipt>,
-    prepared_worker_actions: &'a BTreeMap<ActionId, PreparedWorkerAction>,
-}
-
-impl<'a> From<&'a TaskServiceSnapshot> for LegacyTaskServiceSnapshotHashMaterial<'a> {
-    fn from(state: &'a TaskServiceSnapshot) -> Self {
-        Self {
-            schema: state.schema,
-            journal_sequence: state.journal_sequence,
-            journal_sha256: &state.journal_sha256,
-            task_revisions: &state.task_revisions,
-            assignments: &state.assignments,
-            attempts: &state.attempts,
-            send_attempts: &state.send_attempts,
-            workflows: &state.workflows,
-            receipts: &state.receipts,
-            prepared_worker_actions: &state.prepared_worker_actions,
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct LegacyJournalHashMaterial<'a> {
-    schema: ProviderStoreSchema,
-    sequence: u64,
-    previous_event_sha256: &'a Sha256,
-    operation: &'a str,
-    occurred_at: &'a Rfc3339,
-    resulting_state: LegacyTaskServiceSnapshotHashMaterial<'a>,
-}
-
-fn journal_hash(
-    sequence: u64,
-    previous_event_sha256: &Sha256,
-    operation: &str,
-    occurred_at: &Rfc3339,
-    resulting_state: &TaskServiceSnapshot,
-) -> Result<Sha256, ProviderError> {
-    let bytes = serde_json::to_vec(&JournalHashMaterial {
-        schema: resulting_state.schema,
-        sequence,
-        previous_event_sha256,
-        operation,
-        occurred_at,
-        resulting_state,
-    })
-    .map_err(|_| ProviderError::InvalidStore)?;
-    Ok(hex_sha256(&bytes))
-}
-
-fn legacy_journal_hash(
-    sequence: u64,
-    previous_event_sha256: &Sha256,
-    operation: &str,
-    occurred_at: &Rfc3339,
-    resulting_state: &TaskServiceSnapshot,
-) -> Result<Sha256, ProviderError> {
-    if !resulting_state.completion_notifications.is_empty() {
-        return Err(ProviderError::InvalidStore);
-    }
-    let bytes = serde_json::to_vec(&LegacyJournalHashMaterial {
-        schema: ProviderStoreSchema::V2,
-        sequence,
-        previous_event_sha256,
-        operation,
-        occurred_at,
-        resulting_state: resulting_state.into(),
-    })
-    .map_err(|_| ProviderError::InvalidStore)?;
-    Ok(hex_sha256(&bytes))
-}
-
-fn append_and_snapshot(
-    root: &Path,
-    mut state: TaskServiceSnapshot,
-    operation: &str,
-    occurred_at: Rfc3339,
-) -> Result<(), ProviderError> {
-    validate_state(&state)?;
-    let sequence = state
-        .journal_sequence
-        .checked_add(1)
-        .ok_or(ProviderError::InvalidStore)?;
-    let previous = state.journal_sha256.clone();
-    state.journal_sequence = sequence;
-    let event_sha256 = journal_hash(sequence, &previous, operation, &occurred_at, &state)?;
-    let record = PersistedJournalRecord {
-        schema: state.schema,
-        sequence,
-        previous_event_sha256: previous,
-        event_sha256: event_sha256.clone(),
-        operation: operation.to_string(),
-        occurred_at,
-        resulting_state: state.clone(),
-        completion_notifications_was_present: true,
-    };
-    let mut line = serde_json::to_vec(&record).map_err(|_| ProviderError::InvalidStore)?;
-    line.push(b'\n');
-    let mut options = OpenOptions::new();
-    options.create(true).append(true).write(true);
-    set_private_open_options(&mut options);
-    let mut journal = options.open(root.join(JOURNAL_FILE))?;
-    journal.write_all(&line)?;
-    journal.sync_all()?;
-    state.journal_sha256 = event_sha256;
-    atomic_snapshot(root, &state)
-}
-
-/// Recovers the authenticated current-state checkpoint used by normal
-/// mutations. A missing, stale, partially written, or inconsistent checkpoint
-/// falls back to the original complete journal recovery, which also repairs
-/// the snapshot and any incomplete journal tail.
-fn recover_checkpoint_locked(
-    root: &Path,
-    lock: &File,
-) -> Result<TaskServiceSnapshot, ProviderError> {
-    let snapshot = match load_snapshot_image(root) {
-        Ok(snapshot) => snapshot,
-        Err(ProviderError::InvalidStore) => None,
-        Err(error) => return Err(error),
-    };
-    if let Some(snapshot) = snapshot {
-        let mut never_stopped = || false;
-        let tail = read_journal_tail(root, &mut never_stopped)?;
-        if let Ok(state) = serde_json::from_slice::<TaskServiceSnapshot>(&snapshot.bytes) {
-            if let Ok(state) = recover_checkpoint(state, snapshot.modified, &tail) {
-                return Ok(state);
-            }
-        }
-    }
-    recover_locked(root, lock)
-}
-
-/// Verifies that an atomic snapshot is exactly the state authenticated by the
-/// journal's latest complete record. This deliberately authenticates only the
-/// current checkpoint; [`recover_locked`] remains the full-chain audit and
-/// compatibility recovery boundary.
-fn recover_checkpoint(
-    snapshot: TaskServiceSnapshot,
-    snapshot_modified: Option<SystemTime>,
-    tail: &JournalTail,
-) -> Result<TaskServiceSnapshot, ProviderError> {
-    validate_state(&snapshot)?;
-    if tail.file_len != tail.complete_len {
-        return Err(ProviderError::InvalidStore);
-    }
-    if snapshot.journal_sequence == 0 {
-        return if tail.complete_record.is_none() && tail.file_len == 0 {
-            Ok(snapshot)
-        } else {
-            Err(ProviderError::InvalidStore)
-        };
-    }
-    if !matches!(
-        (tail.modified, snapshot_modified),
-        (Some(journal), Some(snapshot)) if journal <= snapshot
-    ) {
-        return Err(ProviderError::InvalidStore);
-    }
-
-    let line = tail
-        .complete_record
-        .as_deref()
-        .ok_or(ProviderError::InvalidStore)?;
-    let record = parse_journal_record(line)?;
-    let recovered_hash = if record.completion_notifications_was_present {
-        journal_hash(
-            record.sequence,
-            &record.previous_event_sha256,
-            &record.operation,
-            &record.occurred_at,
-            &record.resulting_state,
-        )?
-    } else {
-        legacy_journal_hash(
-            record.sequence,
-            &record.previous_event_sha256,
-            &record.operation,
-            &record.occurred_at,
-            &record.resulting_state,
-        )?
-    };
-    if record.schema != snapshot.schema
-        || record.schema != record.resulting_state.schema
-        || record.sequence != snapshot.journal_sequence
-        || record.resulting_state.journal_sequence != record.sequence
-        || record.resulting_state.journal_sha256 != record.previous_event_sha256
-        || record.event_sha256 != snapshot.journal_sha256
-        || recovered_hash != record.event_sha256
-    {
-        return Err(ProviderError::InvalidStore);
-    }
-    let mut resulting_state = record.resulting_state;
-    resulting_state.journal_sha256 = record.event_sha256;
-    if resulting_state != snapshot {
-        return Err(ProviderError::InvalidStore);
-    }
-    Ok(snapshot)
-}
-
-fn recover_locked(root: &Path, _lock: &File) -> Result<TaskServiceSnapshot, ProviderError> {
-    let (records, complete_len) = read_journal(root)?;
-    let mut state = TaskServiceSnapshot::empty();
-    let mut previous = Sha256::new(ZERO_SHA256).expect("zero hash");
-    let mut expected_sequence = 1u64;
-    for record in records {
-        let recovered_hash = if record.completion_notifications_was_present {
-            journal_hash(
-                record.sequence,
-                &record.previous_event_sha256,
-                &record.operation,
-                &record.occurred_at,
-                &record.resulting_state,
-            )?
-        } else {
-            legacy_journal_hash(
-                record.sequence,
-                &record.previous_event_sha256,
-                &record.operation,
-                &record.occurred_at,
-                &record.resulting_state,
-            )?
-        };
-        if record.schema != record.resulting_state.schema
-            || record.sequence != expected_sequence
-            || record.previous_event_sha256 != previous
-            || record.resulting_state.journal_sequence != record.sequence
-            || record.resulting_state.journal_sha256 != record.previous_event_sha256
-            || recovered_hash != record.event_sha256
-        {
-            return Err(ProviderError::InvalidStore);
-        }
-        state = record.resulting_state;
-        state.journal_sha256 = record.event_sha256.clone();
-        previous = record.event_sha256;
-        expected_sequence = expected_sequence
-            .checked_add(1)
-            .ok_or(ProviderError::InvalidStore)?;
-    }
-    validate_state(&state)?;
-    truncate_partial_tail(root, complete_len)?;
-    let snapshot = load_snapshot(root)?;
-    if snapshot.as_ref() != Some(&state) {
-        atomic_snapshot(root, &state)?;
-    }
-    Ok(state)
-}
-
 fn query_stopped(deadline: Instant, cancelled: &mut dyn FnMut() -> bool) -> bool {
     Instant::now() >= deadline || cancelled()
 }
 
 fn lock_is_contended(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::WouldBlock
-        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
-}
-
-fn parse_journal_record(line: &[u8]) -> Result<PersistedJournalRecord, ProviderError> {
-    let mut record = serde_json::from_slice::<PersistedJournalRecord>(line)
-        .map_err(|_| ProviderError::InvalidStore)?;
-    let encoded = serde_json::from_slice::<serde_json::Value>(line)
-        .map_err(|_| ProviderError::InvalidStore)?;
-    record.completion_notifications_was_present = encoded
-        .get("resulting_state")
-        .and_then(serde_json::Value::as_object)
-        .is_some_and(|state| state.contains_key("completion_notifications"));
-    Ok(record)
-}
-
-fn read_optional_file_bounded(
-    path: &Path,
-    deadline: Instant,
-    cancelled: &mut dyn FnMut() -> bool,
-) -> Result<Option<SnapshotImage>, ProviderError> {
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let mut bytes = Vec::new();
-    let mut chunk = [0_u8; QUERY_READ_CHUNK_BYTES];
-    loop {
-        if query_stopped(deadline, cancelled) {
-            return Err(ProviderError::PersistenceUnavailable);
-        }
-        let read = file.read(&mut chunk)?;
-        if read == 0 {
-            return Ok(Some(SnapshotImage {
-                bytes,
-                modified: file.metadata()?.modified().ok(),
-            }));
-        }
-        bytes.extend_from_slice(&chunk[..read]);
-    }
-}
-
-/// Reads only the last complete JSONL record. The returned lengths preserve
-/// evidence of a crash-interrupted partial tail so callers cannot silently use
-/// or append after it.
-fn read_journal_tail(
-    root: &Path,
-    stopped: &mut dyn FnMut() -> bool,
-) -> Result<JournalTail, ProviderError> {
-    let mut file = match File::open(root.join(JOURNAL_FILE)) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(JournalTail {
-                complete_record: None,
-                complete_len: 0,
-                file_len: 0,
-                modified: None,
-            })
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let file_len = file.seek(SeekFrom::End(0))?;
-    if file_len == 0 {
-        return Ok(JournalTail {
-            complete_record: None,
-            complete_len: 0,
-            file_len: 0,
-            modified: file.metadata()?.modified().ok(),
-        });
-    }
-
-    let mut cursor = file_len;
-    let mut chunks = Vec::new();
-    let mut newline_count = 0_usize;
-    while cursor > 0 && newline_count < 2 {
-        if stopped() {
-            return Err(ProviderError::PersistenceUnavailable);
-        }
-        let read_len = usize::try_from(cursor.min(QUERY_READ_CHUNK_BYTES as u64))
-            .map_err(|_| ProviderError::InvalidStore)?;
-        cursor -= read_len as u64;
-        file.seek(SeekFrom::Start(cursor))?;
-        let mut chunk = vec![0_u8; read_len];
-        file.read_exact(&mut chunk)?;
-        newline_count += chunk.iter().filter(|byte| **byte == b'\n').count();
-        chunks.push(chunk);
-    }
-    chunks.reverse();
-    let mut bytes = Vec::new();
-    for chunk in chunks {
-        bytes.extend_from_slice(&chunk);
-    }
-    let Some(last_newline) = bytes.iter().rposition(|byte| *byte == b'\n') else {
-        return Ok(JournalTail {
-            complete_record: None,
-            complete_len: 0,
-            file_len,
-            modified: file.metadata()?.modified().ok(),
-        });
-    };
-    let complete_len = cursor
-        .checked_add(last_newline as u64)
-        .and_then(|value| value.checked_add(1))
-        .ok_or(ProviderError::InvalidStore)?;
-    let start = bytes[..last_newline]
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |position| position + 1);
-    Ok(JournalTail {
-        complete_record: Some(bytes[start..=last_newline].to_vec()),
-        complete_len,
-        file_len,
-        modified: file.metadata()?.modified().ok(),
-    })
-}
-
-fn read_journal_bytes(
-    bytes: &[u8],
-    deadline: Instant,
-    cancelled: &mut dyn FnMut() -> bool,
-) -> Result<Vec<PersistedJournalRecord>, ProviderError> {
-    let mut records = Vec::new();
-    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
-        if query_stopped(deadline, cancelled) {
-            return Err(ProviderError::PersistenceUnavailable);
-        }
-        if !line.ends_with(b"\n") {
-            break;
-        }
-        records.push(parse_journal_record(line)?);
-    }
-    Ok(records)
-}
-
-fn recover_records(
-    records: Vec<PersistedJournalRecord>,
-    deadline: Instant,
-    cancelled: &mut dyn FnMut() -> bool,
-) -> Result<TaskServiceSnapshot, ProviderError> {
-    let mut state = TaskServiceSnapshot::empty();
-    let mut previous = Sha256::new(ZERO_SHA256).expect("zero hash");
-    let mut expected_sequence = 1_u64;
-    for record in records {
-        if query_stopped(deadline, cancelled) {
-            return Err(ProviderError::PersistenceUnavailable);
-        }
-        let recovered_hash = if record.completion_notifications_was_present {
-            journal_hash(
-                record.sequence,
-                &record.previous_event_sha256,
-                &record.operation,
-                &record.occurred_at,
-                &record.resulting_state,
-            )?
-        } else {
-            legacy_journal_hash(
-                record.sequence,
-                &record.previous_event_sha256,
-                &record.operation,
-                &record.occurred_at,
-                &record.resulting_state,
-            )?
-        };
-        if record.schema != record.resulting_state.schema
-            || record.sequence != expected_sequence
-            || record.previous_event_sha256 != previous
-            || record.resulting_state.journal_sequence != record.sequence
-            || record.resulting_state.journal_sha256 != record.previous_event_sha256
-            || recovered_hash != record.event_sha256
-        {
-            return Err(ProviderError::InvalidStore);
-        }
-        state = record.resulting_state;
-        state.journal_sha256 = record.event_sha256.clone();
-        previous = record.event_sha256;
-        expected_sequence = expected_sequence
-            .checked_add(1)
-            .ok_or(ProviderError::InvalidStore)?;
-    }
-    validate_state(&state)?;
-    Ok(state)
-}
-
-fn read_journal(root: &Path) -> Result<(Vec<PersistedJournalRecord>, u64), ProviderError> {
-    let path = root.join(JOURNAL_FILE);
-    let file = match File::open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
-        Err(error) => return Err(error.into()),
-    };
-    let mut reader = BufReader::new(file);
-    let mut records = Vec::new();
-    let mut complete_len = 0u64;
-    loop {
-        let mut line = Vec::new();
-        let count = reader.read_until(b'\n', &mut line)?;
-        if count == 0 {
-            break;
-        }
-        if !line.ends_with(b"\n") {
-            break;
-        }
-        // Parse the strict typed record first so duplicate or unknown fields
-        // remain fail-closed; Value is used only to retain one field-presence
-        // bit that serde(default) necessarily erases.
-        let record = parse_journal_record(&line)?;
-        complete_len = complete_len
-            .checked_add(count as u64)
-            .ok_or(ProviderError::InvalidStore)?;
-        records.push(record);
-    }
-    Ok((records, complete_len))
-}
-
-fn truncate_partial_tail(root: &Path, complete_len: u64) -> Result<(), ProviderError> {
-    let path = root.join(JOURNAL_FILE);
-    let mut options = OpenOptions::new();
-    options.read(true).write(true);
-    set_private_open_options(&mut options);
-    let mut file = match options.open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    if file.seek(SeekFrom::End(0))? > complete_len {
-        file.set_len(complete_len)?;
-        file.sync_all()?;
-    }
-    Ok(())
-}
-
-fn load_snapshot(root: &Path) -> Result<Option<TaskServiceSnapshot>, ProviderError> {
-    let Some(image) = load_snapshot_image(root)? else {
-        return Ok(None);
-    };
-    let snapshot = serde_json::from_slice(&image.bytes).map_err(|_| ProviderError::InvalidStore)?;
-    Ok(Some(snapshot))
-}
-
-fn load_snapshot_image(root: &Path) -> Result<Option<SnapshotImage>, ProviderError> {
-    let mut bytes = Vec::new();
-    let mut file = match File::open(root.join(STORE_FILE)) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    file.read_to_end(&mut bytes)?;
-    Ok(Some(SnapshotImage {
-        bytes,
-        modified: file.metadata()?.modified().ok(),
-    }))
-}
-
-fn atomic_snapshot(root: &Path, state: &TaskServiceSnapshot) -> Result<(), ProviderError> {
-    let temp = root.join(format!(".{STORE_FILE}.{}.tmp", Uuid::new_v4()));
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
-    set_private_open_options(&mut options);
-    let mut file = options.open(&temp)?;
-    let bytes = serde_json::to_vec(state).map_err(|_| ProviderError::InvalidStore)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    #[cfg(unix)]
-    {
-        fs::rename(&temp, root.join(STORE_FILE))?;
-        File::open(root)?.sync_all()?;
-    }
-    #[cfg(windows)]
-    {
-        let (directory, identity) = crate::platform::private_fs::open_validated_directory(root)
-            .map_err(|error| ProviderError::Io(error.io_kind()))?;
-        let source = temp
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or(ProviderError::InvalidStore)?;
-        crate::platform::private_fs::replace_child(root, identity, source, STORE_FILE)
-            .map_err(|error| ProviderError::Io(error.io_kind()))?;
-        crate::platform::private_fs::sync_directory(&directory)
-            .map_err(|error| ProviderError::Io(error.io_kind()))?;
-    }
-    Ok(())
 }
 
 fn validate_state(state: &TaskServiceSnapshot) -> Result<(), ProviderError> {
@@ -5143,231 +4488,82 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_query_reads_only_authenticated_tail_and_mutation_stays_bounded() {
-        let fixture = Fixture::new("checkpoint-bounded");
+    fn transactional_store_reopens_exact_results_and_pages_events() {
+        let fixture = Fixture::new("transactional-reopen");
         fixture.provision();
-        let mut state = fixture.provider.query().unwrap();
-        let task = state
-            .task_revisions
-            .get_mut(&TaskId::new("CUTEX-test").unwrap())
-            .unwrap()
-            .get_mut(&TaskRevision::new(1).unwrap())
-            .unwrap();
-        task.opaque_contract = "x".repeat(64 * 1024);
-        task.contract_sha256 = hex_sha256(task.opaque_contract.as_bytes());
-        append_and_snapshot(&fixture.provider.root, state, "checkpoint_seed", now()).unwrap();
-        for _ in 0..40 {
-            let state = load_snapshot(&fixture.provider.root).unwrap().unwrap();
-            append_and_snapshot(&fixture.provider.root, state, "checkpoint_growth", now()).unwrap();
-        }
-
-        let journal_len = fs::metadata(fixture.provider.root.join(JOURNAL_FILE))
-            .unwrap()
-            .len();
-        let deadline = Instant::now() + MAX_QUERY_DURATION;
-        let (snapshot, tail) = fixture
-            .provider
-            .capture_checkpoint_for_query(deadline, &mut || false)
-            .unwrap();
-        assert!(snapshot.is_some());
-        let tail_len = tail.complete_record.as_ref().unwrap().len() as u64;
-        assert!(journal_len > tail_len * 20, "{journal_len} <= {tail_len}");
-
-        let startup_started = Instant::now();
-        assert_eq!(
-            fixture.provider.initialize().unwrap(),
-            fixture.provider.query().unwrap()
-        );
-        assert!(startup_started.elapsed() < MAX_QUERY_DURATION);
-
-        let query_started = Instant::now();
-        let before = fixture.provider.query().unwrap();
-        assert!(query_started.elapsed() < MAX_QUERY_DURATION);
-        let mutation_started = Instant::now();
-        fixture.start("checkpoint-start");
-        assert!(mutation_started.elapsed() < MAX_QUERY_DURATION);
-        assert_eq!(
-            fixture.provider.query().unwrap().journal_sequence,
-            before.journal_sequence + 2
-        );
-    }
-
-    #[test]
-    fn missing_checkpoint_falls_back_to_old_store_recovery_before_mutation() {
-        let fixture = Fixture::new("checkpoint-missing");
-        fixture.provision();
+        fixture.start("transactional-start");
         let expected = fixture.provider.query().unwrap();
-        fs::remove_file(fixture.provider.root.join(STORE_FILE)).unwrap();
-
-        assert_eq!(fixture.provider.query().unwrap(), expected);
-        assert!(!fixture.provider.root.join(STORE_FILE).exists());
-        assert_eq!(fixture.provider.initialize().unwrap(), expected);
-        assert!(fixture.provider.root.join(STORE_FILE).exists());
-        fixture.start("checkpoint-recovered-start");
-        assert!(fixture.provider.root.join(STORE_FILE).exists());
-        assert_eq!(
-            fixture.provider.query().unwrap().journal_sequence,
-            expected.journal_sequence + 2
-        );
+        let reopened = TaskServiceProvider::open(fixture.provider.root.as_ref().clone()).unwrap();
+        assert_eq!(reopened.recover().unwrap(), expected);
+        let live = reopened.initialize().unwrap();
+        assert!(live.receipts.is_empty());
+        assert_eq!(live.attempts, expected.attempts);
+        for (id, receipt) in &expected.receipts {
+            assert_eq!(reopened.receipt(id).unwrap().as_ref(), Some(receipt));
+        }
+        let first = reopened.watch(0, 2).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].sequence, 1);
+        let next = reopened.watch(first[1].sequence, 2).unwrap();
+        assert_eq!(next[0].sequence, 3);
     }
 
     #[test]
-    fn modified_historical_journal_invalidates_checkpoint_and_detects_tamper() {
-        let fixture = Fixture::new("checkpoint-tamper");
+    fn repeated_statuses_share_history_and_keep_exact_replay_after_reopen() {
+        let fixture = Fixture::new("status-storage-growth");
         fixture.provision();
-        std::thread::sleep(Duration::from_millis(2));
-        let journal_path = fixture.provider.root.join(JOURNAL_FILE);
-        let journal = fs::read_to_string(&journal_path).unwrap();
-        let tampered = journal.replacen(
-            "\"operation\":\"create_revision\"",
-            "\"operation\":\"tamper_revision\"",
-            1,
-        );
-        assert_ne!(tampered, journal);
-        fs::write(&journal_path, tampered).unwrap();
-
-        assert_eq!(fixture.provider.query(), Err(ProviderError::InvalidStore));
-        assert_eq!(fixture.provider.recover(), Err(ProviderError::InvalidStore));
+        fixture.start("growth-start");
+        let mut first = None;
+        let mut first_request = None;
+        for i in 0..128 {
+            let request = WorkerActionRequest::ReportStatus(StatusActionRequest {
+                schema: ProviderActionSchema::V2,
+                action_id: action(&format!("growth-status-{i}")),
+                assignment_id: assignment_id(),
+                summary: format!("update {i}: {}", "progress detail ".repeat(60)),
+                evidence_sha256: None,
+            });
+            let receipt = fixture.worker_action(request.clone());
+            if i == 0 {
+                first = Some(receipt);
+                first_request = Some(request);
+            }
+        }
+        let reopened = TaskServiceProvider::open(fixture.provider.root.as_ref().clone()).unwrap();
+        let snapshot = reopened.query().unwrap();
         assert_eq!(
-            fixture.provider.initialize(),
-            Err(ProviderError::InvalidStore)
+            snapshot
+                .active_attempt(&assignment_id())
+                .unwrap()
+                .status_receipts
+                .len(),
+            128
         );
-    }
-
-    fn write_legacy_store(root: &Path, mut state: TaskServiceSnapshot) -> TaskServiceSnapshot {
-        state.journal_sequence = 1;
-        state.journal_sha256 = Sha256::new(ZERO_SHA256).unwrap();
-        state.completion_notifications.clear();
-        let occurred_at = Rfc3339::new("2026-08-28T00:00:00Z").unwrap();
-        let event_sha256 = legacy_journal_hash(
-            1,
-            &state.journal_sha256,
-            "legacy_fixture",
-            &occurred_at,
-            &state,
-        )
-        .unwrap();
-        let record = PersistedJournalRecord {
-            schema: ProviderStoreSchema::V2,
-            sequence: 1,
-            previous_event_sha256: state.journal_sha256.clone(),
-            event_sha256: event_sha256.clone(),
-            operation: "legacy_fixture".to_string(),
-            occurred_at,
-            resulting_state: state.clone(),
-            completion_notifications_was_present: false,
-        };
-        let mut encoded_record = serde_json::to_value(record).unwrap();
-        encoded_record["resulting_state"]
-            .as_object_mut()
+        let expanded_bytes = serde_json::to_vec(&snapshot).unwrap().len() as u64;
+        let disk_bytes: u64 = fs::read_dir(fixture.provider.root.as_ref())
             .unwrap()
-            .remove("completion_notifications");
-        let mut journal = serde_json::to_vec(&encoded_record).unwrap();
-        journal.push(b'\n');
-        fs::write(root.join(JOURNAL_FILE), journal).unwrap();
-
-        state.journal_sha256 = event_sha256;
-        let mut encoded_snapshot = serde_json::to_value(&state).unwrap();
-        encoded_snapshot
-            .as_object_mut()
-            .unwrap()
-            .remove("completion_notifications");
-        fs::write(
-            root.join(STORE_FILE),
-            serde_json::to_vec(&encoded_snapshot).unwrap(),
-        )
-        .unwrap();
-        state
-    }
-
-    #[test]
-    fn legacy_store_recovers_mixed_chain_and_replays_after_restart() {
-        let source = Fixture::new("legacy-store-source");
-        source.provision();
-        let source_root = source.provider.root.as_ref().clone();
-        let legacy_root = root("legacy-store-mixed-chain");
-        let expected = write_legacy_store(&legacy_root, source.provider.query().unwrap());
-        let snapshot_before = fs::read(legacy_root.join(STORE_FILE)).unwrap();
-        let journal_before = fs::read(legacy_root.join(JOURNAL_FILE)).unwrap();
-
-        let provider = TaskServiceProvider::open(&legacy_root).unwrap();
-        assert_eq!(provider.recover().unwrap(), expected);
-        assert_eq!(
-            fs::read(legacy_root.join(STORE_FILE)).unwrap(),
-            snapshot_before
-        );
-        assert_eq!(
-            fs::read(legacy_root.join(JOURNAL_FILE)).unwrap(),
-            journal_before
-        );
-
-        let send = expected.send_attempts.values().next().unwrap();
-        let request = CommunicationEventRequest {
-            schema: ProviderActionSchema::V2,
-            action_id: action("legacy-mixed-bus-queued"),
-            send_attempt_id: send.send_attempt_id.clone(),
-            expected_send_attempt_revision: send.local_revision,
-            kind: CommunicationEventKind::BusQueued,
-            receipt_reference: Some("legacy-mixed-message".to_string()),
-        };
-        let first = provider
-            .record_communication_event(&AuthenticatedPrincipal::task_service_system(), &request)
-            .unwrap();
-        let lines = fs::read_to_string(legacy_root.join(JOURNAL_FILE)).unwrap();
-        let records = lines
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(records.len(), 2);
-        assert!(records[0]["resulting_state"]
-            .get("completion_notifications")
-            .is_none());
-        assert!(records[1]["resulting_state"]
-            .get("completion_notifications")
-            .is_some());
-
-        drop(provider);
-        let reopened = TaskServiceProvider::open(&legacy_root).unwrap();
-        let recovered = reopened.recover().unwrap();
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum();
+        assert!(disk_bytes * 2 < expanded_bytes,
+            "persisted history must share repeated status prefixes: disk={disk_bytes}, expanded={expanded_bytes}");
+        let started = Instant::now();
+        let live = reopened.initialize().unwrap();
+        assert_eq!(live.journal_sequence, snapshot.journal_sequence);
+        assert!(started.elapsed() < MAX_QUERY_DURATION);
         let replay = reopened
-            .record_communication_event(&AuthenticatedPrincipal::task_service_system(), &request)
+            .prepare_worker_action(
+                &fixture.worker,
+                &WorkerPrepareRequest {
+                    schema: WorkerPrepareRequestSchema::V2,
+                    action: first_request.unwrap(),
+                },
+            )
             .unwrap();
-        assert_eq!(replay, first);
-        assert_eq!(reopened.query().unwrap(), recovered);
-
-        drop(source);
-        fs::remove_dir_all(source_root).unwrap();
-        fs::remove_dir_all(legacy_root).unwrap();
-    }
-
-    #[test]
-    fn legacy_hash_compatibility_rejects_tampered_complete_record_without_writes() {
-        let source = Fixture::new("legacy-corrupt-source");
-        source.provision();
-        let source_root = source.provider.root.as_ref().clone();
-        let corrupt_root = root("legacy-corrupt-store");
-        write_legacy_store(&corrupt_root, source.provider.query().unwrap());
-
-        let journal_path = corrupt_root.join(JOURNAL_FILE);
-        let mut encoded: serde_json::Value =
-            serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
-        encoded["operation"] = serde_json::json!("tampered_operation");
-        let mut tampered = serde_json::to_vec(&encoded).unwrap();
-        tampered.push(b'\n');
-        fs::write(&journal_path, &tampered).unwrap();
-        let snapshot_before = fs::read(corrupt_root.join(STORE_FILE)).unwrap();
-
-        let provider = TaskServiceProvider::open(&corrupt_root).unwrap();
-        assert_eq!(provider.recover(), Err(ProviderError::InvalidStore));
-        assert_eq!(fs::read(&journal_path).unwrap(), tampered);
+        assert_eq!(replay, WorkerPrepareOutcome::Committed(first.unwrap()));
         assert_eq!(
-            fs::read(corrupt_root.join(STORE_FILE)).unwrap(),
-            snapshot_before
+            reopened.query_live().unwrap().journal_sequence,
+            snapshot.journal_sequence
         );
-
-        drop(source);
-        fs::remove_dir_all(source_root).unwrap();
-        fs::remove_dir_all(corrupt_root).unwrap();
     }
 
     #[test]

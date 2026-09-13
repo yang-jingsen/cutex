@@ -41,6 +41,7 @@ pub(super) fn recover(
 
 pub(super) fn run_command(command: HumanCommand) -> anyhow::Result<()> {
     match command {
+        HumanCommand::Doctor { id } => super::human_diagnostics::run(id.as_deref())?,
         HumanCommand::New { name, cwd } => {
             let cwd = cwd.unwrap_or(std::env::current_dir()?);
             let result = super::light_new::create(&name, &cwd.to_string_lossy())?;
@@ -104,9 +105,7 @@ pub(super) fn run_command(command: HumanCommand) -> anyhow::Result<()> {
                 stop(&id, cancel_tasks, force)?;
                 run_command(HumanCommand::Start { id })?;
             } else {
-                let action = super::stock_lifecycle::ReviewedStockRuntimeAction::review(&id, true)?;
-                eprintln!("Action: {}", action.action_id.as_str());
-                print_runtime_result(action.execute()?)?;
+                print_runtime_result(super::stock_lifecycle::online(&id, true)?)?;
             }
         }
         HumanCommand::Attach { id } => super::stock_lifecycle::attach(&resolve_id(&id)?)?,
@@ -118,10 +117,7 @@ pub(super) fn run_command(command: HumanCommand) -> anyhow::Result<()> {
                 record.explicit_launch.is_some(),
                 "this agent uses the legacy launcher; use session online until upgraded"
             );
-            let action = super::stock_lifecycle::ReviewedStockRuntimeAction::review(&id, false)?;
-            eprintln!("Action: {}", action.action_id.as_str());
-            let receipt = action.execute()?;
-            print_runtime_result(receipt)?;
+            print_runtime_result(super::stock_lifecycle::online(&id, false)?)?;
         }
         HumanCommand::Session { command } => super::session::run_command(command)?,
         HumanCommand::Management { command } => super::management::run_command(command)?,

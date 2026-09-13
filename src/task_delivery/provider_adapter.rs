@@ -124,7 +124,7 @@ fn validate_assignment_metadata_with_provider(
     provider: &TaskServiceProvider,
     metadata: &TaskServiceAssignmentMetadata,
 ) -> Result<TaskServiceSnapshot, ProviderError> {
-    let snapshot = provider.query()?;
+    let snapshot = provider.query_live()?;
     let send_attempt = snapshot
         .send_attempts
         .get(&metadata.send_attempt_id)
@@ -249,7 +249,7 @@ impl TaskServiceAgentBusDispatcher {
         state: &Arc<Mutex<AgentBusState>>,
         now_epoch_secs: u64,
     ) -> Result<CompletionNotificationDispatchSummary, ProviderError> {
-        let snapshot = provider.query()?;
+        let snapshot = provider.query_live()?;
         let mut summary = CompletionNotificationDispatchSummary::default();
         for notification in snapshot.completion_notifications.values() {
             if notification.is_delivered() {
@@ -502,9 +502,13 @@ impl TaskServiceAgentBusDispatcher {
             return Err(AssignmentDispatchError::InvalidCommittedShape);
         }
         let before = provider
-            .query()
+            .query_live()
             .map_err(AssignmentDispatchError::Provider)?;
-        if !before.receipts.contains_key(&request.action_id) {
+        if provider
+            .receipt(&request.action_id)
+            .map_err(AssignmentDispatchError::Provider)?
+            .is_none()
+        {
             let task = before
                 .task_revisions
                 .get(&request.task_id)
@@ -539,7 +543,7 @@ impl TaskServiceAgentBusDispatcher {
             return Err(AssignmentDispatchError::InvalidCommittedShape);
         }
         let task = provider
-            .query()
+            .query_live()
             .map_err(AssignmentDispatchError::Provider)?
             .task_revisions
             .get(&assignment.task_id)
@@ -627,9 +631,13 @@ impl TaskServiceAgentBusDispatcher {
             return Err(AssignmentDispatchError::InvalidCommittedShape);
         }
         let before = provider
-            .query()
+            .query_live()
             .map_err(AssignmentDispatchError::Provider)?;
-        if !before.receipts.contains_key(&request.action_id) {
+        if provider
+            .receipt(&request.action_id)
+            .map_err(AssignmentDispatchError::Provider)?
+            .is_none()
+        {
             let task = before
                 .task_revisions
                 .get(&request.task_id)
@@ -668,7 +676,7 @@ impl TaskServiceAgentBusDispatcher {
             return Err(AssignmentDispatchError::InvalidCommittedShape);
         }
         let task = provider
-            .query()
+            .query_live()
             .map_err(AssignmentDispatchError::Provider)?
             .task_revisions
             .get(&assignment.task_id)
@@ -759,9 +767,13 @@ impl TaskServiceAgentBusDispatcher {
             return Err(AssignmentDispatchError::InvalidCommittedShape);
         }
         let before = provider
-            .query()
+            .query_live()
             .map_err(AssignmentDispatchError::Provider)?;
-        if !before.receipts.contains_key(&request.action_id) {
+        if provider
+            .receipt(&request.action_id)
+            .map_err(AssignmentDispatchError::Provider)?
+            .is_none()
+        {
             let assignment = before
                 .assignments
                 .get(&request.assignment_id)
@@ -789,7 +801,7 @@ impl TaskServiceAgentBusDispatcher {
             _ => return Err(AssignmentDispatchError::InvalidCommittedShape),
         };
         let snapshot = provider
-            .query()
+            .query_live()
             .map_err(AssignmentDispatchError::Provider)?;
         let assignment = snapshot
             .assignments
@@ -999,7 +1011,7 @@ fn record_completion_context_inserted_with_provider(
     agent_bus_message_id: &str,
     native_submission_id: &str,
 ) -> Result<ProviderReceipt, ProviderError> {
-    let snapshot = provider.query()?;
+    let snapshot = provider.query_live()?;
     let notification = snapshot
         .completion_notifications
         .get(&metadata.notification_id)
@@ -1038,7 +1050,7 @@ fn validate_worker_followup_metadata_with_provider(
     metadata: &TaskServiceWorkerFollowupMetadata,
     recipient_cutex_session: &str,
 ) -> Result<(), ProviderError> {
-    let snapshot = provider.query()?;
+    let snapshot = provider.query_live()?;
     let notification = snapshot
         .worker_followup_notifications
         .get(&metadata.notification_id)
@@ -1074,7 +1086,7 @@ pub fn record_worker_followup_context_inserted(
     }
     let provider = TaskServiceProvider::open(default_task_service_provider_root()?)?;
     validate_worker_followup_metadata_with_provider(&provider, metadata, recipient_cutex_session)?;
-    let snapshot = provider.query()?;
+    let snapshot = provider.query_live()?;
     let notification = snapshot
         .worker_followup_notifications
         .get(&metadata.notification_id)

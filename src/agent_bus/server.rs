@@ -362,8 +362,8 @@ impl TaskWorkerActionHost {
                 }
             };
         let was_known = provider
-            .query()
-            .is_ok_and(|snapshot| snapshot.receipts.contains_key(&action_id));
+            .receipt(&action_id)
+            .is_ok_and(|receipt| receipt.is_some());
         let transition = worker_transition_kind(&request.action);
         match provider.execute_worker_action(&principal, &request) {
             Ok(receipt) => {
@@ -406,7 +406,7 @@ impl TaskWorkerActionHost {
                 .provider
                 .as_ref()
                 .context("Task Service provider unavailable")?;
-            let snapshot = provider.query()?;
+            let snapshot = provider.query_live()?;
             let assignment_id = match &receipt.result {
                 crate::task_service::ProviderResult::Assignment { assignment, .. } => {
                     &assignment.assignment_id
@@ -515,7 +515,7 @@ impl TaskWorkerActionHost {
         else {
             return Ok(());
         };
-        let snapshot = provider.query()?;
+        let snapshot = provider.query_live()?;
         let activity = crate::management::v2::activity::load_session_activity_states()
             .map(|states| crate::task_service::task_watchdog_activity_projections(&states))
             .unwrap_or_default();
@@ -987,7 +987,7 @@ impl TaskWorkerActionHost {
             ));
         }
         let predecessor_has_nonterminal_assignment = provider
-            .query()
+            .query_live()
             .map_err(|_| {
                 release_rotation_no_write(
                     request.action_id.clone(),
@@ -1137,8 +1137,8 @@ impl TaskWorkerActionHost {
             );
         };
         let was_known = provider
-            .query()
-            .is_ok_and(|snapshot| snapshot.receipts.contains_key(&action_id));
+            .receipt(&action_id)
+            .is_ok_and(|receipt| receipt.is_some());
         let transition = coordinator_transition_kind(&request.command);
         let response = match self.with_current_seated_session(session_id, |principal| {
             match (&request.command, &request.context) {
@@ -1367,7 +1367,7 @@ impl TaskWorkerActionHost {
                 "provider unavailable",
             );
         };
-        let snapshot = match provider.query() {
+        let snapshot = match provider.query_live() {
             Ok(s) => s,
             Err(_) => {
                 return task_service_v2_no_write(
@@ -1381,7 +1381,9 @@ impl TaskWorkerActionHost {
             return task_service_v2_no_write(action_id, "not_found", "assignment unavailable");
         };
         let context = worker_mechanical_context(&snapshot, assignment);
-        let known = snapshot.receipts.contains_key(&action_id);
+        let known = provider
+            .receipt(&action_id)
+            .is_ok_and(|receipt| receipt.is_some());
         let envelope = crate::task_service::TerminalActionEnvelope {
             schema: crate::task_service::TerminalRequestSchema::V2,
             command,
@@ -1462,8 +1464,8 @@ impl TaskWorkerActionHost {
             );
         };
         let was_known = provider
-            .query()
-            .is_ok_and(|snapshot| snapshot.receipts.contains_key(&action_id));
+            .receipt(&action_id)
+            .is_ok_and(|receipt| receipt.is_some());
         let transition = terminal_transition_kind(&request.command);
         match self.with_current_seated_session(session_id, |principal| {
             provider_result_response(
@@ -1708,13 +1710,15 @@ impl TaskWorkerActionHost {
             Operation::Cancel(decision) => (decision, "cancel"),
             _ => unreachable!(),
         };
-        let snapshot = match provider.query() {
+        let snapshot = match provider.query_live() {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 return director_provider_error(request.action_id.clone(), operation, error)
             }
         };
-        let was_known = snapshot.receipts.contains_key(&request.action_id);
+        let was_known = provider
+            .receipt(&request.action_id)
+            .is_ok_and(|receipt| receipt.is_some());
         let Some(assignment) = snapshot.assignments.get(&decision.assignment_id) else {
             return director_no_write(request.action_id.clone(), operation, "not_found");
         };
@@ -1823,13 +1827,15 @@ impl TaskWorkerActionHost {
         provider_action_id: crate::task_service::ActionId,
         request: &crate::task_service::CreateRevisionSemanticRequest,
     ) -> crate::task_service::DirectorActionReceipt {
-        let snapshot = match provider.query() {
+        let snapshot = match provider.query_live() {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 return director_provider_error(semantic_action_id, "create_revision", error)
             }
         };
-        let was_known = snapshot.receipts.contains_key(&provider_action_id);
+        let was_known = provider
+            .receipt(&provider_action_id)
+            .is_ok_and(|receipt| receipt.is_some());
         let expected = snapshot
             .workflows
             .get(&request.workflow_id)
@@ -1924,11 +1930,13 @@ impl TaskWorkerActionHost {
         provider_action_id: crate::task_service::ActionId,
         request: &crate::task_service::AssignSemanticRequest,
     ) -> crate::task_service::DirectorActionReceipt {
-        let snapshot = match provider.query() {
+        let snapshot = match provider.query_live() {
             Ok(snapshot) => snapshot,
             Err(error) => return director_provider_error(semantic_action_id, "assign", error),
         };
-        let was_known = snapshot.receipts.contains_key(&provider_action_id);
+        let was_known = provider
+            .receipt(&provider_action_id)
+            .is_ok_and(|receipt| receipt.is_some());
         let Some(task) = snapshot
             .task_revisions
             .get(&request.task_id)
@@ -2013,8 +2021,8 @@ impl TaskWorkerActionHost {
                 )
             }
             Err(error) => {
-                if let Ok(after) = provider.query() {
-                    if let Some(receipt) = after.receipts.get(&provider_action_id) {
+                if let Ok(result) = provider.receipt(&provider_action_id) {
+                    if let Some(receipt) = result.as_ref() {
                         if !was_known {
                             if let Err(projection_error) = crate::management::v2::integration_events::append_task_service_assignment(session_id, receipt) {
                                 eprintln!("{YELLOW}warning:{RESET} failed to append committed Task Service assignment after uncertain dispatch: {projection_error:#}");
@@ -2048,7 +2056,7 @@ impl TaskWorkerActionHost {
         let Some(caller_seat) = caller_seat else {
             return director_no_write(action_id, "query", "unauthorized");
         };
-        let snapshot = match provider.query() {
+        let snapshot = match provider.query_live() {
             Ok(snapshot) => snapshot,
             Err(error) => return director_provider_error(action_id, "query", error),
         };
@@ -4659,8 +4667,8 @@ fn task_service_dispatch_response(
         )
     );
     if !payload_conflict {
-        if let Ok(snapshot) = provider.query() {
-            if let Some(receipt) = snapshot.receipts.get(&action_id) {
+        if let Ok(result) = provider.receipt(&action_id) {
+            if let Some(receipt) = result.as_ref() {
                 if matches!(
                     &receipt.result,
                     crate::task_service::ProviderResult::Assignment { .. }

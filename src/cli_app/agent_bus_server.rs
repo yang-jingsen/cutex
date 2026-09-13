@@ -2340,7 +2340,7 @@ mod tests {
         let root = parent.join("service");
         let provider_root = root.join(TASK_WORKER_TASK_SERVICE_ROOT).join("provider-v2");
         fs::create_dir_all(&provider_root).unwrap();
-        let journal = provider_root.join("task-service-provider-v2.events.jsonl");
+        let journal = provider_root.join("task-service.sqlite3");
         fs::write(&journal, b"{}\n").unwrap();
 
         assert!(open_task_worker_action_host(&root).is_err());

@@ -2139,6 +2139,9 @@ mod profile_tests {
 
     #[test]
     fn fresh_live_remote_tui_launch_preserves_profile_endpoint_and_auth_args() {
+        let _environment = crate::cli_app::test_home::environment_lock()
+            .lock()
+            .unwrap();
         let thread_id = format!("fresh-live-no-rollout-{}", Uuid::new_v4());
         assert!(
             !cutex::runtime::lifecycle::codex_session_exists_in_home(&thread_id)

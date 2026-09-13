@@ -474,9 +474,7 @@ fn handle_v2_request_with_repository(
         ("POST", "/v2/agent-management/human-config") => {
             super::human_config::handle(stream, request)
         }
-        ("POST", "/v2/task-service/human-recovery") => {
-            super::human_tasks::handle(stream, request)
-        }
+        ("POST", "/v2/task-service/human-recovery") => super::human_tasks::handle(stream, request),
         ("POST", "/v2/task-service/management-query") => {
             handle_management_task_query(stream, request, context)
         }
@@ -941,7 +939,7 @@ fn handle_owner_task_read_with_provider(
     project_id: &crate::agent_management::ProjectId,
     provider: &crate::task_service::TaskServiceProvider,
 ) -> anyhow::Result<()> {
-    let snapshot = match provider.query_cancellable(|| http_client_disconnected(stream)) {
+    let snapshot = match provider.query_live_cancellable(|| http_client_disconnected(stream)) {
         Ok(snapshot) => snapshot,
         Err(_) => {
             return write_v2_error(
@@ -2312,15 +2310,25 @@ fn handle_cutex_request(
             }
         };
 
-    let operation = dispatch_cutex_request(
-        event_repository,
-        context.handle_user_input,
-        context.flush_user_input_queue,
-        context.mutate_session,
-        cutex_session_id,
-        &session,
-        &cutex_request,
-    );
+    let operation = if cutex_request.method == "cutex/runtime/online" {
+        dispatch_runtime_mutation(
+            event_repository,
+            |id, _method, params| (context.online_session)(owner, id, params),
+            cutex_session_id,
+            &session,
+            &cutex_request,
+        )
+    } else {
+        dispatch_cutex_request(
+            event_repository,
+            context.handle_user_input,
+            context.flush_user_input_queue,
+            context.mutate_session,
+            cutex_session_id,
+            &session,
+            &cutex_request,
+        )
+    };
     match operation {
         Ok(result) => {
             let response = json!({
@@ -2682,7 +2690,11 @@ fn dispatch_cutex_request(
 
 fn dispatch_runtime_mutation(
     event_repository: &EventRepository,
-    mutate_session: ManagementSessionMutationHandler,
+    mutate_session: impl Fn(
+        &str,
+        &str,
+        Value,
+    ) -> Result<Value, super::user_input::UserInputExecutionError>,
     cutex_session_id: &str,
     session: &Value,
     request: &ValidatedCutexRequest,
@@ -2918,6 +2930,14 @@ fn dispatch_runtime_mutation(
             .as_object_mut()
             .expect("runtime mutation response object")
             .insert("launchProfile".to_string(), receipt);
+    }
+    for key in ["actionId", "attachCommand"] {
+        if let Some(value) = result.get(key) {
+            response
+                .as_object_mut()
+                .unwrap()
+                .insert(key.into(), value.clone());
+        }
     }
     Ok(response)
 }
@@ -5091,6 +5111,48 @@ mod tests {
             2
         );
         std::fs::remove_dir_all(root).expect("remove event repository");
+    }
+
+    #[test]
+    fn runtime_online_callback_preserves_native_action_and_attach_route() {
+        let root =
+            std::env::temp_dir().join(format!("cutex-native-online-{}", uuid::Uuid::new_v4()));
+        let repository =
+            EventRepository::open(&root, crate::platform::host::current_host_name()).unwrap();
+        let session = json!({"runtime": {"runtimeGeneration": 7, "backend": "host"}});
+        let request = ValidatedCutexRequest {
+            request_id: "native-online".into(),
+            method: "cutex/runtime/online".into(),
+            params: json!({"expectedRuntimeGeneration": 7, "openVisibleTerminal": true}),
+        };
+        let original_action = String::from("original-action");
+        let callback = |id: &str, method: &str, params: Value| {
+            assert_eq!(id, "cutex.example");
+            assert_eq!(method, "cutex/runtime/online");
+            assert_eq!(params["expectedRuntimeGeneration"], 7);
+            Ok(
+                json!({"runtimeGeneration": 8, "status": "online", "actionId": original_action, "attachCommand": "cutex session takeover cutex.example"}),
+            )
+        };
+        let result =
+            dispatch_runtime_mutation(&repository, callback, "cutex.example", &session, &request)
+                .unwrap();
+        assert_eq!(result["actionId"], "original-action");
+        assert_eq!(
+            result["attachCommand"],
+            "cutex session takeover cutex.example"
+        );
+        let stale_session = json!({"runtime": {"runtimeGeneration": 9}});
+        let error = dispatch_runtime_mutation(
+            &repository,
+            |_, _, _| panic!("stale generation must not start an owner"),
+            "cutex.example",
+            &stale_session,
+            &request,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "revision_conflict");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

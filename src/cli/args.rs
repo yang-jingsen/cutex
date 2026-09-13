@@ -1551,6 +1551,8 @@ pub enum ProfileCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum HumanCommand {
+    /// Inspect local runtime, failed actions and storage without starting services
+    Doctor { id: Option<String> },
     /// Create a persistent native agent without sending a model prompt
     New {
         name: String,

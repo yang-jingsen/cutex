@@ -35,6 +35,79 @@ impl ReviewedStockRuntimeAction {
     }
 }
 
+/// Ordinary online/foreground entry points share the same owner as Human/TUI.
+/// A running owner is reused; an unresolved prior start is never replaced.
+pub(super) fn online(id: &str, restart: bool) -> anyhow::Result<StockRuntimeReceipt> {
+    let sessions = cutex::session::store::load_cutex_session_store()?;
+    let record = sessions.sessions.get(id).context("agent disappeared")?;
+    ensure!(
+        !record.is_retired(),
+        "restore the archived Agent before starting it"
+    );
+    ensure!(
+        cutex::runtime::lifecycle::cutex_session_host_is_local(
+            &record.host_id,
+            &cutex::platform::host::current_host_name()
+        ),
+        "this runtime must be managed on its owning host"
+    );
+    if let Some(claim) = &record.app_server_launch_claim_id {
+        let action = sessions
+            .explicit_launch_receipts
+            .values()
+            .find_map(|receipt| match receipt {
+                cutex::agent_management::ExplicitLaunchActionReceipt::Runtime(receipt)
+                    if receipt.review.subject.cutex_session_id.as_str() == id
+                        && &receipt.claim_id == claim =>
+                {
+                    Some(receipt.action_id.as_str())
+                }
+                _ => None,
+            });
+        anyhow::bail!("previous start is unresolved; inspect cutex human action {} and resume that action or use cutex human recover {}", action.unwrap_or("<original-action-id>"), id);
+    }
+    if !restart {
+        if let Some(binding) = &record.app_server_runtime {
+            verify_stock_process(record, binding)?;
+            super::app_server_runtime::verify_exact_live_runtime_claim(record, binding)?;
+            return matching_ready_receipt(record, &sessions)
+                .cloned()
+                .context("runtime has no matching Ready receipt; use human recovery");
+        }
+    }
+    let action = ReviewedStockRuntimeAction::review(id, restart)?;
+    eprintln!("Action: {}", action.action_id.as_str());
+    let receipt = action.execute()?;
+    ensure!(receipt.stage == cutex::agent_management::StockRuntimeStage::Ready && receipt.error.is_none(),
+        "runtime readiness incomplete; inspect cutex human action {} and resume the same action with cutex human action {} --resume", receipt.action_id.as_str(), receipt.action_id.as_str());
+    Ok(receipt)
+}
+
+pub(super) fn matching_ready_receipt<'a>(
+    record: &CutexSessionRecord,
+    sessions: &'a cutex::session::model::CutexSessionStore,
+) -> Option<&'a StockRuntimeReceipt> {
+    let binding = record.app_server_runtime.as_ref()?;
+    sessions
+        .explicit_launch_receipts
+        .values()
+        .find_map(|receipt| match receipt {
+            cutex::agent_management::ExplicitLaunchActionReceipt::Runtime(receipt)
+                if receipt.stage == cutex::agent_management::StockRuntimeStage::Ready
+                    && receipt.error.is_none()
+                    && receipt.review.subject.cutex_session_id.as_str()
+                        == record.cutex_session_id
+                    && receipt.binding.as_ref() == Some(binding)
+                    && receipt.expected_generation == record.runtime_generation
+                    && record.current_runtime_agent_id.as_deref()
+                        == Some(&receipt.runtime_agent_id) =>
+            {
+                Some(receipt)
+            }
+            _ => None,
+        })
+}
+
 #[derive(Default)]
 pub(super) struct StockExecutor {
     child: Option<super::stock_publication::GatedChild>,
@@ -799,13 +872,19 @@ fn running_stock_contract(
             if receipt.review.subject.cutex_session_id.as_str() == record.cutex_session_id
                 && receipt.binding.as_ref() == Some(binding)
                 && receipt.expected_generation == record.runtime_generation
-                && record.current_runtime_agent_id.as_deref().is_none_or(|id|id==receipt.runtime_agent_id)
+                && record
+                    .current_runtime_agent_id
+                    .as_deref()
+                    .is_none_or(|id| id == receipt.runtime_agent_id)
             {
                 return Ok(receipt.review.contract.clone());
             }
         }
     }
-    record.explicit_launch.clone().context("runtime package binding missing")
+    record
+        .explicit_launch
+        .clone()
+        .context("runtime package binding missing")
 }
 
 pub(super) fn verify_stock_process_with_bundle(
@@ -912,21 +991,7 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
         record.app_server_launch_claim_id.is_none(),
         "stock readiness unresolved; replay launch action"
     );
-    let ready = store
-        .explicit_launch_receipts
-        .values()
-        .find_map(|r| match r {
-            cutex::agent_management::ExplicitLaunchActionReceipt::Runtime(r)
-                if r.stage == cutex::agent_management::StockRuntimeStage::Ready
-                    && r.binding.as_ref() == Some(binding)
-                    && r.expected_generation == record.runtime_generation
-                    && record.current_runtime_agent_id.as_deref() == Some(&r.runtime_agent_id) =>
-            {
-                Some(r)
-            }
-            _ => None,
-        })
-        .context("stock ready receipt missing")?;
+    let ready = matching_ready_receipt(record, &store).context("runtime Ready receipt missing")?;
     // Remote CLI config must describe the running occurrence, not silently
     // substitute local OpenAI defaults or a newly selected durable profile.
     let cli = bundle.cli.as_ref().unwrap_or(&bundle.executable);

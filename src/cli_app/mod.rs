@@ -13,6 +13,7 @@ mod app_server_state_sync;
 mod app_server_user_input;
 mod auth;
 mod human;
+mod human_diagnostics;
 mod im_cli;
 mod launch;
 mod launch_command;
