@@ -1,5 +1,7 @@
 # cutex
 
+September 2026 runtime repair review: [scope, code map, validation and known limits](docs/review/2026-09-runtime-repair/README.md).
+
 `cutex` is a local-first session manager and profile launcher for
 [`cute-codex`](https://github.com/yang-jingsen/cute-codex). It keeps Codex
 profiles separate, tracks durable sessions across terminal and process
