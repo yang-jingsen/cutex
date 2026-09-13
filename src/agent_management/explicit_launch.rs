@@ -323,8 +323,15 @@ impl AgentManagementProvider {
                     } else {
                         let sessions =
                             crate::session::store::load_cutex_session_store_from_path(path)?;
-                        saved_runtime_job(&sessions, cutex_session_id, &r.contract)
-                            .map(|job| job.descriptor.review_current(&bundle))
+                        let saved = saved_runtime_job(&sessions, cutex_session_id, &r.contract)
+                            .map(|job| job.descriptor.clone());
+                        let descriptor = match saved {
+                            Some(job) => Some(job),
+                            None => crate::launch::local_deployment::LocalDeployment::selected()?
+                                .and_then(|d| d.job_mcp),
+                        };
+                        descriptor
+                            .map(|job| job.review_current(&bundle))
                             .transpose()?
                     };
                     r.configuration
@@ -531,7 +538,8 @@ fn saved_runtime_job<'a>(
         .filter_map(|receipt| match receipt {
             ExplicitLaunchActionReceipt::Runtime(r)
                 if &r.review.subject.cutex_session_id == id
-                    && &r.review.contract == contract
+                    && r.review.contract.native_id == contract.native_id
+                    && r.review.contract.native_home == contract.native_home
                     && r.stage == StockRuntimeStage::Ready =>
             {
                 Some(r)

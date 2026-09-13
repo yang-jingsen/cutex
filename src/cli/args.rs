@@ -1551,6 +1551,25 @@ pub enum ProfileCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum HumanCommand {
+    /// Create a persistent native agent without sending a model prompt
+    New {
+        name: String,
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
+    },
+    /// Select an installed native runtime for new and adopted agents
+    InstallRuntime {
+        bundle_manifest: std::path::PathBuf,
+        #[arg(long)]
+        source_home: Option<std::path::PathBuf>,
+        #[arg(long)]
+        job_descriptor: Option<std::path::PathBuf>,
+    },
+    /// Inspect, change, or undo desired configuration
+    Config {
+        #[command(subcommand)]
+        command: HumanConfigCommand,
+    },
     /// Inspect the result of an existing runtime action; never starts another
     Action { action_id: String },
     /// Clear an interrupted start after proving its process no longer exists
@@ -1613,6 +1632,27 @@ pub enum HumanTaskCommand {
     Reassign {
         assignment: String,
         assignee: String,
+        #[arg(long)]
+        action_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HumanConfigCommand {
+    Show {
+        id: String,
+    },
+    /// Set fields using KEY=VALUE; KEY=null clears an override
+    Set {
+        id: String,
+        #[arg(required = true)]
+        fields: Vec<String>,
+        #[arg(long)]
+        action_id: Option<String>,
+    },
+    Undo {
+        id: String,
+        original_action_id: String,
         #[arg(long)]
         action_id: Option<String>,
     },

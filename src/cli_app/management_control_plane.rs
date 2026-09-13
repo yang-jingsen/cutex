@@ -25,6 +25,18 @@ pub(super) struct ManagementControlClient {
 }
 
 impl ManagementControlClient {
+    pub(super) fn human_config(
+        &self,
+        request: &cutex::agent_management::HumanConfigRequest,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.request_with_timeout(
+            "POST",
+            "/v2/agent-management/human-config",
+            Some(&serde_json::to_vec(request)?),
+            Duration::from_secs(120),
+        )
+    }
+
     pub(super) fn human_tasks(
         &self,
         request: &cutex::management::control_plane::HumanTaskRecoveryRequest,
@@ -213,6 +225,12 @@ impl ManagementControlClient {
 
     fn connect_with_config(config: &CodezConfig) -> anyhow::Result<Self> {
         let root_bearer = management_root_credential(config, None)?.to_string();
+        if let Some(value) = std::env::var_os("CUTEX_MANAGEMENT_URL") {
+            let base_url=value.into_string().map_err(|_|anyhow::anyhow!("CUTEX_MANAGEMENT_URL must be UTF-8"))?;
+            let url=url::Url::parse(&base_url)?;
+            anyhow::ensure!(url.scheme()=="http" && url.host_str().is_some() && url.username().is_empty() && url.password().is_none(), "CUTEX_MANAGEMENT_URL must be an http endpoint without embedded credentials");
+            return Ok(Self {base_url,root_bearer});
+        }
         cutex::management::launch::ensure_management_api_running(config, DEFAULT_MANAGEMENT_PORT)?;
         Ok(Self {
             base_url: management_base_url(DEFAULT_MANAGEMENT_PORT),

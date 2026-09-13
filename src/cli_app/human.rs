@@ -2,7 +2,7 @@
 use super::management_control_plane::ManagementControlClient;
 use anyhow::{ensure, Context};
 use cutex::agent_management::AgentActionId;
-use cutex::cli::args::{HumanCommand, HumanTaskCommand};
+use cutex::cli::args::{HumanCommand, HumanConfigCommand, HumanTaskCommand};
 use cutex::management::control_plane::HumanTaskRecoveryRequest;
 use cutex::role_revision::CutexSessionId;
 
@@ -41,6 +41,32 @@ pub(super) fn recover(
 
 pub(super) fn run_command(command: HumanCommand) -> anyhow::Result<()> {
     match command {
+        HumanCommand::New { name, cwd } => {
+            let cwd = cwd.unwrap_or(std::env::current_dir()?);
+            let result = super::light_new::create(&name, &cwd.to_string_lossy())?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        HumanCommand::InstallRuntime {
+            bundle_manifest,
+            source_home,
+            job_descriptor,
+        } => {
+            use cutex::launch::local_deployment::LocalDeployment;
+            let prior = LocalDeployment::selected()?;
+            let deployment = LocalDeployment {
+                bundle_manifest: bundle_manifest.canonicalize()?,
+                native_home: source_home
+                    .unwrap_or(cutex::config::paths::host_codex_home_dir()?)
+                    .canonicalize()?,
+                job_mcp: match job_descriptor {
+                    Some(path) => Some(serde_json::from_slice(&std::fs::read(path)?)?),
+                    None => prior.and_then(|p| p.job_mcp),
+                },
+            };
+            deployment.install()?;
+            println!("{}", serde_json::to_string_pretty(&deployment)?);
+        }
+        HumanCommand::Config { command } => run_config(command)?,
         HumanCommand::Action { action_id } => {
             let result = ManagementControlClient::connect()?
                 .runtime_action_status(AgentActionId::new(action_id)?)?;
@@ -240,4 +266,74 @@ mod tests {
             })
         ));
     }
+}
+
+fn run_config(command: HumanConfigCommand) -> anyhow::Result<()> {
+    use cutex::agent_management::HumanConfigRequest;
+    let id = |value: &str| {
+        CutexSessionId::new(resolve_id(value)?).map_err(|_| anyhow::anyhow!("invalid agent ID"))
+    };
+    let action = |value: Option<String>| {
+        AgentActionId::new(
+            value.unwrap_or_else(|| format!("human-config-{}", uuid::Uuid::new_v4())),
+        )
+    };
+    let request = match command {
+        HumanConfigCommand::Show { id: selector } => HumanConfigRequest::Show {
+            cutex_session_id: id(&selector)?,
+        },
+        HumanConfigCommand::Set {
+            id: selector,
+            fields,
+            action_id,
+        } => {
+            let mut patch = std::collections::BTreeMap::new();
+            for field in fields {
+                let (key, value) = field
+                    .split_once('=')
+                    .context("configuration must be KEY=VALUE or KEY=null")?;
+                let value = if value == "null" {
+                    None
+                } else if matches!(key, "cwd" | "bundle_manifest") {
+                    Some(
+                        std::path::Path::new(value)
+                            .canonicalize()?
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                } else {
+                    Some(value.to_string())
+                };
+                ensure!(
+                    patch.insert(key.to_string(), value).is_none(),
+                    "duplicate configuration field: {key}"
+                );
+            }
+            HumanConfigRequest::Set {
+                cutex_session_id: id(&selector)?,
+                action_id: action(action_id)?,
+                patch,
+            }
+        }
+        HumanConfigCommand::Undo {
+            id: selector,
+            original_action_id,
+            action_id,
+        } => HumanConfigRequest::Undo {
+            cutex_session_id: id(&selector)?,
+            action_id: action(action_id)?,
+            original_action_id: AgentActionId::new(original_action_id)?,
+        },
+    };
+    match &request {
+        HumanConfigRequest::Set { action_id, .. } | HumanConfigRequest::Undo { action_id, .. } => {
+            eprintln!("Action: {}", action_id.as_str())
+        }
+        _ => {}
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&ManagementControlClient::connect()?.human_config(&request)?)?
+    );
+    Ok(())
 }

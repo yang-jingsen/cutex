@@ -45,7 +45,14 @@ impl JobMcpDescriptor {
     /// A new runtime review binds the saved configuration to the currently
     /// listening daemon. Execution still validates that exact new occurrence.
     pub fn review_current(&self, bundle: &StockBundle) -> anyhow::Result<ReviewedJobMcp> {
-        self.current_occurrence()?.review(bundle)
+        let mut descriptor = self.current_occurrence()?;
+        if bundle.version == 4 {
+            descriptor.launcher = bundle
+                .cli
+                .clone()
+                .context("installed runtime CLI missing")?;
+        }
+        descriptor.review(bundle)
     }
 
     #[cfg(target_os = "linux")]
@@ -101,7 +108,7 @@ impl JobMcpDescriptor {
             "Job MCP requires reviewed coherent native bundle"
         );
         ensure!(
-            self.adapter.sha256.as_str() == JOB_SHA256,
+            bundle.version == 4 || self.adapter.sha256.as_str() == JOB_SHA256,
             "unsupported Job adapter bytes"
         );
         ensure!(
