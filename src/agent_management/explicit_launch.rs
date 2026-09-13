@@ -522,13 +522,26 @@ pub(super) fn inherited_runtime_job(
 ) -> anyhow::Result<Option<crate::launch::job_mcp::ReviewedJobMcp>> {
     let sessions = crate::session::store::load_cutex_session_store_from_path(path)?;
     let saved = saved_runtime_job(&sessions, id, contract).map(|job| job.descriptor.clone());
-    let descriptor = match saved {
-        Some(job) => Some(job),
-        None => crate::launch::local_deployment::LocalDeployment::selected()?
-            .and_then(|d| d.job_mcp),
+    let selected =
+        crate::launch::local_deployment::LocalDeployment::selected()?.and_then(|d| d.job_mcp);
+    let descriptor = match (saved, selected) {
+        // Installation may replace the daemon/adapter while retaining its
+        // endpoint and credentials. Refresh new launches from that installation;
+        // never rewrite an existing action receipt or move an agent to another service.
+        (Some(saved), Some(selected))
+            if saved.endpoint == selected.endpoint
+                && saved.api_token_file == selected.api_token_file
+                && saved.grant_key_file == selected.grant_key_file =>
+        {
+            Some(selected)
+        }
+        (Some(saved), _) => Some(saved),
+        (None, selected) => selected,
     };
     let bundle = crate::launch::stock::StockBundle::load(contract)?;
-    descriptor.map(|job| job.review_current(&bundle)).transpose()
+    descriptor
+        .map(|job| job.review_current(&bundle))
+        .transpose()
 }
 
 /// Reuse configuration from the most recent completed launch of this contract,

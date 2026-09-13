@@ -12,6 +12,8 @@ pub(super) trait Transport {
     fn post(&mut self, path: &str, body: &Value) -> anyhow::Result<Value>;
 }
 
+pub(super) const READ: &str = "cutex_task_service_read";
+
 pub(super) const WORKER: &str = "cutex_task_service";
 pub(super) const DIRECTOR: &str = "cutex_task_service_director";
 pub(super) const TERMINAL: &str = "cutex_task_service_terminal";
@@ -65,6 +67,7 @@ pub(super) fn tools() -> Vec<Value> {
     director["opaque_contract"]["description"] = json!("Exact UTF-8 contract, at most 131072 bytes. Trusted adapter computes SHA-256; do not submit a digest.");
     director["completion_authority_cutex_session_id"]["description"] = json!("Optional intended completion target; provider validates its current seat. Never caller authority.");
     vec![
+        json!({"name":READ,"description":"Read the full immutable contract of your own assignment, including its revision and SHA-256. Available before start; does not start an attempt or modify task state.","inputSchema":{"type":"object","properties":{"assignment_id":{"type":"string"}},"required":["assignment_id"],"additionalProperties":false}}),
         json!({"name":TERMINAL,"description":"Explicit completion-seat decision (including Release). accept_result/request_changes/fail_result only; request_changes requires decision_reference. Current runtime, seat and mechanical revisions are resolved by Cutex, never tool arguments. Reuse exact action_id/payload after uncertainty.","inputSchema":{"type":"object","properties":{"operation":{"type":"string","enum":["accept_result","request_changes","fail_result"]},"action_id":{"type":"string"},"assignment_id":{"type":"string"},"decision_reference":{"type":"string","maxLength":4096}},"required":["operation","action_id","assignment_id"],"additionalProperties":false}}),
         json!({"name":WORKER,"description":"Semantic Worker action. Requires operation, action_id and assignment_id. Runtime and assignment authority are provider-authenticated, never supplied in arguments. report_status/block require summary; submit requires result_sha256 and result_reference.","inputSchema":{"type":"object","properties":worker,"required":["operation","action_id","assignment_id"],"additionalProperties":false}}),
         json!({"name":DIRECTOR,"description":"Semantic Director action. Create requires project_id, workflow_id, task_id, task_revision, opaque_contract, completion_policy. Assign requires project_id, task_id, task_revision, assignment_id, assignee_cutex_session_id, summary. create_and_assign requires both sets and is a recoverable two-step operation, NOT atomic. Query requires selector. Decisions require assignment_id. Reuse action_id exactly after uncertain response.","inputSchema":{"type":"object","properties":director,"required":["operation","action_id"],"additionalProperties":false}}),
@@ -128,6 +131,20 @@ fn missing_field(name: &str, args: &Value) -> Option<&'static str> {
 }
 
 pub(super) fn invoke(name: &str, args: Value, transport: &mut impl Transport) -> Value {
+    if name == READ {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ReadArgs {
+            assignment_id: crate::task_service::AssignmentId,
+        }
+        let Ok(args) = serde_json::from_value::<ReadArgs>(args) else {
+            return json!({"status":"no_write","code":"invalid_read_arguments"});
+        };
+        return transport.post("/api/task/v2/query", &json!({
+            "schema":"cutex/task-service-query/v2",
+            "query":{"operation":"read_contract","body":{"assignment_id":args.assignment_id}}
+        })).unwrap_or_else(|_| json!({"status":"no_write","code":"query_transport_failed"}));
+    }
     if let Some(field) = missing_field(name, &args) {
         return json!({"schema":if name==WORKER {"cutex/task-service-tool-receipt/v1"} else {"cutex/task-service-director-tool-receipt/v1"},"status":"no_write","code":format!("missing_{field}")});
     }
@@ -154,6 +171,38 @@ mod tests {
             self.replies.pop_front().unwrap_or_else(|| Ok(json!({})))
         }
     }
+    #[test]
+    fn contract_read_uses_authenticated_query_and_preserves_full_body() {
+        let contract = "合同\n".repeat(10000);
+        let expected = json!({"outcome":{"kind":"contract","body":{"opaque_contract":contract}}});
+        let mut wire = Wire::default();
+        wire.replies.push_back(Ok(expected.clone()));
+        assert_eq!(
+            invoke(READ, json!({"assignment_id":"assignment-1"}), &mut wire),
+            expected
+        );
+        assert_eq!(
+            wire.sent,
+            vec![(
+                "/api/task/v2/query".into(),
+                json!({
+                    "schema":"cutex/task-service-query/v2",
+                    "query":{"operation":"read_contract","body":{"assignment_id":"assignment-1"}}
+                })
+            )]
+        );
+        let mut wire = Wire::default();
+        assert_eq!(
+            invoke(
+                READ,
+                json!({"assignment_id":"assignment-1","caller":"other"}),
+                &mut wire
+            )["code"],
+            "invalid_read_arguments"
+        );
+        assert!(wire.sent.is_empty());
+    }
+
     fn create() -> Value {
         json!({"operation":"create_and_assign","action_id":"act","project_id":"p","workflow_id":"w","task_id":"t","task_revision":1,"opaque_contract":" exact 合同\n","completion_policy":"director_acceptance","assignment_id":"a","assignee_cutex_session_id":"cutex.00000000-0000-0000-0000-000000000001","summary":"work"})
     }

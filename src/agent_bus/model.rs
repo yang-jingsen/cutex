@@ -855,6 +855,7 @@ pub enum TaskServiceQueryResponseSchema {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "body", rename_all = "snake_case")]
 pub enum TaskServiceQueryOutcome {
+    Contract(crate::task_service::TaskRevisionRecord),
     Snapshot(crate::task_service::TaskServiceSnapshot),
     AssigneeSnapshot(crate::task_service::AssigneeTaskServiceSnapshot),
     Watch(Vec<crate::task_service::WatchEvent>),

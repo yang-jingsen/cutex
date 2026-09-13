@@ -923,6 +923,7 @@ impl TerminalActionEnvelope {
 )]
 pub enum TaskServiceQueryOperation {
     Snapshot,
+    ReadContract { assignment_id: AssignmentId },
     Watch { after_sequence: u64, limit: usize },
 }
 
@@ -1274,11 +1275,16 @@ impl TaskServiceProvider {
         &self,
         operation: impl FnOnce(&TaskServiceSnapshot) -> T,
     ) -> Result<T, ProviderError> {
-        let _process = self.process_lock.lock().map_err(|_| ProviderError::PersistenceUnavailable)?;
+        let _process = self
+            .process_lock
+            .lock()
+            .map_err(|_| ProviderError::PersistenceUnavailable)?;
         self.with_store_lock(true, |_| {
             let mut snapshot = TaskServiceSnapshot::empty();
             for assignment in storage::Store::open(&self.root)?.active_assignments()? {
-                snapshot.assignments.insert(assignment.assignment_id.clone(), assignment);
+                snapshot
+                    .assignments
+                    .insert(assignment.assignment_id.clone(), assignment);
             }
             Ok(operation(&snapshot))
         })
@@ -2013,6 +2019,26 @@ impl TaskServiceProvider {
     /// Returns the exact mechanical binding for one assignment and only to
     /// its authenticated durable assignee. The semantic Worker document is
     /// deliberately not part of this response.
+    /// Read the exact immutable contract without starting an attempt.
+    pub fn read_assignee_contract(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        assignment_id: &AssignmentId,
+    ) -> Result<TaskRevisionRecord, ProviderError> {
+        let session = principal.session_id()?;
+        let state = self.query_assignment(assignment_id)?;
+        let assignment = assignment(&state, assignment_id)?;
+        if &assignment.assignee_cutex_session != session {
+            return Err(ProviderError::Unauthorized);
+        }
+        state
+            .task_revisions
+            .get(&assignment.task_id)
+            .and_then(|revisions| revisions.get(&assignment.task_revision))
+            .cloned()
+            .ok_or(ProviderError::InvalidStore)
+    }
+
     pub fn worker_context(
         &self,
         principal: &AuthenticatedPrincipal,
@@ -6875,6 +6901,35 @@ mod tests {
                 .attempt_number,
             AttemptNumber::new(2).unwrap()
         );
+    }
+
+    #[test]
+    fn assignee_reads_exact_contract_before_start_without_writes() {
+        let fixture = Fixture::new("assignee-contract-read");
+        fixture.provision();
+        let before = fixture.provider.query().unwrap();
+        let contract = fixture
+            .provider
+            .read_assignee_contract(&fixture.worker, &assignment_id())
+            .unwrap();
+        let assignment = &before.assignments[&assignment_id()];
+        assert_eq!(
+            contract,
+            before.task_revisions[&assignment.task_id][&assignment.task_revision]
+        );
+        assert_eq!(contract.contract_sha256, sha(&contract.opaque_contract));
+        assert!(!contract.opaque_contract.is_empty());
+        assert_eq!(
+            fixture.provider.read_assignee_contract(
+                &AuthenticatedPrincipal::session(session("different-worker")),
+                &assignment_id()
+            ),
+            Err(ProviderError::Unauthorized)
+        );
+        assert_eq!(fixture.provider.query().unwrap(), before);
+        let encoded = serde_json::to_string(&contract).unwrap();
+        assert!(!encoded.contains("attempt_token"));
+        assert!(!encoded.contains("prepared_worker_actions"));
     }
 
     #[test]

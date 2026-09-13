@@ -207,6 +207,68 @@ pub(super) fn validate_target(
     Ok(())
 }
 
+fn native_task_lineage<'a>(
+    store: &'a crate::session::model::CutexSessionStore,
+    r: &'a crate::session::model::CutexSessionRecord,
+    bootstrap_intents: &std::collections::BTreeMap<
+        crate::agent_management::AgentActionId,
+        crate::agent_management::BootstrapIntentReview,
+    >,
+    owner: &str,
+) -> anyhow::Result<&'a str> {
+    store
+        .explicit_launch_receipts
+        .values()
+        .filter_map(|receipt| match receipt {
+            crate::agent_management::ExplicitLaunchActionReceipt::Activation(a)
+                if a.review.subject.cutex_session_id.as_str() == owner
+                    && r.explicit_launch.as_ref() == Some(&a.review.contract) =>
+            {
+                Some(a.committed_at.as_str())
+            }
+            crate::agent_management::ExplicitLaunchActionReceipt::Bootstrap(a)
+                if a.cutex_session_id.as_str() == owner
+                    && r.codex_session_id.as_deref() == Some(a.native_id.as_str())
+                    && bootstrap_intents.values().any(|intent| {
+                        use sha2::{Digest, Sha256};
+                        serde_json::to_vec(intent).is_ok_and(|bytes| {
+                            format!("{:x}", Sha256::digest(bytes)) == a.intent_sha256.as_str()
+                                && r.explicit_launch.as_ref().is_some_and(|c| {
+                                    c.native_id == a.native_id
+                                        && c.native_home == intent.native_home
+                                        && c.bundle_manifest == intent.bundle_manifest
+                                        && c.bundle_sha256 == intent.bundle_sha256
+                                })
+                        })
+                    }) =>
+            {
+                // S8a creates the new durable record, marker and
+                // receipt in ONE save. Its immutable creation
+                // timestamp is that lineage, not a later launch.
+                Some(r.created_at.as_str())
+            }
+            crate::agent_management::ExplicitLaunchActionReceipt::Runtime(a)
+                if a.stage == crate::agent_management::StockRuntimeStage::Ready
+                    && a.review.subject.cutex_session_id.as_str() == owner
+                    && r.explicit_launch.as_ref().is_some_and(|contract| {
+                        contract.native_id == a.review.contract.native_id
+                            && contract.native_home == a.review.contract.native_home
+                    })
+                    && r.codex_session_id.as_deref()
+                        == Some(a.review.contract.native_id.as_str()) =>
+            {
+                // A normal typed/human launch establishes native ownership
+                // without an Activation or Bootstrap migration receipt.
+                // Use creation, not restart time: queued assignments survive
+                // a later runtime restart.
+                Some(r.created_at.as_str())
+            }
+            _ => None,
+        })
+        .min()
+        .context("native activation provenance absent")
+}
+
 /// Validate the authoritative outbox projection before freezing native bytes.
 /// Existing historical envelopes are not synthesized from a new display name.
 fn fresh_task_projection(
@@ -454,6 +516,23 @@ pub(super) fn envelope(
     Ok(e)
 }
 
+// Display facts are frozen with the envelope; routing and model input keep the
+// authenticated durable sender. A missing local name never blocks delivery.
+fn agent_message_view(e: &mut Envelope, name: Option<&str>, mode: &str) -> anyhow::Result<()> {
+    if e.message.source.kind != SourceKind::Agent || e.message.event_type != "message" {
+        return Ok(());
+    }
+    e.version = 2;
+    e.view = Some(crate::app_server::external_input::view::StructuredView {
+        schema: "cutex.agent-message.v1".into(),
+        data: serde_json::json!({"senderId":e.message.source.id,
+            "senderName":name.map(|name| name.chars().take(160).collect::<String>()),
+            "deliveryMode":mode}),
+    });
+    e.semantic_sha256 = e.digest();
+    e.validate()
+}
+
 // Compatibility projection for v1 canonical messages, including pending ones.
 // New completion versions must never change these bytes on recovery.
 fn legacy_job_model_text(
@@ -644,45 +723,12 @@ pub(super) fn deliver(
                         .get(&options.cutex_session_id)
                         .context("recipient absent")?;
                     r.app_server_runtime.as_ref().context("recipient offline")?;
-                    let activated_at = store
-                        .explicit_launch_receipts
-                        .values()
-                        .filter_map(|receipt| match receipt {
-                            crate::agent_management::ExplicitLaunchActionReceipt::Activation(a)
-                                if a.review.subject.cutex_session_id.as_str()
-                                    == options.cutex_session_id
-                                    && r.explicit_launch.as_ref() == Some(&a.review.contract) =>
-                            {
-                                Some(a.committed_at.as_str())
-                            }
-                            crate::agent_management::ExplicitLaunchActionReceipt::Bootstrap(a)
-                                if a.cutex_session_id.as_str() == options.cutex_session_id
-                                    && r.codex_session_id.as_deref()
-                                        == Some(a.native_id.as_str())
-                                    && before.bootstrap_intents.values().any(|intent| {
-                                        use sha2::{Digest, Sha256};
-                                        serde_json::to_vec(intent).is_ok_and(|bytes| {
-                                            format!("{:x}", Sha256::digest(bytes))
-                                                == a.intent_sha256.as_str()
-                                                && r.explicit_launch.as_ref().is_some_and(|c| {
-                                                    c.native_id == a.native_id
-                                                        && c.native_home == intent.native_home
-                                                        && c.bundle_manifest
-                                                            == intent.bundle_manifest
-                                                        && c.bundle_sha256 == intent.bundle_sha256
-                                                })
-                                        })
-                                    }) =>
-                            {
-                                // S8a creates the new durable record, marker and
-                                // receipt in ONE save. Its immutable creation
-                                // timestamp is that lineage, not a later launch.
-                                Some(r.created_at.as_str())
-                            }
-                            _ => None,
-                        })
-                        .min()
-                        .context("native activation provenance absent")?;
+                    let activated_at = native_task_lineage(
+                        &store,
+                        r,
+                        &before.bootstrap_intents,
+                        &options.cutex_session_id,
+                    )?;
                     // The explicit activation, not the latest runtime start,
                     // establishes this private lineage across owned restarts.
                     fresh_task_projection(&polled, &options.cutex_session_id, activated_at)?;
@@ -729,7 +775,22 @@ pub(super) fn deliver(
             })??;
             let frozen =
                 repository.freeze_external_input(&options.cutex_session_id, &message.id, |m| {
-                    let e = envelope(m, client.binding())?;
+                    let mut e = envelope(m, client.binding())?;
+                    let sender_name = m.from_cutex_session_id.as_ref().and_then(|id| {
+                        crate::session::store::load_cutex_session_store_from_path(&path)
+                            .ok()
+                            .and_then(|store| {
+                                store
+                                    .sessions
+                                    .get(id)
+                                    .and_then(|r| r.formal_agent_name.clone())
+                            })
+                    });
+                    agent_message_view(
+                        &mut e,
+                        sender_name.as_deref(),
+                        m.delivery_mode.event_label(),
+                    )?;
                     client.require_delivery(&e.message.delivery)?;
                     Ok(e)
                 })?;
@@ -886,6 +947,72 @@ mod tests {
             .contains("Requested by Director: cutex.director"));
         m.from = "forged ordinary sender".into();
         assert!(envelope(&m, &binding()).is_err());
+    }
+
+    #[test]
+    fn ready_launch_establishes_task_lineage_without_migration_receipts() {
+        use crate::agent_management::{ExplicitLaunchActionReceipt, StockRuntimeReceipt};
+        let mut record = crate::session::model::CutexSessionRecord::new(
+            "cutex.worker".into(),
+            Some("22222222-2222-4222-8222-222222222222".into()),
+            "private".into(),
+            "/private".into(),
+            Some("alpha".into()),
+        )
+        .unwrap();
+        record.created_at = "2026-09-13T00:00:00Z".into();
+        let mut receipt: StockRuntimeReceipt = serde_json::from_value(serde_json::json!({
+            "action_id":"normal-create", "stage":"ready", "claim_id":"claim", "runtime_agent_id":"stock.worker",
+            "expected_generation":1,"binding":null,"publication":null,"error":null,"updated_at":"2026-09-14T00:00:00Z",
+            "review":{
+                "subject":{"cutex_session_id":record.cutex_session_id,"formal_name":"worker","durable_sha256":"a".repeat(64),"authority_sha256":"a".repeat(64),"current_project_id":null,"revision":1,"runtime_generation":0},
+                "contract":{"version":4,"native_id":record.codex_session_id,"native_home":"/private","bundle_manifest":"/private/manifest","bundle_sha256":"b".repeat(64)},
+                "configuration":{"profile_name":"alpha","profile_id":"private","inherited":false,"profile_sha256":"c".repeat(64),"account_sha256":"d".repeat(64),"model":"fixture","reasoning":null,"model_provider":"private","provider":{"name":"private","base_url":"http://127.0.0.1:1/v1","wire_api":"responses","requires_openai_auth":false,"supports_websockets":false},"sandbox":"danger-full-access","approval":"never"},
+                "restart":false
+            }
+        })).unwrap();
+        record.explicit_launch = Some(receipt.review.contract.clone());
+        let mut store = crate::session::model::CutexSessionStore::default();
+        let intents = Default::default();
+        store.explicit_launch_receipts.insert(
+            receipt.action_id.to_string(),
+            ExplicitLaunchActionReceipt::Runtime(receipt.clone()),
+        );
+        assert_eq!(
+            native_task_lineage(&store, &record, &intents, &record.cutex_session_id).unwrap(),
+            record.created_at
+        );
+        // A later restart must not make an already queued assignment too old.
+        receipt.review.restart = true;
+        receipt.updated_at = "2026-09-15T00:00:00Z".into();
+        store.explicit_launch_receipts.insert(
+            receipt.action_id.to_string(),
+            ExplicitLaunchActionReceipt::Runtime(receipt),
+        );
+        assert_eq!(
+            native_task_lineage(&store, &record, &intents, &record.cutex_session_id).unwrap(),
+            record.created_at
+        );
+        record.explicit_launch.as_mut().unwrap().bundle_manifest = "/private/new-bundle".into();
+        assert_eq!(
+            native_task_lineage(&store, &record, &intents, &record.cutex_session_id).unwrap(),
+            record.created_at
+        );
+        assert!(native_task_lineage(&store, &record, &intents, "cutex.other").is_err());
+        record.codex_session_id = Some("33333333-3333-4333-8333-333333333333".into());
+        assert!(native_task_lineage(&store, &record, &intents, &record.cutex_session_id).is_err());
+    }
+
+    #[test]
+    fn agent_display_facts_do_not_change_model_text_or_durable_sender() {
+        let mut e = envelope(&message(), &binding()).unwrap();
+        let original = e.message.clone();
+        agent_message_view(&mut e, Some("worker-name"), "after_turn").unwrap();
+        assert_eq!(e.message, original);
+        assert_eq!(e.version, 2);
+        assert_eq!(e.view.as_ref().unwrap().data["senderName"], "worker-name");
+        assert_eq!(e.semantic_sha256, e.digest());
+        e.validate().unwrap();
     }
 
     #[test]

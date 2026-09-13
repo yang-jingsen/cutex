@@ -2230,6 +2230,11 @@ impl TaskWorkerActionHost {
             );
         };
         let result = match request.query {
+            crate::task_service::TaskServiceQueryOperation::ReadContract { assignment_id } => {
+                provider
+                    .read_assignee_contract(principal, &assignment_id)
+                    .map(TaskServiceQueryOutcome::Contract)
+            }
             crate::task_service::TaskServiceQueryOperation::Snapshot => {
                 match self.seat_authority.as_ref() {
                     Some(seats) => match seats.with_current_principal(session_id, |_| {

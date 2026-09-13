@@ -3,9 +3,9 @@ use anyhow::{ensure, Context};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use super::stock::{StockBundle, VerifiedFile};
 #[cfg(test)]
 use super::stock::S6E_CLI_SHA256;
+use super::stock::{StockBundle, VerifiedFile};
 
 pub const JOB_SHA256: &str = "ba1a8d4f3e0b5f739e666e3f515d40b0c543e9e75953759ff181f1e71b29c521";
 
@@ -54,7 +54,42 @@ impl JobMcpDescriptor {
                 .clone()
                 .context("installed runtime CLI missing")?;
         }
-        descriptor.review(bundle)
+        let reviewed = descriptor.review(bundle)?;
+        descriptor.check_launcher_capability()?;
+        Ok(reviewed)
+    }
+
+    #[cfg(unix)]
+    fn check_launcher_capability(&self) -> anyhow::Result<()> {
+        use std::io::{BufRead, Read, Write};
+        let mut socket = std::os::unix::net::UnixStream::connect(&self.endpoint)?;
+        let timeout = Some(std::time::Duration::from_secs(3));
+        socket.set_read_timeout(timeout)?;
+        socket.set_write_timeout(timeout)?;
+        let token: String = std::fs::read(&self.api_token_file)?
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let request = serde_json::json!({"token":token,"method":"capabilities","params":{}});
+        serde_json::to_writer(&mut socket, &request)?;
+        socket.write_all(b"\n")?;
+        let mut response = String::new();
+        std::io::BufReader::new(socket.take(65537)).read_line(&mut response)?;
+        ensure!(
+            response.len() <= 65536,
+            "Job capabilities response too large"
+        );
+        let response: serde_json::Value = serde_json::from_str(&response)?;
+        ensure!(response["ok"] == true
+            && response["result"]["allowedLaunchers"][self.launcher.path.to_string_lossy().as_ref()]
+                .as_str() == Some(self.launcher.sha256.as_str()),
+            "Job daemon does not accept the selected native launcher; update its --allow-launcher configuration before launching this runtime");
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn check_launcher_capability(&self) -> anyhow::Result<()> {
+        anyhow::bail!("Job launcher preflight currently supports Unix only")
     }
 
     #[cfg(target_os = "linux")]
@@ -296,6 +331,54 @@ fn private_object(_: &Path, _: bool) -> anyhow::Result<PrivateObject> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn launcher_preflight_uses_wire_credentials_and_exact_accepted_digest() {
+        use std::io::{BufRead, Write};
+        let root = std::env::temp_dir().join(format!("job-preflight-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let endpoint = root.join("socket");
+        let listener = std::os::unix::net::UnixListener::bind(&endpoint).unwrap();
+        let api_token_file = root.join("token");
+        std::fs::write(&api_token_file, [0, 255, 10]).unwrap();
+        let file = VerifiedFile {
+            path: "/fixture/codex".into(),
+            sha256: crate::role_revision::Sha256::new("a".repeat(64)).unwrap(),
+        };
+        let descriptor = JobMcpDescriptor {
+            version: 1,
+            adapter: file.clone(),
+            launcher: file,
+            endpoint,
+            api_token_file,
+            grant_key_file: root.join("grant"),
+            daemon_pid: 1,
+            daemon_start_ticks: 0,
+        };
+        let server = std::thread::spawn(move || {
+            for digest in ["a".repeat(64), "b".repeat(64)] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(
+                    request,
+                    serde_json::json!({"token":"00ff0a","method":"capabilities","params":{}})
+                );
+                writeln!(stream, "{}", serde_json::json!({"ok":true,"result":{"allowedLaunchers":{"/fixture/codex":digest}}})).unwrap();
+            }
+        });
+        descriptor.check_launcher_capability().unwrap();
+        assert!(descriptor
+            .check_launcher_capability()
+            .unwrap_err()
+            .to_string()
+            .contains("--allow-launcher"));
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn job_mcp_custody_rejects_replacement_symlink_and_public_files() {

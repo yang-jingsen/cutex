@@ -178,7 +178,10 @@ pub fn run() -> anyhow::Result<()> {
                     thread_id: thread,
                     generation,
                 };
-                let result = if matches!(name, tasks::WORKER | tasks::DIRECTOR | tasks::TERMINAL) {
+                let result = if matches!(
+                    name,
+                    tasks::WORKER | tasks::DIRECTOR | tasks::TERMINAL | tasks::READ
+                ) {
                     tasks::invoke(
                         name,
                         args,
