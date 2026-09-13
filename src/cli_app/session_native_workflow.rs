@@ -92,7 +92,7 @@ impl NativeLaunch {
             bundle.executable.validate()?;
             isolated_command(
                 &LaunchCommand::new(bundle.executable.path.to_string_lossy().into_owned())
-                    .args(["--listen", "stdio"]),
+                    .args(["--listen", "stdio://"]),
                 &self.cwd,
                 &self.native_home,
             )
