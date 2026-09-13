@@ -84,7 +84,21 @@ impl NativeLaunch {
     }
 
     pub(super) fn endpoint(&self) -> anyhow::Result<OwnedStdioEndpoint> {
-        let command = self.command(&["app-server".into(), "--stdio".into()])?;
+        let command = if let Some(deployment) =
+            cutex::launch::local_deployment::LocalDeployment::selected()?
+        {
+            let bundle: cutex::launch::stock::StockBundle =
+                serde_json::from_slice(&std::fs::read(&deployment.bundle_manifest)?)?;
+            bundle.executable.validate()?;
+            isolated_command(
+                &LaunchCommand::new(bundle.executable.path.to_string_lossy().into_owned())
+                    .args(["--listen", "stdio"]),
+                &self.cwd,
+                &self.native_home,
+            )
+        } else {
+            self.command(&["app-server".into(), "--stdio".into()])?
+        };
         let options = StdioAppServerOptions::new(command.get_program(), self.native_home.clone());
         let mut endpoint = OwnedStdioEndpoint::spawn_command(options, command)?;
         let initialized = endpoint.request("initialize", json!({"clientInfo": {"name":"cutex_native_workflow", "version":env!("CARGO_PKG_VERSION")}, "capabilities":{"experimentalApi":true}}))?;

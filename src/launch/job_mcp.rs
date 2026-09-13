@@ -3,7 +3,9 @@ use anyhow::{ensure, Context};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use super::stock::{StockBundle, VerifiedFile, S6E_CLI_SHA256};
+use super::stock::{StockBundle, VerifiedFile};
+#[cfg(test)]
+use super::stock::S6E_CLI_SHA256;
 
 pub const JOB_SHA256: &str = "ba1a8d4f3e0b5f739e666e3f515d40b0c543e9e75953759ff181f1e71b29c521";
 

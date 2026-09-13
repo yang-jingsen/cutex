@@ -134,3 +134,55 @@ pub(super) fn create(
         })
         .with_context(|| format!("Saved native thread {native} exists; retry Adopt for this ID"))
 }
+
+/// Foreground form shared by the main selector's New action.
+pub(super) fn wizard() -> anyhow::Result<Option<cutex::agent_management::HumanAdoptResult>> {
+    let name = super::prompt::prompt_line("New agent name (empty cancels)", "")?;
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let cwd = super::prompt::prompt_line(
+        "Working directory",
+        &std::env::current_dir()?.to_string_lossy(),
+    )?;
+    let result = create(&name, &cwd)?;
+    if let Some(error) = &result.error {
+        anyhow::bail!("Agent created, but import incomplete: {error}");
+    }
+    Ok(Some(result))
+}
+
+pub(super) fn adopt_saved(
+    native: &str,
+    name: &str,
+    cwd: &str,
+) -> anyhow::Result<cutex::agent_management::HumanAdoptResult> {
+    use cutex::catalog::CatalogEndpoint;
+    let launch = super::session_native_workflow::NativeLaunch {
+        cwd: cwd.into(),
+        native_home: cutex::config::paths::host_codex_home_dir()?,
+        profile: None,
+        model: None,
+    };
+    let source = launch.endpoint()?.request(
+        "thread/read",
+        serde_json::json!({"threadId":native,"includeTurns":false}),
+    )?;
+    let cwd = source
+        .pointer("/thread/cwd")
+        .and_then(serde_json::Value::as_str)
+        .context("saved thread cwd missing")?;
+    let result = super::management_control_plane::ManagementControlClient::connect()?
+        .adopt_saved_native(&cutex::agent_management::HumanAdoptRequest {
+            action_id: cutex::agent_management::AgentActionId::new(format!(
+                "human-adopt-{native}"
+            ))?,
+            native_id: native.into(),
+            cwd: cwd.into(),
+            formal_name: name.into(),
+        })?;
+    if let Some(error) = &result.error {
+        anyhow::bail!("Agent adopted, but roster import incomplete: {error}. Retry the same Adopt");
+    }
+    Ok(result)
+}

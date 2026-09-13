@@ -1873,7 +1873,7 @@ fn handle_project_widget_key(
                 {
                     model.create_editor.as_mut().unwrap().field += 1;
                 } else if model.available_agents.is_empty() {
-                    model.notice = Some("Draft kept. Select/Adopt an existing saved session in Recent, then Alt+P returns here. New Agent is unavailable until native persistence is verified.".into());
+                    model.notice = Some("Draft kept. Create an Agent with Alt+N or Adopt a saved session in Recent, then Alt+P returns here.".into());
                     return Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Recent));
                 } else if model
                     .create_editor
@@ -2698,7 +2698,7 @@ fn render_create_editor(frame: &mut Frame<'_>, area: Rect, model: &CutexProjects
         .map(|agent| format!("{} ({})", agent.name, agent.cutex_session_id.as_str()))
         .unwrap_or_else(|| {
             if model.available_agents.is_empty() {
-                "None — Enter: saved Recent; New Agent unavailable (persistence unverified)"
+                "None — Enter: Recent, then Alt+N creates an Agent"
                     .to_string()
             } else {
                 "Choose… Enter opens searchable candidates".to_string()
@@ -3095,7 +3095,7 @@ mod tests {
             .notice
             .as_ref()
             .unwrap()
-            .contains("New Agent is unavailable"));
+            .contains("Alt+N"));
     }
     use super::*;
     use std::time::Duration;

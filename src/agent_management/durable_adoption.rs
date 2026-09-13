@@ -70,7 +70,7 @@ impl AgentManagementProvider {
                     );
                     return Ok(receipt.clone());
                 }
-                anyhow::ensure!(!sessions.sessions.values().any(|r| r.codex_session_id.as_deref() == Some(request.native_id.as_str())), "native identity already has a durable record; use existing Agent/import/Restore");
+                anyhow::ensure!(!sessions.sessions.values().any(|r| r.codex_session_id.as_deref() == Some(request.native_id.as_str()) && (r.registration_class == crate::agent_bus::model::AgentRegistrationClass::Persistent || r.is_retired())), "native identity already has a managed record; use existing Agent/import/Restore");
                 let candidate = crate::session::service::adopt_cutex_session(
                     sessions,
                     &request.native_id,
@@ -256,6 +256,14 @@ mod tests {
         };
         let no_tasks = |_: &ProjectId, _: Option<&crate::role_revision::CutexSessionId>| Ok(false);
         let host = crate::platform::host::current_host_name();
+        // Recent/settings may already have materialized an unmanaged record.
+        // Adopt must keep its durable key and import that one identity.
+        let original_key = crate::session::store::with_locked_session_store(&path, |store| {
+            let key = crate::session::service::ensure_cutex_session_record_for_user_id(store, &request.native_id,
+                crate::session::service::CutexSessionEnsureSeed { host_id: host.clone(), cwd: request.cwd.clone(), profile: None })?;
+            crate::session::store::save_locked_session_store(&path, store)?;
+            Ok(key)
+        }).unwrap();
         let result = provider
             .adopt_saved_native(&principal, &path, &request, &host, &no_tasks)
             .unwrap();
@@ -263,6 +271,7 @@ mod tests {
             result.imported.as_ref().is_some_and(|r| r.complete),
             "{result:?}"
         );
+        assert_eq!(result.adopted.record.cutex_session_id, original_key);
         assert_eq!(result.adopted.record.profile, None);
         assert_eq!(
             result.adopted.record.formal_agent_name.as_deref(),

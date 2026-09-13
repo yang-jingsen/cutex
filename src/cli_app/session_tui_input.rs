@@ -204,7 +204,7 @@ pub(super) const BINDINGS: &[Binding] = &[
     alt(Command::Actions, 'a', "Object actions", "Alt+A"),
     alt(Command::Inspect, 'i', "Inspect", "Alt+I"),
     alt(Command::Edit, 'e', "Edit object", "Alt+E"),
-    alt(Command::NewProject, 'n', "New Project", "Alt+N"),
+    alt(Command::NewProject, 'n', "New", "Alt+N"),
     alt(Command::LoadMore, 'l', "Load more recent rows", "Alt+L"),
     alt(
         Command::Scope,

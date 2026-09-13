@@ -364,6 +364,7 @@ pub(super) type SelectorEvent = WorkspaceEvent;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SelectorControl {
+    NewAgent,
     NativeResume {
         catalog: String,
         thread: String,
@@ -474,6 +475,7 @@ struct ProfileManagerStartup {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SessionTuiCycleOutcome {
+    NewAgent,
     NativeResume {
         catalog: String,
         thread: String,
@@ -4572,6 +4574,19 @@ pub(crate) fn run() -> anyhow::Result<()> {
             }
         };
         match outcome {
+            SessionTuiCycleOutcome::NewAgent => {
+                match shell.handoff(super::light_new::wizard)? {
+                    Ok(Some(result)) => {
+                        selector_model.notice = Some(format!("Created Agent {}", result.adopted.record.formal_agent_name.as_deref().unwrap_or("")));
+                        refresh = spawn_snapshot_refresh()?;
+                        selector_model.refreshing = true;
+                        refresh_project_members = true;
+                        panel = PrimaryPanel::Agents;
+                    }
+                    Ok(None) => {},
+                    Err(error) => selector_model.warning = Some(format!("New Agent: {error:#}")),
+                }
+            }
             SessionTuiCycleOutcome::NativeResume {
                 catalog,
                 thread,
@@ -5792,9 +5807,7 @@ fn selector_commands(model: &SelectorModel) -> Vec<(Command, Option<&'static str
                 Command::Scope if !matches!(model.mode, SelectorMode::Agents) => {
                     Some("Available on Managed")
                 }
-                Command::NewProject => {
-                    Some("New Agent unavailable: native bootstrap persistence is unverified. Select/Adopt an existing saved session; New Project is on Projects")
-                }
+                Command::NewProject if cutex::launch::local_deployment::LocalDeployment::selected().ok().flatten().is_none() => Some("Install a local runtime to create an Agent"),
                 Command::LoadMore
                     if !matches!(model.mode, SelectorMode::RecentSessions)
                         || model.recent.next_cursor().is_none()
@@ -5961,7 +5974,8 @@ fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyR
                 SelectorKeyRoute::Control(None)
             }
         }
-        Command::Details | Command::NewProject => SelectorKeyRoute::Control(None),
+        Command::NewProject => SelectorKeyRoute::Control(Some(SelectorControl::NewAgent)),
+        Command::Details => SelectorKeyRoute::Control(None),
         Command::Titles => {
             if matches!(model.mode, SelectorMode::Agents) {
                 model.show_thread_titles = !model.show_thread_titles;
@@ -6409,6 +6423,7 @@ fn run_event_loop(
                 };
                 if let Some(control) = control {
                     match control {
+                        SelectorControl::NewAgent => return Ok(SessionTuiCycleOutcome::NewAgent),
                         SelectorControl::NativeResume {
                             catalog,
                             thread,
@@ -6631,6 +6646,14 @@ fn apply_session_settings(
 fn apply_session_management(
     request: &SessionManagementRequest,
 ) -> anyhow::Result<SessionManagementResult> {
+    if request.command == SessionSettingsCommand::Adopt
+        && cutex::launch::local_deployment::LocalDeployment::selected()?.is_some()
+    {
+        let store = load_cutex_session_store()?;
+        let record = store.sessions.get(&request.key).context("saved session missing")?;
+        let native = record.codex_session_id.as_deref().context("saved native identity missing")?;
+        super::light_new::adopt_saved(native, &cutex_session_display_name(record), &record.cwd)?;
+    }
     let mut store = load_cutex_session_store()?;
     apply_session_management_to_store(&mut store, request)?;
     persist_cutex_session_store_and_im_record(&store, &request.key)?;
@@ -9670,6 +9693,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn new_agent_without_install_explains_runtime_selection() {
+        let mut model = SelectorModel::new(Vec::new(), false, false);
+        assert!(matches!(selector_command(&mut model, Command::NewProject), SelectorKeyRoute::Control(None)));
+        assert!(model.notice.as_deref().is_some_and(|notice| notice.contains("Install a local runtime")));
+    }
+
     #[test]
     fn ui_contract_e1_focus_scroll_status_modal_and_editor_return() {
         let mut model = SelectorModel::new(

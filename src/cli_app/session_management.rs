@@ -59,6 +59,25 @@ pub(crate) fn cmd_session_adopt(
         cwd.map(|path| normalize_cutex_session_managed_cwd_path(&path))
             .transpose()?
     };
+    if cutex::launch::local_deployment::LocalDeployment::selected()?.is_some() {
+        let current = load_cutex_session_store()?;
+        let key = cutex_session_key_for_user_id(&current, id);
+        let existing = key.as_ref().and_then(|key| current.sessions.get(key));
+        if existing.is_none_or(|record| !cutex::session::metadata::cutex_session_is_managed(record))
+        {
+            let native = existing
+                .and_then(|record| record.codex_session_id.as_deref())
+                .unwrap_or(id);
+            let formal = name
+                .clone()
+                .or_else(|| existing.map(cutex::session::metadata::cutex_session_display_name))
+                .unwrap_or_else(|| native.to_string());
+            let source_cwd = existing
+                .map(|record| record.cwd.clone())
+                .unwrap_or_else(|| cutex_session_ensure_seed().cwd);
+            super::light_new::adopt_saved(native, &formal, &source_cwd)?;
+        }
+    }
     let mut store = load_cutex_session_store()?;
     let outcome = adopt_cutex_session(
         &mut store,
