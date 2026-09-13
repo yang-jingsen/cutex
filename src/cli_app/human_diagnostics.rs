@@ -39,7 +39,7 @@ pub(super) fn run(selector: Option<&str>) -> anyhow::Result<()> {
     .map(|name| json!({"path":task_root.join(name),"bytes":file_bytes(&task_root.join(name))}));
     let result = json!({
         "cli_executable":std::env::current_exe().ok(),
-        "codex_home_env":std::env::var_os("CODEX_HOME"),
+        "codex_home_env":std::env::var_os("CODEX_HOME").map(|value| value.to_string_lossy().into_owned()),
         "cutex_native_home":cutex::config::paths::host_codex_home_dir()?,
         "runtime_root":root,"task_storage":files,
         "running_cutex_executables":running_cutex_executables(),
