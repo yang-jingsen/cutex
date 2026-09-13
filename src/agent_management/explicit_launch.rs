@@ -321,18 +321,7 @@ impl AgentManagementProvider {
                     r.job_mcp = if let Some(job) = job_mcp.as_ref() {
                         Some(job.review(&bundle)?)
                     } else {
-                        let sessions =
-                            crate::session::store::load_cutex_session_store_from_path(path)?;
-                        let saved = saved_runtime_job(&sessions, cutex_session_id, &r.contract)
-                            .map(|job| job.descriptor.clone());
-                        let descriptor = match saved {
-                            Some(job) => Some(job),
-                            None => crate::launch::local_deployment::LocalDeployment::selected()?
-                                .and_then(|d| d.job_mcp),
-                        };
-                        descriptor
-                            .map(|job| job.review_current(&bundle))
-                            .transpose()?
+                        inherited_runtime_job(path, cutex_session_id, &r.contract)?
                     };
                     r.configuration
                         .validate_job_requirement(r.job_mcp.is_some())?;
@@ -522,6 +511,24 @@ fn validate_activation(
         "persistent identity required"
     );
     Ok(())
+}
+
+/// Shared default resolution for ordinary and typed management launches.
+/// Refresh only the Job daemon occurrence; keep historical receipts immutable.
+pub(super) fn inherited_runtime_job(
+    path: &Path,
+    id: &CutexSessionId,
+    contract: &ExplicitLaunchContract,
+) -> anyhow::Result<Option<crate::launch::job_mcp::ReviewedJobMcp>> {
+    let sessions = crate::session::store::load_cutex_session_store_from_path(path)?;
+    let saved = saved_runtime_job(&sessions, id, contract).map(|job| job.descriptor.clone());
+    let descriptor = match saved {
+        Some(job) => Some(job),
+        None => crate::launch::local_deployment::LocalDeployment::selected()?
+            .and_then(|d| d.job_mcp),
+    };
+    let bundle = crate::launch::stock::StockBundle::load(contract)?;
+    descriptor.map(|job| job.review_current(&bundle)).transpose()
 }
 
 /// Reuse configuration from the most recent completed launch of this contract,

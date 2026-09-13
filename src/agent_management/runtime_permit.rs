@@ -31,9 +31,15 @@ impl RuntimeExecutionPermit<'_> {
                 prior.review.clone()
             }
             Some(_) => anyhow::bail!("managed runtime action conflict"),
-            None => self
-                .provider
-                .review_stock_runtime_locked(path, self.id, false, tasks)?,
+            None => {
+                let mut review = self
+                    .provider
+                    .review_stock_runtime_locked(path, self.id, false, tasks)?;
+                review.job_mcp =
+                    super::explicit_launch::inherited_runtime_job(path, self.id, &review.contract)?;
+                review.configuration.validate_job_requirement(review.job_mcp.is_some())?;
+                review
+            }
         };
         self.provider
             .execute_stock_runtime_locked(path, &action, &review, tasks, runtime)

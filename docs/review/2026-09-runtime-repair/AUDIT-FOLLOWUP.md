@@ -51,3 +51,5 @@
 CLI、Agent Bus、Management 均更新。部署后 392 个既有身份保留，4 个存活 native owner 的 PID/出生时间/代次不变、心跳前进；两服务 active、NRestarts=0。任务库 quick_check=ok，current/receipts/events 为 2/1/1，部署前后相同；本轮没有清空数据。`human doctor` 和 `human tasks list` 返回成功。cute-codex bundle 未替换。
 
 这些结果证明本轮对应修复及服务更新通过验收，不代表长期模型/Job 业务链已全量验证。已有 TUI 进程需退出列表后重新运行 `cutex` 才加载新版前台。
+
+后续发现并修复了启用 Job MCP 时 typed 创建遗漏 descriptor 的分支，见 [Job 配置后续修复](JOB-FOLLOWUP.md)。首轮无 MCP 的隔离验收未覆盖该条件。
