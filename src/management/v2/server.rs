@@ -217,6 +217,7 @@ fn agent_management_admin_path(path: &str) -> bool {
             | "/v2/agent-management/operator-actions"
             | "/v2/agent-management/project-mutations"
             | "/v2/task-service/management-query"
+            | "/v2/task-service/human-recovery"
     ) || management_project_id_from_path(path).is_some()
 }
 
@@ -468,6 +469,9 @@ fn handle_v2_request_with_repository(
         }
         ("POST", "/v2/agent-management/project-mutations") => {
             handle_management_project_mutation(stream, request, context)
+        }
+        ("POST", "/v2/task-service/human-recovery") => {
+            super::human_tasks::handle(stream, request)
         }
         ("POST", "/v2/task-service/management-query") => {
             handle_management_task_query(stream, request, context)
@@ -4324,6 +4328,7 @@ mod tests {
             "/v2/agent-management/operator-actions",
             "/v2/agent-management/project-mutations",
             "/v2/task-service/management-query",
+            "/v2/task-service/human-recovery",
         ] {
             assert!(agent_management_admin_path(path), "root scope: {path}");
             assert_eq!(

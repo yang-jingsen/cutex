@@ -282,3 +282,23 @@ mod tests {
         assert!(serde_json::from_value::<HumanManagementProjectMutationRequest>(invalid).is_err());
     }
 }
+
+/// Local administration of assignment bookkeeping. No Director seat is needed.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HumanTaskRecoveryRequest {
+    Query {
+        #[serde(default)]
+        assignee: Option<crate::role_revision::CutexSessionId>,
+    },
+    Reassign {
+        action_id: crate::task_service::ActionId,
+        assignment_id: crate::task_service::AssignmentId,
+        new_assignment_id: crate::task_service::AssignmentId,
+        assignee: crate::role_revision::CutexSessionId,
+    },
+    Cancel {
+        action_id: crate::task_service::ActionId,
+        assignment_id: crate::task_service::AssignmentId,
+    },
+}

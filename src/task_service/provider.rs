@@ -1747,7 +1747,7 @@ impl TaskServiceProvider {
             digest,
             None,
             |state, now| {
-                require_scoped_mutation_after_v3(state, &request.assignment_id)?;
+                require_existing_assignment(state, &request.assignment_id)?;
                 let assignment = assignment(state, &request.assignment_id)?.clone();
                 require_local_revision(
                     expected_assignment_revision,
@@ -1834,7 +1834,7 @@ impl TaskServiceProvider {
                     .ok_or(ProviderError::NotFound("send_attempt"))?
                     .assignment_id
                     .clone();
-                require_scoped_mutation_after_v3(state, &assignment_id)?;
+                require_existing_assignment(state, &assignment_id)?;
                 let (result, assignment_id) = {
                     let send = state
                         .send_attempts
@@ -1909,7 +1909,7 @@ impl TaskServiceProvider {
                     .ok_or(ProviderError::NotFound("completion_notification"))?
                     .assignment_id
                     .clone();
-                require_scoped_mutation_after_v3(state, &assignment_id)?;
+                require_existing_assignment(state, &assignment_id)?;
                 let notification = state
                     .completion_notifications
                     .get_mut(&request.notification_id)
@@ -1964,7 +1964,7 @@ impl TaskServiceProvider {
                     .ok_or(ProviderError::NotFound("worker_followup_notification"))?
                     .assignment_id
                     .clone();
-                require_scoped_mutation_after_v3(state, &assignment_id)?;
+                require_existing_assignment(state, &assignment_id)?;
                 let notification = state
                     .worker_followup_notifications
                     .get_mut(&request.notification_id)
@@ -2036,7 +2036,7 @@ impl TaskServiceProvider {
                     Err(ProviderError::Conflict("action_id_payload_conflict"))
                 };
             }
-            require_scoped_mutation_after_v3(&state, request.action.assignment_id())?;
+            require_existing_assignment(&state, request.action.assignment_id())?;
 
             if let Some(prepared) = state.prepared_worker_actions.get(&action_id).cloned() {
                 if prepared.authenticated_cutex_session != session {
@@ -2125,7 +2125,7 @@ impl TaskServiceProvider {
         // semantic identity.
         let recovered = self.query()?;
         if !recovered.receipts.contains_key(request.action_id()) {
-            require_scoped_mutation_after_v3(&recovered, assignment_id)?;
+            require_existing_assignment(&recovered, assignment_id)?;
         }
         let known_binding = recovered
             .receipts
@@ -2150,7 +2150,7 @@ impl TaskServiceProvider {
             digest,
             attempt_binding,
             |state, now| {
-                require_scoped_mutation_after_v3(state, assignment_id)?;
+                require_existing_assignment(state, assignment_id)?;
                 let prepared = state
                     .prepared_worker_actions
                     .get(request.action_id())
@@ -2374,7 +2374,7 @@ impl TaskServiceProvider {
             digest,
             attempt_binding,
             |state, now| {
-                require_scoped_mutation_after_v3(state, &body.assignment_id)?;
+                require_existing_assignment(state, &body.assignment_id)?;
                 authorize_terminal(state, principal, &body.assignment_id)?;
                 match &request.command {
                     TerminalAuthorityRequest::RequestChanges(_) => {
@@ -2528,6 +2528,94 @@ impl TaskServiceProvider {
         )
     }
 
+    /// Administrative cancellation at the authenticated local management boundary.
+    /// Resolves current attempt state inside the same transaction, even when the
+    /// original Director is gone or a legacy assignment survived v3 activation.
+    /// This closes task bookkeeping; it does not interrupt the worker process.
+    pub fn human_cancel_assignment(
+        &self,
+        _principal: &crate::management::control_plane::HumanManagementPrincipal,
+        action_id: &ActionId,
+        assignment_id: &AssignmentId,
+    ) -> Result<ProviderReceipt, ProviderError> {
+        let bytes = serde_json::to_vec(&("cutex/human-task-cancel/v1", action_id, assignment_id))
+            .map_err(|_| ProviderError::InvalidRequest("unserializable_request"))?;
+        self.mutate(
+            "human_cancel_assignment",
+            action_id,
+            hex_sha256(&bytes),
+            None,
+            |state, now| {
+                if assignment(state, assignment_id)?.state != AssignmentState::Closed {
+                    cancel_assignment_internal(state, assignment_id, action_id, now)?;
+                }
+                // Return assignment state without exposing the worker's attempt token.
+                Ok(ProviderResult::Assignment {
+                    assignment: assignment(state, assignment_id)?.clone(),
+                    send_attempt: None,
+                })
+            },
+        )
+    }
+
+    /// Transfer ownership by closing the old assignment and creating a fresh
+    /// one in a single journal transaction. Existing attempts remain attached
+    /// to their original assignment. Delivery is deliberately a separate step.
+    pub fn human_reassign_assignment(
+        &self,
+        _principal: &crate::management::control_plane::HumanManagementPrincipal,
+        action_id: &ActionId,
+        assignment_id: &AssignmentId,
+        new_assignment_id: &AssignmentId,
+        assignee: &CutexSessionId,
+    ) -> Result<ProviderReceipt, ProviderError> {
+        let bytes = serde_json::to_vec(&(
+            "cutex/human-task-reassign/v1",
+            action_id,
+            assignment_id,
+            new_assignment_id,
+            assignee,
+        ))
+        .map_err(|_| ProviderError::InvalidRequest("unserializable_request"))?;
+        self.mutate(
+            "human_reassign_assignment",
+            action_id,
+            hex_sha256(&bytes),
+            None,
+            |state, now| {
+                if state.assignments.contains_key(new_assignment_id) {
+                    return Err(ProviderError::Conflict("assignment_exists"));
+                }
+                let previous = assignment(state, assignment_id)?.clone();
+                task_revision(state, &previous.task_id, previous.task_revision)?;
+                if previous.state != AssignmentState::Closed {
+                    cancel_assignment_internal(state, assignment_id, action_id, now)?;
+                }
+                let assignment = Assignment {
+                    project_id: previous.project_id,
+                    assignment_id: new_assignment_id.clone(),
+                    task_id: previous.task_id,
+                    task_revision: previous.task_revision,
+                    assignee_cutex_session: assignee.clone(),
+                    state: AssignmentState::AwaitingAck,
+                    local_revision: 1,
+                    created_at: now.clone(),
+                    acknowledged_at: None,
+                    active_attempt: None,
+                    retry_authorization: None,
+                    closure: None,
+                };
+                state
+                    .assignments
+                    .insert(new_assignment_id.clone(), assignment.clone());
+                Ok(ProviderResult::Assignment {
+                    assignment,
+                    send_attempt: None,
+                })
+            },
+        )
+    }
+
     pub fn cancel_assignment(
         &self,
         principal: &AuthenticatedPrincipal,
@@ -2553,7 +2641,7 @@ impl TaskServiceProvider {
             digest,
             attempt_binding,
             |state, now| {
-                require_scoped_mutation_after_v3(state, &request.assignment_id)?;
+                require_existing_assignment(state, &request.assignment_id)?;
                 authorize_assignment_coordinator(state, principal, &request.assignment_id)?;
                 require_cancel_context(state, &request.assignment_id, &context)?;
                 let result = cancel_assignment_internal(
@@ -2590,7 +2678,7 @@ impl TaskServiceProvider {
             digest,
             None,
             |state, now| {
-                require_scoped_mutation_after_v3(state, &request.assignment_id)?;
+                require_existing_assignment(state, &request.assignment_id)?;
                 authorize_assignment_coordinator(state, principal, &request.assignment_id)?;
                 let assignment = assignment_mut(state, &request.assignment_id)?;
                 require_local_revision(
@@ -2640,7 +2728,7 @@ impl TaskServiceProvider {
             digest,
             attempt_binding,
             |state, now| {
-                require_scoped_mutation_after_v3(state, &request.assignment_id)?;
+                require_existing_assignment(state, &request.assignment_id)?;
                 authorize_assignment_coordinator(state, principal, &request.assignment_id)?;
                 require_worker_attempt_context(state, &request.assignment_id, &context)?;
                 require_assignment_revision(state, &request.assignment_id, &context)?;
@@ -3517,15 +3605,13 @@ fn assignment_mut<'a>(
         .ok_or(ProviderError::NotFound("assignment"))
 }
 
-fn require_scoped_mutation_after_v3(
+fn require_existing_assignment(
     state: &TaskServiceSnapshot,
     assignment_id: &AssignmentId,
 ) -> Result<(), ProviderError> {
-    let assignment = assignment(state, assignment_id)?;
-    if state.schema == ProviderStoreSchema::V3 && assignment.project_id.is_none() {
-        return Err(ProviderError::Conflict("legacy_assignment_immutable"));
-    }
-    Ok(())
+    // Existing tasks remain operable across project-schema activation. Caller
+    // identity, authority, and attempt checks are enforced by each operation.
+    assignment(state, assignment_id).map(|_| ())
 }
 
 fn active_attempt_mut<'a>(
@@ -4963,12 +5049,12 @@ mod tests {
     }
 
     #[test]
-    fn v3_activation_makes_every_legacy_assignment_mutation_no_write() {
-        let fixture = Fixture::new("v3-legacy-immutable");
+    fn v3_activation_preserves_legacy_worker_authorization_and_attempt_checks() {
+        let fixture = Fixture::new("v3-legacy-continued");
         fixture.provision();
         let start = WorkerActionRequest::Start(AssignmentActionRequest {
             schema: ProviderActionSchema::V2,
-            action_id: action("legacy-prepared-before-v3"),
+            action_id: action("start"),
             assignment_id: assignment_id(),
         });
         let prepared = fixture.worker_envelope(start.clone());
@@ -4993,177 +5079,33 @@ mod tests {
                 None,
             )
             .unwrap();
+        let outsider = AuthenticatedPrincipal::session(session("cutex-outsider"));
         let before = fixture.provider.query().unwrap();
-
         assert!(matches!(
-            fixture.provider.prepare_worker_action(
-                &fixture.worker,
-                &WorkerPrepareRequest {
-                    schema: WorkerPrepareRequestSchema::V2,
-                    action: start,
-                },
-            ),
-            Err(ProviderError::Conflict("legacy_assignment_immutable"))
+            fixture.provider.execute_worker_action(&outsider, &prepared),
+            Err(ProviderError::Unauthorized)
         ));
-        assert!(matches!(
-            fixture
-                .provider
-                .execute_worker_action(&fixture.worker, &prepared),
-            Err(ProviderError::Conflict("legacy_assignment_immutable"))
-        ));
-        assert!(matches!(
-            fixture.provider.record_communication_event(
-                &AuthenticatedPrincipal::task_service_system(),
-                &CommunicationEventRequest {
-                    schema: ProviderActionSchema::V2,
-                    action_id: action("legacy-communication-after-v3"),
-                    send_attempt_id: id("send-1", SendAttemptId::new),
-                    expected_send_attempt_revision: 1,
-                    kind: CommunicationEventKind::BusQueued,
-                    receipt_reference: Some("legacy-message".into()),
-                },
-            ),
-            Err(ProviderError::Conflict("legacy_assignment_immutable"))
-        ));
-        assert!(matches!(
-            fixture.provider.retry_delivery(
-                &fixture.coordinator,
-                &RetryDeliveryRequest {
-                    schema: ProviderActionSchema::V2,
-                    action_id: action("legacy-delivery-retry-after-v3"),
-                    assignment_id: assignment_id(),
-                    send_attempt_id: id("legacy-send-retry-after-v3", SendAttemptId::new),
-                    external_message_id: "legacy-message-retry-after-v3".into(),
-                },
-                1,
-                "legacy retry",
-            ),
-            Err(ProviderError::Conflict("legacy_assignment_immutable"))
-        ));
-        assert!(matches!(
-            fixture.provider.cancel_assignment(
-                &fixture.coordinator,
-                &AssignmentActionRequest {
-                    schema: ProviderActionSchema::V2,
-                    action_id: action("legacy-cancel-after-v3"),
-                    assignment_id: assignment_id(),
-                },
-                1,
-                None,
-            ),
-            Err(ProviderError::Conflict("legacy_assignment_immutable"))
-        ));
-        assert!(matches!(
-            fixture.provider.authorize_attempt_retry(
-                &fixture.coordinator,
-                &AssignmentActionRequest {
-                    schema: ProviderActionSchema::V2,
-                    action_id: action("legacy-authorize-retry-after-v3"),
-                    assignment_id: assignment_id(),
-                },
-                1,
-            ),
-            Err(ProviderError::Conflict("legacy_assignment_immutable"))
-        ));
-        assert!(matches!(
-            fixture.provider.execute_terminal_action(
-                &fixture.authority,
-                &TerminalActionEnvelope {
-                    schema: TerminalRequestSchema::V2,
-                    command: TerminalAuthorityRequest::Cancel(TerminalActionRequest {
-                        schema: ProviderActionSchema::V2,
-                        action_id: action("legacy-terminal-after-v3"),
-                        assignment_id: assignment_id(),
-                        decision_reference: None,
-                    }),
-                    context: prepared.context.clone(),
-                },
-            ),
-            Err(ProviderError::Conflict("legacy_assignment_immutable"))
-        ));
-        assert!(matches!(
-            fixture.provider.close_assignment(
-                &fixture.coordinator,
-                &CloseAssignmentRequest {
-                    schema: ProviderActionSchema::V2,
-                    action_id: action("legacy-close-after-v3"),
-                    assignment_id: assignment_id(),
-                },
-                1,
-                &AttemptMechanicalContext {
-                    attempt_number: AttemptNumber::new(1).unwrap(),
-                    attempt_token: ProviderAttemptToken::new("legacy-attempt-token").unwrap(),
-                    expected_attempt_revision: 1,
-                },
-            ),
-            Err(ProviderError::Conflict("legacy_assignment_immutable"))
-        ));
-
-        let after = fixture.provider.query().unwrap();
-        assert_eq!(after.journal_sequence, before.journal_sequence);
-        assert_eq!(
-            after.assignments[&assignment_id()],
-            before.assignments[&assignment_id()]
-        );
-        assert_eq!(
-            after.prepared_worker_actions,
-            before.prepared_worker_actions
-        );
-        assert!(after.attempts.get(&assignment_id()).is_none());
-
-        let notification_fixture = Fixture::new("v3-legacy-notification-immutable");
-        notification_fixture.provision();
-        notification_fixture.worker_action(WorkerActionRequest::Decline(AssignmentActionRequest {
-            schema: ProviderActionSchema::V2,
-            action_id: action("legacy-decline-before-v3"),
-            assignment_id: assignment_id(),
-        }));
-        notification_fixture
+        assert_eq!(fixture.provider.query().unwrap(), before);
+        fixture
             .provider
-            .create_project_revision(
-                &notification_fixture.coordinator,
-                &CreateProjectRevisionRequest {
-                    schema: ProviderActionSchema::V3,
-                    action_id: action("activate-v3-after-notification"),
-                    project_id: crate::agent_management::ProjectId::new("project-beta").unwrap(),
-                    workflow_id: id("project-beta-workflow", WorkflowId::new),
-                    task_id: TaskId::new("CUTEX-project-after-notification").unwrap(),
-                    task_revision: TaskRevision::new(1).unwrap(),
-                    contract_sha256: sha("project beta contract"),
-                    opaque_contract: "project beta contract".into(),
-                    completion_policy: CompletionPolicy {
-                        kind: CompletionPolicyKind::ReleaseReview,
-                        authority_seat_id: id("release", SeatId::new),
-                    },
+            .execute_worker_action(&fixture.worker, &prepared)
+            .unwrap();
+        assert!(fixture
+            .provider
+            .cancel_assignment(
+                &fixture.coordinator,
+                &AssignmentActionRequest {
+                    schema: ProviderActionSchema::V2,
+                    action_id: action("stale-cancel"),
+                    assignment_id: assignment_id(),
                 },
-                None,
+                1,
+                None
             )
-            .unwrap();
-        let before_notification = notification_fixture.provider.query().unwrap();
-        let notification = before_notification
-            .completion_notifications
-            .values()
-            .next()
-            .unwrap();
-        assert!(matches!(
-            notification_fixture
-                .provider
-                .record_completion_notification_fact(
-                    &AuthenticatedPrincipal::task_service_system(),
-                    &CompletionNotificationFactRequest {
-                        schema: ProviderActionSchema::V2,
-                        action_id: action("legacy-notification-fact-after-v3"),
-                        notification_id: notification.notification_id.clone(),
-                        expected_notification_revision: notification.local_revision,
-                        kind: CompletionNotificationFactKind::Queued,
-                        reference: Some("legacy-notification".into()),
-                    },
-                ),
-            Err(ProviderError::Conflict("legacy_assignment_immutable"))
-        ));
+            .is_err());
         assert_eq!(
-            notification_fixture.provider.query().unwrap(),
-            before_notification
+            fixture.provider.query().unwrap().assignments[&assignment_id()].state,
+            AssignmentState::Active
         );
     }
 
@@ -5974,6 +5916,202 @@ mod tests {
         assert!(watch
             .windows(2)
             .all(|pair| pair[0].sequence + 1 == pair[1].sequence));
+    }
+
+    #[test]
+    fn human_cancel_recovers_running_assignment_and_replays_receipt() {
+        let fixture = Fixture::new("human-cancel");
+        fixture.provision();
+        fixture.start("start");
+        let before = fixture.provider.query().unwrap();
+        let principal = crate::management::control_plane::HumanManagementPrincipal::authenticated();
+        let action_id = action("human-cancel");
+        let receipt = fixture
+            .provider
+            .human_cancel_assignment(&principal, &action_id, &assignment_id())
+            .unwrap();
+        let after = fixture.provider.query().unwrap();
+        assert_eq!(
+            after.assignments[&assignment_id()].state,
+            AssignmentState::Closed
+        );
+        assert_eq!(
+            after.attempts[&assignment_id()][&AttemptNumber::new(1).unwrap()].phase,
+            AttemptPhase::Cancelled
+        );
+        assert_eq!(after.task_revisions, before.task_revisions);
+        assert_eq!(after.send_attempts, before.send_attempts);
+        assert!(!serde_json::to_string(&receipt)
+            .unwrap()
+            .contains("attempt_token"));
+        assert_eq!(
+            fixture
+                .provider
+                .human_cancel_assignment(&principal, &action_id, &assignment_id())
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(
+            fixture.provider.query().unwrap().journal_sequence,
+            after.journal_sequence
+        );
+        assert!(matches!(
+            fixture.provider.human_cancel_assignment(
+                &principal,
+                &action_id,
+                &AssignmentId::new("other").unwrap()
+            ),
+            Err(ProviderError::Conflict("action_id_payload_conflict"))
+        ));
+        let reopened = TaskServiceProvider::open((*fixture.provider.root).clone()).unwrap();
+        assert_eq!(reopened.recover().unwrap(), after);
+    }
+
+    #[test]
+    fn human_cancel_can_close_legacy_assignment_after_v3_activation() {
+        let fixture = Fixture::new("human-cancel-legacy-v3");
+        fixture.provision();
+        fixture
+            .provider
+            .create_project_revision(
+                &fixture.coordinator,
+                &CreateProjectRevisionRequest {
+                    schema: ProviderActionSchema::V3,
+                    action_id: action("activate-v3"),
+                    project_id: crate::agent_management::ProjectId::new("project-alpha").unwrap(),
+                    workflow_id: id("project-workflow", WorkflowId::new),
+                    task_id: TaskId::new("CUTEX-project").unwrap(),
+                    task_revision: TaskRevision::new(1).unwrap(),
+                    contract_sha256: sha("project contract"),
+                    opaque_contract: "project contract".into(),
+                    completion_policy: CompletionPolicy {
+                        kind: CompletionPolicyKind::ReleaseReview,
+                        authority_seat_id: id("release", SeatId::new),
+                    },
+                },
+                None,
+            )
+            .unwrap();
+        let principal = crate::management::control_plane::HumanManagementPrincipal::authenticated();
+        fixture
+            .provider
+            .human_cancel_assignment(&principal, &action("human-cancel"), &assignment_id())
+            .unwrap();
+        assert_eq!(
+            fixture.provider.query().unwrap().assignments[&assignment_id()].state,
+            AssignmentState::Closed
+        );
+    }
+
+    #[test]
+    fn human_reassign_is_atomic_and_keeps_old_attempt_identity() {
+        let fixture = Fixture::new("human-reassign");
+        fixture.provision();
+        fixture.start("start");
+        fixture
+            .provider
+            .create_project_revision(
+                &fixture.coordinator,
+                &CreateProjectRevisionRequest {
+                    schema: ProviderActionSchema::V3,
+                    action_id: action("activate-v3"),
+                    project_id: crate::agent_management::ProjectId::new("project-alpha").unwrap(),
+                    workflow_id: id("project-workflow", WorkflowId::new),
+                    task_id: TaskId::new("CUTEX-project-after-legacy").unwrap(),
+                    task_revision: TaskRevision::new(1).unwrap(),
+                    contract_sha256: sha("project contract"),
+                    opaque_contract: "project contract".into(),
+                    completion_policy: CompletionPolicy {
+                        kind: CompletionPolicyKind::ReleaseReview,
+                        authority_seat_id: id("release", SeatId::new),
+                    },
+                },
+                None,
+            )
+            .unwrap();
+        let principal = crate::management::control_plane::HumanManagementPrincipal::authenticated();
+        let new_id = AssignmentId::new("replacement").unwrap();
+        let target = session("cutex-worker-r2");
+        let action_id = action("human-reassign");
+        let receipt = fixture
+            .provider
+            .human_reassign_assignment(&principal, &action_id, &assignment_id(), &new_id, &target)
+            .unwrap();
+        let after = fixture.provider.query().unwrap();
+        assert_eq!(
+            after.assignments[&assignment_id()].state,
+            AssignmentState::Closed
+        );
+        assert_eq!(after.assignments[&new_id].assignee_cutex_session, target);
+        assert_eq!(
+            after.assignments[&new_id].state,
+            AssignmentState::AwaitingAck
+        );
+        assert_eq!(after.assignments[&new_id].active_attempt, None);
+        assert!(!after.attempts.contains_key(&new_id));
+        assert_eq!(
+            after.attempts[&assignment_id()][&AttemptNumber::new(1).unwrap()].phase,
+            AttemptPhase::Cancelled
+        );
+        assert_eq!(
+            fixture
+                .provider
+                .human_reassign_assignment(
+                    &principal,
+                    &action_id,
+                    &assignment_id(),
+                    &new_id,
+                    &target
+                )
+                .unwrap(),
+            receipt
+        );
+        let before_conflict = fixture.provider.query().unwrap();
+        assert!(fixture
+            .provider
+            .human_reassign_assignment(&principal, &action("conflict"), &new_id, &new_id, &target)
+            .is_err());
+        assert_eq!(fixture.provider.query().unwrap(), before_conflict);
+        let reopened = TaskServiceProvider::open((*fixture.provider.root).clone()).unwrap();
+        assert_eq!(reopened.recover().unwrap(), after);
+        // The replacement can start as the new assignee without a fabricated delivery receipt.
+        let worker = AuthenticatedPrincipal::session(target);
+        let outsider = AuthenticatedPrincipal::session(session("cutex-outsider"));
+        assert!(matches!(
+            fixture.provider.prepare_worker_action(
+                &outsider,
+                &WorkerPrepareRequest {
+                    schema: WorkerPrepareRequestSchema::V2,
+                    action: WorkerActionRequest::Start(AssignmentActionRequest {
+                        schema: ProviderActionSchema::V2,
+                        action_id: action("outsider-start"),
+                        assignment_id: new_id.clone(),
+                    }),
+                }
+            ),
+            Err(ProviderError::Unauthorized)
+        ));
+        let prepared = fixture
+            .provider
+            .prepare_worker_action(
+                &worker,
+                &WorkerPrepareRequest {
+                    schema: WorkerPrepareRequestSchema::V2,
+                    action: WorkerActionRequest::Start(AssignmentActionRequest {
+                        schema: ProviderActionSchema::V2,
+                        action_id: action("new-start"),
+                        assignment_id: new_id,
+                    }),
+                },
+            )
+            .unwrap();
+        let WorkerPrepareOutcome::Prepared(envelope) = prepared else {
+            panic!("prepared")
+        };
+        fixture
+            .provider
+            .execute_worker_action(&worker, &envelope)
+            .unwrap();
     }
 
     #[test]
