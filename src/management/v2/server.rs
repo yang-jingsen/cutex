@@ -2222,9 +2222,7 @@ fn handle_cutex_request(
             context.load_runtime_status,
             event_repository,
         )?
-    } else if request_may_resolve_hidden_session(&cutex_request.method)
-        || (owner.is_some() && runtime_stop_method(&cutex_request.method))
-    {
+    } else if request_may_resolve_hidden_session(&cutex_request.method, owner.is_some()) {
         session_resource_including_hidden(
             cutex_session_id,
             &registry,
@@ -2481,8 +2479,10 @@ fn write_post_cutex_operation_outcome_unknown(
     )
 }
 
-fn request_may_resolve_hidden_session(method: &str) -> bool {
-    method == "cutex/session/visibility/show"
+fn request_may_resolve_hidden_session(method: &str, authenticated_owner: bool) -> bool {
+    // Listing visibility is not permission: authenticated Human owners can address
+    // active durable Agents by exact ID. Method and archive guards still apply.
+    authenticated_owner || method == "cutex/session/visibility/show"
 }
 
 fn cutex_request_lock(cutex_session_id: &str) -> anyhow::Result<Arc<Mutex<()>>> {
@@ -4744,14 +4744,34 @@ mod tests {
     }
 
     #[test]
+    fn human_supported_requests_resolve_offline_unexposed_agents() {
+        for method in [
+            "cutex/runtime/online",
+            "cutex/runtime/offline",
+            "cutex/runtime/close",
+            "cutex/session/get",
+            "cutex/session/profile/set",
+            "cutex/userInput/submit",
+        ] {
+            assert!(request_may_resolve_hidden_session(method, true));
+            assert!(!request_may_resolve_hidden_session(method, false));
+        }
+    }
+
+    #[test]
     fn only_visibility_show_can_resolve_a_hidden_session() {
         assert!(request_may_resolve_hidden_session(
-            "cutex/session/visibility/show"
+            "cutex/session/visibility/show",
+            false
         ));
         assert!(!request_may_resolve_hidden_session(
-            "cutex/session/visibility/hide"
+            "cutex/session/visibility/hide",
+            false
         ));
-        assert!(!request_may_resolve_hidden_session("cutex/runtime/online"));
+        assert!(!request_may_resolve_hidden_session(
+            "cutex/runtime/online",
+            false
+        ));
     }
 
     #[test]

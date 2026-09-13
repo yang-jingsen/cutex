@@ -117,3 +117,8 @@ An Agent Bus bearer is not a Human Management bearer. For a native Agent the old
 runtime endpoint returns `human_runtime_route_required`, with the exact Human
 endpoint and CLI command. A human may delegate those commands to an agent using
 the already configured Human credential. No additional approval token is needed.
+
+Visibility controls list exposure, not Human ownership: an authenticated Human
+may address an active local durable Agent by exact ID even while it is hidden.
+The normal method validation, generation checks, and archive lifecycle rules
+still apply. Other callers retain the existing visibility rules.
