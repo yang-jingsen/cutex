@@ -165,6 +165,7 @@ fn dispatch(
     params: Value,
 ) -> Result<Value, JobError> {
     match method {
+        "capabilities" => service.capabilities(token),
         "submit" => {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase", deny_unknown_fields)]

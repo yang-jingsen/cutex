@@ -87,3 +87,23 @@ The daemon default is 16 concurrent jobs, 1,024 retained job records, 1 MiB per 
 `tests/mcp_real_path.rs` starts isolated Job Service, Agent Bus, and Responses fixtures, then invokes the installed cute-codex `0.153.4` binary with a private temporary `CODEX_HOME` and actual configured stdio MCP transport. It proves that the client-generated thread, authenticated durable projection, active `disabled` permission profile, cwd, submission, and actual subprocess reach the persisted core boundary without a model call. Managed read-only filesystem/network probes remain direct OS-oracle tests with a synthetic issuer; no live MCP, Cutex, Agent, project, task, or user-manager state is touched.
 
 The source provenance is cute-codex `ef53716b7673ad14c24b977667334e31e66110d8` and Cutex `e7d01585661d350bffeea468d1db202628047490`. The former constructs trusted MCP `_meta`; the latter launches managed app servers with runtime occurrence and Agent Bus credentials and projects the native session to a durable Cutex identity. JS2 is an integration candidate, not installed or deployed.
+
+## Runtime upgrade and execution directories
+
+A job's `cwd` is its execution directory, independently of the originating
+`sandboxCwd` policy anchor. The runner enters the original sandbox first, then
+changes directory and executes argv with positional arguments. This preserves
+managed filesystem/network limits and supports child worktrees, spaces and
+Unicode paths. Failure to access the requested directory is a job failure.
+
+Daemon startup accepts repeated `--allow-launcher PATH` arguments in addition to
+the positional launcher. During a native upgrade retain launchers used by live
+older agents and add the newly installed launcher. Each canonical path remains
+bound to its file digest; arbitrary interpreters are not substituted for the
+native launcher. The authenticated local `capabilities` method returns
+`allowedLaunchers` (path to SHA-256) and `independentExecutionCwd` for installation
+preflight. API credentials remain hex-encoded raw secret-file bytes.
+
+Run `cargo test --features test-harness` to include the owner-death helper binary.
+The real MCP test uses a local mock Responses server, submits in a child worktree,
+and checks the actual command output and inherited disabled profile.

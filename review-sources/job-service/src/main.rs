@@ -41,22 +41,36 @@ fn mcp_stdio(args: &[String]) -> Result<(), JobError> {
 }
 
 fn serve(args: &[String]) -> Result<(), JobError> {
-    if args.len() != 5 && args.len() != 8 {
+    if args.len() < 5 {
         return Err(JobError::Invalid(
-            "serve requires STATE_ROOT SOCKET API_TOKEN_FILE GRANT_KEY_FILE SANDBOX_LAUNCHER [--completion ENDPOINT TOKEN_FILE]"
+            "serve requires STATE_ROOT SOCKET API_TOKEN_FILE GRANT_KEY_FILE SANDBOX_LAUNCHER"
                 .into(),
         ));
     }
-    if args.len() == 8 && !matches!(args[5].as_str(), "--completion" | "--completion-v2") {
-        return Err(JobError::Invalid(
-            "optional completion configuration requires --completion or --completion-v2 ENDPOINT TOKEN_FILE".into(),
-        ));
+    let mut launchers = vec![args[4].as_str()];
+    let mut completion = None;
+    let mut index = 5;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--allow-launcher" if index + 1 < args.len() => {
+                launchers.push(args[index + 1].as_str());
+                index += 2;
+            }
+            "--completion" | "--completion-v2" if index + 2 < args.len() && completion.is_none() => {
+                completion = Some((args[index].as_str(), args[index + 1].clone(), args[index + 2].clone()));
+                index += 3;
+            }
+            _ => return Err(JobError::Invalid("invalid serve option; expected --allow-launcher PATH or --completion[-v2] ENDPOINT TOKEN_FILE".into())),
+        }
     }
     let api = read_secret(&args[2])?;
     let grant = read_secret(&args[3])?;
-    let launcher = std::fs::canonicalize(&args[4])?;
-    let launcher_path = launcher.to_string_lossy().into_owned();
-    let launcher_sha = cutex_job_service::file_sha256(&launcher)?;
+    let mut allowed_launchers = std::collections::BTreeMap::new();
+    for path in launchers {
+        let path = std::fs::canonicalize(path)?;
+        let digest = cutex_job_service::file_sha256(&path)?;
+        allowed_launchers.insert(path.to_string_lossy().into_owned(), digest);
+    }
     let service = JobService::open(ServiceConfig {
         state_root: args[0].clone().into(),
         grant_key: grant,
@@ -67,19 +81,22 @@ fn serve(args: &[String]) -> Result<(), JobError> {
         cancel_grace: Duration::from_secs(2),
         max_jobs: 1024,
         max_active_jobs: 16,
-        allowed_launchers: [(launcher_path, launcher_sha)].into_iter().collect(),
-        completion_wire_version: if args.get(5).is_some_and(|value| value == "--completion-v2") {
+        allowed_launchers,
+        completion_wire_version: if completion
+            .as_ref()
+            .is_some_and(|(kind, _, _)| *kind == "--completion-v2")
+        {
             cutex_job_service::CompletionWireVersion::V2
         } else {
             cutex_job_service::CompletionWireVersion::V1
         },
     })?;
-    let _completion_worker = if args.len() == 8 {
+    let _completion_worker = if let Some((_, endpoint, token_file)) = completion {
         Some(CompletionDeliveryWorker::start(
             service.clone(),
             CompletionDeliveryConfig {
-                endpoint: args[6].clone(),
-                token_file: args[7].clone().into(),
+                endpoint,
+                token_file: token_file.into(),
                 request_timeout: Duration::from_secs(5),
                 minimum_backoff: Duration::from_secs(2),
                 maximum_backoff: Duration::from_secs(5 * 60),

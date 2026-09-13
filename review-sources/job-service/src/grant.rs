@@ -241,11 +241,14 @@ fn validate_sandbox_state(value: &Value, expected_cwd: &str) -> Result<(), JobEr
         .map_err(|_| JobError::Unauthorized("sandboxCwd cannot be resolved".into()))?;
     let expected_cwd = std::fs::canonicalize(expected_cwd)
         .map_err(|_| JobError::Unauthorized("request cwd cannot be resolved".into()))?;
-    if sandbox_cwd != expected_cwd {
+    if !sandbox_cwd.is_dir() || !expected_cwd.is_dir() {
         return Err(JobError::Unauthorized(
-            "sandboxCwd differs from the bound request cwd".into(),
+            "sandbox and request cwd must be directories".into(),
         ));
     }
+    // sandboxCwd anchors the originating policy, not the job's execution cwd.
+    // The runner changes directory inside that unchanged sandbox; access remains
+    // subject to its original filesystem permissions.
     Ok(())
 }
 

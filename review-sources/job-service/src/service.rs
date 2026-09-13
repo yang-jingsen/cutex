@@ -378,6 +378,16 @@ impl JobService {
         })
     }
 
+    /// Installation preflight: report the exact launchers accepted by this daemon.
+    pub fn capabilities(&self, api_token: &[u8]) -> Result<serde_json::Value, JobError> {
+        self.authenticate(api_token)?;
+        Ok(
+            serde_json::json!({"schema":"cutex/job-service-capabilities/v1",
+            "allowedLaunchers":self.inner.config.allowed_launchers,
+            "independentExecutionCwd":true}),
+        )
+    }
+
     pub fn query(&self, api_token: &[u8], job_id: &str) -> Result<JobRecord, JobError> {
         self.authenticate(api_token)?;
         self.query_inner(job_id)

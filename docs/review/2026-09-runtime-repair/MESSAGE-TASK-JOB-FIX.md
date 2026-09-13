@@ -16,7 +16,9 @@ the exact immutable task revision, full `opaque_contract`, and its SHA-256. It
 uses authenticated `POST /api/task/v2/query` with operation `read_contract` and
 an assignment ID body. Only that assignment's assignee can read through this
 surface. It works before start, creates no attempt, and exposes no attempt token
-or prepared action. The MCP facade must be rebuilt along with Cutex.
+or prepared action. The MCP facade must be rebuilt along with Cutex. Its client route set now
+explicitly includes `/api/task/v2/query`; a real loopback transport regression
+covers the occurrence headers and full long response.
 
 ## Agent message display
 
@@ -73,3 +75,23 @@ Keep launchers used by live older agents in the allowlist during upgrade.
 Deployment and current source commit references are recorded separately with the
 release acceptance results. Production agents/tasks are preserved; cesc's exec
 experiments are not moved to Job Service.
+
+## Local acceptance after installation
+
+The isolated r20 native/Job lifecycle passed create, online reuse, restart,
+offline, online and close with no model prompts. All native fixture owners and
+fixture services were stopped; copied fixture credentials were removed.
+
+Production Bus/Management replacement preserved 5 native owners, their PIDs and
+generations, and advancing heartbeats. Task database counts stayed at 6 current
+aggregates, 9 receipts and 14 events during the r20 switch; no reset occurred.
+The idle Job daemon had zero Jobs and now accepts four old/new launcher paths.
+35 existing native identities received the new next-launch package. Existing
+native/MCP processes were retained to avoid interrupting work.
+
+Both the real HTTP route and rebuilt MCP executable read the existing cesc
+assignment contract as its current assignee: 13,677 UTF-8 bytes, exact stored
+SHA-256. A different authenticated agent was rejected. This was read-only; no
+message or experimental job was sent. New tool discovery requires the agent's
+next runtime start; reopening the TUI alone does not replace an existing MCP
+process. Reopening with the new CLI enables its display renderer.

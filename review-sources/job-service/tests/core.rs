@@ -616,3 +616,50 @@ fn persisted_launch_pending_recovers_as_unknown_without_launch() {
         serde_json::from_slice(&std::fs::read(root.path().join("state.json")).unwrap()).unwrap();
     assert_eq!(stored["version"], 1, "legacy unknowns are not backfilled");
 }
+
+#[test]
+fn child_worktree_cwd_preserves_arguments_and_original_read_only_policy() {
+    let root = tempfile::tempdir().unwrap();
+    let anchor = tempfile::tempdir().unwrap();
+    let child = anchor.path().join("worktree with spaces ' 私有");
+    std::fs::create_dir(&child).unwrap();
+    let service = JobService::open(config(root.path())).unwrap();
+    let request = job_request(
+        &child,
+        "child-cwd",
+        "pwd; printf '%s\\n' \"$1\"; touch forbidden",
+    );
+    let mut request = request;
+    request
+        .argv
+        .extend(["arg0".into(), "literal $(touch injected) ' 私有".into()]);
+    let grant = GrantIssuer::new(GRANT)
+        .unwrap()
+        .issue(
+            &request,
+            TrustedSandboxContext {
+                subject_cutex_session_id: request.subscriber_cutex_session_id.clone(),
+                cwd: request.cwd.clone(),
+                sandbox_state: sandbox(anchor.path()),
+                launcher_path: launcher(),
+                launcher_sha256: launcher_sha(),
+                operating_system_uid: unsafe { libc::geteuid() },
+            },
+            now(),
+            60,
+        )
+        .unwrap();
+    let receipt = service.submit(API, request, grant).unwrap();
+    let job = await_terminal(&service, &receipt.job.job_id);
+    assert_ne!(job.exit_code, Some(0));
+    let output = service
+        .read_output(API, &job.job_id, "stdout", 0, 1024)
+        .unwrap();
+    let encoded = serde_json::to_value(output).unwrap();
+    let text =
+        String::from_utf8(hex::decode(encoded["bytesHex"].as_str().unwrap()).unwrap()).unwrap();
+    assert!(text.contains(child.to_str().unwrap()), "{text}");
+    assert!(text.contains("literal $(touch injected) ' 私有"), "{text}");
+    assert!(!child.join("forbidden").exists());
+    assert!(!child.join("injected").exists());
+}

@@ -41,6 +41,8 @@ fn installed_codex_configured_mcp_binds_real_full_access_origin() {
             socket.to_str().unwrap(),
             api_file.to_str().unwrap(),
             grant_file.to_str().unwrap(),
+            "/bin/false",
+            "--allow-launcher",
             launcher(),
         ])
         .spawn()
@@ -49,8 +51,10 @@ fn installed_codex_configured_mcp_binds_real_full_access_origin() {
 
     let observed_thread = Arc::new(Mutex::new(None));
     let (bus_url, bus_stop, bus_worker) = fake_agent_bus(Arc::clone(&observed_thread));
+    let child_cwd = temp.path().join("worker worktree 私有");
+    std::fs::create_dir(&child_cwd).unwrap();
     let (model_url, model_stop, model_worker) =
-        fake_responses_server(temp.path(), Arc::clone(&observed_thread));
+        fake_responses_server(&child_cwd, Arc::clone(&observed_thread));
     let codex_home = temp.path().join("codex-home");
     std::fs::create_dir(&codex_home).unwrap();
     let config = format!(
@@ -144,7 +148,7 @@ direct_only_tool_namespaces = ["mcp__job_service"]
     assert_eq!(jobs.len(), 1);
     let job = jobs.values().next().unwrap();
     assert_eq!(job["request"]["subscriberCutexSessionId"], DURABLE_ID);
-    assert_eq!(job["request"]["cwd"], temp.path().to_str().unwrap());
+    assert_eq!(job["request"]["cwd"], child_cwd.to_str().unwrap());
     assert_eq!(job["request"]["origin"]["runtimeAgentId"], RUNTIME_ID);
     assert_eq!(
         job["request"]["origin"]["nativeThreadId"],
@@ -166,6 +170,11 @@ direct_only_tool_namespaces = ["mcp__job_service"]
         b"real-path"
     ));
 
+    assert!(job_output_contains(
+        &state,
+        jobs.keys().next().unwrap(),
+        child_cwd.to_str().unwrap().as_bytes()
+    ));
     let _ = daemon.kill();
     let _ = daemon.wait();
 }
@@ -279,7 +288,7 @@ fn fake_responses_server(
                             "name":"submit",
                             "arguments":serde_json::to_string(&json!({
                                 "actionId":"js2-real-path-action",
-                                "argv":["/bin/sh","-c","printf real-path"],
+                                "argv":["/bin/sh","-c","pwd; printf real-path"],
                                 "cwd":cwd
                             })).unwrap()
                         }
