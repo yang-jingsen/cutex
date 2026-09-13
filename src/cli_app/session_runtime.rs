@@ -438,6 +438,11 @@ fn management_endpoint_for_record(
     let token = management_api_token(config, None);
     let current_host = current_host_name();
     if cutex_session_host_is_local(&record.host_id, &current_host) {
+        if let Ok(base_url) = std::env::var("CUTEX_MANAGEMENT_URL") {
+            let url=url::Url::parse(&base_url)?;
+            anyhow::ensure!(url.scheme()=="http" && url.host_str().is_some() && url.username().is_empty() && url.password().is_none(), "CUTEX_MANAGEMENT_URL must be an http endpoint without embedded credentials");
+            return Ok((base_url,token.map(str::to_string)));
+        }
         if !management_api_healthy(DEFAULT_MANAGEMENT_PORT, token) {
             cutex::management::launch::ensure_management_api_running(
                 config,

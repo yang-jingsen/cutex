@@ -781,12 +781,31 @@ pub(super) fn verify_stock_process(
     record: &CutexSessionRecord,
     binding: &CutexAppServerRuntimeBinding,
 ) -> anyhow::Result<()> {
-    let contract = record
-        .explicit_launch
-        .as_ref()
-        .context("stock marker missing")?;
-    let bundle = StockBundle::load(contract)?;
+    let sessions = cutex::session::store::load_cutex_session_store()?;
+    let contract = running_stock_contract(record, binding, &sessions)?;
+    let bundle = StockBundle::load(&contract)?;
     verify_stock_process_with_bundle(binding, &bundle)
+}
+
+// Desired configuration may change while an older runtime is still alive.
+// Attach/stop must verify that occurrence's launch receipt, not the next package.
+fn running_stock_contract(
+    record: &CutexSessionRecord,
+    binding: &CutexAppServerRuntimeBinding,
+    sessions: &cutex::session::model::CutexSessionStore,
+) -> anyhow::Result<cutex::agent_management::ExplicitLaunchContract> {
+    for receipt in sessions.explicit_launch_receipts.values() {
+        if let cutex::agent_management::ExplicitLaunchActionReceipt::Runtime(receipt) = receipt {
+            if receipt.review.subject.cutex_session_id.as_str() == record.cutex_session_id
+                && receipt.binding.as_ref() == Some(binding)
+                && receipt.expected_generation == record.runtime_generation
+                && record.current_runtime_agent_id.as_deref().is_none_or(|id|id==receipt.runtime_agent_id)
+            {
+                return Ok(receipt.review.contract.clone());
+            }
+        }
+    }
+    record.explicit_launch.clone().context("runtime package binding missing")
 }
 
 pub(super) fn verify_stock_process_with_bundle(
@@ -881,11 +900,8 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
         .app_server_runtime
         .as_ref()
         .context("stock runtime is offline")?;
-    let contract = record
-        .explicit_launch
-        .as_ref()
-        .context("stock activation missing")?;
-    let bundle = StockBundle::load(contract)?;
+    let contract = running_stock_contract(record, binding, &store)?;
+    let bundle = StockBundle::load(&contract)?;
     ensure!(
         !bundle.common_ingress() || bundle.soon_ingress(),
         "U+S6 bundle contains only app-server; this slice has no pinned compatible CLI attach artifact"
