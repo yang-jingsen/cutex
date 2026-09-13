@@ -1,4 +1,4 @@
-//! Versioned, finite selected-profile projection. Not a general TOML importer.
+//! Typed selected-profile projection. Not a general TOML importer.
 //! Credential values never belong to this serializable review domain.
 use anyhow::{ensure, Context};
 use serde::{Deserialize, Serialize};
@@ -196,10 +196,13 @@ impl Config {
             self.cli_auth_credentials_store == "file",
             "selected profile requires File storage"
         );
-        let route = match id {
-            super::aemeath_auth::PROFILE_ID | OCTOBRE_ID => Route::ChatgptFile,
-            GLM_ID => Route::GlmApiKey,
-            _ => anyhow::bail!("profile ID outside selected projection scope"),
+        ensure!(uuid::Uuid::parse_str(id).is_ok(), "invalid profile ID");
+        // Account identity does not determine credential semantics. Select the
+        // supported route from the actual configured provider instead.
+        let route = match self.model_provider.as_deref() {
+            None | Some("openai") => Route::ChatgptFile,
+            Some("GLM") => Route::GlmApiKey,
+            _ => anyhow::bail!("unsupported selected profile provider"),
         };
         match route {
             Route::ChatgptFile => ensure!(
@@ -327,18 +330,17 @@ impl Settings {
                             .path
                             .components()
                             .any(|c| matches!(c, std::path::Component::ParentDir)),
-                    "invalid skill exclusion path"
+                    "invalid skill declaration path"
                 );
-                ensure!(
-                    !skill.enabled,
-                    "enabled skill asset needs explicit custody contract"
-                );
-                // Disabled missing paths must stay disabled, never auto-created.
+                // Preserve enabled and disabled intent. Native resolves skill
+                // contents; this projection does not create or execute them.
             }
         }
         ensure!(
-            self.plugins.keys().all(|k| k == "sample@debug"),
-            "unsupported plugin projection"
+            self.plugins
+                .keys()
+                .all(|k| !k.trim().is_empty() && !k.chars().any(char::is_control)),
+            "invalid plugin declaration key"
         );
         if let Some(tui) = &self.tui {
             ensure!(
@@ -369,27 +371,37 @@ impl Settings {
     }
 }
 
+pub(super) fn validate_model_identifier(model: &str) -> anyhow::Result<()> {
+    ensure!(
+        !model.trim().is_empty() && !model.chars().any(char::is_control),
+        "model identifier must be nonempty and contain no control characters"
+    );
+    Ok(())
+}
+
+pub(super) fn supported_effort(effort: &str) -> bool {
+    matches!(
+        effort,
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | "persistent"
+    )
+}
+
 pub fn validate_model(
     route: &Route,
     model: &str,
     effort: Option<&str>,
     catalog: Option<&VerifiedFile>,
 ) -> anyhow::Result<()> {
+    validate_model_identifier(model)?;
     match route {
         Route::ChatgptFile => {
-            ensure!(catalog.is_none(), "ChatGPT custom catalog not reviewed");
-            // Exact 2eab lineage models-manager/models.json selected subset.
+            ensure!(catalog.is_none(), "ChatGPT custom catalog not supported");
             ensure!(
-                matches!(model, "gpt-6-astra" | "gpt-5.6-sol" | "gpt-5.6-terra")
-                    && effort.is_some_and(|r| matches!(
-                        r,
-                        "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
-                    )),
-                "model/effort absent from pinned selected catalog"
+                effort.is_none_or(supported_effort),
+                "unsupported reasoning effort"
             );
         }
         Route::GlmApiKey => {
-            ensure!(model == "glm-5.3", "selected GLM model must remain glm-5.3");
             let catalog = catalog.context("GLM reviewed catalog required")?;
             catalog.validate()?;
             let bytes = bounded_asset(&catalog.path)?;
@@ -714,21 +726,113 @@ impl Projection {
 mod tests {
     use super::*;
     #[test]
-    fn selected_catalog_keeps_models_and_max_without_fallback() {
-        for model in ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"] {
-            for effort in ["low", "medium", "high", "xhigh", "max"] {
+    fn selected_models_allow_new_names_and_native_efforts_without_fallback() {
+        for model in ["gpt-6-astra", "gpt-5.6-luna", "future-model/revision-2"] {
+            assert!(validate_model(&Route::ChatgptFile, model, None, None).is_ok());
+            for effort in [
+                "none",
+                "minimal",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+                "ultra",
+                "persistent",
+            ] {
                 assert!(validate_model(&Route::ChatgptFile, model, Some(effort), None).is_ok());
             }
         }
         for (model, effort) in [
-            ("unknown", Some("low")),
+            ("", Some("low")),
+            ("bad\nmodel", Some("low")),
             ("gpt-5.6-sol", Some("guessed")),
-            ("gpt-5.6-sol", None),
         ] {
             assert!(validate_model(&Route::ChatgptFile, model, effort, None).is_err());
         }
         assert!(validate_model(&Route::GlmApiKey, "glm-5.3", Some("max"), None).is_err());
     }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn new_account_identity_uses_configured_route_and_forwards_enabled_settings() {
+        use base64::Engine;
+        use std::os::unix::fs::PermissionsExt;
+        // Auth validation intentionally rejects /tmp and group-writable source
+        // ancestors. Keep this disposable fixture in the actual user's home,
+        // independently of the test harness's redirected HOME.
+        let mut passwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result = std::ptr::null_mut();
+        let mut buffer = vec![0u8; 16384];
+        assert_eq!(
+            unsafe {
+                libc::getpwuid_r(
+                    libc::geteuid(),
+                    &mut passwd,
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    &mut result,
+                )
+            },
+            0
+        );
+        assert!(!result.is_null());
+        let home = unsafe { std::ffi::CStr::from_ptr(passwd.pw_dir) }
+            .to_str()
+            .unwrap();
+        let root = Path::new(home).join(format!(".cutex-profile-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let auth = root.join("auth.json");
+        let id_token = format!(
+            "header.{}.signature",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(br#"{"https://api.openai.com/auth":{"chatgpt_user_id":"fixture-user"}}"#)
+        );
+        std::fs::write(&auth, serde_json::to_vec(&serde_json::json!({"auth_mode":"chatgpt","OPENAI_API_KEY":null,
+            "tokens":{"id_token":id_token,"access_token":"fixture-access","refresh_token":"fixture-refresh","account_id":"fixture-account"},"last_refresh":null})).unwrap()).unwrap();
+        std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let config = "cutex_provider_mode='selected_profile_v2'\ncli_auth_credentials_store='file'\nmodel='future-model/revision-2'\n[[skills.config]]\npath='/private/my-skill/SKILL.md'\nenabled=true\n[plugins.'custom@tools']\nenabled=true\n";
+        let (projection, model, effort) = Config::parse(config)
+            .unwrap()
+            .review(&uuid::Uuid::new_v4().to_string(), auth, None, None)
+            .unwrap();
+        assert_eq!(projection.route, Route::ChatgptFile);
+        assert_eq!(model, "future-model/revision-2");
+        assert_eq!(effort, None);
+        let args = projection.native_args(true).unwrap().join(" ");
+        assert!(args.contains("custom@tools"));
+        assert!(args.contains("/private/my-skill/SKILL.md"));
+        assert!(args.contains("enabled = true"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn glm_model_selection_uses_supplied_catalog_instead_of_hardcoded_slug() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("selected-glm-catalog-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("catalog.json");
+        std::fs::write(
+            &path,
+            br#"{"models":[{"slug":"glm-next","supported_reasoning_levels":[{"effort":"max"}]}]}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let file = VerifiedFile {
+            sha256: crate::agent_management::file_sha256(&path).unwrap(),
+            path,
+        };
+        assert!(validate_model(&Route::GlmApiKey, "glm-next", Some("max"), Some(&file)).is_ok());
+        assert!(
+            validate_model(&Route::GlmApiKey, "missing-model", Some("max"), Some(&file)).is_err()
+        );
+        assert!(validate_model(&Route::GlmApiKey, "glm-next", Some("high"), Some(&file)).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn typed_profile_rejects_unknown_fields_and_credential_overrides() {
         let base = "cutex_provider_mode='selected_profile_v2'\ncli_auth_credentials_store='file'\n";
@@ -742,7 +846,7 @@ mod tests {
         assert_eq!(serde_json::to_value(Version).unwrap(), serde_json::json!(2));
     }
     #[test]
-    fn settings_preserve_disabled_missing_skills_and_missing_plugin_intent() {
+    fn settings_preserve_enabled_and_disabled_skills_and_arbitrary_plugins() {
         let mut s = Settings::default();
         s.skills = Some(Skills {
             config: vec![Skill {
@@ -754,7 +858,12 @@ mod tests {
             .insert("sample@debug".into(), Plugin { enabled: true });
         assert!(s.validate().is_ok());
         s.skills.as_mut().unwrap().config[0].enabled = true;
+        s.plugins
+            .insert("custom@tools".into(), Plugin { enabled: false });
+        assert!(s.validate().is_ok());
+        s.plugins.insert("".into(), Plugin { enabled: true });
         assert!(s.validate().is_err());
+        s.plugins.remove("");
         s.skills = None;
         s.tui = Some(Tui {
             status_line: vec!["custom:profile".into()],

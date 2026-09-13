@@ -40,3 +40,18 @@ only to establish the durable owner, native ID, and native home. They validate t
 currently selected package separately. Historical package hashes and parent
 filesystem inode/device numbers no longer freeze post-migration repairs or block
 a restored filesystem. Initial migration materialization checks remain unchanged.
+
+Selected profiles are no longer limited to migration-time account UUIDs or model
+names. A valid account UUID can use the supported configured route: native
+ChatGPT file authentication for no custom provider/`openai`, or the existing
+explicit GLM Responses provider mapping. ChatGPT model identifiers must be
+nonempty and control-free; omitted reasoning and native effort values are
+accepted. GLM model/effort selection must match its supplied catalog. Enabled and
+disabled skill declarations and nonempty plugin keys retain their native intent;
+installing a previously missing plugin does not invalidate the profile.
+
+This remains a typed profile projection, with existing credential-file checks.
+Arbitrary provider endpoints, credential overrides, general MCP import, and
+unknown configuration keys are not introduced by this change. The older
+`aemeath_chatgpt_v1` compatibility path is unchanged; migrated/local v3/v4 agents
+use the selected-profile route above.

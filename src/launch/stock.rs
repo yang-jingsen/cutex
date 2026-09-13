@@ -405,13 +405,9 @@ pub fn validate_shared_config(raw: &str) -> anyhow::Result<()> {
                 && config.tui.is_none()),
         "shared selected defaults require explicit projection version2"
     );
-    ensure!(
-        config
-            .model
-            .as_deref()
-            .is_none_or(|m| matches!(m, "gpt-6-astra" | "gpt-5.6-sol" | "gpt-5.6-terra")),
-        "unsupported shared model default"
-    );
+    if let Some(model) = config.model.as_deref() {
+        super::selected_profile::validate_model_identifier(model)?;
+    }
     for effort in [
         config.model_reasoning_effort.as_deref(),
         config.plan_mode_reasoning_effort.as_deref(),
@@ -420,10 +416,7 @@ pub fn validate_shared_config(raw: &str) -> anyhow::Result<()> {
     .flatten()
     {
         ensure!(
-            matches!(
-                effort,
-                "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
-            ),
+            super::selected_profile::supported_effort(effort),
             "unsupported shared reasoning default"
         );
     }
@@ -520,15 +513,6 @@ impl StockConfiguration {
                         .status_line,
                     &self.profile_name,
                 )?;
-            }
-            if projection
-                .settings
-                .plugins
-                .get("sample@debug")
-                .is_some_and(|p| p.enabled)
-            {
-                ensure!(!home.join("plugins/cache/debug/sample").try_exists()?,
-                    "sample@debug installation changed; only preserved missing-plugin diagnostic reviewed");
             }
             return Ok(());
         }
@@ -1046,6 +1030,13 @@ mod tests {
         );
         assert!(validate_selected_permissions(Some(":read-only"), "read-only", "always").is_err());
     }
+    #[test]
+    fn shared_defaults_accept_new_model_identifiers_and_native_efforts() {
+        assert!(validate_shared_config("cutex_projection_version=2\nmodel='future-model/revision-2'\nmodel_reasoning_effort='none'\n").is_ok());
+        assert!(validate_shared_config("cutex_projection_version=2\nmodel=''\n").is_err());
+        assert!(validate_shared_config("cutex_projection_version=2\nmodel='model'\nmodel_reasoning_effort='guessed'\n").is_err());
+    }
+
     #[test]
     fn selected_shared_version_is_explicit_and_unknowns_stay_closed() {
         let raw="cutex_projection_version=2\nmodel='gpt-5.6-sol'\nmodel_reasoning_effort='max'\nsandbox_mode='danger-full-access'\napprovals_reviewer='user'\n[shell_environment_policy]\nexclude=['CODEX_AUTH_FILE']\n";
