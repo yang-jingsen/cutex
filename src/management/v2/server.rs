@@ -70,15 +70,14 @@ pub fn handle_v2_request(
         .split('?')
         .next()
         .unwrap_or(request.path.as_str());
-    // Runtime Stop is an exact-target Human operation. The ordinary bridge
-    // bearer retains its visible-only lookup; only the dedicated root bearer
-    // can stop a hidden durable session. Never apply this exception to reads,
-    // online, native requests, or arbitrary Cutex mutations.
-    if authenticated_owner_runtime_stop(request, agent_management_admin_token) {
+    // Carry the existing Human bearer proof into exact-ID Cutex requests.
+    // Listing exposure does not restrict the owner; method and lifecycle checks
+    // still run in handle_cutex_request. Ordinary bridge callers have no proof.
+    if authenticated_owner_cutex_request(request, agent_management_admin_token) {
         let repository = management_v2_repository()?;
         materialize_active_stream_reset(repository, context)?;
         let session_id = cutex_request_session_id_from_path(path)
-            .expect("authenticated owner stop has an exact session path");
+            .expect("authenticated owner request has an exact session path");
         return handle_cutex_request(
             stream,
             request,
@@ -170,18 +169,12 @@ pub fn handle_v2_request(
     handle_v2_request_with_repository(stream, request, repository, context, None)
 }
 
-fn authenticated_owner_runtime_stop(request: &SimpleHttpRequest, root: Option<&str>) -> bool {
+fn authenticated_owner_cutex_request(request: &SimpleHttpRequest, root: Option<&str>) -> bool {
     let path = request.path.split('?').next().unwrap_or(&request.path);
     request.method == "POST"
         && cutex_request_session_id_from_path(path).is_some()
         && root.is_some()
-        && require_service_bridge_token(request, root, "Human runtime Stop").is_ok()
-        && validate_cutex_request_body(&request.body)
-            .is_ok_and(|request| runtime_stop_method(&request.method))
-}
-
-fn runtime_stop_method(method: &str) -> bool {
-    matches!(method, "cutex/runtime/offline" | "cutex/runtime/close")
+        && require_service_bridge_token(request, root, "Human Cutex request").is_ok()
 }
 
 fn v2_required_token<'a>(
@@ -4741,6 +4734,45 @@ mod tests {
         );
         assert!(session_id_from_path("/v2/sessions/cutex%2Fsession").is_none());
         assert!(session_id_from_path("/v2/sessions/cutex%ZZsession").is_none());
+    }
+
+    #[test]
+    fn exact_id_cutex_requests_preserve_root_bearer_proof() {
+        let mut request = SimpleHttpRequest {
+            method: "POST".into(),
+            path: "/v2/sessions/cutex.example/cutex/requests".into(),
+            headers: std::collections::HashMap::from([(
+                "authorization".into(),
+                "Bearer root-test-token".into(),
+            )]),
+            body: Vec::new(),
+        };
+        // Authentication is independent of method parsing; the target handler
+        // must still return its normal validation error for malformed bodies.
+        assert!(authenticated_owner_cutex_request(
+            &request,
+            Some("root-test-token")
+        ));
+        assert!(!authenticated_owner_cutex_request(
+            &request,
+            Some("different-token")
+        ));
+        assert!(!authenticated_owner_cutex_request(&request, None));
+        request
+            .headers
+            .insert("authorization".into(), "Bearer bus-test-token".into());
+        assert!(!authenticated_owner_cutex_request(
+            &request,
+            Some("root-test-token")
+        ));
+        request
+            .headers
+            .insert("authorization".into(), "Bearer root-test-token".into());
+        request.path = "/v2/sessions/cutex.example/native/requests".into();
+        assert!(!authenticated_owner_cutex_request(
+            &request,
+            Some("root-test-token")
+        ));
     }
 
     #[test]
