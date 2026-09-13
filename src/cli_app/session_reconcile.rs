@@ -39,13 +39,9 @@ pub(crate) fn reconcile_cutex_session_registration(
         cutex::session::reviewed_registration::preserve_reviewed_groups(&store, agent, &host_id)?;
     let bundle = reviewed
         .as_ref()
-        .map(|record| {
-            cutex::launch::stock::StockBundle::load(
-                record.explicit_launch.as_ref().expect("validated marker"),
-            )
-        })
+        .map(|(_, running_contract)| cutex::launch::stock::StockBundle::load(running_contract))
         .transpose()?;
-    if let Some(record) = &reviewed {
+    if let Some((record, _)) = &reviewed {
         super::stock_lifecycle::verify_stock_process_with_bundle(
             record
                 .app_server_runtime
@@ -59,7 +55,7 @@ pub(crate) fn reconcile_cutex_session_registration(
     if !reconciliation.store_fence_required {
         return Ok(());
     }
-    if let Some(record) = &reviewed {
+    if let Some((record, _)) = &reviewed {
         super::stock_lifecycle::verify_stock_process_with_bundle(
             record
                 .app_server_runtime

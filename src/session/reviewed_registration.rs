@@ -1,12 +1,14 @@
 //! Registration projection from committed reviewed ownership, never a caller flag.
 use crate::agent_bus::groups::normalize_registered_agent_groups;
 use crate::agent_bus::model::{AgentBusAgent, AgentRegistrationClass};
-use crate::agent_management::{ExplicitLaunchActionReceipt, StockRuntimeStage};
+use crate::agent_management::{
+    ExplicitLaunchActionReceipt, ExplicitLaunchContract, StockRuntimeStage,
+};
 use crate::session::model::{CutexSessionRecord, CutexSessionStore};
 
 /// Called only behind the authenticated service registration route, before its
 /// store CAS and roster publication. The caller must additionally verify the
-/// returned exact native process/bundle before committing. Ordinary registration
+/// returned exact native process and receipt contract before committing. Ordinary registration
 /// remains unchanged. A pending launch pins its reviewed revision. A Ready
 /// owner can re-register after durable configuration edits, provided its exact
 /// process, binding, runtime identity, and current group projection still match.
@@ -14,7 +16,7 @@ pub fn preserve_reviewed_groups(
     store: &CutexSessionStore,
     agent: &mut AgentBusAgent,
     host: &str,
-) -> anyhow::Result<Option<CutexSessionRecord>> {
+) -> anyhow::Result<Option<(CutexSessionRecord, ExplicitLaunchContract)>> {
     let targets: Vec<_> = store
         .sessions
         .values()
@@ -80,7 +82,8 @@ pub fn preserve_reviewed_groups(
             && record.codex_session_id.as_deref()
                 == Some(receipt.review.contract.native_id.as_str())
             && agent.session_id == record.codex_session_id
-            && record.explicit_launch.as_ref() == Some(&receipt.review.contract)
+            && (receipt.stage == StockRuntimeStage::Ready
+                || record.explicit_launch.as_ref() == Some(&receipt.review.contract))
             && (receipt.stage == StockRuntimeStage::Ready
                 || record.revision == receipt.review.subject.revision)
             && record.app_server_runtime.as_ref() == Some(binding)
@@ -118,7 +121,7 @@ pub fn preserve_reviewed_groups(
         "reviewed registration requested groups changed"
     );
     agent.groups = record.agent_groups.clone();
-    Ok(Some(record.clone()))
+    Ok(Some((record.clone(), receipt.review.contract.clone())))
 }
 
 #[cfg(test)]
@@ -243,6 +246,52 @@ mod tests {
             .get_mut("cutex.test")
             .unwrap()
             .runtime_generation += 1;
+        assert!(preserve_reviewed_groups(&store, &mut agent, "private").is_err());
+    }
+
+    #[test]
+    fn ready_registration_uses_running_package_without_overwriting_next_package() {
+        let (mut store, mut agent) = fixture();
+        let old_contract = store.sessions["cutex.test"]
+            .explicit_launch
+            .clone()
+            .unwrap();
+        let record = store.sessions.get_mut("cutex.test").unwrap();
+        record.app_server_launch_claim_id = None;
+        record.runtime_generation = 1;
+        record.current_runtime_agent_id = Some(agent.id.clone());
+        record.revision += 1;
+        record.explicit_launch.as_mut().unwrap().bundle_manifest = "/next/manifest".into();
+        let next_contract = record.explicit_launch.clone();
+        if let ExplicitLaunchActionReceipt::Runtime(receipt) = store
+            .explicit_launch_receipts
+            .get_mut("reviewed-register")
+            .unwrap()
+        {
+            receipt.stage = StockRuntimeStage::Ready;
+        }
+        let (record, running_contract) = preserve_reviewed_groups(&store, &mut agent, "private")
+            .unwrap()
+            .unwrap();
+        assert_eq!(running_contract, old_contract);
+        assert_eq!(record.explicit_launch, next_contract);
+        assert_eq!(store.sessions["cutex.test"].explicit_launch, next_contract);
+        // Package changes cannot relax the exact owner check.
+        agent.pid += 1;
+        assert!(preserve_reviewed_groups(&store, &mut agent, "private").is_err());
+    }
+
+    #[test]
+    fn pending_registration_still_requires_reviewed_package() {
+        let (mut store, mut agent) = fixture();
+        store
+            .sessions
+            .get_mut("cutex.test")
+            .unwrap()
+            .explicit_launch
+            .as_mut()
+            .unwrap()
+            .bundle_manifest = "/next/manifest".into();
         assert!(preserve_reviewed_groups(&store, &mut agent, "private").is_err());
     }
 
