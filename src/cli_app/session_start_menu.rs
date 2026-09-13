@@ -7,6 +7,7 @@ use super::session_presenter;
 pub(super) enum StartSessionMenuAction {
     ResumeAttach,
     Attach,
+    StockAttach,
     Takeover,
     Foreground,
     Online,
@@ -26,6 +27,27 @@ pub(super) fn start_session_menu_choices(
     attachable: bool,
     live_native: bool,
 ) -> Vec<StartSessionMenuChoice> {
+    if record.explicit_launch.is_some() {
+        let mut choices = Vec::new();
+        // The attach command revalidates the exact PID, endpoint, receipt,
+        // generation, and runtime Agent before entering the native TUI.
+        if record.app_server_runtime.is_some() {
+            choices.push(menu_choice(
+                StartSessionMenuAction::StockAttach,
+                None,
+                "attach exact ready stock owner",
+            ));
+        }
+        choices.extend([
+            menu_choice(StartSessionMenuAction::Edit, None, "edit/manage session"),
+            menu_choice(
+                StartSessionMenuAction::ChooseAnother,
+                None,
+                "choose another session",
+            ),
+        ]);
+        return choices;
+    }
     let is_alden = record.runtime_backend == CutexSessionRuntimeBackend::CuteAlden;
     let is_native = record.runtime_backend == CutexSessionRuntimeBackend::HostForeground;
     if is_alden {
@@ -177,6 +199,50 @@ mod tests {
         let mut record = native_record();
         record.runtime_backend = CutexSessionRuntimeBackend::CuteAlden;
         record
+    }
+
+    fn stock_record(online: bool) -> CutexSessionRecord {
+        let mut record = native_record();
+        record.runtime_backend = CutexSessionRuntimeBackend::Host;
+        record.explicit_launch = Some(cutex::agent_management::ExplicitLaunchContract {
+            version: 1,
+            migration_action_id: None,
+            native_id: "019e-native".to_string(),
+            native_home: "/tmp/stock-home".into(),
+            bundle_manifest: "/tmp/stock-bundle.json".into(),
+            bundle_sha256: cutex::role_revision::Sha256::new("a".repeat(64)).unwrap(),
+        });
+        if online {
+            record.app_server_runtime = Some(cutex::session::model::CutexAppServerRuntimeBinding {
+                transport: cutex::session::model::CutexAppServerTransport::UnixSocket,
+                endpoint: "unix:///tmp/runtime/stock.sock".to_string(),
+                pid: std::process::id(),
+                runtime_dir: "/tmp/runtime".to_string(),
+                launched_profile: Some("aemeath".to_string()),
+                launch_profile_source: None,
+                auth_token_path: None,
+                diagnostic_journal_path: "/tmp/runtime/events.jsonl".to_string(),
+                schema_version: "test".to_string(),
+                schema_sha256: "hash".to_string(),
+                started_at: "2026-08-08T00:00:00Z".to_string(),
+            });
+        }
+        record
+    }
+
+    #[test]
+    fn stock_menu_never_offers_generic_start_resume_or_repair_routes() {
+        let offline = start_session_menu_choices(&stock_record(false), false, false);
+        assert_eq!(offline.len(), 2);
+        assert_eq!(offline[0].action, StartSessionMenuAction::Edit);
+
+        let online = start_session_menu_choices(&stock_record(true), false, false);
+        assert_eq!(online[0].action, StartSessionMenuAction::StockAttach);
+        assert!(online
+            .iter()
+            .all(|choice| choice.action != StartSessionMenuAction::Online
+                && choice.action != StartSessionMenuAction::ResumeHere
+                && choice.action != StartSessionMenuAction::ResumeManaged));
     }
 
     #[test]

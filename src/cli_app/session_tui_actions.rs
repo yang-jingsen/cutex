@@ -12,6 +12,7 @@ use cutex::session::service::cutex_session_is_managed;
 pub(super) enum SessionTuiAction {
     ResumeAttach,
     AttachExisting,
+    StockAttach,
     TakeoverExisting,
     OpenTui,
     Online,
@@ -29,6 +30,7 @@ impl SessionTuiAction {
         match self {
             Self::ResumeAttach => "takeover",
             Self::AttachExisting => "attach",
+            Self::StockAttach => "attach stock TUI",
             Self::TakeoverExisting => "takeover existing",
             Self::OpenTui => "open TUI",
             Self::Online => "online",
@@ -65,6 +67,7 @@ impl SessionTuiAction {
             Self::Online => lifecycle != CutexSessionLifecycleState::Online,
             Self::CloseAndRestart => true,
             Self::AttachExisting
+            | Self::StockAttach
             | Self::TakeoverExisting
             | Self::ResumeHere
             | Self::ResumeManaged
@@ -93,6 +96,34 @@ pub(super) fn session_tui_actions_for_record(
     }
     let attachable = cutex_session_is_attachable(record, alden_sessions);
     let lifecycle = cutex_session_lifecycle_state_with_agents(record, alden_sessions, live_agents);
+    let runtime_known = lifecycle != CutexSessionLifecycleState::Offline
+        || record.app_server_runtime.is_some()
+        || record.alden_pid.is_some()
+        || record.runtime_pid.is_some()
+        || record.current_runtime_agent_id.is_some();
+    if record.explicit_launch.is_some() {
+        let mut actions = Vec::new();
+        if lifecycle == CutexSessionLifecycleState::Online
+            && record.app_server_runtime.is_some()
+            && record.current_runtime_agent_id.is_some()
+        {
+            push_action(
+                &mut actions,
+                SessionTuiAction::StockAttach,
+                "Join the exact ready stock owner without creating another writer",
+                true,
+            );
+        }
+        if runtime_known {
+            push_action(
+                &mut actions,
+                SessionTuiAction::CloseRuntime,
+                "Close runtime gracefully; keep session and history",
+                false,
+            );
+        }
+        return actions;
+    }
     let tui_detached = record.runtime_backend == CutexSessionRuntimeBackend::CuteAlden
         && !attachable
         && cutex_session_has_live_managed_core(record, live_agents);
@@ -158,11 +189,6 @@ pub(super) fn session_tui_actions_for_record(
         );
     }
 
-    let runtime_known = lifecycle != CutexSessionLifecycleState::Offline
-        || record.app_server_runtime.is_some()
-        || record.alden_pid.is_some()
-        || record.runtime_pid.is_some()
-        || record.current_runtime_agent_id.is_some();
     if runtime_known {
         if managed_runtime {
             push_action(
@@ -208,6 +234,9 @@ fn primary_action_detail(action: SessionTuiAction) -> &'static str {
     match action {
         SessionTuiAction::ResumeAttach => "Bring runtime online if needed, then take over TUI",
         SessionTuiAction::AttachExisting => "Join the existing TUI",
+        SessionTuiAction::StockAttach => {
+            "Join the exact ready stock owner without creating another writer"
+        }
         SessionTuiAction::TakeoverExisting => "Take control of the existing TUI",
         SessionTuiAction::OpenTui => "Open the visible TUI for the managed app-server",
         SessionTuiAction::Online => "Bring the managed runtime online",
@@ -267,6 +296,72 @@ mod tests {
 
     fn action_kinds(actions: &[SessionTuiActionItem]) -> Vec<SessionTuiAction> {
         actions.iter().map(|item| item.action).collect()
+    }
+
+    fn mark_explicit_stock(record: &mut CutexSessionRecord) {
+        record.explicit_launch = Some(cutex::agent_management::ExplicitLaunchContract {
+            version: 1,
+            migration_action_id: None,
+            native_id: "019e-actions".to_string(),
+            native_home: "/tmp/stock-home".into(),
+            bundle_manifest: "/tmp/stock-bundle.json".into(),
+            bundle_sha256: cutex::role_revision::Sha256::new("a".repeat(64)).unwrap(),
+        });
+    }
+
+    #[test]
+    fn offline_explicit_stock_hides_all_generic_launch_and_history_repair_actions() {
+        let mut record = record(CutexSessionRuntimeBackend::Host);
+        mark_explicit_stock(&mut record);
+
+        assert!(session_tui_actions_for_record(&record, &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn ready_explicit_stock_offers_exact_attach_and_graceful_close_only() {
+        let mut record = record(CutexSessionRuntimeBackend::Host);
+        mark_explicit_stock(&mut record);
+        record.current_runtime_agent_id = Some("stock.actions.runtime".to_string());
+        record.app_server_runtime = Some(CutexAppServerRuntimeBinding {
+            transport: CutexAppServerTransport::UnixSocket,
+            endpoint: "unix:///tmp/runtime/stock.sock".to_string(),
+            pid: std::process::id(),
+            runtime_dir: "/tmp/runtime".to_string(),
+            launched_profile: Some("aemeath".to_string()),
+            launch_profile_source: None,
+            auth_token_path: None,
+            diagnostic_journal_path: "/tmp/runtime/events.jsonl".to_string(),
+            schema_version: "test".to_string(),
+            schema_sha256: "hash".to_string(),
+            started_at: "2026-08-08T00:00:00Z".to_string(),
+        });
+        let live_agents = vec![AgentBusAgent {
+            id: "stock.actions.runtime".to_string(),
+            name: "stock-actions".to_string(),
+            base_name: Some("stock-actions".to_string()),
+            thread_name: None,
+            path_key: None,
+            session_id: record.codex_session_id.clone(),
+            cutex_session_id: None,
+            profile: "aemeath".to_string(),
+            cwd: record.cwd.clone(),
+            pid: std::process::id(),
+            host_id: Some(cutex::platform::host::current_host_name()),
+            groups: Vec::new(),
+            registration_class: AgentRegistrationClass::Persistent,
+            last_seen_epoch_secs: 42,
+        }];
+
+        let actions = session_tui_actions_for_record(&record, &[], &live_agents);
+
+        assert_eq!(
+            action_kinds(&actions),
+            vec![
+                SessionTuiAction::StockAttach,
+                SessionTuiAction::CloseRuntime,
+            ]
+        );
+        assert!(actions[0].primary);
     }
 
     #[test]

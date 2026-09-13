@@ -8966,7 +8966,7 @@ fn render_runtime_close_progress(frame: &mut Frame<'_>, area: Rect, model: &Sele
 fn homepage_action_label(action: SessionTuiAction) -> &'static str {
     match action {
         SessionTuiAction::ResumeAttach | SessionTuiAction::TakeoverExisting => "takeover",
-        SessionTuiAction::AttachExisting => "attach",
+        SessionTuiAction::AttachExisting | SessionTuiAction::StockAttach => "attach",
         SessionTuiAction::OpenTui => "open",
         SessionTuiAction::Online => "start",
         SessionTuiAction::ResumeHere | SessionTuiAction::ResumeManaged => "resume",

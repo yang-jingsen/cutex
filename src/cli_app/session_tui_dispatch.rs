@@ -25,6 +25,10 @@ enum SessionTuiDispatchPlan {
         key: String,
         name: String,
     },
+    StockAttach {
+        key: String,
+        id: String,
+    },
     TakeoverExisting {
         key: String,
         id: String,
@@ -71,6 +75,7 @@ impl SessionTuiDispatchPlan {
             Self::Online { key, .. } => Some((key, CutexSessionUserAction::Online)),
             Self::ResumeHere { key, .. } => Some((key, CutexSessionUserAction::ResumeHere)),
             Self::ResumeAttach { .. }
+            | Self::StockAttach { .. }
             | Self::OpenTui { .. }
             | Self::ResumeManaged { .. }
             | Self::CloseAndRestart { .. }
@@ -225,6 +230,10 @@ fn dispatch_plan_for_intent(
                 name,
             }
         }
+        SessionTuiAction::StockAttach => SessionTuiDispatchPlan::StockAttach {
+            key: intent.key.clone(),
+            id: record.cutex_session_id.clone(),
+        },
         SessionTuiAction::TakeoverExisting => SessionTuiDispatchPlan::TakeoverExisting {
             key: intent.key.clone(),
             id,
@@ -273,6 +282,10 @@ fn execute_dispatch_plan(
         }
         SessionTuiDispatchPlan::AttachExisting { name, .. } => {
             session_attach::cmd_session_attach(&name, false)
+        }
+        SessionTuiDispatchPlan::StockAttach { key, id } => {
+            super::stock_lifecycle::attach(&id)?;
+            session::record_cutex_session_user_action(&key, CutexSessionUserAction::Attach)
         }
         SessionTuiDispatchPlan::TakeoverExisting { id, .. } => session::cmd_session_takeover(&id),
         SessionTuiDispatchPlan::OpenTui { id, launch_profile } => {
@@ -357,6 +370,82 @@ mod tests {
             action,
             launch_profile: Some(profile.to_string()),
         }
+    }
+
+    fn mark_explicit_stock(record: &mut CutexSessionRecord) {
+        record.explicit_launch = Some(cutex::agent_management::ExplicitLaunchContract {
+            version: 1,
+            migration_action_id: None,
+            native_id: "019e-dispatch".to_string(),
+            native_home: "/tmp/stock-home".into(),
+            bundle_manifest: "/tmp/stock-bundle.json".into(),
+            bundle_sha256: cutex::role_revision::Sha256::new("a".repeat(64)).unwrap(),
+        });
+    }
+
+    #[test]
+    fn explicit_stock_dispatch_uses_durable_id_and_rejects_generic_stale_intents() {
+        let mut record = record(CutexSessionRuntimeBackend::Host);
+        mark_explicit_stock(&mut record);
+        record.current_runtime_agent_id = Some("stock.dispatch.runtime".to_string());
+        record.app_server_runtime = Some(CutexAppServerRuntimeBinding {
+            transport: CutexAppServerTransport::UnixSocket,
+            endpoint: "unix:///tmp/runtime/stock.sock".to_string(),
+            pid: std::process::id(),
+            runtime_dir: "/tmp/runtime".to_string(),
+            launched_profile: Some("aemeath".to_string()),
+            launch_profile_source: None,
+            auth_token_path: None,
+            diagnostic_journal_path: "/tmp/runtime/events.jsonl".to_string(),
+            schema_version: "test".to_string(),
+            schema_sha256: "hash".to_string(),
+            started_at: "2026-08-08T00:00:00Z".to_string(),
+        });
+        let live_agents = vec![AgentBusAgent {
+            id: "stock.dispatch.runtime".to_string(),
+            name: "stock-dispatch".to_string(),
+            base_name: Some("stock-dispatch".to_string()),
+            thread_name: None,
+            path_key: None,
+            session_id: record.codex_session_id.clone(),
+            cutex_session_id: None,
+            profile: "aemeath".to_string(),
+            cwd: record.cwd.clone(),
+            pid: std::process::id(),
+            host_id: Some(cutex::platform::host::current_host_name()),
+            groups: Vec::new(),
+            registration_class: AgentRegistrationClass::Persistent,
+            last_seen_epoch_secs: 42,
+        }];
+        let store = store_with(record);
+
+        assert_eq!(
+            dispatch_plan_for_intent(
+                &intent(SessionTuiAction::StockAttach),
+                &store,
+                &[],
+                &live_agents,
+            )
+            .expect("stock attach plan"),
+            SessionTuiDispatchPlan::StockAttach {
+                key: "durable-key".to_string(),
+                id: "cutex.dispatch".to_string(),
+            }
+        );
+        assert!(dispatch_plan_for_intent(
+            &intent(SessionTuiAction::Online),
+            &store,
+            &[],
+            &live_agents,
+        )
+        .is_err());
+        assert!(dispatch_plan_for_intent(
+            &intent(SessionTuiAction::RepairInterruptedHistory),
+            &store,
+            &[],
+            &live_agents,
+        )
+        .is_err());
     }
 
     #[test]

@@ -112,6 +112,13 @@ pub fn primary_start_action_kind_for_record(
     record: &CutexSessionRecord,
     alden_sessions: &[CuteAldenSession],
 ) -> Option<StartQuickActionKind> {
+    // Explicit stock sessions have a separate reviewed launch and same-owner
+    // attach protocol. Never project a generic start/resume quick action for
+    // them; the detailed session surface can offer stock attach when a ready
+    // owner exists and otherwise explain that explicit stock start is needed.
+    if record.explicit_launch.is_some() {
+        return Some(StartQuickActionKind::OpenDetails);
+    }
     let attachable = cutex_session_is_attachable(record, alden_sessions);
     let kind = if record.runtime_backend == CutexSessionRuntimeBackend::HostForeground {
         StartQuickActionKind::VisibleTui
@@ -312,6 +319,33 @@ mod tests {
             .find(|action| action.key == "cutex.native")
             .expect("native action");
         assert_eq!(action.kind, StartQuickActionKind::VisibleTui);
+    }
+
+    #[test]
+    fn explicit_stock_quick_action_opens_details_instead_of_generic_online() {
+        let mut record = CutexSessionRecord::new_at(
+            "cutex.stock".to_string(),
+            Some("019e-stock".to_string()),
+            "tethys".to_string(),
+            "/tmp/stock".to_string(),
+            Some("aemeath".to_string()),
+            "2026-06-30T00:00:00Z".to_string(),
+        )
+        .expect("record");
+        record.registration_class = AgentRegistrationClass::Persistent;
+        record.explicit_launch = Some(crate::agent_management::ExplicitLaunchContract {
+            version: 1,
+            migration_action_id: None,
+            native_id: "019e-stock".to_string(),
+            native_home: "/tmp/stock-home".into(),
+            bundle_manifest: "/tmp/stock-bundle.json".into(),
+            bundle_sha256: crate::role_revision::Sha256::new("a".repeat(64)).unwrap(),
+        });
+
+        assert_eq!(
+            primary_start_action_kind_for_record(&record, &[]),
+            Some(StartQuickActionKind::OpenDetails)
+        );
     }
 
     #[test]

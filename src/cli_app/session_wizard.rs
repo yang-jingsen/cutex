@@ -112,13 +112,20 @@ pub(crate) fn cmd_start_wizard(list: &SessionListArgs) -> anyhow::Result<()> {
 }
 
 fn execute_start_quick_action(action: StartQuickAction) -> anyhow::Result<()> {
-    session::record_cutex_session_user_action(&action.key, action.kind.user_action())?;
     let store = load_cutex_session_store()?;
     let record = store
         .sessions
         .get(&action.key)
         .cloned()
         .ok_or_else(|| anyhow!("cutex session disappeared while starting: {}", action.key))?;
+    if record.explicit_launch.is_some() {
+        anyhow::ensure!(
+            action.kind == StartQuickActionKind::OpenDetails,
+            "explicit stock action changed; reopen the session details"
+        );
+        return session_start_wizard_loop(&action.key, &SessionListArgs::default());
+    }
+    session::record_cutex_session_user_action(&action.key, action.kind.user_action())?;
     let id = record
         .codex_session_id
         .as_deref()
@@ -197,6 +204,11 @@ fn session_start_wizard_loop(initial_key: &str, list: &SessionListArgs) -> anyho
                 };
                 session::record_cutex_session_user_action(&key, CutexSessionUserAction::Attach)?;
                 return session_attach::cmd_session_attach(name, false);
+            }
+            StartSessionMenuAction::StockAttach => {
+                super::stock_lifecycle::attach(&record.cutex_session_id)?;
+                session::record_cutex_session_user_action(&key, CutexSessionUserAction::Attach)?;
+                return Ok(());
             }
             StartSessionMenuAction::Takeover => {
                 if !attachable {
