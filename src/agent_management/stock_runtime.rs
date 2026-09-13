@@ -156,8 +156,8 @@ impl AgentManagementProvider {
     ) -> anyhow::Result<StockRuntimeReview> {
         tasks.with_archive_read_fence(|tasks| -> anyhow::Result<_> {
             let state = self.store().snapshot()?;
-            let project = super::archive::guard(&state, id)
-                .map_err(|e| anyhow::anyhow!("explicit stock protected-role/project guard: {e}"))?;
+            let project = super::archive::runtime_guard(&state, id)
+                .map_err(|e| anyhow::anyhow!("explicit stock runtime/project guard: {e}"))?;
             no_task(tasks, id)?;
             let sessions = load_cutex_session_store_from_path(path)?;
             let record = sessions
@@ -193,7 +193,7 @@ impl AgentManagementProvider {
                     cutex_session_id: id.clone(),
                     formal_name,
                     durable_sha256: RuntimeReviewDigestVersion::SemanticV2.digest(record)?,
-                    authority_sha256: self.archive_authority_digest(&state, id)?,
+                    authority_sha256: self.runtime_authority_digest(&state, id)?,
                     current_project_id: project,
                     revision: record.revision,
                     runtime_generation: record.runtime_generation,
@@ -319,9 +319,9 @@ impl AgentManagementProvider {
             #[cfg(not(target_os="linux"))]
             let maintenance_validated=false;
             if !maintenance_validated {
-                super::archive::guard(&state, id)?;
+                super::archive::runtime_guard(&state, id)?;
                 no_task(tasks, id)?;
-                anyhow::ensure!(self.archive_authority_digest(&state,id)?==review.subject.authority_sha256,"stock authority changed");
+                anyhow::ensure!(self.runtime_authority_digest(&state,id)?==review.subject.authority_sha256,"stock authority changed");
             }
             let record = sessions
                 .sessions

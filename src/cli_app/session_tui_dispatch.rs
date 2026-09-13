@@ -29,6 +29,11 @@ enum SessionTuiDispatchPlan {
         key: String,
         id: String,
     },
+    StockRuntime {
+        key: String,
+        id: String,
+        action: super::stock_lifecycle::ReviewedStockRuntimeAction,
+    },
     TakeoverExisting {
         key: String,
         id: String,
@@ -76,6 +81,7 @@ impl SessionTuiDispatchPlan {
             Self::ResumeHere { key, .. } => Some((key, CutexSessionUserAction::ResumeHere)),
             Self::ResumeAttach { .. }
             | Self::StockAttach { .. }
+            | Self::StockRuntime { .. }
             | Self::OpenTui { .. }
             | Self::ResumeManaged { .. }
             | Self::CloseAndRestart { .. }
@@ -209,6 +215,31 @@ fn dispatch_plan_for_intent(
             cutex_session_display_name(&record)
         );
     }
+    let reviewed_stock = if matches!(
+        intent.action,
+        SessionTuiAction::StockStart | SessionTuiAction::StockRestart
+    ) {
+        let reviewed = intent
+            .stock_runtime
+            .clone()
+            .context("reviewed stock runtime action missing; review again")?;
+        anyhow::ensure!(
+            reviewed.review.subject.cutex_session_id.as_str() == record.cutex_session_id
+                && reviewed.review.contract
+                    == record.explicit_launch.clone().context(
+                        "selected Agent no longer has an explicit stock launch contract"
+                    )?
+                && reviewed.review.restart == (intent.action == SessionTuiAction::StockRestart),
+            "reviewed stock runtime target or operation changed; review again"
+        );
+        Some(reviewed)
+    } else {
+        anyhow::ensure!(
+            intent.stock_runtime.is_none(),
+            "reviewed stock runtime payload supplied for a different action"
+        );
+        None
+    };
 
     let id = record
         .codex_session_id
@@ -234,6 +265,13 @@ fn dispatch_plan_for_intent(
             key: intent.key.clone(),
             id: record.cutex_session_id.clone(),
         },
+        SessionTuiAction::StockStart | SessionTuiAction::StockRestart => {
+            SessionTuiDispatchPlan::StockRuntime {
+                key: intent.key.clone(),
+                id: record.cutex_session_id.clone(),
+                action: reviewed_stock.expect("validated reviewed stock action"),
+            }
+        }
         SessionTuiAction::TakeoverExisting => SessionTuiDispatchPlan::TakeoverExisting {
             key: intent.key.clone(),
             id,
@@ -285,6 +323,19 @@ fn execute_dispatch_plan(
         }
         SessionTuiDispatchPlan::StockAttach { key, id } => {
             super::stock_lifecycle::attach(&id)?;
+            session::record_cutex_session_user_action(&key, CutexSessionUserAction::Attach)
+        }
+        SessionTuiDispatchPlan::StockRuntime { key, id, action } => {
+            let receipt = action.execute()?;
+            anyhow::ensure!(
+                receipt.stage == cutex::agent_management::StockRuntimeStage::Ready
+                    && receipt.error.is_none()
+                    && receipt.binding.is_some(),
+                "stock runtime action did not reach Ready; replay the same reviewed action"
+            );
+            session::record_cutex_session_user_action(&key, CutexSessionUserAction::Online)?;
+            super::stock_lifecycle::attach(&id)
+                .context("stock runtime is Ready, but foreground attach failed")?;
             session::record_cutex_session_user_action(&key, CutexSessionUserAction::Attach)
         }
         SessionTuiDispatchPlan::TakeoverExisting { id, .. } => session::cmd_session_takeover(&id),
@@ -361,6 +412,7 @@ mod tests {
             key: "durable-key".to_string(),
             action,
             launch_profile: None,
+            stock_runtime: None,
         }
     }
 
@@ -369,6 +421,7 @@ mod tests {
             key: "durable-key".to_string(),
             action,
             launch_profile: Some(profile.to_string()),
+            stock_runtime: None,
         }
     }
 
@@ -381,6 +434,69 @@ mod tests {
             bundle_manifest: "/tmp/stock-bundle.json".into(),
             bundle_sha256: cutex::role_revision::Sha256::new("a".repeat(64)).unwrap(),
         });
+    }
+
+    fn reviewed_stock(
+        record: &CutexSessionRecord,
+        restart: bool,
+    ) -> super::super::stock_lifecycle::ReviewedStockRuntimeAction {
+        super::super::stock_lifecycle::ReviewedStockRuntimeAction {
+            action_id: cutex::agent_management::AgentActionId::new("tui-stock-test").unwrap(),
+            review: serde_json::from_value(serde_json::json!({
+                "digest_version": 2,
+                "subject": {
+                    "cutex_session_id": record.cutex_session_id,
+                    "formal_name": "dispatch-agent",
+                    "durable_sha256": "b".repeat(64),
+                    "authority_sha256": "c".repeat(64),
+                    "current_project_id": null,
+                    "revision": record.revision,
+                    "runtime_generation": record.runtime_generation
+                },
+                "contract": record.explicit_launch,
+                "configuration": {
+                    "profile_name": "aemeath",
+                    "profile_id": "test-profile",
+                    "inherited": false,
+                    "profile_sha256": "d".repeat(64),
+                    "account_sha256": "e".repeat(64),
+                    "model": "test-model",
+                    "reasoning": null,
+                    "model_provider": "test",
+                    "provider": {
+                        "name": "test",
+                        "base_url": "http://127.0.0.1:1/v1",
+                        "wire_api": "responses",
+                        "requires_openai_auth": false,
+                        "supports_websockets": false
+                    },
+                    "sandbox": "danger-full-access",
+                    "approval": "never"
+                },
+                "restart": restart
+            }))
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn offline_explicit_stock_dispatch_requires_and_preserves_exact_review() {
+        let mut record = record(CutexSessionRuntimeBackend::Host);
+        mark_explicit_stock(&mut record);
+        let action = reviewed_stock(&record, false);
+        let store = store_with(record);
+        let mut start = intent(SessionTuiAction::StockStart);
+        assert!(dispatch_plan_for_intent(&start, &store, &[], &[]).is_err());
+        start.stock_runtime = Some(action.clone());
+
+        assert_eq!(
+            dispatch_plan_for_intent(&start, &store, &[], &[]).unwrap(),
+            SessionTuiDispatchPlan::StockRuntime {
+                key: "durable-key".to_string(),
+                id: "cutex.dispatch".to_string(),
+                action,
+            }
+        );
     }
 
     #[test]

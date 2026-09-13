@@ -261,6 +261,24 @@ mod tests {
                 Ok((state, (), true))
             })
             .unwrap();
+        let seat_action = crate::task_service::ActionId::new("runtime-director-seat").unwrap();
+        f.provider
+            .director_seats
+            .prepare_project_director(&seat_action, &project, &request.review.cutex_session_id)
+            .unwrap();
+        f.provider
+            .director_seats
+            .activate_project_director(&seat_action, &project, &request.review.cutex_session_id)
+            .unwrap();
+        let state = f.provider.store().snapshot().unwrap();
+        assert_eq!(
+            runtime_guard(&state, &request.review.cutex_session_id).unwrap(),
+            Some(project.clone())
+        );
+        assert!(f
+            .provider
+            .runtime_authority_digest(&state, &request.review.cutex_session_id)
+            .is_ok());
         let mut runtime = Offline {
             stops: 0,
             reject: false,
@@ -611,7 +629,7 @@ fn conflict(code: &'static str) -> AgentManagementError {
     AgentManagementError::Conflict(code)
 }
 
-fn authority_digest(
+pub(super) fn authority_digest(
     state: &AgentManagementSnapshot,
     id: &CutexSessionId,
 ) -> Result<Sha256, AgentManagementError> {
@@ -639,6 +657,51 @@ fn authority_digest(
             .filter_map(|(p, g)| g.get(id).map(|g| (p, g)))
             .collect::<Vec<_>>(),
     ))
+}
+
+/// Runtime start/restart protects the current authority topology without
+/// treating the authority holder itself as an archive target. A seated
+/// Director or granted Operator is allowed to run; retirement and broken
+/// project membership still fail closed.
+pub(super) fn runtime_guard(
+    state: &AgentManagementSnapshot,
+    id: &CutexSessionId,
+) -> Result<Option<ProjectId>, AgentManagementError> {
+    let agent = state.agents.get(id);
+    if agent.is_some_and(|a| a.retired_at.is_some()) {
+        return Err(conflict("permanent_retirement_is_not_runnable"));
+    }
+    let roster_project = agent.and_then(|a| current_project_id(state, a));
+    let director_projects = state
+        .projects
+        .iter()
+        .filter_map(|(project, authority)| {
+            (&authority.authorized_director_session == id).then_some(project)
+        })
+        .collect::<Vec<_>>();
+    if director_projects.len() > 1 {
+        return Err(conflict("director_authorized_for_multiple_projects"));
+    }
+    let director_project = director_projects.first().copied().cloned();
+    if roster_project.is_some() && director_project.is_some() && roster_project != director_project
+    {
+        return Err(conflict("runtime_project_authority_mismatch"));
+    }
+    let project = roster_project.or(director_project);
+    if let Some(project) = &project {
+        if !state.projects.contains_key(project) {
+            return Err(conflict("runtime_current_project_missing"));
+        }
+        if state.project_tombstones.contains_key(project)
+            || state
+                .project_states
+                .get(project)
+                .is_some_and(|p| p.lifecycle != ProjectLifecycle::Active)
+        {
+            return Err(conflict("restore_current_project_before_agent_lifecycle"));
+        }
+    }
+    Ok(project)
 }
 
 pub(super) fn guard(
@@ -677,6 +740,57 @@ pub(super) fn guard(
 }
 
 impl AgentManagementProvider {
+    pub(super) fn runtime_authority_digest(
+        &self,
+        state: &AgentManagementSnapshot,
+        id: &CutexSessionId,
+    ) -> Result<Sha256, AgentManagementError> {
+        let project = runtime_guard(state, id)?;
+        let seats = self
+            .director_seats
+            .query()
+            .map_err(super::provider::seat_authority_error)?;
+        if let Some(project) = &project {
+            if seats
+                .active_project_director_transfers
+                .contains_key(project)
+            {
+                return Err(conflict("runtime_project_authority_transfer_in_progress"));
+            }
+            if let Some(authority) = state.projects.get(project) {
+                let seat = seats.project_director_occupancies.get(project);
+                if &authority.authorized_director_session == id
+                    && seat.is_none_or(|seat| &seat.occupant_cutex_session != id)
+                {
+                    return Err(conflict("runtime_director_seat_mismatch"));
+                }
+                if let Some(seat) = seat {
+                    // Legacy seat stores omit this field; the seat subsystem
+                    // canonically interprets an absent state as Active.
+                    let seat_state = seats
+                        .project_director_states
+                        .get(project)
+                        .copied()
+                        .unwrap_or(crate::seat::ProjectDirectorSeatState::Active);
+                    if authority.authorized_director_session != seat.occupant_cutex_session
+                        || seat_state != crate::seat::ProjectDirectorSeatState::Active
+                    {
+                        return Err(conflict("runtime_project_authority_incompatible"));
+                    }
+                }
+            }
+        }
+        super::store::request_sha256(&(
+            authority_digest(state, id)?,
+            project
+                .as_ref()
+                .and_then(|p| seats.project_director_occupancies.get(p)),
+            project
+                .as_ref()
+                .and_then(|p| seats.project_director_states.get(p)),
+        ))
+    }
+
     pub(super) fn archive_authority_digest(
         &self,
         state: &AgentManagementSnapshot,

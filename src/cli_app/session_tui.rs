@@ -394,6 +394,7 @@ pub(super) struct SessionTuiIntent {
     pub(super) key: String,
     pub(super) action: SessionTuiAction,
     pub(super) launch_profile: Option<String>,
+    pub(super) stock_runtime: Option<super::stock_lifecycle::ReviewedStockRuntimeAction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -792,6 +793,7 @@ struct SelectorModel {
     settings_return_panel: Option<PrimaryPanel>,
     confirmation_returns_to_list: bool,
     archive_confirmation: Option<cutex::agent_management::AgentArchiveRequest>,
+    stock_runtime_confirmation: Option<super::stock_lifecycle::ReviewedStockRuntimeAction>,
     object_return: Option<(PrimaryPanel, Option<SelectorTarget>)>,
     show_thread_titles: bool,
     enhanced_keyboard: bool,
@@ -843,6 +845,7 @@ impl SelectorModel {
             settings_return_panel: None,
             confirmation_returns_to_list: false,
             archive_confirmation: None,
+            stock_runtime_confirmation: None,
             object_return: None,
             show_thread_titles: false,
             enhanced_keyboard,
@@ -3349,6 +3352,29 @@ impl SelectorModel {
             SelectorEvent::Activate if next_confirmed => {
                 if matches!(
                     action,
+                    SessionTuiAction::StockStart | SessionTuiAction::StockRestart
+                ) {
+                    let Some(request) = self.stock_runtime_confirmation.clone() else {
+                        self.warning =
+                            Some("Stock runtime review unavailable; no action submitted".into());
+                        return SelectorControl::Continue;
+                    };
+                    if request.review.subject.cutex_session_id.as_str() != agent_key
+                        || request.review.restart != (action == SessionTuiAction::StockRestart)
+                    {
+                        self.warning =
+                            Some("Stock runtime confirmation target changed; review again".into());
+                        return SelectorControl::Continue;
+                    }
+                    return SelectorControl::Selected(SessionTuiIntent {
+                        key: agent_key,
+                        action,
+                        launch_profile: None,
+                        stock_runtime: Some(request),
+                    });
+                }
+                if matches!(
+                    action,
                     SessionTuiAction::RetireSession | SessionTuiAction::RestoreSession
                 ) {
                     let Some(request) = self.archive_confirmation.take() else {
@@ -3371,10 +3397,12 @@ impl SelectorModel {
                     key: agent_key,
                     action,
                     launch_profile,
+                    stock_runtime: None,
                 });
             }
             SelectorEvent::Activate | SelectorEvent::Escape => {
                 self.archive_confirmation = None;
+                self.stock_runtime_confirmation = None;
                 if self.confirmation_returns_to_list {
                     self.confirmation_returns_to_list = false;
                     self.inspector_overview_focused = false;
@@ -3542,6 +3570,7 @@ impl SelectorModel {
         if (row.managed && row.lifecycle == Some(CutexSessionLifecycleState::Offline))
             || action.requires_confirmation()
         {
+            self.stock_runtime_confirmation = None;
             self.confirmation_returns_to_list = true;
             self.mode = SelectorMode::ConfirmRuntimeAction {
                 agent_key,
@@ -3555,6 +3584,7 @@ impl SelectorModel {
             key: agent_key,
             action,
             launch_profile: None,
+            stock_runtime: None,
         })
     }
 
@@ -3588,6 +3618,7 @@ impl SelectorModel {
                 )
         });
         if action.requires_confirmation() || starts_offline_agent {
+            self.stock_runtime_confirmation = None;
             self.confirmation_returns_to_list = false;
             self.mode = SelectorMode::ConfirmRuntimeAction {
                 agent_key,
@@ -3601,6 +3632,7 @@ impl SelectorModel {
                 key: agent_key,
                 action,
                 launch_profile,
+                stock_runtime: None,
             })
         }
     }
@@ -4565,6 +4597,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
                     .handoff(|| super::session_tui_dispatch::dispatch_session_tui_intent(intent))?
                 {
                     Ok(()) => {
+                        selector_model.stock_runtime_confirmation = None;
                         selector_model.notice = Some("Returned from foreground session".into())
                     }
                     Err(error) => {
@@ -5790,9 +5823,15 @@ fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyR
     if command == Command::Details {
         model.status_scroll.reset();
         model.details = Some(format!(
-            "Current review: {:?}\nArchive confirmation: {:?}\nRecent adoption: {:?}\nFormal name input: {}\nRecent: {:?}\nNotice: {}\nStatus: {}",
+            "Current review: {:?}\nArchive confirmation: {:?}\nStock runtime review: {:?}\nRecent adoption: {:?}\nFormal name input: {}\nRecent: {:?}\nNotice: {}\nStatus: {}",
             model.mode,
             model.archive_confirmation,
+            model.stock_runtime_confirmation.as_ref().map(|request| (
+                request.action_id.as_str(),
+                request.review.subject.cutex_session_id.as_str(),
+                request.review.restart,
+                request.review.subject.runtime_generation,
+            )),
             model.recent.review(),
             model.recent.adoption_name().map(|i| i.value()).unwrap_or("not editing"),
             model.recent.load_state(),
@@ -6275,6 +6314,21 @@ fn run_event_loop(
         {
             if matches!(
                 action,
+                SessionTuiAction::StockStart | SessionTuiAction::StockRestart
+            ) && model.stock_runtime_confirmation.is_none()
+            {
+                match super::stock_lifecycle::ReviewedStockRuntimeAction::review(
+                    agent_key,
+                    *action == SessionTuiAction::StockRestart,
+                ) {
+                    Ok(request) => model.stock_runtime_confirmation = Some(request),
+                    Err(error) => {
+                        model.warning = Some(format!("Stock runtime review failed: {error:#}"));
+                        model.mode = SelectorMode::Agents;
+                    }
+                }
+            } else if matches!(
+                action,
                 SessionTuiAction::RetireSession | SessionTuiAction::RestoreSession
             ) && model.archive_confirmation.is_none()
             {
@@ -6311,6 +6365,7 @@ fn run_event_loop(
             }
         } else if !matches!(model.mode, SelectorMode::ClosingRuntime { .. }) {
             model.archive_confirmation = None;
+            model.stock_runtime_confirmation = None;
         }
         terminal.draw(|frame| render_selector(frame, model))?;
 
@@ -6377,6 +6432,7 @@ fn run_event_loop(
                                     SessionTuiAction::RetireSession
                                 },
                                 launch_profile: None,
+                                stock_runtime: None,
                             };
                             model.runtime_close_started(&intent);
                             let (send, receive) = std::sync::mpsc::channel();
@@ -8822,6 +8878,43 @@ fn render_runtime_action_confirmation(frame: &mut Frame<'_>, area: Rect, model: 
         Style::new().fg(Color::Yellow)
     };
     let (title, prompt, action_label, detail) = match action {
+        SessionTuiAction::StockStart | SessionTuiAction::StockRestart => {
+            let restart = *action == SessionTuiAction::StockRestart;
+            let (generation, profile, model_name, native_home) = model
+                .stock_runtime_confirmation
+                .as_ref()
+                .map(|request| {
+                    (
+                        request.review.subject.runtime_generation,
+                        request.review.configuration.profile_name.as_str(),
+                        request.review.configuration.model.as_str(),
+                        compact_home_path(
+                            request.review.contract.native_home.to_string_lossy().as_ref(),
+                        ),
+                    )
+                })
+                .unwrap_or((0, "review pending", "review pending", "review pending".into()));
+            (
+                if restart {
+                    " Confirm reviewed stock restart "
+                } else {
+                    " Confirm reviewed stock start "
+                },
+                format!(
+                    "{} reviewed stock runtime for {}?",
+                    if restart { "Restart" } else { "Start" },
+                    row.agent
+                ),
+                if restart {
+                    "  Restart & attach  "
+                } else {
+                    "  Start & attach  "
+                },
+                format!(
+                    "Generation {generation} · profile {profile} · model {model_name} · native home {native_home}. The exact reviewed owner will be launched, then attached."
+                ),
+            )
+        }
         SessionTuiAction::Online
         | SessionTuiAction::ResumeAttach
         | SessionTuiAction::OpenTui
@@ -8967,6 +9060,8 @@ fn homepage_action_label(action: SessionTuiAction) -> &'static str {
     match action {
         SessionTuiAction::ResumeAttach | SessionTuiAction::TakeoverExisting => "takeover",
         SessionTuiAction::AttachExisting | SessionTuiAction::StockAttach => "attach",
+        SessionTuiAction::StockStart => "start",
+        SessionTuiAction::StockRestart => "restart",
         SessionTuiAction::OpenTui => "open",
         SessionTuiAction::Online => "start",
         SessionTuiAction::ResumeHere | SessionTuiAction::ResumeManaged => "resume",
@@ -14011,6 +14106,7 @@ mod tests {
                 key: "agent".to_string(),
                 action: SessionTuiAction::ResumeAttach,
                 launch_profile: None,
+                stock_runtime: None,
             })
         );
     }
@@ -14087,6 +14183,91 @@ mod tests {
                 key: "agent".to_string(),
                 action: SessionTuiAction::ResumeAttach,
                 launch_profile: None,
+                stock_runtime: None,
+            })
+        );
+    }
+
+    #[test]
+    fn reviewed_stock_start_confirmation_carries_exact_review_to_dispatch() {
+        let key = "cutex.stock";
+        let mut stock = row(
+            key,
+            "Stock Agent",
+            CutexSessionLifecycleState::Offline,
+            true,
+            true,
+        );
+        stock.actions = vec![SessionTuiActionItem {
+            action: SessionTuiAction::StockStart,
+            detail: "Review and start exact stock owner",
+            primary: true,
+        }];
+        let mut model = SelectorModel::new(vec![stock], false, false);
+        let reviewed = super::super::stock_lifecycle::ReviewedStockRuntimeAction {
+            action_id: cutex::agent_management::AgentActionId::new("tui-stock-confirm").unwrap(),
+            review: serde_json::from_value(serde_json::json!({
+                "digest_version": 2,
+                "subject": {
+                    "cutex_session_id": key,
+                    "formal_name": "Stock Agent",
+                    "durable_sha256": "a".repeat(64),
+                    "authority_sha256": "b".repeat(64),
+                    "current_project_id": null,
+                    "revision": 4,
+                    "runtime_generation": 7
+                },
+                "contract": {
+                    "version": 3,
+                    "migration_action_id": "migration-test",
+                    "native_id": "019e0000-0000-7000-8000-000000000001",
+                    "native_home": "/private/stock-home",
+                    "bundle_manifest": "/private/stock-home/bundle.json",
+                    "bundle_sha256": "c".repeat(64)
+                },
+                "configuration": {
+                    "profile_name": "aemeath",
+                    "profile_id": "profile",
+                    "inherited": false,
+                    "profile_sha256": "d".repeat(64),
+                    "account_sha256": "e".repeat(64),
+                    "model": "gpt-test",
+                    "reasoning": "high",
+                    "model_provider": "test",
+                    "provider": {
+                        "name": "test",
+                        "base_url": "http://127.0.0.1:1/v1",
+                        "wire_api": "responses",
+                        "requires_openai_auth": false,
+                        "supports_websockets": false
+                    },
+                    "sandbox": "danger-full-access",
+                    "approval": "never"
+                },
+                "restart": false
+            }))
+            .unwrap(),
+        };
+        model.mode = SelectorMode::ConfirmRuntimeAction {
+            agent_key: key.to_string(),
+            action: SessionTuiAction::StockStart,
+            launch_profile: None,
+            confirmed: false,
+        };
+        model.stock_runtime_confirmation = Some(reviewed.clone());
+
+        let confirmation = rendered_text_at(100, 24, &model);
+        assert!(confirmation.contains("Confirm reviewed stock start"));
+        assert!(confirmation.contains("Generation 7"));
+        assert!(confirmation.contains("profile aemeath"));
+        model.handle(SelectorEvent::Down);
+        assert_eq!(
+            model.handle(SelectorEvent::Activate),
+            SelectorControl::Selected(SessionTuiIntent {
+                key: key.to_string(),
+                action: SessionTuiAction::StockStart,
+                launch_profile: None,
+                stock_runtime: Some(reviewed),
             })
         );
     }
@@ -14455,6 +14636,7 @@ mod tests {
             key: "agent".to_string(),
             action: SessionTuiAction::CloseRuntime,
             launch_profile: None,
+            stock_runtime: None,
         };
         assert!(intent_runs_in_selector(&intent));
         intent.action = SessionTuiAction::CloseAndRestart;
@@ -14529,6 +14711,7 @@ mod tests {
                 key: "agent".to_string(),
                 action: SessionTuiAction::CloseRuntime,
                 launch_profile: None,
+                stock_runtime: None,
             })
         );
     }
@@ -14595,6 +14778,7 @@ mod tests {
                 key: EDITABLE_AGENT_KEY.to_string(),
                 action: SessionTuiAction::CloseAndRestart,
                 launch_profile: Some("beta".to_string()),
+                stock_runtime: None,
             })
         );
     }
@@ -14690,6 +14874,7 @@ mod tests {
                 key: EDITABLE_AGENT_KEY.to_string(),
                 action: SessionTuiAction::Online,
                 launch_profile: Some("beta".to_string()),
+                stock_runtime: None,
             })
         );
     }
@@ -15784,6 +15969,7 @@ mod tests {
             key: "cutex.exact".into(),
             action: SessionTuiAction::RetireSession,
             launch_profile: None,
+            stock_runtime: None,
         };
         // Same guard used immediately by the production effect consumer.
         model.runtime_close_started(&intent);

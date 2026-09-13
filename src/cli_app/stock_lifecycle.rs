@@ -9,6 +9,32 @@ use cutex::session::model::{
 };
 use std::sync::Arc;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ReviewedStockRuntimeAction {
+    pub action_id: cutex::agent_management::AgentActionId,
+    pub review: cutex::agent_management::StockRuntimeReview,
+}
+
+impl ReviewedStockRuntimeAction {
+    pub(super) fn review(id: &str, restart: bool) -> anyhow::Result<Self> {
+        let client = super::management_control_plane::ManagementControlClient::connect()?;
+        let cutex_session_id = cutex::role_revision::CutexSessionId::new(id.to_string())
+            .map_err(|_| anyhow::anyhow!("exact durable stock Agent ID required"))?;
+        Ok(Self {
+            action_id: cutex::agent_management::AgentActionId::new(format!(
+                "tui-stock-runtime-{}",
+                uuid::Uuid::new_v4()
+            ))?,
+            review: client.review_stock_runtime(cutex_session_id, restart)?,
+        })
+    }
+
+    pub(super) fn execute(&self) -> anyhow::Result<cutex::agent_management::StockRuntimeReceipt> {
+        super::management_control_plane::ManagementControlClient::connect()?
+            .run_stock_runtime(self.action_id.clone(), self.review.clone())
+    }
+}
+
 #[derive(Default)]
 pub(super) struct StockExecutor {
     child: Option<super::stock_publication::GatedChild>,

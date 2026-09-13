@@ -13,6 +13,8 @@ pub(super) enum SessionTuiAction {
     ResumeAttach,
     AttachExisting,
     StockAttach,
+    StockStart,
+    StockRestart,
     TakeoverExisting,
     OpenTui,
     Online,
@@ -31,6 +33,8 @@ impl SessionTuiAction {
             Self::ResumeAttach => "takeover",
             Self::AttachExisting => "attach",
             Self::StockAttach => "attach stock TUI",
+            Self::StockStart => "start reviewed stock runtime",
+            Self::StockRestart => "restart reviewed stock runtime",
             Self::TakeoverExisting => "takeover existing",
             Self::OpenTui => "open TUI",
             Self::Online => "online",
@@ -48,6 +52,8 @@ impl SessionTuiAction {
         matches!(
             self,
             Self::Online
+                | Self::StockStart
+                | Self::StockRestart
                 | Self::CloseAndRestart
                 | Self::CloseRuntime
                 | Self::RepairInterruptedHistory
@@ -68,6 +74,8 @@ impl SessionTuiAction {
             Self::CloseAndRestart => true,
             Self::AttachExisting
             | Self::StockAttach
+            | Self::StockStart
+            | Self::StockRestart
             | Self::TakeoverExisting
             | Self::ResumeHere
             | Self::ResumeManaged
@@ -103,6 +111,15 @@ pub(super) fn session_tui_actions_for_record(
         || record.current_runtime_agent_id.is_some();
     if record.explicit_launch.is_some() {
         let mut actions = Vec::new();
+        if !runtime_known {
+            push_action(
+                &mut actions,
+                SessionTuiAction::StockStart,
+                "Review the sealed runtime configuration, start its exact owner, then attach",
+                true,
+            );
+            return actions;
+        }
         if lifecycle == CutexSessionLifecycleState::Online
             && record.app_server_runtime.is_some()
             && record.current_runtime_agent_id.is_some()
@@ -114,6 +131,13 @@ pub(super) fn session_tui_actions_for_record(
                 true,
             );
         }
+        let restart_primary = actions.is_empty();
+        push_action(
+            &mut actions,
+            SessionTuiAction::StockRestart,
+            "Review the sealed runtime configuration, replace its exact owner, then attach",
+            restart_primary,
+        );
         if runtime_known {
             push_action(
                 &mut actions,
@@ -237,6 +261,12 @@ fn primary_action_detail(action: SessionTuiAction) -> &'static str {
         SessionTuiAction::StockAttach => {
             "Join the exact ready stock owner without creating another writer"
         }
+        SessionTuiAction::StockStart => {
+            "Review the sealed runtime configuration, start its exact owner, then attach"
+        }
+        SessionTuiAction::StockRestart => {
+            "Review the sealed runtime configuration, replace its exact owner, then attach"
+        }
         SessionTuiAction::TakeoverExisting => "Take control of the existing TUI",
         SessionTuiAction::OpenTui => "Open the visible TUI for the managed app-server",
         SessionTuiAction::Online => "Bring the managed runtime online",
@@ -310,15 +340,17 @@ mod tests {
     }
 
     #[test]
-    fn offline_explicit_stock_hides_all_generic_launch_and_history_repair_actions() {
+    fn offline_explicit_stock_offers_reviewed_start_and_hides_generic_routes() {
         let mut record = record(CutexSessionRuntimeBackend::Host);
         mark_explicit_stock(&mut record);
 
-        assert!(session_tui_actions_for_record(&record, &[], &[]).is_empty());
+        let actions = session_tui_actions_for_record(&record, &[], &[]);
+        assert_eq!(action_kinds(&actions), vec![SessionTuiAction::StockStart]);
+        assert!(actions[0].primary);
     }
 
     #[test]
-    fn ready_explicit_stock_offers_exact_attach_and_graceful_close_only() {
+    fn ready_explicit_stock_offers_attach_reviewed_restart_and_graceful_close() {
         let mut record = record(CutexSessionRuntimeBackend::Host);
         mark_explicit_stock(&mut record);
         record.current_runtime_agent_id = Some("stock.actions.runtime".to_string());
@@ -358,6 +390,7 @@ mod tests {
             action_kinds(&actions),
             vec![
                 SessionTuiAction::StockAttach,
+                SessionTuiAction::StockRestart,
                 SessionTuiAction::CloseRuntime,
             ]
         );

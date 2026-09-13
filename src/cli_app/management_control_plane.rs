@@ -24,6 +24,39 @@ pub(super) struct ManagementControlClient {
 }
 
 impl ManagementControlClient {
+    pub(super) fn review_stock_runtime(
+        &self,
+        cutex_session_id: cutex::role_revision::CutexSessionId,
+        restart: bool,
+    ) -> anyhow::Result<cutex::agent_management::StockRuntimeReview> {
+        self.request(
+            "POST",
+            "/v2/agent-management/explicit-launch",
+            Some(&serde_json::to_vec(
+                &cutex::agent_management::ExplicitLaunchRequest::ReviewRuntime {
+                    cutex_session_id,
+                    restart,
+                    receiver_canonical_byte_limit: Default::default(),
+                    job_mcp: None,
+                },
+            )?),
+        )
+    }
+
+    pub(super) fn run_stock_runtime(
+        &self,
+        action_id: cutex::agent_management::AgentActionId,
+        review: cutex::agent_management::StockRuntimeReview,
+    ) -> anyhow::Result<cutex::agent_management::StockRuntimeReceipt> {
+        self.request(
+            "POST",
+            "/v2/agent-management/explicit-launch",
+            Some(&serde_json::to_vec(
+                &cutex::agent_management::ExplicitLaunchRequest::Run { action_id, review },
+            )?),
+        )
+    }
+
     pub(super) fn adopt_saved_native(
         &self,
         request: &cutex::agent_management::HumanAdoptRequest,
