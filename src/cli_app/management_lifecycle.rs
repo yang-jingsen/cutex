@@ -1537,6 +1537,23 @@ pub(crate) fn stop_cutex_session_runtime_for_entry_fenced(
         }
     }
     ensure_cutex_session_runtime_host_is_local(&record)?;
+    if record.explicit_launch.is_some() {
+        let outcome = super::native_stop::stop_and_commit(&record, force)?;
+        return Ok(SessionRuntimeStopResult {
+            had_runtime: record.app_server_runtime.is_some(),
+            stopped: outcome.stopped,
+            forced: outcome.forced,
+            pid: record.app_server_runtime.as_ref().map(|b| b.pid),
+            pids: record
+                .app_server_runtime
+                .as_ref()
+                .map(|b| vec![b.pid])
+                .unwrap_or_default(),
+            alden_session_name: None,
+            runtime_agent_id: record.current_runtime_agent_id.clone(),
+            detail: outcome.detail,
+        });
+    }
     let alden_session = record
         .alden_session_name
         .as_deref()

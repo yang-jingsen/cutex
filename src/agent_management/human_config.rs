@@ -71,6 +71,7 @@ fn fields(record: &CutexSessionRecord) -> BTreeMap<String, Value> {
         ("cwd".into(), json!(record.managed_cwd)),
         ("approval".into(), json!(record.approval_policy)),
         ("sandbox".into(), json!(record.sandbox_mode)),
+        ("permission_alias".into(), json!(record.permission_defaults)),
         // Retain the entire contract in before/after, while input only accepts a
         // manifest path. This protects native identity and enables exact undo.
         ("bundle_manifest".into(), json!(record.explicit_launch)),
@@ -86,6 +87,9 @@ fn apply(record: &mut CutexSessionRecord, values: &BTreeMap<String, Value>) -> a
             "cwd" => record.managed_cwd = serde_json::from_value(value.clone())?,
             "approval" => record.approval_policy = serde_json::from_value(value.clone())?,
             "sandbox" => record.sandbox_mode = serde_json::from_value(value.clone())?,
+            "permission_alias" => {
+                record.permission_defaults = serde_json::from_value(value.clone())?
+            }
             "bundle_manifest" => record.explicit_launch = serde_json::from_value(value.clone())?,
             _ => anyhow::bail!("unknown configuration field: {key}"),
         }
@@ -152,6 +156,11 @@ fn patch_values(
             }
             _ => anyhow::bail!("unknown configuration field: {key}"),
         };
+        if key == "sandbox" {
+            // This compatibility alias is derived, not an independent setting.
+            // Persist both sides in the receipt so Undo restores the exact pair.
+            values.insert("permission_alias".into(), v.clone());
+        }
         values.insert(key.clone(), v);
     }
     Ok(values)
@@ -386,6 +395,36 @@ mod tests {
         assert_eq!(after.codex_session_id, before.codex_session_id);
         f.run(&f.set("clear-model", json!({"model":null}))).unwrap();
         assert_eq!(f.record().model_defaults, None);
+    }
+
+    #[test]
+    fn sandbox_alias_is_receipted_and_exactly_undone() {
+        let f = Fixture::new();
+        with_locked_session_store(&f.path, |s| {
+            let record = s.sessions.get_mut(f.id.as_str()).unwrap();
+            record.sandbox_mode = Some("danger-full-access".into());
+            record.permission_defaults = Some("full-access".into());
+            save_locked_session_store(&f.path, s)
+        })
+        .unwrap();
+        let receipt = f
+            .run(&f.set("sandbox-pair", json!({"sandbox":"read-only"})))
+            .unwrap();
+        assert_eq!(f.record().permission_defaults.as_deref(), Some("read-only"));
+        assert_eq!(receipt["after"]["permission_alias"], "read-only");
+        f.run(&f.undo("undo-sandbox-pair", "sandbox-pair")).unwrap();
+        assert_eq!(
+            f.record().permission_defaults.as_deref(),
+            Some("full-access")
+        );
+        assert_eq!(
+            f.record().sandbox_mode.as_deref(),
+            Some("danger-full-access")
+        );
+        f.run(&f.set("clear-sandbox-pair", json!({"sandbox":null})))
+            .unwrap();
+        assert_eq!(f.record().permission_defaults, None);
+        assert_eq!(f.record().sandbox_mode, None);
     }
 
     #[test]

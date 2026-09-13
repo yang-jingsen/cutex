@@ -460,6 +460,10 @@ pub struct ThreadStartParams {
 pub struct ThreadResumeParams {
     pub thread_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclude_turns: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_turns_page: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_provider: Option<String>,

@@ -979,7 +979,10 @@
         "status": {
           "enum": ["starting", "online", "offline", "closing", "closed", "error"]
         },
-        "launchProfile": { "$ref": "#/$defs/launchProfileReceipt" }
+        "launchProfile": { "$ref": "#/$defs/launchProfileReceipt" },
+        "runtimeAgentId": { "type": ["string", "null"] },
+        "actionId": { "$ref": "#/$defs/nonEmptyString" },
+        "attachCommand": { "$ref": "#/$defs/nonEmptyString" }
       }
     },
     "userInputSubmitResult": {

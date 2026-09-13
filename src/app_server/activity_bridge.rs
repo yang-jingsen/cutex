@@ -102,7 +102,7 @@ struct ProviderTaskAssignmentHydrator;
 impl TaskAssignmentHydrator for ProviderTaskAssignmentHydrator {
     fn hydrate(&self, assignment_id: &AssignmentId) -> anyhow::Result<TaskAssignmentFacts> {
         let provider = TaskServiceProvider::open(default_task_service_provider_root()?)?;
-        assignment_facts(&provider.query()?, assignment_id)
+        assignment_facts(&provider.query_assignment(assignment_id)?, assignment_id)
     }
 }
 

@@ -205,6 +205,22 @@ pub trait AgentLifecycle: Send + Sync {
         spec: &ManagedAgentSpec,
     ) -> Result<RuntimeRecoveryOutcome, LifecycleFailure>;
     fn online(&self, cutex_session_id: &CutexSessionId) -> Result<(), LifecycleFailure>;
+    fn online_managed(
+        &self,
+        _permit: &RuntimeExecutionPermit<'_>,
+        cutex_session_id: &CutexSessionId,
+    ) -> Result<(), LifecycleFailure> {
+        self.online(cutex_session_id)
+    }
+    fn restart_managed_if_occurrence(
+        &self,
+        _permit: &RuntimeExecutionPermit<'_>,
+        id: &CutexSessionId,
+        expected: &RuntimeOccurrenceFence,
+    ) -> Result<(AgentRuntimeObservation, AgentRuntimeObservation), LifecycleFailure> {
+        self.restart_if_occurrence(id, expected)
+    }
+
     fn offline(&self, cutex_session_id: &CutexSessionId) -> Result<(), LifecycleFailure>;
     fn offline_if_occurrence(
         &self,
@@ -367,6 +383,30 @@ impl AgentManagementProvider {
                             agent.cutex_session_id.as_str()
                         ))
                     })?;
+                if record.explicit_launch.as_ref().is_some_and(|contract| {
+                    contract.native_id == agent.native_session_id
+                        && record.codex_session_id.as_deref()
+                            == Some(agent.native_session_id.as_str())
+                }) && record.runtime_backend
+                    == crate::session::model::CutexSessionRuntimeBackend::Host
+                {
+                    // Current configuration belongs to the durable native record.
+                    // Creation specs/receipts remain immutable provenance, not a
+                    // second authority that can reject legitimate Human edits.
+                    agent.spec.runtime_backend = "host".into();
+                    agent.spec.cwd =
+                        crate::session::metadata::cutex_session_launch_cwd(record).into();
+                    agent.spec.profile = record.profile.clone();
+                    agent.spec.model = record.model_defaults.clone().unwrap_or_default();
+                    agent.spec.reasoning = record.reasoning_defaults.clone().unwrap_or_default();
+                    agent.spec.permissions = record.permission_defaults.clone().unwrap_or_default();
+                    agent.spec.approval_policy = record.approval_policy.clone().unwrap_or_default();
+                    agent.spec.sandbox_mode = record.sandbox_mode.clone().unwrap_or_default();
+                    agent.spec.groups = record.agent_groups.clone();
+                    agent.spec.expose_to_im = record.exposed_to_backend;
+                    agent.spec.pin = record.quick_action
+                        == crate::session::model::CutexSessionQuickActionMode::Pinned;
+                }
                 snapshot
                     .reversible_archive_projection
                     .insert(agent.cutex_session_id.clone(), record.is_retired());
@@ -1617,24 +1657,18 @@ impl AgentManagementProvider {
                 )
             }
             AgentOperation::Restart { cutex_session_id } => {
-                if let Some(path) = &self.current_names_path {
-                    let sessions = crate::session::store::load_cutex_session_store_from_path(path)
-                        .map_err(|_| AgentManagementError::PersistenceUnavailable)?;
-                    let record = sessions
-                        .sessions
-                        .get(cutex_session_id.as_str())
-                        .ok_or_else(|| {
-                            AgentManagementError::OwnerActionRequired(
-                                "durable record unavailable".into(),
-                            )
-                        })?;
-                    super::explicit_launch::require_default_launch(record)
-                        .map_err(|e| AgentManagementError::OwnerActionRequired(e.to_string()))?;
-                }
                 let agent = self.active_agent(&request.project_id, cutex_session_id)?;
                 let (before, after) = match action.historical_runtime_occurrence_fence.as_ref() {
                     Some(fence) => lifecycle
-                        .restart_if_occurrence(cutex_session_id, fence)
+                        .restart_managed_if_occurrence(
+                            &RuntimeExecutionPermit {
+                                provider: self,
+                                action: &request.action_id,
+                                id: cutex_session_id,
+                            },
+                            cutex_session_id,
+                            fence,
+                        )
                         .map_err(lifecycle_error)?,
                     None => {
                         recover_runtime_for_agent(&agent, lifecycle)?;
@@ -1645,7 +1679,14 @@ impl AgentManagementProvider {
                             .offline(cutex_session_id)
                             .map_err(lifecycle_error)?;
                         lifecycle
-                            .online(cutex_session_id)
+                            .online_managed(
+                                &RuntimeExecutionPermit {
+                                    provider: self,
+                                    action: &request.action_id,
+                                    id: cutex_session_id,
+                                },
+                                cutex_session_id,
+                            )
                             .map_err(lifecycle_error)?;
                         let after = lifecycle
                             .observe(cutex_session_id)
@@ -2022,7 +2063,14 @@ impl AgentManagementProvider {
                 let agent = self.active_agent(&request.project_id, &cutex_session_id)?;
                 recover_runtime_for_agent(&agent, lifecycle)?;
                 lifecycle
-                    .online(&cutex_session_id)
+                    .online_managed(
+                        &RuntimeExecutionPermit {
+                            provider: self,
+                            action: &request.action_id,
+                            id: &cutex_session_id,
+                        },
+                        &cutex_session_id,
+                    )
                     .map_err(lifecycle_error)?;
             }
             action = self.set_phase(request, AgentActionPhase::Online)?;
@@ -2035,7 +2083,14 @@ impl AgentManagementProvider {
                 let agent = self.active_agent(&request.project_id, &cutex_session_id)?;
                 recover_runtime_for_agent(&agent, lifecycle)?;
                 lifecycle
-                    .online(&cutex_session_id)
+                    .online_managed(
+                        &RuntimeExecutionPermit {
+                            provider: self,
+                            action: &request.action_id,
+                            id: &cutex_session_id,
+                        },
+                        &cutex_session_id,
+                    )
                     .map_err(lifecycle_error)?;
             }
         }
@@ -2195,7 +2250,14 @@ impl AgentManagementProvider {
             .observe(cutex_session_id)
             .map_err(lifecycle_error)?;
         lifecycle
-            .online(cutex_session_id)
+            .online_managed(
+                &RuntimeExecutionPermit {
+                    provider: self,
+                    action: &request.action_id,
+                    id: cutex_session_id,
+                },
+                cutex_session_id,
+            )
             .map_err(lifecycle_error)?;
         let after = lifecycle
             .observe(cutex_session_id)
@@ -4236,7 +4298,10 @@ fn validate_ready_with_groups(
     if !observation.active {
         return Err(managed_observation_mismatch("Agent readiness", "active"));
     }
-    let groups_match = observation.groups == expected_groups;
+    // Native observations retain desired explicit groups; legacy adapters may
+    // include the deterministic cwd group. Both represent the same membership.
+    let groups_match =
+        observation.groups == agent.spec.groups || observation.groups == expected_groups;
     if let Some(field) = managed_spec_mismatch(agent, observation, groups_match) {
         return Err(managed_observation_mismatch("Agent readiness", field));
     }
@@ -5942,6 +6007,9 @@ mod tests {
         };
         let ready = ready_observation(&agent);
         validate_ready(&agent, &ready).expect("cwd-derived project group is system-owned");
+        let mut native = ready.clone();
+        native.groups = agent.spec.groups.clone();
+        validate_ready(&agent, &native).expect("native explicit groups are authoritative");
 
         let mut extra = ready.clone();
         extra.groups.push("unexpected-extra".to_string());
@@ -6516,6 +6584,91 @@ mod tests {
         assert!(provider.store().snapshot().unwrap().agents[&id]
             .retired_at
             .is_some());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn current_backend_projects_proven_native_migration_without_rewriting_create_spec() {
+        use crate::session::{
+            model::{CutexSessionRecord, CutexSessionStore},
+            store::save_cutex_session_store_to_path,
+        };
+        let root = root("backend-migration-projection");
+        let provider = AgentManagementProvider::open(&root).unwrap();
+        bind(&provider, "bind", "cutex.director", None);
+        let lifecycle = FakeLifecycle::default();
+        completed(provider.execute(
+            &invocation("cutex.director"),
+            &create_request("create-worker", "worker", AgentStartMode::BootstrapOnly),
+            &lifecycle,
+        ));
+        let original = provider.store().snapshot().unwrap();
+        let agent = original.agents.values().next().unwrap();
+        let mut record = CutexSessionRecord::new(
+            agent.cutex_session_id.as_str().into(),
+            Some(agent.native_session_id.clone()),
+            crate::platform::host::current_host_name(),
+            agent.spec.cwd.clone(),
+            None,
+        )
+        .unwrap();
+        record.runtime_backend = crate::session::model::CutexSessionRuntimeBackend::Host;
+        record.explicit_launch = Some(ExplicitLaunchContract {
+            version: 4,
+            migration_action_id: None,
+            native_id: agent.native_session_id.clone(),
+            native_home: root.join("native"),
+            bundle_manifest: root.join("bundle.json"),
+            bundle_sha256: Sha256::new("a".repeat(64)).unwrap(),
+        });
+        record.managed_cwd = Some(root.join("next-cwd").to_string_lossy().into_owned());
+        record.model_defaults = Some("next-model".into());
+        record.sandbox_mode = Some("read-only".into());
+        record.permission_defaults = Some("read-only".into());
+        record.agent_groups = vec!["next-group".into()];
+        let mut sessions = CutexSessionStore::default();
+        sessions
+            .sessions
+            .insert(agent.cutex_session_id.as_str().into(), record);
+        let path = root.join("sessions.json");
+        save_cutex_session_store_to_path(&path, &sessions).unwrap();
+        let provider = provider.with_current_names_path(path.clone());
+        assert_eq!(
+            provider.current_name_snapshot().unwrap().agents[&agent.cutex_session_id]
+                .spec
+                .runtime_backend,
+            "host"
+        );
+        let current = provider.current_name_snapshot().unwrap().agents[&agent.cutex_session_id]
+            .spec
+            .clone();
+        assert_eq!(current.cwd, root.join("next-cwd").to_string_lossy());
+        assert_eq!(current.model, "next-model");
+        assert_eq!(current.sandbox_mode, "read-only");
+        assert_eq!(current.permissions, "read-only");
+        assert_eq!(current.groups, vec!["next-group"]);
+
+        assert_eq!(
+            provider.store().snapshot().unwrap().agents[&agent.cutex_session_id]
+                .spec
+                .runtime_backend,
+            "cute_alden"
+        );
+        sessions
+            .sessions
+            .get_mut(agent.cutex_session_id.as_str())
+            .unwrap()
+            .explicit_launch
+            .as_mut()
+            .unwrap()
+            .native_id = "other-native".into();
+        save_cutex_session_store_to_path(&path, &sessions).unwrap();
+        assert_eq!(
+            provider.current_name_snapshot().unwrap().agents[&agent.cutex_session_id]
+                .spec
+                .runtime_backend,
+            "cute_alden"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -764,6 +764,25 @@ impl AgentLifecycle for CutexAgentLifecycle {
     }
 
     fn bootstrap_native(&self, spec: &ManagedAgentSpec) -> Result<String, LifecycleFailure> {
+        if cutex::launch::local_deployment::LocalDeployment::selected()
+            .map_err(definite("native_bootstrap_preflight_failed"))?
+            .is_some()
+        {
+            let configuration = cutex::launch::stock::local_bootstrap_configuration(spec)
+                .map_err(definite("native_bootstrap_preflight_failed"))?;
+            let mut known_native_session_id = None;
+            return super::light_new::create_native(
+                Path::new(&spec.cwd),
+                &configuration,
+                |native| known_native_session_id = Some(native.to_string()),
+            )
+            .map_err(|error| LifecycleFailure {
+                code: "native_bootstrap_failed".into(),
+                detail: format!("{error:#}"),
+                outcome_unknown: true,
+                known_native_session_id,
+            });
+        }
         // Validate the selected profile and its materialized credential/config
         // files in this process. A failure here is provably before Command::output
         // can spawn the native runtime and is therefore safe for exact retry.
@@ -1172,8 +1191,14 @@ impl AgentLifecycle for CutexAgentLifecycle {
         record.formal_agent_name = Some(spec.name.clone());
         record.managed_cwd = Some(spec.cwd.clone());
         record.profile = spec.profile.clone();
-        record.runtime_backend = parse_cutex_session_runtime_backend(&spec.runtime_backend)
-            .map_err(definite("invalid_runtime_backend"))?;
+        record.runtime_backend = if record.explicit_launch.is_some() {
+            // Adoption installs a native host contract even for a legacy create
+            // specification. Do not put its migrated record back on cute-alden.
+            CutexSessionRuntimeBackend::Host
+        } else {
+            parse_cutex_session_runtime_backend(&spec.runtime_backend)
+                .map_err(definite("invalid_runtime_backend"))?
+        };
         record.agent_enabled = true;
         record.agent_groups = spec.groups.clone();
         record.registration_class = AgentRegistrationClass::Persistent;
@@ -1206,9 +1231,12 @@ impl AgentLifecycle for CutexAgentLifecycle {
         validate_managed_recovery_record(&before, cutex_session_id, native_session_id, spec)?;
         let generation = before.runtime_generation;
         let config = cutex::config::store::load_codez_config();
-        let outcome =
+        let outcome = if before.explicit_launch.is_some() {
+            super::native_management_lifecycle::recover(&before)
+        } else {
             super::app_server_runtime::recover_persisted_runtime_for_lifecycle(&config, &before)
-                .map_err(unknown("runtime_recovery_failed"))?;
+        }
+        .map_err(unknown("runtime_recovery_failed"))?;
         let after = load_record(cutex_session_id)?;
         validate_managed_recovery_record(&after, cutex_session_id, native_session_id, spec)?;
         if after.runtime_generation != generation {
@@ -1247,6 +1275,20 @@ impl AgentLifecycle for CutexAgentLifecycle {
                 }
                 Ok(RuntimeRecoveryOutcome::ClearedDeadClaim)
             }
+        }
+    }
+
+    fn online_managed(
+        &self,
+        permit: &cutex::agent_management::RuntimeExecutionPermit<'_>,
+        cutex_session_id: &CutexSessionId,
+    ) -> Result<(), LifecycleFailure> {
+        let record = load_record(cutex_session_id)?;
+        if record.explicit_launch.is_some() {
+            super::native_management_lifecycle::online(permit, &record)
+                .map_err(unknown("session_online_failed"))
+        } else {
+            self.online(cutex_session_id)
         }
     }
 
@@ -1327,6 +1369,31 @@ impl AgentLifecycle for CutexAgentLifecycle {
                 LifecycleFailure::outcome_unknown("runtime_occurrence_changed", reason),
             ),
         }
+    }
+
+    fn restart_managed_if_occurrence(
+        &self,
+        permit: &cutex::agent_management::RuntimeExecutionPermit<'_>,
+        id: &CutexSessionId,
+        expected: &RuntimeOccurrenceFence,
+    ) -> Result<(AgentRuntimeObservation, AgentRuntimeObservation), LifecycleFailure> {
+        let record = load_record(id)?;
+        if record.explicit_launch.is_none() {
+            return self.restart_if_occurrence(id, expected);
+        }
+        match self.historical_runtime_occurrence_for_record(&record)? {
+            HistoricalRuntimeOccurrenceReconciliation::ProvenAbsent { fence, .. }
+                if &fence == expected => {}
+            _ => {
+                return Err(LifecycleFailure::definite(
+                    "runtime_occurrence_changed",
+                    "fenced restart owner changed",
+                ))
+            }
+        }
+        let before = self.observe(id)?;
+        self.online_managed(permit, id)?;
+        Ok((before, self.observe(id)?))
     }
 
     fn restart_if_occurrence(
@@ -1554,7 +1621,11 @@ pub(super) fn validate_managed_recovery_record(
         Some("managed_cwd")
     } else if cutex_session_launch_cwd(record) != spec.cwd {
         Some("launch_cwd")
-    } else if record.runtime_backend != backend {
+    } else if record.runtime_backend != backend
+        && !(record.explicit_launch.is_some()
+            && record.runtime_backend == CutexSessionRuntimeBackend::Host
+            && backend == CutexSessionRuntimeBackend::CuteAlden)
+    {
         Some("runtime_backend")
     } else if record.formal_agent_name.is_none()
         && record.thread_name.as_deref() != Some(spec.name.as_str())
@@ -1995,6 +2066,27 @@ mod tests {
         record.model_defaults = Some(spec.model.clone());
         record.reasoning_defaults = Some(spec.reasoning.clone());
         record
+    }
+
+    #[test]
+    fn migrated_native_backend_does_not_reapply_legacy_worker_backend() {
+        let expected = spec();
+        let mut record = managed_recovery_record(&expected);
+        let id = CutexSessionId::new(record.cutex_session_id.clone()).unwrap();
+        let native = record.codex_session_id.clone().unwrap();
+        record.runtime_backend = CutexSessionRuntimeBackend::Host;
+        assert!(validate_managed_recovery_record(&record, &id, &native, &expected).is_err());
+        record.explicit_launch = Some(cutex::agent_management::ExplicitLaunchContract {
+            version: 4,
+            migration_action_id: None,
+            native_id: native.clone(),
+            native_home: "/tmp/native".into(),
+            bundle_manifest: "/tmp/bundle.json".into(),
+            bundle_sha256: cutex::role_revision::Sha256::new("a".repeat(64)).unwrap(),
+        });
+        validate_managed_recovery_record(&record, &id, &native, &expected).unwrap();
+        record.runtime_backend = CutexSessionRuntimeBackend::HostForeground;
+        assert!(validate_managed_recovery_record(&record, &id, &native, &expected).is_err());
     }
 
     #[test]

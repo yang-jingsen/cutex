@@ -510,7 +510,9 @@ impl StockConfiguration {
                         .tui
                         .as_ref()
                         .context("status selection missing")?
-                        .status_line,
+                        .status_line
+                        .as_deref()
+                        .unwrap_or_default(),
                     &self.profile_name,
                 )?;
             }
@@ -610,6 +612,22 @@ pub fn bootstrap_configuration(
         Some(&spec.model),
         Some(&spec.reasoning),
         false,
+    )
+}
+
+/// Installed native defaults accept the same selected-profile projection as
+/// Human New, while keeping the typed request's explicit model and permissions.
+pub fn local_bootstrap_configuration(
+    spec: &crate::agent_management::ManagedAgentSpec,
+) -> anyhow::Result<StockConfiguration> {
+    configuration_for_selection(
+        spec.profile.as_ref(),
+        Some(&spec.permissions),
+        Some(spec.sandbox_mode.clone()),
+        Some(spec.approval_policy.clone()),
+        Some(&spec.model),
+        Some(&spec.reasoning),
+        true,
     )
 }
 
@@ -737,7 +755,7 @@ fn configuration_for_selection(
         if let Some(tui) = &projection.settings.tui {
             projection.status = super::selected_status::Status::review(
                 &files.custom_status_items_path,
-                &tui.status_line,
+                tui.status_line.as_deref().unwrap_or_default(),
                 &account.name,
             )?;
         }
@@ -1034,7 +1052,10 @@ mod tests {
     fn shared_defaults_accept_new_model_identifiers_and_native_efforts() {
         assert!(validate_shared_config("cutex_projection_version=2\nmodel='future-model/revision-2'\nmodel_reasoning_effort='none'\n").is_ok());
         assert!(validate_shared_config("cutex_projection_version=2\nmodel=''\n").is_err());
-        assert!(validate_shared_config("cutex_projection_version=2\nmodel='model'\nmodel_reasoning_effort='guessed'\n").is_err());
+        assert!(validate_shared_config(
+            "cutex_projection_version=2\nmodel='model'\nmodel_reasoning_effort='guessed'\n"
+        )
+        .is_err());
     }
 
     #[test]

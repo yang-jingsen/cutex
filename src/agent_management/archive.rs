@@ -242,6 +242,71 @@ mod tests {
     }
 
     #[test]
+    fn restore_allows_pending_assignment_for_archived_agent() {
+        use crate::task_service::*;
+        use sha2::{Digest, Sha256 as Hash};
+        let f = Fixture::new();
+        let archive = f.request(AgentArchiveOperation::Archive, "before-assignment");
+        f.execute(&archive, &mut Offline { stops:0, reject:false }).unwrap();
+        let request = f.request(AgentArchiveOperation::Restore, "restore-with-assignment");
+        let director = AuthenticatedPrincipal::seated_session(
+            CutexSessionId::new("cutex.director").unwrap(),
+            SeatId::new("director").unwrap(),
+            1,
+        )
+        .unwrap();
+        let task_id = crate::role_revision::TaskId::new("archive-task").unwrap();
+        let revision = crate::role_revision::TaskRevision::new(1).unwrap();
+        f.tasks
+            .create_revision(
+                &director,
+                &CreateRevisionRequest {
+                    schema: ProviderActionSchema::V2,
+                    action_id: ActionId::new("create-archive-task").unwrap(),
+                    workflow_id: WorkflowId::new("archive-workflow").unwrap(),
+                    task_id: task_id.clone(),
+                    task_revision: revision,
+                    contract_sha256: Sha256::new(format!("{:x}", Hash::digest(b"contract")))
+                        .unwrap(),
+                    opaque_contract: "contract".into(),
+                    completion_policy: CompletionPolicy {
+                        kind: CompletionPolicyKind::ReleaseReview,
+                        authority_seat_id: SeatId::new("release").unwrap(),
+                    },
+                },
+                None,
+            )
+            .unwrap();
+        f.tasks
+            .assign_and_dispatch(
+                &director,
+                &AssignAndDispatchRequest {
+                    schema: ProviderActionSchema::V2,
+                    action_id: ActionId::new("assign-archive-task").unwrap(),
+                    assignment_id: AssignmentId::new("archive-assignment").unwrap(),
+                    task_id,
+                    task_revision: revision,
+                    assignee_cutex_session: request.review.cutex_session_id.clone(),
+                    send_attempt_id: SendAttemptId::new("archive-send").unwrap(),
+                    external_message_id: "archive-message".into(),
+                },
+                1,
+                "assignment",
+            )
+            .unwrap();
+        let mut runtime = Offline {
+            stops: 0,
+            reject: false,
+        };
+        f.execute(&request, &mut runtime).unwrap();
+        assert_eq!(runtime.stops, 0);
+        assert!(load_cutex_session_store_from_path(&f.path)
+            .unwrap()
+            .sessions["cutex.archive-test"]
+            .is_active());
+    }
+
+    #[test]
     fn d1r2_operator_and_director_guards_apply_without_roster_membership() {
         let f = Fixture::new();
         let request = f.request(AgentArchiveOperation::Archive, "role-protected-archive");
@@ -969,7 +1034,7 @@ impl AgentManagementProvider {
         if self.archive_authority_digest(&state, id)? != request.review.authority_sha256 {
             return Err(conflict("archive_authority_confirmation_stale"));
         }
-        if tasks.assignments.values().any(|a| {
+        if request.review.operation == AgentArchiveOperation::Archive && tasks.assignments.values().any(|a| {
             &a.assignee_cutex_session == id
                 && a.state != crate::task_service::AssignmentState::Closed
         }) {

@@ -107,10 +107,8 @@ pub(super) fn validate_target(
         );
     }
     if let Some(metadata) = task_service_completion_metadata(message)? {
-        let snapshot = task_provider()?.query()?;
-        let n = snapshot
-            .completion_notifications
-            .get(&metadata.notification_id)
+        let n = task_provider()?
+            .completion_notification(&metadata.notification_id)?
             .context("completion notification absent")?;
         ensure!(
             n.project_id == metadata.project_id
@@ -141,11 +139,9 @@ pub(super) fn validate_target(
     }
     if let Some(metadata) = task_service_metadata(message)? {
         DurableTaskServiceContextRecorder.validate_assignment(&metadata)?;
-        let snapshot = task_provider()?.query()?;
         ensure!(
-            snapshot
-                .assignments
-                .get(&metadata.assignment_id)
+            task_provider()?
+                .assignment_record(&metadata.assignment_id)?
                 .context("assignment absent")?
                 .assignee_cutex_session
                 .as_str()
@@ -164,11 +160,10 @@ pub(super) fn validate_target(
             crate::task_service::TaskWatchdogMessageMetadata::from(&n) == metadata,
             "watchdog metadata conflict"
         );
-        let snapshot = task_provider()?.query()?;
-        let assignment = snapshot
-            .assignments
-            .values()
-            .find(|a| a.assignment_id.as_str() == metadata.assignment_id)
+        let assignment = task_provider()?
+            .assignment_record(&crate::task_service::AssignmentId::new(
+                metadata.assignment_id.clone(),
+            )?)?
             .context("watchdog assignment absent")?;
         ensure!(
             assignment.project_id == metadata.project_id
@@ -224,11 +219,10 @@ fn fresh_task_projection(
         message.from == TASK_SERVICE_SYSTEM_SENDER && message.from_cutex_session_id.is_none(),
         "Task source conflict"
     );
-    let snapshot = task_provider()?.query()?;
+    let provider = task_provider()?;
     let (family, external, created) = if let Some(m) = task_service_completion_metadata(message)? {
-        let n = snapshot
-            .completion_notifications
-            .get(&m.notification_id)
+        let n = provider
+            .completion_notification(&m.notification_id)?
             .context("completion absent")?;
         let mode = match n.delivery_mode {
             crate::task_service::CompletionNotificationDeliveryMode::AfterTurn => Mode::AfterTurn,
@@ -246,13 +240,11 @@ fn fresh_task_projection(
             n.created_at.as_str().to_string(),
         )
     } else if let Some(m) = task_service_metadata(message)? {
-        let a = snapshot
-            .assignments
-            .get(&m.assignment_id)
+        let a = provider
+            .assignment_record(&m.assignment_id)?
             .context("assignment absent")?;
-        let send = snapshot
-            .send_attempts
-            .get(&m.send_attempt_id)
+        let send = provider
+            .send_attempt(&m.send_attempt_id)?
             .context("send attempt absent")?;
         ensure!(
             message.delivery_mode == Mode::Soon
@@ -269,9 +261,8 @@ fn fresh_task_projection(
             a.created_at.as_str().to_string(),
         )
     } else if let Some(m) = task_service_worker_followup_metadata(message)? {
-        let n = snapshot
-            .worker_followup_notifications
-            .get(&m.notification_id)
+        let n = provider
+            .worker_followup_notification(&m.notification_id)?
             .context("follow-up absent")?;
         ensure!(
             !n.is_delivered()
@@ -371,10 +362,8 @@ pub(super) fn envelope(
                 "Task source conflict"
             );
             let text = if let Some(metadata) = task_service_completion_metadata(message)? {
-                let snapshot = task_provider()?.query()?;
-                snapshot
-                    .completion_notifications
-                    .get(&metadata.notification_id)
+                task_provider()?
+                    .completion_notification(&metadata.notification_id)?
                     .context("completion absent")?
                     .human_readable_content
                     .clone()

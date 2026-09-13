@@ -243,7 +243,7 @@ impl TaskWorkerActionHost {
             crate::task_service::TaskServiceProvider::open(task_service_root.join("provider-v2"))
                 .map_err(|error| anyhow!("failed to open Task Service provider v2: {error}"))?;
         provider
-            .initialize()
+            .initialize_store()
             .map_err(|error| anyhow!("failed to recover Task Service provider v2: {error}"))?;
         let watchdog = Arc::new(crate::task_service::TaskStaleWatchdog::open(
             task_service_root.join("watchdog-v1"),
@@ -4971,7 +4971,7 @@ fn poll_messages_with_completion_fence(
         .with_notification_snapshot(|snapshot| {
             let queued = messages.clone();
             let tasks = if queued.iter().any(|message| message.control_type.as_deref() == Some("cutex.task_service.watchdog.v1")) {
-                provider.map(|provider| provider.query()).transpose().map_err(anyhow::Error::new)?
+                provider.map(|provider| provider.query_live()).transpose().map_err(anyhow::Error::new)?
             } else { None };
             let allowed = queued
                 .iter()

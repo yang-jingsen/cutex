@@ -67,6 +67,8 @@ mod session_tui_workspace_render;
 mod session_wizard;
 mod settings;
 mod stock_lifecycle;
+mod native_management_lifecycle;
+mod native_stop;
 mod stock_publication;
 #[cfg(test)]
 mod test_home;

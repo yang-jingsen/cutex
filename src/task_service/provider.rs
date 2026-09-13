@@ -1191,6 +1191,11 @@ impl TaskServiceProvider {
         })
     }
 
+    /// Open/recover the transactional database without materializing task history.
+    pub fn initialize_store(&self) -> Result<(), ProviderError> {
+        self.with_query_store(&mut || false, |store, _, _| store.initialize())
+    }
+
     /// Compatibility snapshot, including exact historical action receipts.
     pub fn query(&self) -> Result<TaskServiceSnapshot, ProviderError> {
         self.query_cancellable(|| false)
@@ -1200,6 +1205,53 @@ impl TaskServiceProvider {
     pub fn query_live(&self) -> Result<TaskServiceSnapshot, ProviderError> {
         self.with_query_store(&mut || false, |store, deadline, cancelled| {
             store.load_live_cancellable(deadline, cancelled)
+        })
+    }
+
+    /// Read one assignment and its own task/attempt history using indexed keys.
+    /// Unrelated closed tasks and historical action receipts are not decoded.
+    pub fn query_assignment(
+        &self,
+        id: &AssignmentId,
+    ) -> Result<TaskServiceSnapshot, ProviderError> {
+        self.with_query_store(&mut || false, |store, _, _| store.assignment_snapshot(id))
+    }
+
+    /// Lifecycle guards need assignment ownership/state, never attempt bodies.
+    pub fn active_assignments(&self) -> Result<Vec<Assignment>, ProviderError> {
+        self.with_query_store(&mut || false, |store, _, _| store.active_assignments())
+    }
+
+    pub fn completion_notification(
+        &self,
+        id: &NotificationId,
+    ) -> Result<Option<CompletionNotification>, ProviderError> {
+        self.with_query_store(&mut || false, |store, _, _| {
+            store.aggregate("completion_notifications", id)
+        })
+    }
+
+    pub fn worker_followup_notification(
+        &self,
+        id: &NotificationId,
+    ) -> Result<Option<WorkerFollowupNotification>, ProviderError> {
+        self.with_query_store(&mut || false, |store, _, _| {
+            store.aggregate("worker_followup_notifications", id)
+        })
+    }
+
+    pub fn send_attempt(&self, id: &SendAttemptId) -> Result<Option<SendAttempt>, ProviderError> {
+        self.with_query_store(&mut || false, |store, _, _| {
+            store.aggregate("send_attempts", id)
+        })
+    }
+
+    pub fn assignment_record(
+        &self,
+        id: &AssignmentId,
+    ) -> Result<Option<Assignment>, ProviderError> {
+        self.with_query_store(&mut || false, |store, _, _| {
+            store.aggregate("assignments", id)
         })
     }
 
@@ -1214,6 +1266,22 @@ impl TaskServiceProvider {
 
     pub fn receipt(&self, action_id: &ActionId) -> Result<Option<ProviderReceipt>, ProviderError> {
         self.with_query_store(&mut || false, |store, _, _| store.receipt(action_id))
+    }
+
+    /// Brief runtime admission guard. Snapshot contains active assignment
+    /// ownership/state only; use the full archive fence for historical digests.
+    pub(crate) fn with_runtime_admission_fence<T>(
+        &self,
+        operation: impl FnOnce(&TaskServiceSnapshot) -> T,
+    ) -> Result<T, ProviderError> {
+        let _process = self.process_lock.lock().map_err(|_| ProviderError::PersistenceUnavailable)?;
+        self.with_store_lock(true, |_| {
+            let mut snapshot = TaskServiceSnapshot::empty();
+            for assignment in storage::Store::open(&self.root)?.active_assignments()? {
+                snapshot.assignments.insert(assignment.assignment_id.clone(), assignment);
+            }
+            Ok(operation(&snapshot))
+        })
     }
 
     /// Application lifecycle guard. No Task protocol/state change; serializes
@@ -1951,7 +2019,7 @@ impl TaskServiceProvider {
         request: &WorkerContextRequest,
     ) -> Result<WorkerContext, ProviderError> {
         let session = principal.session_id()?;
-        let state = self.query_live()?;
+        let state = self.query_assignment(&request.assignment_id)?;
         let assignment = assignment(&state, &request.assignment_id)?;
         if &assignment.assignee_cutex_session != session {
             return Err(ProviderError::Unauthorized);
@@ -1978,8 +2046,6 @@ impl TaskServiceProvider {
             .map_err(|_| ProviderError::PersistenceUnavailable)?;
         self.with_store_lock(true, |_lock| {
             let store = storage::Store::open(&self.root)?;
-            let before = store.load_live()?;
-            let mut state = before.clone();
             if let Some(receipt) = store.receipt(&action_id)? {
                 let digest = worker_request_digest(
                     request.action.operation(),
@@ -1993,6 +2059,11 @@ impl TaskServiceProvider {
                     Err(ProviderError::Conflict("action_id_payload_conflict"))
                 };
             }
+            let before = store.mutation_snapshot(
+                std::slice::from_ref(request.action.assignment_id()),
+                Some(&action_id),
+            )?;
+            let mut state = before.clone();
             require_existing_assignment(&state, request.action.assignment_id())?;
 
             if let Some(prepared) = state.prepared_worker_actions.get(&action_id).cloned() {
@@ -2036,7 +2107,7 @@ impl TaskServiceProvider {
 
             let (context, attempt_binding) =
                 prepare_worker_context(&state, &session, &request.action, None)?;
-            if state.prepared_worker_actions.len() >= MAX_PREPARED_WORKER_ACTIONS {
+            if store.active_prepared_count()? >= MAX_PREPARED_WORKER_ACTIONS {
                 return Err(ProviderError::Conflict("prepared_action_capacity"));
             }
             let request_sha256 = worker_request_digest(
@@ -2080,20 +2151,17 @@ impl TaskServiceProvider {
         // Resolve the durable binding before hashing. Caller-supplied mechanics
         // are only a transport copy and cannot redefine prepared or committed
         // semantic identity.
-        let recovered = self.query()?;
-        if !recovered.receipts.contains_key(request.action_id()) {
+        let committed = self.receipt(request.action_id())?;
+        let known_binding = if let Some(receipt) = committed {
+            Some(receipt.attempt_binding)
+        } else {
+            let recovered = self.query_assignment(assignment_id)?;
             require_existing_assignment(&recovered, assignment_id)?;
-        }
-        let known_binding = recovered
-            .receipts
-            .get(request.action_id())
-            .map(|receipt| receipt.attempt_binding.clone())
-            .or_else(|| {
-                recovered
-                    .prepared_worker_actions
-                    .get(request.action_id())
-                    .map(|prepared| prepared.attempt_binding.clone())
-            });
+            self.with_query_store(&mut || false, |store, _, _| {
+                store.prepared(request.action_id())
+            })?
+            .map(|prepared| prepared.attempt_binding)
+        };
         let attempt_binding = match known_binding {
             Some(binding) => binding,
             None => worker_envelope_attempt_binding(request)?,
@@ -2101,7 +2169,8 @@ impl TaskServiceProvider {
         let digest = worker_request_digest(operation, principal, action, attempt_binding.as_ref())?;
         let prepared_digest = digest.clone();
         let prepared_binding = attempt_binding.clone();
-        self.mutate(
+        self.mutate_scoped(
+            Some(std::slice::from_ref(assignment_id)),
             operation,
             request.action_id(),
             digest,
@@ -2497,7 +2566,8 @@ impl TaskServiceProvider {
     ) -> Result<ProviderReceipt, ProviderError> {
         let bytes = serde_json::to_vec(&("cutex/human-task-cancel/v1", action_id, assignment_id))
             .map_err(|_| ProviderError::InvalidRequest("unserializable_request"))?;
-        self.mutate(
+        self.mutate_scoped(
+            Some(std::slice::from_ref(assignment_id)),
             "human_cancel_assignment",
             action_id,
             hex_sha256(&bytes),
@@ -2534,7 +2604,8 @@ impl TaskServiceProvider {
             assignee,
         ))
         .map_err(|_| ProviderError::InvalidRequest("unserializable_request"))?;
-        self.mutate(
+        self.mutate_scoped(
+            Some(&[assignment_id.clone(), new_assignment_id.clone()]),
             "human_reassign_assignment",
             action_id,
             hex_sha256(&bytes),
@@ -2738,14 +2809,31 @@ impl TaskServiceProvider {
         attempt_binding: Option<DurableAttemptBinding>,
         apply: impl FnOnce(&mut TaskServiceSnapshot, &Rfc3339) -> Result<ProviderResult, ProviderError>,
     ) -> Result<ProviderReceipt, ProviderError> {
+        self.mutate_scoped(
+            None,
+            operation,
+            action_id,
+            request_sha256,
+            attempt_binding,
+            apply,
+        )
+    }
+
+    fn mutate_scoped(
+        &self,
+        assignment_ids: Option<&[AssignmentId]>,
+        operation: &str,
+        action_id: &ActionId,
+        request_sha256: Sha256,
+        attempt_binding: Option<DurableAttemptBinding>,
+        apply: impl FnOnce(&mut TaskServiceSnapshot, &Rfc3339) -> Result<ProviderResult, ProviderError>,
+    ) -> Result<ProviderReceipt, ProviderError> {
         let _process = self
             .process_lock
             .lock()
             .map_err(|_| ProviderError::PersistenceUnavailable)?;
         self.with_store_lock(true, |_lock| {
             let store = storage::Store::open(&self.root)?;
-            let before = store.load_live()?;
-            let mut state = before.clone();
             if let Some(receipt) = store.receipt(action_id)? {
                 return if receipt.request_sha256 == request_sha256 {
                     Ok(receipt.clone())
@@ -2753,6 +2841,12 @@ impl TaskServiceProvider {
                     Err(ProviderError::Conflict("action_id_payload_conflict"))
                 };
             }
+            let before = if let Some(ids) = assignment_ids {
+                store.mutation_snapshot(ids, Some(action_id))?
+            } else {
+                store.load_live()?
+            };
+            let mut state = before.clone();
             let now = now();
             let result = apply(&mut state, &now)?;
             let sequence = state
@@ -3765,10 +3859,49 @@ fn lock_is_contended(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::WouldBlock
 }
 
+// Keep expired preparations as identity tombstones, but never charge them
+// against executable capacity. They cannot retarget a later attempt on replay.
+fn active_prepared_count(state: &TaskServiceSnapshot) -> usize {
+    state
+        .prepared_worker_actions
+        .values()
+        .filter(|prepared| {
+            let Some(assignment) = state.assignments.get(&prepared.assignment_id) else {
+                return false;
+            };
+            if assignment.state == AssignmentState::Closed
+                || assignment.assignee_cutex_session != prepared.authenticated_cutex_session
+            {
+                return false;
+            }
+            match &prepared.attempt_binding {
+                None => matches!(
+                    assignment.state,
+                    AssignmentState::AwaitingAck | AssignmentState::RetryPending
+                ),
+                Some(binding) => {
+                    state
+                        .active_attempt(&prepared.assignment_id)
+                        .is_some_and(|attempt| {
+                            attempt.attempt_number == binding.attempt_number
+                                && attempt.attempt_token == binding.attempt_token
+                                && matches!(
+                                    attempt.phase,
+                                    AttemptPhase::Running
+                                        | AttemptPhase::Blocked
+                                        | AttemptPhase::ReviewReady
+                                )
+                        })
+                }
+            }
+        })
+        .count()
+}
+
 fn validate_state(state: &TaskServiceSnapshot) -> Result<(), ProviderError> {
     if state.journal_sequence > MAX_JSON_SAFE_INTEGER
         || (state.journal_sequence == 0 && state.journal_sha256.as_str() != ZERO_SHA256)
-        || state.prepared_worker_actions.len() > MAX_PREPARED_WORKER_ACTIONS
+        || active_prepared_count(state) > MAX_PREPARED_WORKER_ACTIONS
     {
         return Err(ProviderError::InvalidStore);
     }
@@ -4506,6 +4639,175 @@ mod tests {
         assert_eq!(first[0].sequence, 1);
         let next = reopened.watch(first[1].sequence, 2).unwrap();
         assert_eq!(next[0].sequence, 3);
+    }
+
+    #[test]
+    fn indexed_assignment_and_replay_do_not_decode_unrelated_aggregates() {
+        let fixture = Fixture::new("indexed-independent-recovery");
+        fixture.provision();
+        let request = WorkerActionRequest::Start(AssignmentActionRequest {
+            schema: ProviderActionSchema::V2,
+            action_id: action("indexed-start"),
+            assignment_id: assignment_id(),
+        });
+        let envelope = fixture.worker_envelope(request.clone());
+        let receipt = fixture
+            .provider
+            .execute_worker_action(&fixture.worker, &envelope)
+            .unwrap();
+        let expected = fixture.provider.query_assignment(&assignment_id()).unwrap();
+        // A poison unrelated historical root proves these APIs never touch it,
+        // independently of machine speed or a fragile wall-clock assertion.
+        let conn =
+            rusqlite::Connection::open(fixture.provider.root.join(storage::DATABASE_FILE)).unwrap();
+        conn.execute("INSERT INTO current(collection,key,root) VALUES('attempts', '[\"unrelated\",1]', 'missing-history-root')", []).unwrap();
+        assert!(fixture.provider.query_live().is_err());
+        assert_eq!(
+            fixture.provider.query_assignment(&assignment_id()).unwrap(),
+            expected
+        );
+        assert_eq!(fixture.provider.active_assignments().unwrap().len(), 1);
+        assert_eq!(
+            fixture
+                .provider
+                .execute_worker_action(&fixture.worker, &envelope)
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(
+            fixture
+                .provider
+                .prepare_worker_action(
+                    &fixture.worker,
+                    &WorkerPrepareRequest {
+                        schema: WorkerPrepareRequestSchema::V2,
+                        action: request,
+                    }
+                )
+                .unwrap(),
+            WorkerPrepareOutcome::Committed(receipt)
+        );
+        let report = WorkerActionRequest::ReportStatus(StatusActionRequest {
+            schema: ProviderActionSchema::V2,
+            action_id: action("indexed-progress"),
+            assignment_id: assignment_id(),
+            summary: "new action with unrelated poisoned history".into(),
+            evidence_sha256: None,
+        });
+        let WorkerPrepareOutcome::Prepared(prepared) = fixture
+            .provider
+            .prepare_worker_action(
+                &fixture.worker,
+                &WorkerPrepareRequest {
+                    schema: WorkerPrepareRequestSchema::V2,
+                    action: report,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("expected preparation");
+        };
+        fixture
+            .provider
+            .execute_worker_action(&fixture.worker, &prepared)
+            .unwrap();
+        let human = crate::management::control_plane::HumanManagementPrincipal::authenticated();
+        let successor = AssignmentId::new("indexed-successor").unwrap();
+        fixture
+            .provider
+            .human_reassign_assignment(
+                &human,
+                &action("indexed-reassign"),
+                &assignment_id(),
+                &successor,
+                fixture.worker.session_id().unwrap(),
+            )
+            .unwrap();
+        fixture
+            .provider
+            .human_cancel_assignment(&human, &action("indexed-cancel"), &successor)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .provider
+                .query_assignment(&successor)
+                .unwrap()
+                .assignments[&successor]
+                .state,
+            AssignmentState::Closed
+        );
+    }
+
+    #[test]
+    fn cancelled_preparations_preserve_identity_without_consuming_capacity() {
+        let fixture = Fixture::new("expired-prepare-capacity");
+        fixture.provision();
+        fixture.start("capacity-start");
+        let request = WorkerActionRequest::ReportStatus(StatusActionRequest {
+            schema: ProviderActionSchema::V2,
+            action_id: action("capacity-original"),
+            assignment_id: assignment_id(),
+            summary: "pending status".into(),
+            evidence_sha256: None,
+        });
+        fixture.worker_envelope(request);
+        let store = storage::Store::open(fixture.provider.root.as_ref()).unwrap();
+        let before = store.load_live().unwrap();
+        let mut full = before.clone();
+        let original = full
+            .prepared_worker_actions
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        for i in 1..MAX_PREPARED_WORKER_ACTIONS {
+            let mut prepared = original.clone();
+            prepared.action_id = action(&format!("capacity-unused-{i}"));
+            full.prepared_worker_actions
+                .insert(prepared.action_id.clone(), prepared);
+        }
+        store
+            .commit(&before, &mut full, "capacity_fixture", now())
+            .unwrap();
+        assert_eq!(active_prepared_count(&full), MAX_PREPARED_WORKER_ACTIONS);
+        let human = crate::management::control_plane::HumanManagementPrincipal::authenticated();
+        let new_id = AssignmentId::new("capacity-new-assignment").unwrap();
+        fixture
+            .provider
+            .human_reassign_assignment(
+                &human,
+                &action("capacity-transfer"),
+                &assignment_id(),
+                &new_id,
+                fixture.worker.session_id().unwrap(),
+            )
+            .unwrap();
+        let reopened = TaskServiceProvider::open(fixture.provider.root.as_ref().clone()).unwrap();
+        assert_eq!(active_prepared_count(&reopened.query_live().unwrap()), 0);
+        let next = WorkerActionRequest::Start(AssignmentActionRequest {
+            schema: ProviderActionSchema::V2,
+            action_id: action("capacity-new-start"),
+            assignment_id: new_id,
+        });
+        assert!(matches!(
+            reopened
+                .prepare_worker_action(
+                    &fixture.worker,
+                    &WorkerPrepareRequest {
+                        schema: WorkerPrepareRequestSchema::V2,
+                        action: next,
+                    }
+                )
+                .unwrap(),
+            WorkerPrepareOutcome::Prepared(_)
+        ));
+        let state = reopened.query_live().unwrap();
+        assert_eq!(
+            state.prepared_worker_actions.len(),
+            MAX_PREPARED_WORKER_ACTIONS + 1
+        );
+        assert_eq!(active_prepared_count(&state), 1);
+        assert_eq!(state.prepared_worker_actions[&original.action_id], original);
     }
 
     #[test]

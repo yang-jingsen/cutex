@@ -14,6 +14,18 @@ const FORMAT_VERSION: i64 = 1;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_NODE_CACHE: usize = 32_768;
 
+fn read_current<T: DeserializeOwned>(
+    conn: &Connection,
+    collection: &str,
+    key: &str,
+) -> Result<Option<T>, ProviderError> {
+    current_root(conn, collection, key)?
+        .map(|root| {
+            Decoder::new(conn, Instant::now() + MAX_QUERY_DURATION, &mut || false).typed(&root)
+        })
+        .transpose()
+}
+
 type NodeId = String;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -303,6 +315,215 @@ impl Store {
             }
         }
         check_deadline(deadline, decoder.cancelled)?;
+        validate_state(&state)?;
+        Ok(state)
+    }
+
+    pub(super) fn active_assignments(&self) -> Result<Vec<Assignment>, ProviderError> {
+        let Some(conn) = self.connection(false)? else {
+            return Ok(Vec::new());
+        };
+        let mut query = conn
+            .prepare("SELECT root FROM current WHERE collection='assignments' ORDER BY key")
+            .map_err(sql_error)?;
+        let mut rows = query.query([]).map_err(sql_error)?;
+        let mut cancelled = || false;
+        let mut decoder = Decoder::new(&conn, Instant::now() + MAX_QUERY_DURATION, &mut cancelled);
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().map_err(sql_error)? {
+            let assignment: Assignment =
+                decoder.typed(&row.get::<_, String>(0).map_err(sql_error)?)?;
+            if assignment.state != AssignmentState::Closed {
+                result.push(assignment);
+            }
+        }
+        Ok(result)
+    }
+
+    pub(super) fn mutation_snapshot(
+        &self,
+        ids: &[AssignmentId],
+        action: Option<&ActionId>,
+    ) -> Result<TaskServiceSnapshot, ProviderError> {
+        let mut state = TaskServiceSnapshot::empty();
+        for id in ids {
+            let current = self.assignment_snapshot(id)?;
+            state.schema = current.schema;
+            state.journal_sequence = current.journal_sequence;
+            state.journal_sha256 = current.journal_sha256;
+            state.assignments.extend(current.assignments);
+            state.attempts.extend(current.attempts);
+            state.workflows.extend(current.workflows);
+            for (id, revisions) in current.task_revisions {
+                state
+                    .task_revisions
+                    .entry(id)
+                    .or_default()
+                    .extend(revisions);
+            }
+        }
+        if let Some(action) = action {
+            if let Some(prepared) = self.prepared(action)? {
+                state
+                    .prepared_worker_actions
+                    .insert(action.clone(), prepared);
+            }
+        }
+        validate_state(&state)?;
+        Ok(state)
+    }
+
+    /// Count only executable preparations using small identity/phase fields;
+    /// never decode status/result arrays from unrelated active attempts.
+    pub(super) fn active_prepared_count(&self) -> Result<usize, ProviderError> {
+        let Some(conn) = self.connection(false)? else {
+            return Ok(0);
+        };
+        let mut query = conn
+            .prepare("SELECT root FROM current WHERE collection='prepared_worker_actions'")
+            .map_err(sql_error)?;
+        let mut rows = query.query([]).map_err(sql_error)?;
+        let mut cancelled = || false;
+        let mut decoder = Decoder::new(&conn, Instant::now() + MAX_QUERY_DURATION, &mut cancelled);
+        let mut count = 0;
+        let mut assignments = BTreeMap::new();
+        while let Some(row) = rows.next().map_err(sql_error)? {
+            let prepared: PreparedWorkerAction =
+                decoder.typed(&row.get::<_, String>(0).map_err(sql_error)?)?;
+            if !assignments.contains_key(&prepared.assignment_id) {
+                assignments.insert(
+                    prepared.assignment_id.clone(),
+                    read_current::<Assignment>(
+                        &conn,
+                        "assignments",
+                        &key(&prepared.assignment_id)?,
+                    )?,
+                );
+            }
+            let Some(assignment) = assignments[&prepared.assignment_id].as_ref() else {
+                continue;
+            };
+            if assignment.state == AssignmentState::Closed
+                || assignment.assignee_cutex_session != prepared.authenticated_cutex_session
+            {
+                continue;
+            }
+            let active = match prepared.attempt_binding {
+                None => matches!(
+                    assignment.state,
+                    AssignmentState::AwaitingAck | AssignmentState::RetryPending
+                ),
+                Some(binding) if assignment.active_attempt == Some(binding.attempt_number) => {
+                    let Some(root) = current_root(
+                        &conn,
+                        "attempts",
+                        &key(&(&prepared.assignment_id, binding.attempt_number))?,
+                    )?
+                    else {
+                        return Err(ProviderError::InvalidStore);
+                    };
+                    let Node::Object(fields) = read_node(&conn, &root)? else {
+                        return Err(ProviderError::InvalidStore);
+                    };
+                    let token: ProviderAttemptToken = decoder.typed(
+                        fields
+                            .get("attempt_token")
+                            .ok_or(ProviderError::InvalidStore)?,
+                    )?;
+                    let phase: AttemptPhase =
+                        decoder.typed(fields.get("phase").ok_or(ProviderError::InvalidStore)?)?;
+                    token == binding.attempt_token
+                        && matches!(
+                            phase,
+                            AttemptPhase::Running
+                                | AttemptPhase::Blocked
+                                | AttemptPhase::ReviewReady
+                        )
+                }
+                Some(_) => false,
+            };
+            if active {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    pub(super) fn aggregate<T: DeserializeOwned>(
+        &self,
+        collection: &str,
+        id: &impl Serialize,
+    ) -> Result<Option<T>, ProviderError> {
+        let Some(conn) = self.connection(false)? else {
+            return Ok(None);
+        };
+        read_current(&conn, collection, &key(id)?)
+    }
+
+    pub(super) fn prepared(
+        &self,
+        action: &ActionId,
+    ) -> Result<Option<PreparedWorkerAction>, ProviderError> {
+        let Some(conn) = self.connection(false)? else {
+            return Ok(None);
+        };
+        read_current(&conn, "prepared_worker_actions", &key(action)?)
+    }
+
+    pub(super) fn assignment_snapshot(
+        &self,
+        id: &AssignmentId,
+    ) -> Result<TaskServiceSnapshot, ProviderError> {
+        let Some(mut conn) = self.connection(false)? else {
+            return Ok(TaskServiceSnapshot::empty());
+        };
+        let tx = conn.transaction().map_err(sql_error)?;
+        let meta = metadata(&tx)?;
+        let mut state = TaskServiceSnapshot::empty();
+        state.schema = meta.schema;
+        state.journal_sequence = meta.sequence;
+        state.journal_sha256 = meta.event_sha256;
+        let Some(assignment): Option<Assignment> = read_current(&tx, "assignments", &key(id)?)?
+        else {
+            return Ok(state);
+        };
+        if let Some(revision) = read_current::<TaskRevisionRecord>(
+            &tx,
+            "task_revisions",
+            &key(&(&assignment.task_id, assignment.task_revision))?,
+        )? {
+            if let Some(workflow) =
+                read_current::<Workflow>(&tx, "workflows", &key(&revision.workflow_id)?)?
+            {
+                state
+                    .workflows
+                    .insert(revision.workflow_id.clone(), workflow);
+            }
+            state
+                .task_revisions
+                .entry(assignment.task_id.clone())
+                .or_default()
+                .insert(assignment.task_revision, revision);
+        }
+        // Composite JSON keys start with the exact serialized assignment ID.
+        // A bounded key range uses the current table's primary key index.
+        let prefix = format!("[{},", key(id)?);
+        let upper = format!("{}\u{10ffff}", prefix);
+        let mut query = tx.prepare("SELECT key,root FROM current WHERE collection='attempts' AND key>=?1 AND key<?2 ORDER BY key").map_err(sql_error)?;
+        let mut rows = query.query(params![prefix, upper]).map_err(sql_error)?;
+        let mut cancelled = || false;
+        let mut decoder = Decoder::new(&tx, Instant::now() + MAX_QUERY_DURATION, &mut cancelled);
+        while let Some(row) = rows.next().map_err(sql_error)? {
+            let (owner, number): (AssignmentId, AttemptNumber) =
+                decode_key(&row.get::<_, String>(0).map_err(sql_error)?)?;
+            let attempt = decoder.typed(&row.get::<_, String>(1).map_err(sql_error)?)?;
+            state
+                .attempts
+                .entry(owner)
+                .or_default()
+                .insert(number, attempt);
+        }
+        state.assignments.insert(id.clone(), assignment);
         validate_state(&state)?;
         Ok(state)
     }
@@ -672,7 +893,13 @@ fn sync_map<K: Ord + Serialize, V: Serialize + PartialEq, P: Serialize>(
             continue;
         }
         let root = encoder.typed(value)?;
-        put_current(encoder.conn, collection, &encode_key(k)?, &root, changes)?;
+        let encoded_key = encode_key(k)?;
+        if !before.contains_key(k)
+            && current_root(encoder.conn, collection, &encoded_key)?.is_some()
+        {
+            return Err(ProviderError::Conflict("aggregate_exists"));
+        }
+        put_current(encoder.conn, collection, &encoded_key, &root, changes)?;
     }
     for k in before.keys().filter(|k| !after.contains_key(k)) {
         delete_current(encoder.conn, collection, &encode_key(k)?, changes)?;

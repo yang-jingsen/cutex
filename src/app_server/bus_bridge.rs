@@ -321,7 +321,7 @@ impl TaskServiceContextRecorder for DurableTaskServiceContextRecorder {
         let provider = crate::task_service::TaskServiceProvider::open(
             crate::task_delivery::provider_adapter::default_task_service_provider_root()?,
         )?;
-        let snapshot = provider.query()?;
+        let snapshot = provider.query_assignment(&metadata.assignment_id)?;
         crate::management::v2::integration_events::append_task_service_transition(
             coordinator,
             crate::management::v2::integration_events::TaskAssignmentTransitionKind::AttemptAcknowledged,

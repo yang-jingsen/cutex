@@ -12,13 +12,26 @@ Array prefixes share a tree, so another status does not duplicate all old status
 bodies. Receipts reference the committed Attempt version and remain independent
 of later changes. Current rows, receipt indexes and events are committed together.
 
-Normal task reads and lifecycle guards use `query_live`: current entities without
-expanding historical action receipts. `receipt(action)` retrieves one exact
-result. The compatibility `query` snapshot still expands receipts and is subject
-to a deadline; it is not the hot path for status, lifecycle or notifications.
-`watch(after, limit)` uses the event sequence index and reads only the requested
-page. Startup loads current state, not a full journal replay. SQLite transaction
-recovery handles interrupted writes.
+Worker context and execution use indexed assignment reads; prepare/execute and
+Human Cancel/Reassign load only affected assignments, their task/workflow and own
+attempt history, plus the exact prepared action. Delta commits retain store CAS
+and reject insertion over an existing aggregate. Committed replay checks the
+single action receipt before loading any current aggregates. Notification bridge
+reads use exact outbox IDs. `query_live` remains a global current-state projection
+for dashboards and cross-task coordinator operations; callers must not use it
+for single-task recovery. The compatibility `query` additionally expands all
+historical receipts and is deadline-bound.
+
+Runtime admission reads only lightweight active assignment records. Maintenance
+and archival authority digests still require their complete historical projection.
+Bus startup calls `initialize_store`, validating/opening the SQLite store without
+materializing task history. SQLite transaction recovery handles interrupted
+writes. `watch(after, limit)` uses the event sequence index and requested page.
+
+Expired prepared actions remain identity tombstones so an old action cannot
+retarget a later attempt. Closed assignments and superseded/terminal attempt
+bindings do not count against executable preparation capacity. The capacity
+check reads identity/phase fields rather than unrelated attempt status arrays.
 
 The JSON snapshot/full-state-journal format is not automatically imported. At
 this installation the user explicitly authorized discarding old Task Service

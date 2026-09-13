@@ -108,10 +108,23 @@ pub struct Skill {
     pub path: PathBuf,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResumeCwd {
+    Session,
+    Current,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tui {
-    pub status_line: Vec<String>,
-    pub status_line_use_colors: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_cwd: Option<ResumeCwd>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_line: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_line_use_colors: Option<bool>,
+    /// Native owns presentation settings. Keep their values nested under tui;
+    /// they do not select providers, credentials, tools or permissions.
+    #[serde(default, flatten)]
+    pub presentation: BTreeMap<String, serde_json::Value>,
     /// Native persisted tooltip counters, not model availability authority.
     /// Absent/empty preserves the original reviewed serialization exactly.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -355,15 +368,11 @@ impl Settings {
                 "unsupported model tooltip counter keys"
             );
             ensure!(
-                tui.status_line.iter().all(|s| matches!(
-                    s.as_str(),
-                    "model-with-reasoning"
-                        | "current-dir"
-                        | "context-used"
-                        | "weekly-limit"
-                        | "custom:profile"
-                        | "custom:bon-voyage"
-                )),
+                tui.status_line
+                    .iter()
+                    .flatten()
+                    .all(|s| !s.starts_with("custom:")
+                        || matches!(s.as_str(), "custom:profile" | "custom:bon-voyage")),
                 "unsupported selected status item"
             );
         }
@@ -685,11 +694,12 @@ impl Projection {
     }
     pub fn validate(&self) -> anyhow::Result<()> {
         self.settings.validate()?;
-        let wants_status = self
-            .settings
-            .tui
-            .as_ref()
-            .is_some_and(|t| t.status_line.iter().any(|s| s.starts_with("custom:")));
+        let wants_status = self.settings.tui.as_ref().is_some_and(|t| {
+            t.status_line
+                .iter()
+                .flatten()
+                .any(|s| s.starts_with("custom:"))
+        });
         ensure!(
             wants_status == self.status.is_some(),
             "selected status projection missing or inappropriate"
@@ -725,6 +735,49 @@ impl Projection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_presentation_is_preserved_without_inventing_status_defaults() {
+        let original = serde_json::json!({
+            "animations": false, "show_tooltips": true, "theme": "night-owl",
+            "terminal_title": ["activity", "project"],
+            "keymap": {"global": {"copy": "ctrl+c"}}, "resume_cwd": "session",
+        });
+        let tui: Tui = serde_json::from_value(original.clone()).unwrap();
+        assert!(tui.status_line.is_none());
+        assert!(tui.status_line_use_colors.is_none());
+        assert_eq!(serde_json::to_value(&tui).unwrap(), original);
+        let settings = Settings {
+            tui: Some(tui),
+            ..Default::default()
+        };
+        settings.validate().unwrap();
+        let minimal: Tui = toml::from_str("animations=false").unwrap();
+        assert_eq!(toml::to_string(&minimal).unwrap(), "animations = false\n");
+        let invalid: Result<Tui, _> = toml::from_str("animations=false\nresume_cwd='other'");
+        assert!(invalid.is_err());
+        let mut native = settings.clone();
+        native.tui.as_mut().unwrap().status_line = Some(vec!["git-branch".into()]);
+        native.validate().unwrap();
+        native.tui.as_mut().unwrap().status_line = Some(vec!["custom:unknown".into()]);
+        assert!(native.validate().is_err());
+    }
+
+    #[test]
+    fn native_resume_cwd_preference_is_accepted_and_preserved() {
+        for value in ["session", "current"] {
+            let config = format!(
+                "status_line = []\nstatus_line_use_colors = true\nresume_cwd = \"{value}\"\n"
+            );
+            let tui: Tui = toml::from_str(&config).unwrap();
+            let encoded = toml::to_string(&tui).unwrap();
+            assert!(encoded.contains(&format!("resume_cwd = \"{value}\"")));
+        }
+        assert!(toml::from_str::<Tui>(
+            "status_line=[]\nstatus_line_use_colors=true\nresume_cwd='other'"
+        )
+        .is_err());
+    }
+
     #[test]
     fn selected_models_allow_new_names_and_native_efforts_without_fallback() {
         for model in ["gpt-6-astra", "gpt-5.6-luna", "future-model/revision-2"] {
@@ -866,8 +919,10 @@ mod tests {
         s.plugins.remove("");
         s.skills = None;
         s.tui = Some(Tui {
-            status_line: vec!["custom:profile".into()],
-            status_line_use_colors: true,
+            resume_cwd: Some(ResumeCwd::Session),
+            status_line: Some(vec!["custom:profile".into()]),
+            status_line_use_colors: Some(true),
+            presentation: BTreeMap::new(),
             model_availability_nux: BTreeMap::new(),
         });
         assert!(s.validate().is_ok());
@@ -875,6 +930,8 @@ mod tests {
             .as_mut()
             .unwrap()
             .status_line
+            .as_mut()
+            .unwrap()
             .push("custom:unknown".into());
         assert!(s.validate().is_err());
     }

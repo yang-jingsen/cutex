@@ -41,3 +41,6 @@ pub const AGENT_MANAGEMENT_CONTRACT: &str = "cutex/agent-management/v1";
 pub const AGENT_MANAGEMENT_START_CONTROL_TYPE: &str = "cutex.agent_management.start.v1";
 pub const AGENT_MANAGEMENT_SYSTEM_SENDER: &str = "AgentManagementSystem";
 pub const AGENT_MANAGEMENT_MAX_BODY_BYTES: usize = 256 * 1024;
+
+mod runtime_permit;
+pub use runtime_permit::RuntimeExecutionPermit;

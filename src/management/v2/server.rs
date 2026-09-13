@@ -2924,7 +2924,7 @@ fn dispatch_runtime_mutation(
             .expect("runtime mutation response object")
             .insert("launchProfile".to_string(), receipt);
     }
-    for key in ["actionId", "attachCommand"] {
+    for key in ["actionId", "attachCommand", "runtimeAgentId"] {
         if let Some(value) = result.get(key) {
             response
                 .as_object_mut()
@@ -5113,7 +5113,7 @@ mod tests {
         .expect("dispatch runtime mutation");
         assert_eq!(
             result,
-            json!({ "runtimeGeneration": 7, "status": "offline" })
+            json!({ "runtimeGeneration": 7, "status": "offline", "runtimeAgentId": null })
         );
         let page = repository
             .page(ReplayQuery::default())
@@ -5183,13 +5183,14 @@ mod tests {
             assert_eq!(method, "cutex/runtime/online");
             assert_eq!(params["expectedRuntimeGeneration"], 7);
             Ok(
-                json!({"runtimeGeneration": 8, "status": "online", "actionId": original_action, "attachCommand": "cutex session takeover cutex.example"}),
+                json!({"runtimeGeneration": 8, "runtimeAgentId":"stock.exact", "status": "online", "actionId": original_action, "attachCommand": "cutex session takeover cutex.example"}),
             )
         };
         let result =
             dispatch_runtime_mutation(&repository, callback, "cutex.example", &session, &request)
                 .unwrap();
         assert_eq!(result["actionId"], "original-action");
+        assert_eq!(result["runtimeAgentId"], "stock.exact");
         assert_eq!(
             result["attachCommand"],
             "cutex session takeover cutex.example"
@@ -5243,7 +5244,7 @@ mod tests {
         .expect("dispatch runtime mutation");
         assert_eq!(
             result,
-            json!({ "runtimeGeneration": 8, "status": "online" })
+            json!({ "runtimeGeneration": 8, "status": "online", "runtimeAgentId": "runtime-2" })
         );
 
         let page = repository
@@ -5312,6 +5313,7 @@ mod tests {
             json!({
                 "runtimeGeneration": 8,
                 "status": "online",
+                "runtimeAgentId": "runtime-2",
                 "launchProfile": {
                     "requested": "beta",
                     "selected": "beta-canonical",

@@ -982,7 +982,8 @@ fn active_turn_id_from_thread_response(response: &Value) -> Option<String> {
         return None;
     }
     response
-        .pointer("/thread/turns")
+        .pointer("/initialTurnsPage/data")
+        .or_else(|| response.pointer("/thread/turns"))
         .and_then(Value::as_array)
         .and_then(|turns| {
             turns
@@ -1220,6 +1221,18 @@ mod tests {
     }
 
     #[test]
+    fn bounded_resume_preserves_live_turn_without_historical_payloads() {
+        let mut response = json!({"thread":{"id":"thread-1","status":{"type":"active"},"turns":[]},
+            "initialTurnsPage":{"data":[{"id":"live-turn","status":"inProgress","items":[]}],"nextCursor":"older"}});
+        assert_eq!(active_turn_id_from_thread_response(&response).as_deref(), Some("live-turn"));
+        response["thread"]["status"]["type"] = json!("idle");
+        assert_eq!(active_turn_id_from_thread_response(&response), None);
+        response["thread"]["status"]["type"] = json!("active");
+        response["initialTurnsPage"]["data"][0]["status"] = json!("completed");
+        assert_eq!(active_turn_id_from_thread_response(&response), None);
+    }
+
+    #[test]
     fn idle_resume_ignores_historical_in_progress_turn() {
         let response = json!({
             "thread": {
@@ -1237,101 +1250,108 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn manager_interrupts_active_turn_before_runtime_stop() {
-        let directory = short_socket_test_directory();
-        let socket_path = directory.join("app-server.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind test socket");
-        let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("accept client");
-            let mut socket = tungstenite::accept(stream).expect("accept websocket");
-            initialize_test_connection(&mut socket);
-            let resume = read_json(&mut socket);
-            assert_eq!(resume["method"], "thread/resume");
-            write_json(
-                &mut socket,
-                json!({
-                    "id": resume["id"].clone(),
-                    "result": {
-                        "thread": {
-                            "id": "thread-1",
-                            "status": { "type": "active", "activeFlags": [] },
-                            "turns": [
-                                { "id": "turn-1", "status": "inProgress", "items": [] }
-                            ]
+        for bounded in [false, true] {
+            let directory = short_socket_test_directory();
+            let socket_path = directory.join("app-server.sock");
+            let listener = UnixListener::bind(&socket_path).expect("bind test socket");
+            let server = thread::spawn(move || {
+                let (stream, _) = listener.accept().expect("accept client");
+                let mut socket = tungstenite::accept(stream).expect("accept websocket");
+                initialize_test_connection(&mut socket);
+                let resume = read_json(&mut socket);
+                assert_eq!(resume["method"], "thread/resume");
+                write_json(
+                    &mut socket,
+                    json!({
+                        "id": resume["id"].clone(),
+                        "result": {
+                            "thread": {
+                                "id": "thread-1",
+                                "status": { "type": "active", "activeFlags": [] },
+                                "turns": if bounded { json!([]) } else { json!([
+                                    { "id": "turn-1", "status": "inProgress", "items": [] }
+                                ]) }
+                            },
+                            "initialTurnsPage": if bounded { json!({"data":[
+                                {"id":"turn-1","status":"inProgress","items":[]}
+                            ],"nextCursor":"older"}) } else { serde_json::Value::Null }
                         }
-                    }
-                }),
-            );
-            let interrupt = read_json(&mut socket);
-            assert_eq!(interrupt["method"], "turn/interrupt");
-            assert_eq!(interrupt["params"]["threadId"], "thread-1");
-            assert_eq!(interrupt["params"]["turnId"], "turn-1");
-            write_json(
-                &mut socket,
-                json!({
-                    "method": "turn/completed",
-                    "params": {
-                        "threadId": "thread-1",
-                        "turn": { "id": "turn-1", "status": "interrupted", "items": [] }
-                    }
-                }),
-            );
-            write_json(
-                &mut socket,
-                json!({ "id": interrupt["id"].clone(), "result": {} }),
-            );
-            let _ = socket.read();
-        });
+                    }),
+                );
+                let interrupt = read_json(&mut socket);
+                assert_eq!(interrupt["method"], "turn/interrupt");
+                assert_eq!(interrupt["params"]["threadId"], "thread-1");
+                assert_eq!(interrupt["params"]["turnId"], "turn-1");
+                write_json(
+                    &mut socket,
+                    json!({
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "thread-1",
+                            "turn": { "id": "turn-1", "status": "interrupted", "items": [] }
+                        }
+                    }),
+                );
+                write_json(
+                    &mut socket,
+                    json!({ "id": interrupt["id"].clone(), "result": {} }),
+                );
+                let _ = socket.read();
+            });
 
-        let manager = AppServerRuntimeManager::without_event_sink();
-        manager
-            .connect_endpoint(
-                "cutex-1",
-                AppServerEndpoint::UnixSocket {
-                    socket_path: socket_path.clone(),
-                },
-                directory.join("journal.jsonl").display().to_string(),
-                AppServerSchemaIdentity {
-                    version: "test-schema".to_string(),
-                    sha256: "test-schema-sha256".to_string(),
-                },
-                ThreadBootstrap::Resume(ThreadResumeParams {
-                    thread_id: "thread-1".to_string(),
-                    ..Default::default()
-                }),
-                1,
-                "host",
-                None,
-            )
-            .expect("connect managed runtime");
-
-        assert_eq!(
+            let manager = AppServerRuntimeManager::without_event_sink();
             manager
-                .interrupt_active_turn("cutex-1")
-                .expect("interrupt active turn")
-                .as_deref(),
-            Some("turn-1")
-        );
-        for _ in 0..20 {
-            if manager
-                .status("cutex-1")
-                .expect("runtime status")
-                .expect("connected runtime")
-                .active_turn_id
-                .is_none()
-            {
-                break;
+                .connect_endpoint(
+                    "cutex-1",
+                    AppServerEndpoint::UnixSocket {
+                        socket_path: socket_path.clone(),
+                    },
+                    directory.join("journal.jsonl").display().to_string(),
+                    AppServerSchemaIdentity {
+                        version: "test-schema".to_string(),
+                        sha256: "test-schema-sha256".to_string(),
+                    },
+                    ThreadBootstrap::Resume(ThreadResumeParams {
+                        thread_id: "thread-1".to_string(),
+                        ..Default::default()
+                    }),
+                    1,
+                    "host",
+                    None,
+                )
+                .expect("connect managed runtime");
+
+            assert_eq!(
+                manager
+                    .interrupt_active_turn("cutex-1")
+                    .expect("interrupt active turn")
+                    .as_deref(),
+                Some("turn-1")
+            );
+            for _ in 0..20 {
+                if manager
+                    .status("cutex-1")
+                    .expect("runtime status")
+                    .expect("connected runtime")
+                    .active_turn_id
+                    .is_none()
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
             }
-            thread::sleep(Duration::from_millis(10));
+            assert!(
+                manager
+                    .status("cutex-1")
+                    .expect("runtime status")
+                    .expect("connected runtime")
+                    .active_turn_id
+                    .is_none()
+            );
+            assert!(manager.disconnect("cutex-1").expect("disconnect runtime"));
+            server.join().expect("server thread");
+            fs::remove_dir_all(directory).expect("remove test directory");
         }
-        assert!(manager
-            .status("cutex-1")
-            .expect("runtime status")
-            .expect("connected runtime")
-            .active_turn_id
-            .is_none());
-        assert!(manager.disconnect("cutex-1").expect("disconnect runtime"));
-        server.join().expect("server thread");
-        fs::remove_dir_all(directory).expect("remove test directory");
     }
 
     #[cfg(unix)]

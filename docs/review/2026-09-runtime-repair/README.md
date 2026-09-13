@@ -1,6 +1,6 @@
 # Cutex 修复版独立代码审核入口
 
-本分支供独立审核，不代表审核已通过。部署的代码版本是 `be6374a`；本目录和 README 索引是之后补充的审核材料，不改变运行代码。
+本分支供独立审核，不代表审核已通过。首轮审核基线为 `be6374a`（材料快照 `74734f3`）；后续修复、实际验收和剩余边界见 [审核修复记录](AUDIT-FOLLOWUP.md)。以下旧版数量和现场状态仅描述首轮材料，不代表最新部署。
 
 ## 比较范围
 
@@ -17,7 +17,7 @@ review 是内部启动准备和可恢复 action 记录，不是另一个 agent �
 
 ## 建议分三轮审核
 
-1. **管理 API 与权限**：`src/management/{control_plane.rs,v2/server.rs,v2/runtime.rs,v2/human_config.rs,v2/human_tasks.rs}`、`src/cli_app/{management_context.rs,management_control_plane.rs,human.rs}`。跟踪路由认证、owner 身份传递、隐藏 agent 定位、归档/跨主机限制，以及错误后的恢复入口。
+1. **管理 API 与权限**：`src/management/{control_plane.rs,v2/server.rs,v2/session.rs,v2/human_config.rs,v2/human_tasks.rs}`、`src/cli_app/{management_context.rs,management_control_plane.rs,human.rs}`。跟踪路由认证、owner 身份传递、隐藏 agent 定位、归档/跨主机限制，以及错误后的恢复入口。
 2. **生命周期与重连**：`src/agent_management/stock_runtime.rs`、`src/cli_app/{stock_lifecycle.rs,app_server_runtime.rs,session_runtime.rs,session_reconcile.rs}`、`src/session/reviewed_registration.rs`、`src/app_server/{manager.rs,bus_bridge.rs}`。跟踪重复启动、响应丢失、进程退出、服务重启、在线修改配置/包，以及 Stop/Attach 是否使用实际运行回执。
 3. **任务存储**：`src/task_service/provider/`、`src/task_delivery/provider_adapter.rs` 和调用方。检查原子性、幂等回执、并发冲突、崩溃恢复、查询内存成本、watch 分页、节点共享及长期增长。旧实现每条事件保存全库和累计回执，形成约 81.87 GB 数据；本机经用户授权清空旧任务子树，没有实现通用旧格式迁移。
 

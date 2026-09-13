@@ -90,6 +90,9 @@ pub enum StockRuntimeStage {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StockRuntimeReceipt {
+    /// Actual launch cwd for this occurrence, independent of next-launch edits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_cwd: Option<String>,
     pub action_id: AgentActionId,
     pub review: StockRuntimeReview,
     pub stage: StockRuntimeStage,
@@ -265,7 +268,20 @@ impl AgentManagementProvider {
             &crate::seat::SeatOccupancySnapshot,
         >|
          -> anyhow::Result<_> {
-            tasks.with_archive_read_fence(|tasks| -> anyhow::Result<_> {
+            // Task state is a short admission check, not a lock held across
+            // native stop/spawn/transport initialization. Prepared below records
+            // the transition before external work; deliveries defer that owner.
+            let task_provider = tasks;
+            #[cfg(target_os="linux")]
+            let needs_full_tasks = maintenance.is_some();
+            #[cfg(not(target_os="linux"))]
+            let needs_full_tasks = false;
+            let task_snapshot = if needs_full_tasks {
+                task_provider.with_archive_read_fence(Clone::clone)?
+            } else {
+                task_provider.with_runtime_admission_fence(Clone::clone)?
+            };
+            let tasks = &task_snapshot;
             review.configuration.validate_job_requirement(review.job_mcp.is_some())?;
             let id = &review.subject.cutex_session_id;
             let sessions = load_cutex_session_store_from_path(path)?;
@@ -294,6 +310,7 @@ impl AgentManagementProvider {
                         "stock confirmation stale"
                     );
                     StockRuntimeReceipt {
+                        launch_cwd: Some(crate::session::service::cutex_session_launch_cwd(record).into()),
                         action_id: action_id.clone(),
                         review: review.clone(),
                         stage: StockRuntimeStage::Prepared,
@@ -375,7 +392,16 @@ impl AgentManagementProvider {
                     review.digest_version.digest(record)? == review.subject.durable_sha256,
                     "stock prepared outcome uncertain; no repeated destructive stop"
                 );
-                save_receipt(path, &receipt)?;
+                let admit = |current_tasks: &crate::task_service::TaskServiceSnapshot| -> anyhow::Result<()> {
+                    if !maintenance_validated { runtime_task_guard(current_tasks, id, review.restart)?; }
+                    #[cfg(target_os="linux")]
+                    if let Some(permit) = maintenance {
+                        permit.validate(path,action_id,review,&state,current_tasks,seats.ok_or_else(||anyhow::anyhow!("maintenance seat fence absent"))?)?;
+                    }
+                    save_receipt(path, &receipt)
+                };
+                if needs_full_tasks { task_provider.with_archive_read_fence(admit)??; }
+                else { task_provider.with_runtime_admission_fence(admit)??; }
                 // Reobserve after potentially expensive evidence validation.
                 // Compare to the ORIGINAL review, never mint a replacement CAS.
                 if let Some(job) = &review.job_mcp { job.validate(&bundle)?; }
@@ -562,7 +588,6 @@ impl AgentManagementProvider {
                 save_locked_session_store(path, store)
             })?;
             Ok(receipt)
-            })?
         };
         #[cfg(target_os = "linux")]
         if maintenance.is_some() {
@@ -624,9 +649,16 @@ pub fn commit_stock_runtime_stop(path: &Path, expected: &CutexSessionRecord) -> 
         anyhow::ensure!(
             current.app_server_runtime == expected.app_server_runtime
                 && current.runtime_generation == expected.runtime_generation
-                && current.explicit_launch == expected.explicit_launch,
+                && current.current_runtime_agent_id == expected.current_runtime_agent_id
+                && current.codex_session_id == expected.codex_session_id,
             "stock stopped, but current occurrence changed; no clear"
         );
+        if expected.app_server_runtime.is_some() {
+            store.native_stop_receipts.insert(expected.cutex_session_id.clone(), crate::session::model::NativeStopReceipt {
+                native_id: expected.codex_session_id.clone(), generation: expected.runtime_generation,
+                binding: expected.app_server_runtime.clone(),
+            });
+        }
         crate::session::service::clear_cutex_session_runtime_record(
             store,
             &expected.cutex_session_id,
@@ -779,6 +811,85 @@ mod review_digest_tests {
         assert_ne!(new, legacy);
     }
 
+    #[test]
+    fn runtime_admission_helper_releases_task_lock_before_gated_connect() {
+        // Exercises the same admission -> persisted Prepared -> executor.connect
+        // structure as execute_stock_runtime_inner. Bundle/auth/native transport
+        // are intentionally replaced; real executor-path acceptance is separate.
+        use std::sync::mpsc;
+        use std::time::Duration;
+        struct GatedConnect {
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        }
+        impl StockRuntimeExecutor for GatedConnect {
+            fn publication(&mut self, _: &StockRuntimeReceipt) -> anyhow::Result<StockPublication> { panic!("not part of admission test") }
+            fn published_owner_absent(&mut self, _: &StockRuntimeReceipt) -> anyhow::Result<bool> { panic!("not part of admission test") }
+            fn stop(&mut self, _: &CutexSessionRecord) -> anyhow::Result<()> { panic!("not part of admission test") }
+            fn spawn(&mut self, _: &CutexSessionRecord, _: &StockBundle, _: &StockRuntimeReceipt) -> anyhow::Result<CutexAppServerRuntimeBinding> { panic!("not part of admission test") }
+            fn connect(&mut self, _: &CutexSessionRecord, _: &StockRuntimeReceipt) -> anyhow::Result<()> {
+                self.entered.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(10)).unwrap();
+                Ok(())
+            }
+            fn cleanup_owned(&mut self) -> anyhow::Result<()> { panic!("not part of admission test") }
+            fn retain_owner(&mut self) {}
+        }
+        let root = std::env::temp_dir().join(format!("runtime-admission-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("sessions.json");
+        let tasks = crate::task_service::TaskServiceProvider::open(root.join("tasks")).unwrap();
+        tasks.initialize_store().unwrap();
+        let mut record = record();
+        let review = review(&record);
+        record.explicit_launch = Some(review.contract.clone());
+        let action = AgentActionId::new("gated-connect").unwrap();
+        let receipt = StockRuntimeReceipt {
+            launch_cwd: Some(record.cwd.clone()),
+            action_id: action.clone(), review, stage: StockRuntimeStage::Prepared,
+            claim_id: "gated-claim".into(), runtime_agent_id: "stock.gated".into(),
+            expected_generation: 1, binding: None, publication: None, error: None,
+            updated_at: "2030-01-01T00:00:00Z".into(),
+        };
+        let mut store = crate::session::model::CutexSessionStore::default();
+        store.sessions.insert(record.cutex_session_id.clone(), record.clone());
+        assert!(!native_runtime_transition_pending(&store, &record));
+        crate::session::store::save_cutex_session_store_to_path(&path, &store).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker_tasks = tasks.clone();
+        let worker_path = path.clone();
+        let worker_record = record.clone();
+        let worker = std::thread::spawn(move || {
+            worker_tasks.with_runtime_admission_fence(|snapshot| {
+                runtime_task_guard(snapshot, &receipt.review.subject.cutex_session_id, true)?;
+                save_receipt(&worker_path, &receipt)
+            }).unwrap().unwrap();
+            GatedConnect { entered: entered_tx, release: release_rx }
+                .connect(&worker_record, &receipt).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let pending = load_cutex_session_store_from_path(&path).unwrap();
+        let transition_deferred = native_runtime_transition_pending(&pending, &record);
+        // Do not release connect until the task query finishes. Holding the
+        // admission fence across connect would make this read hit its deadline.
+        let read_result = tasks.query_live();
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(transition_deferred, "persisted intent must defer old-owner delivery");
+        assert!(read_result.is_ok(), "unrelated Task read blocked behind connect: {read_result:?}");
+        let mut ready = pending;
+        if let ExplicitLaunchActionReceipt::Runtime(receipt) = ready.explicit_launch_receipts.get_mut(action.as_str()).unwrap() {
+            receipt.stage = StockRuntimeStage::Ready;
+        }
+        assert!(!native_runtime_transition_pending(&ready, &record), "Ready releases delivery guard");
+        // A still-held claim must defer even if a historical Ready receipt exists.
+        let mut claimed = record.clone();
+        claimed.app_server_launch_claim_id = Some("gated-claim".into());
+        assert!(native_runtime_transition_pending(&ready, &claimed));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     struct NeverRuntime;
     impl StockRuntimeExecutor for NeverRuntime {
         fn publication(&mut self, _: &StockRuntimeReceipt) -> anyhow::Result<StockPublication> {
@@ -821,6 +932,7 @@ mod review_digest_tests {
         let review = review(&record());
         let action = AgentActionId::new("legacy-completed").unwrap();
         let receipt = StockRuntimeReceipt {
+            launch_cwd: None,
             action_id: action.clone(),
             review: review.clone(),
             stage: StockRuntimeStage::Ready,
@@ -892,4 +1004,18 @@ mod review_digest_tests {
         assert_eq!(std::fs::read(&path).unwrap(), original);
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+/// A persisted startup/restart intent suppresses delivery to the old owner while
+/// external stop/connect runs without holding the global Task Service lock.
+pub fn native_runtime_transition_pending(
+    store: &crate::session::model::CutexSessionStore,
+    record: &CutexSessionRecord,
+) -> bool {
+    record.explicit_launch.is_some() && (record.app_server_launch_claim_id.is_some()
+        || store.explicit_launch_receipts.values().any(|r| matches!(r,
+            ExplicitLaunchActionReceipt::Runtime(r)
+                if r.stage == StockRuntimeStage::Prepared
+                && r.review.subject.cutex_session_id.as_str() == record.cutex_session_id
+                && r.review.subject.runtime_generation == record.runtime_generation)))
 }

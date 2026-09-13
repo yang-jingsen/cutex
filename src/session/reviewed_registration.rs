@@ -6,6 +6,42 @@ use crate::agent_management::{
 };
 use crate::session::model::{CutexSessionRecord, CutexSessionStore};
 
+/// Resolve the running occurrence's cwd. Older receipts have no saved field;
+/// recover it from the exact live process rather than the mutable desired cwd.
+pub fn occurrence_launch_cwd(
+    receipt: &crate::agent_management::StockRuntimeReceipt,
+) -> anyhow::Result<String> {
+    if let Some(cwd) = &receipt.launch_cwd {
+        anyhow::ensure!(
+            std::path::Path::new(cwd).is_absolute(),
+            "saved runtime cwd is not absolute"
+        );
+        return Ok(cwd.clone());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let binding = receipt
+            .binding
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("legacy runtime cwd requires bound owner"))?;
+        let expected =
+            chrono::DateTime::parse_from_rfc3339(&binding.started_at)?.with_timezone(&chrono::Utc);
+        let before = crate::platform::process::process_started_at(binding.pid)?;
+        anyhow::ensure!(before == expected, "legacy runtime cwd owner birth changed");
+        let cwd = std::fs::read_link(format!("/proc/{}/cwd", binding.pid))?;
+        anyhow::ensure!(
+            crate::platform::process::process_started_at(binding.pid)? == before,
+            "legacy runtime cwd owner changed during read"
+        );
+        return Ok(cwd
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("runtime cwd is not UTF-8"))?
+            .to_string());
+    }
+    #[cfg(not(target_os = "linux"))]
+    anyhow::bail!("legacy runtime cwd recovery requires Linux process identity")
+}
+
 /// Called only behind the authenticated service registration route, before its
 /// store CAS and roster publication. The caller must additionally verify the
 /// returned exact native process and receipt contract before committing. Ordinary registration
@@ -77,8 +113,10 @@ pub fn preserve_reviewed_groups(
             && record.agent_enabled
             && record.registration_class == AgentRegistrationClass::Persistent
             && agent.registration_class == AgentRegistrationClass::Persistent
-            && record.host_id == host
-            && agent.host_id.as_deref() == Some(host)
+            && crate::runtime::lifecycle::cutex_session_host_is_local(&record.host_id, host)
+            && agent.host_id.as_deref().is_some_and(|value| {
+                crate::runtime::lifecycle::cutex_session_host_is_local(value, host)
+            })
             && record.codex_session_id.as_deref()
                 == Some(receipt.review.contract.native_id.as_str())
             && agent.session_id == record.codex_session_id
@@ -89,7 +127,7 @@ pub fn preserve_reviewed_groups(
             && record.app_server_runtime.as_ref() == Some(binding)
             && record.runtime_pid == Some(binding.pid)
             && agent.pid == binding.pid
-            && agent.cwd == crate::session::service::cutex_session_launch_cwd(record)
+            && agent.cwd == occurrence_launch_cwd(receipt)?
             && agent.profile == binding.launched_profile.as_deref().unwrap_or("-"),
         "reviewed registration owner/configuration mismatch"
     );
@@ -109,17 +147,20 @@ pub fn preserve_reviewed_groups(
         },
         "reviewed registration claim/generation mismatch"
     );
-    // Both existing producer and receiver normalize convenience groups. Accept
-    // only that exact compatibility projection, not arbitrary submitted groups.
-    let expected = normalize_registered_agent_groups(
-        record.agent_groups.clone(),
-        agent.path_key.as_deref(),
-        &agent.cwd,
-    );
-    anyhow::ensure!(
-        agent.groups == expected,
-        "reviewed registration requested groups changed"
-    );
+    // Pending launch still checks its exact intended registration. Once the
+    // owner is Ready, its old bridge may send groups from launch time: current
+    // membership comes from management, never from that submitted list.
+    if receipt.stage != StockRuntimeStage::Ready {
+        let expected = normalize_registered_agent_groups(
+            record.agent_groups.clone(),
+            agent.path_key.as_deref(),
+            &agent.cwd,
+        );
+        anyhow::ensure!(
+            agent.groups == expected,
+            "reviewed registration requested groups changed"
+        );
+    }
     agent.groups = record.agent_groups.clone();
     Ok(Some((record.clone(), receipt.review.contract.clone())))
 }
@@ -145,7 +186,7 @@ mod tests {
         record.agent_groups = vec!["original-z".into(), "original-a".into()];
         record.display_name_hint = Some("formal".into());
         let receipt: StockRuntimeReceipt = serde_json::from_value(json!({
-            "action_id":"reviewed-register", "stage":"spawned", "claim_id":"claim", "runtime_agent_id":"stock.test", "expected_generation":1,
+            "launch_cwd":"/private", "action_id":"reviewed-register", "stage":"spawned", "claim_id":"claim", "runtime_agent_id":"stock.test", "expected_generation":1,
             "publication":null,"error":null,"updated_at":"2026-01-01T00:00:00Z",
             "binding":{"transport":"unix_socket","endpoint":"unix:///private/sock","pid":1234,"runtime_dir":"/private","launched_profile":"alpha","diagnostic_journal_path":"/private/journal","schema_version":"test","schema_sha256":"e".repeat(64),"started_at":"2026-01-01T00:00:00Z"},
             "review":{
@@ -232,6 +273,10 @@ mod tests {
         record.runtime_generation = 1;
         record.current_runtime_agent_id = Some(agent.id.clone());
         record.revision += 2;
+        record.managed_cwd = Some("/next-launch".into());
+        record.agent_groups = vec!["updated-group".into()];
+        record.host_id = "localhost".into();
+        agent.host_id = Some("localhost".into());
         if let ExplicitLaunchActionReceipt::Runtime(receipt) = store
             .explicit_launch_receipts
             .get_mut("reviewed-register")
@@ -240,13 +285,42 @@ mod tests {
             receipt.stage = StockRuntimeStage::Ready;
         }
         preserve_reviewed_groups(&store, &mut agent, "private").unwrap();
-        agent.groups = normalize_registered_agent_groups(agent.groups, None, "/private");
+        assert_eq!(agent.groups, vec!["updated-group"]);
+        assert_eq!(agent.cwd, "/private");
+        agent.groups = vec!["forged-group".into()];
+        preserve_reviewed_groups(&store, &mut agent, "private").unwrap();
+        assert_eq!(agent.groups, vec!["updated-group"]);
         store
             .sessions
             .get_mut("cutex.test")
             .unwrap()
             .runtime_generation += 1;
         assert!(preserve_reviewed_groups(&store, &mut agent, "private").is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn legacy_cwd_reads_only_exact_process_birth() {
+        let (mut store, _) = fixture();
+        let ExplicitLaunchActionReceipt::Runtime(receipt) = store
+            .explicit_launch_receipts
+            .get_mut("reviewed-register")
+            .unwrap()
+        else {
+            panic!()
+        };
+        receipt.launch_cwd = None;
+        let binding = receipt.binding.as_mut().unwrap();
+        binding.pid = std::process::id();
+        binding.started_at = crate::platform::process::process_started_at(binding.pid)
+            .unwrap()
+            .to_rfc3339();
+        assert_eq!(
+            occurrence_launch_cwd(receipt).unwrap(),
+            std::env::current_dir().unwrap().to_str().unwrap()
+        );
+        receipt.binding.as_mut().unwrap().started_at = "2020-01-01T00:00:00Z".into();
+        assert!(occurrence_launch_cwd(receipt).is_err());
     }
 
     #[test]
@@ -329,9 +403,11 @@ mod tests {
             .unwrap()
             .explicit_launch = None;
         let before = agent.groups.clone();
-        assert!(preserve_reviewed_groups(&store, &mut agent, "private")
-            .unwrap()
-            .is_none());
+        assert!(
+            preserve_reviewed_groups(&store, &mut agent, "private")
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(agent.groups, before);
         assert!(before.len() > 2);
     }

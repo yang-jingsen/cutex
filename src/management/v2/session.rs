@@ -42,7 +42,7 @@ pub const NATIVE_REQUEST_ALLOW_RULES_SHA256: &str =
 pub const CUTEX_METHOD_REGISTRY_INDEX_SHA256: &str =
     "5c97fce39614e2ecc0c751ea0a7b289e5086bb0c6d4043ad1b5ea71347be6896";
 pub const CUTEX_METHOD_REGISTRY_SCHEMA_SHA256: &str =
-    "306ae387f5e84656e67e06add996a367b3c3330781dc2d412fa8907a656f8826";
+    "ab628fed89da654d1ddec9bd41b87056d40112a55c7865e7a183556e8ec4499b";
 
 pub const CUTEX_METHOD_REGISTRY_INDEX: &str = include_str!("schema/cutex-method-registry-v3.json");
 
@@ -150,7 +150,9 @@ pub fn session_list_resource(
     let mut records = store
         .sessions
         .values()
-        .filter(|record| record.host_id == host_id)
+        .filter(|record| {
+            crate::runtime::lifecycle::cutex_session_host_is_local(&record.host_id, &host_id)
+        })
         .filter(|record| record.is_active())
         .filter(|record| is_durable_management_session(record))
         .filter(|record| seen.insert(record.cutex_session_id.clone()))
@@ -241,8 +243,10 @@ pub fn session_resource_including_archive(
     else {
         return Ok(None);
     };
-    if record.host_id != crate::platform::host::current_host_name()
-        || !is_durable_management_session(record)
+    if !crate::runtime::lifecycle::cutex_session_host_is_local(
+        &record.host_id,
+        &crate::platform::host::current_host_name(),
+    ) || !is_durable_management_session(record)
     {
         return Ok(None);
     }
@@ -276,8 +280,10 @@ fn session_resource_with_visibility(
         return Ok(None);
     };
     let visible = session_is_visible(registry, record);
-    if record.host_id != crate::platform::host::current_host_name()
-        || record.is_retired()
+    if !crate::runtime::lifecycle::cutex_session_host_is_local(
+        &record.host_id,
+        &crate::platform::host::current_host_name(),
+    ) || record.is_retired()
         || !is_durable_management_session(record)
         || (require_visible && !visible)
     {
@@ -344,7 +350,9 @@ pub fn retired_session_list_resource() -> anyhow::Result<Value> {
     let mut sessions = store
         .sessions
         .values()
-        .filter(|record| record.host_id == host_id)
+        .filter(|record| {
+            crate::runtime::lifecycle::cutex_session_host_is_local(&record.host_id, &host_id)
+        })
         .filter(|record| record.is_retired())
         .filter(|record| is_durable_management_session(record))
         .map(|record| {
@@ -369,7 +377,10 @@ pub fn retired_session_resource(cutex_session_id: &str) -> anyhow::Result<Option
     let activity_states = load_activity_states_best_effort();
     let record = store.sessions.values().find(|record| {
         record.cutex_session_id == cutex_session_id
-            && record.host_id == crate::platform::host::current_host_name()
+            && crate::runtime::lifecycle::cutex_session_host_is_local(
+                &record.host_id,
+                &crate::platform::host::current_host_name(),
+            )
             && record.is_retired()
             && is_durable_management_session(record)
     });

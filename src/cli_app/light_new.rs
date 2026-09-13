@@ -17,6 +17,24 @@ pub(super) fn create(
     );
     let cwd = std::path::Path::new(cwd).canonicalize()?;
     ensure!(cwd.is_dir(), "agent cwd must be a directory");
+    let native = create_native(&cwd, &cutex::launch::stock::local_configuration()?, |_| {})?;
+    super::management_control_plane::ManagementControlClient::connect()?
+        .adopt_saved_native(&cutex::agent_management::HumanAdoptRequest {
+            action_id: cutex::agent_management::AgentActionId::new(format!("human-new-{native}"))?,
+            native_id: native.clone(),
+            cwd: cwd.to_string_lossy().into_owned(),
+            formal_name: formal_name.into(),
+        })
+        .with_context(|| format!("Saved native thread {native} exists; retry Adopt for this ID"))
+}
+
+/// Persist an empty native thread without a model turn or management recursion.
+/// Report its identity immediately so typed callers can journal late failures.
+pub(super) fn create_native(
+    cwd: &std::path::Path,
+    configuration: &cutex::launch::stock::StockConfiguration,
+    mut captured: impl FnMut(&str),
+) -> anyhow::Result<String> {
     let deployment = LocalDeployment::selected()?.context("No local runtime installed")?;
     let bundle: StockBundle = serde_json::from_slice(&std::fs::read(&deployment.bundle_manifest)?)?;
     StockBundle::load_references(
@@ -28,7 +46,6 @@ pub(super) fn create(
         &deployment.bundle_manifest,
         &cutex::agent_management::file_sha256(&deployment.bundle_manifest)?,
     )?;
-    let configuration = cutex::launch::stock::local_configuration()?;
     configuration.validate_auth_home(&deployment.native_home)?;
     let directory = std::env::temp_dir().join(format!(
         "cn-{}",
@@ -105,6 +122,7 @@ pub(super) fn create(
         uuid::Uuid::parse_str(&native)?.to_string() == native,
         "invalid native ID"
     );
+    captured(&native);
     // Once the native ID is known, always report it on later failure so that a
     // saved thread can be adopted without generating a second identity.
     let operation = || -> anyhow::Result<_> {
@@ -125,14 +143,7 @@ pub(super) fn create(
     })?;
     drop(client);
     drop(owned);
-    super::management_control_plane::ManagementControlClient::connect()?
-        .adopt_saved_native(&cutex::agent_management::HumanAdoptRequest {
-            action_id: cutex::agent_management::AgentActionId::new(format!("human-new-{native}"))?,
-            native_id: native.clone(),
-            cwd: cwd.to_string_lossy().into_owned(),
-            formal_name: formal_name.into(),
-        })
-        .with_context(|| format!("Saved native thread {native} exists; retry Adopt for this ID"))
+    Ok(native)
 }
 
 /// Foreground form shared by the main selector's New action.

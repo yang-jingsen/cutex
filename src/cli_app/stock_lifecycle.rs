@@ -70,9 +70,12 @@ pub(super) fn online(id: &str, restart: bool) -> anyhow::Result<StockRuntimeRece
         if let Some(binding) = &record.app_server_runtime {
             verify_stock_process(record, binding)?;
             super::app_server_runtime::verify_exact_live_runtime_claim(record, binding)?;
-            return matching_ready_receipt(record, &sessions)
-                .cloned()
-                .context("runtime has no matching Ready receipt; use human recovery");
+            let receipt = matching_ready_receipt(record, &sessions)
+                .context("runtime has no matching Ready receipt; use human recovery")?;
+            let client = super::management_control_plane::ManagementControlClient::connect()?;
+            return reconnect_existing_owner(record, receipt, |path, body| {
+                client.request_with_timeout("POST", path, Some(body), std::time::Duration::from_secs(120))
+            });
         }
     }
     let action = ReviewedStockRuntimeAction::review(id, restart)?;
@@ -81,6 +84,31 @@ pub(super) fn online(id: &str, restart: bool) -> anyhow::Result<StockRuntimeRece
     ensure!(receipt.stage == cutex::agent_management::StockRuntimeStage::Ready && receipt.error.is_none(),
         "runtime readiness incomplete; inspect cutex human action {} and resume the same action with cutex human action {} --resume", receipt.action_id.as_str(), receipt.action_id.as_str());
     Ok(receipt)
+}
+
+/// A historical Ready receipt proves process ownership, not present bridge
+/// health. Ask Management to reconnect that exact occurrence before returning it.
+fn reconnect_existing_owner(
+    record: &CutexSessionRecord,
+    receipt: &StockRuntimeReceipt,
+    send: impl FnOnce(&str, &[u8]) -> anyhow::Result<serde_json::Value>,
+) -> anyhow::Result<StockRuntimeReceipt> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let encoded = url::form_urlencoded::byte_serialize(record.cutex_session_id.as_bytes()).collect::<String>();
+    let path = format!("/v2/sessions/{encoded}/cutex/requests");
+    let body = serde_json::to_vec(&serde_json::json!({"requestId":request_id,
+        "method":"cutex/runtime/online", "params":{"expectedRuntimeGeneration":record.runtime_generation,
+        "reason":"cutex_cli_reconnect", "openVisibleTerminal":false}}))?;
+    let response = send(&path, &body)?;
+    ensure!(response["contractVersion"] == 2 && response["requestId"] == request_id
+        && response["cutexSessionId"] == record.cutex_session_id
+        && response.pointer("/cutex/method").and_then(serde_json::Value::as_str) == Some("cutex/runtime/online"),
+        "Management reconnect response identity mismatch");
+    let result = response.pointer("/cutex/result").context("Management reconnect result missing")?;
+    ensure!(result["status"] == "online" && result["runtimeGeneration"] == receipt.expected_generation
+        && result["runtimeAgentId"] == receipt.runtime_agent_id && result["actionId"] == receipt.action_id.as_str(),
+        "Management did not reconnect the expected runtime occurrence");
+    Ok(receipt.clone())
 }
 
 pub(super) fn matching_ready_receipt<'a>(
@@ -135,6 +163,12 @@ pub(super) fn reconnect_ready_runtime(
     verify_stock_process(record, binding)?;
     super::app_server_runtime::verify_exact_live_runtime_claim(record, binding)?;
     StockExecutor::default().connect(record, receipt)?;
+    let status = super::app_server_runtime::runtime_manager()
+        .refresh_agent_bus_registration(&record.cutex_session_id)?
+        .context("reconnected runtime has no Agent Bus bridge")?;
+    ensure!(status.running && status.registered && status.runtime_agent_id == receipt.runtime_agent_id
+        && status.thread_id == receipt.review.contract.native_id,
+        "reconnected runtime bridge is not registered for the expected occurrence");
     Ok(receipt.clone())
 }
 
@@ -559,33 +593,9 @@ impl StockRuntimeExecutor for StockExecutor {
         Ok(result)
     }
     fn stop(&mut self, record: &CutexSessionRecord) -> anyhow::Result<()> {
-        let Some(binding) = &record.app_server_runtime else {
-            ensure!(
-                !cutex::session::archive::record_has_runtime_claim(record),
-                "stock owner unavailable; cannot prove stop"
-            );
-            return Ok(());
-        };
-        #[cfg(feature = "stock-launch-test-hook")]
-        cutex::app_server::private_restart_phase("stop.verify_claim.begin");
-        super::app_server_runtime::verify_exact_live_runtime_claim(record, binding)?;
-        #[cfg(feature = "stock-launch-test-hook")]
-        cutex::app_server::private_restart_phase("stop.verify_process.begin");
-        verify_stock_process(record, binding)?;
-        #[cfg(feature = "stock-launch-test-hook")]
-        cutex::app_server::private_restart_phase("stop.interrupt.begin");
-        super::app_server_runtime::runtime_manager()
-            .interrupt_active_turn(&record.cutex_session_id)?;
-        #[cfg(feature = "stock-launch-test-hook")]
-        cutex::app_server::private_restart_phase("stop.disconnect.begin");
-        super::app_server_runtime::disconnect_runtime(&record.cutex_session_id)?;
-        #[cfg(feature = "stock-launch-test-hook")]
-        cutex::app_server::private_restart_phase("stop.group.begin");
-        stop_group(binding.pid)?;
-        #[cfg(feature = "stock-launch-test-hook")]
-        cutex::app_server::private_restart_phase("stop.commit.begin");
-        let path = cutex::session::store::cutex_sessions_path()?;
-        cutex::agent_management::commit_stock_runtime_stop(&path, record)
+        let outcome = super::native_stop::stop_and_commit(record, true)?;
+        ensure!(outcome.stopped, "native runtime stop incomplete: {}", outcome.detail);
+        Ok(())
     }
     fn spawn(
         &mut self,
@@ -686,7 +696,7 @@ impl StockRuntimeExecutor for StockExecutor {
             .flatten();
         self.child = Some(super::stock_publication::spawn_with_secret(
             &launch,
-            cutex::session::service::cutex_session_launch_cwd(record),
+            &cutex::session::reviewed_registration::occurrence_launch_cwd(receipt)?,
             &log,
             &self
                 .publication
@@ -771,9 +781,15 @@ impl StockRuntimeExecutor for StockExecutor {
                 binding,
                 cutex::app_server::commands::ThreadResumeParams {
                     thread_id: receipt.review.contract.native_id.clone(),
+                    // Management needs live turn identity, not conversation history.
+                    // Descending limit one includes the native server's active overlay.
+                    exclude_turns: Some(true),
+                    initial_turns_page: Some(serde_json::json!({
+                        "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded"
+                    })),
                     model: Some(cfg.model.clone()),
                     model_provider: Some(cfg.model_provider.clone()),
-                    cwd: Some(cutex::session::service::cutex_session_launch_cwd(record).into()),
+                    cwd: Some(cutex::session::reviewed_registration::occurrence_launch_cwd(receipt)?.into()),
                     approval_policy: Some(serde_json::json!(cfg.approval)),
                     // The coherent CLI requires the receiver's named profile.
                     // A legacy per-resume sandbox override erases that identity
@@ -798,10 +814,8 @@ impl StockRuntimeExecutor for StockExecutor {
                 "existing thread active permission profile mismatches reviewed receiver; explicit controller correction required"
             );
         }
-        if manager
-            .agent_bus_bridge_status(&record.cutex_session_id)?
-            .is_none()
-        {
+        if manager.agent_bus_bridge_status(&record.cutex_session_id)?.is_none_or(|status| !status.running) {
+            manager.stop_agent_bus_bridge(&record.cutex_session_id)?;
             let mut registration = super::app_server_runtime::runtime_agent_registration(
                 record,
                 binding,
@@ -809,6 +823,7 @@ impl StockRuntimeExecutor for StockExecutor {
             )?;
             // Stock registration carries the reviewed configuration unchanged;
             // it must not derive new collaboration groups from a cwd hash.
+            registration.cwd = cutex::session::reviewed_registration::occurrence_launch_cwd(receipt)?;
             registration.groups = record.agent_groups.clone();
             registration.path_key = None;
             registration.name = receipt.review.subject.formal_name.clone();
@@ -949,28 +964,6 @@ pub(super) fn verify_stock_process_with_bundle(
         anyhow::bail!("stock subset requires Linux")
     }
 }
-fn stop_group(pid: u32) -> anyhow::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        ensure!(
-            pid > 1 && pid <= i32::MAX as u32 && unsafe { libc::getpgid(pid as i32) } == pid as i32,
-            "cannot prove owned stock process group"
-        );
-        ensure!(
-            unsafe { libc::kill(-(pid as i32), libc::SIGKILL) } == 0,
-            "owned stock group stop failed"
-        );
-        let result = cutex::platform::process::terminate_process_and_wait(pid, true)?;
-        ensure!(result.stopped, "owned stock child stop not proven");
-        Ok(())
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        anyhow::bail!("stock subset requires Linux")
-    }
-}
-
 pub(super) fn request(path: &std::path::Path, management_url: &str) -> anyhow::Result<()> {
     let url = url::Url::parse(management_url)?;
     ensure!(
@@ -1025,6 +1018,7 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
     // Remote CLI config must describe the running occurrence, not silently
     // substitute local OpenAI defaults or a newly selected durable profile.
     let cli = bundle.cli.as_ref().unwrap_or(&bundle.executable);
+    let actual_cwd = cutex::session::reviewed_registration::occurrence_launch_cwd(ready)?;
     let launch = clean_launch(&cli.path, &contract.native_home)?.args([
         "resume",
         "--remote",
@@ -1032,7 +1026,7 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
         &contract.native_id,
         "--no-alt-screen",
         "--cd",
-        cutex::session::service::cutex_session_launch_cwd(record),
+        &actual_cwd,
         "-c",
         "tui.resume_cwd=\"current\"",
     ]);
@@ -1073,6 +1067,48 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
 
 #[cfg(all(test, target_os = "linux"))]
 mod ingress_guard_tests {
+    #[test]
+    fn existing_ready_owner_requires_successful_management_reconnect() {
+        let native = "019f4b34-82e6-7f72-9027-34df7bdcb82e";
+        let mut record = cutex::session::model::CutexSessionRecord::new(
+            "cutex.test".into(), Some(native.into()), "private".into(), "/private".into(), None).unwrap();
+        record.runtime_generation = 1;
+        let receipt: cutex::agent_management::StockRuntimeReceipt = serde_json::from_value(serde_json::json!({
+            "launch_cwd":"/private", "action_id":"reviewed-register", "stage":"spawned", "claim_id":"claim", "runtime_agent_id":"stock.test", "expected_generation":1,
+            "publication":null,"error":null,"updated_at":"2026-01-01T00:00:00Z",
+            "binding":{"transport":"unix_socket","endpoint":"unix:///private/sock","pid":1234,"runtime_dir":"/private","launched_profile":"alpha","diagnostic_journal_path":"/private/journal","schema_version":"test","schema_sha256":"e".repeat(64),"started_at":"2026-01-01T00:00:00Z"},
+            "review":{
+                "subject":{"cutex_session_id":record.cutex_session_id,"formal_name":"formal","durable_sha256":"a".repeat(64),"authority_sha256":"a".repeat(64),"current_project_id":null,"revision":record.revision,"runtime_generation":0},
+                "contract":{"version":2,"native_id":native,"native_home":"/private","bundle_manifest":"/private/manifest","bundle_sha256":"b".repeat(64)},
+                "configuration":{"profile_name":"alpha","profile_id":"private-profile","inherited":false,"profile_sha256":"c".repeat(64),"account_sha256":"d".repeat(64),"model":"private-model","reasoning":null,"model_provider":"private","provider":{"name":"private","base_url":"http://127.0.0.1:1/v1","wire_api":"responses","requires_openai_auth":false,"supports_websockets":false},"sandbox":"read-only","approval":"on-request"},
+                "restart":false
+            }
+        })).unwrap();
+        let mut sent = false;
+        let result = super::reconnect_existing_owner(&record, &receipt, |path, body| {
+            sent = true;
+            assert_eq!(path, "/v2/sessions/cutex.test/cutex/requests");
+            let request: serde_json::Value = serde_json::from_slice(body)?;
+            assert_eq!(request["method"], "cutex/runtime/online");
+            assert_eq!(request["params"]["expectedRuntimeGeneration"], 1);
+            Ok(serde_json::json!({"contractVersion":2,"requestId":request["requestId"],
+                "cutexSessionId":record.cutex_session_id,"cutex":{"method":"cutex/runtime/online",
+                "result":{"status":"online","runtimeGeneration":1,"runtimeAgentId":receipt.runtime_agent_id,
+                "actionId":receipt.action_id}}}))
+        }).unwrap();
+        assert!(sent);
+        assert_eq!(result, receipt);
+        assert!(super::reconnect_existing_owner(&record, &receipt, |_, _| anyhow::bail!("bridge unavailable")).is_err());
+        assert!(super::reconnect_existing_owner(&record, &receipt, |_, body| {
+            let request: serde_json::Value = serde_json::from_slice(body)?;
+            Ok(serde_json::json!({"contractVersion":2,"requestId":request["requestId"],
+                "cutexSessionId":record.cutex_session_id,"cutex":{"method":"cutex/runtime/online",
+                "result":{"status":"online","runtimeGeneration":2,"runtimeAgentId":receipt.runtime_agent_id,
+                "actionId":receipt.action_id}}}))
+        }).is_err());
+    }
+
+
     #[test]
     fn foreground_tmpdir_defaults_without_shell_export_and_honors_override() {
         let home = crate::cli_app::test_home::IsolatedTestHome::new("stock-tmp").unwrap();

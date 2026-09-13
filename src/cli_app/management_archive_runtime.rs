@@ -9,6 +9,7 @@ pub(super) struct GuardedArchiveRuntime {
     events: Option<File>,
     generation: Option<u64>,
     never_started: bool,
+    native: Option<CutexSessionRecord>,
 }
 
 impl GuardedArchiveRuntime {
@@ -67,6 +68,62 @@ impl AgentArchiveRuntime for GuardedArchiveRuntime {
             "unsupported_remote_stop_proof"
         );
         self.generation = Some(record.runtime_generation);
+        if record.explicit_launch.is_some() {
+            let mut occurrence = record.clone();
+            if occurrence.app_server_runtime.is_none() {
+                let store = cutex::session::store::load_cutex_session_store()?;
+                let archived_stop_proven = !record_has_runtime_claim(record) && store.agent_archive_receipts.values().any(|r|
+                    r.stage == cutex::agent_management::AgentArchiveStage::Committed
+                    && r.request.review.operation == cutex::agent_management::AgentArchiveOperation::Archive
+                    && r.result.as_ref().is_some_and(|p| p.cutex_session_id == record.cutex_session_id
+                        && p.codex_session_id == record.codex_session_id && p.runtime_generation == record.runtime_generation));
+                if archived_stop_proven {
+                    self.native = Some(occurrence);
+                    return Ok(());
+                }
+                if let Some(proof) = store
+                    .native_stop_receipts
+                    .get(&record.cutex_session_id)
+                    .filter(|p| {
+                        p.generation == record.runtime_generation
+                            && p.native_id == record.codex_session_id
+                    })
+                {
+                    occurrence.app_server_runtime = proof.binding.clone();
+                } else {
+                    // Compatibility with native Stop before durable stop receipts.
+                    occurrence.app_server_runtime = store
+                        .explicit_launch_receipts
+                        .values()
+                        .find_map(|r| match r {
+                            cutex::agent_management::ExplicitLaunchActionReceipt::Runtime(r)
+                                if r.stage == cutex::agent_management::StockRuntimeStage::Ready
+                                    && r.expected_generation == record.runtime_generation
+                                    && r.review.subject.cutex_session_id.as_str()
+                                        == record.cutex_session_id
+                                    && record.last_runtime_agent_id.as_deref()
+                                        == Some(r.runtime_agent_id.as_str()) =>
+                            {
+                                r.binding.clone()
+                            }
+                            _ => None,
+                        });
+                }
+                if occurrence.app_server_runtime.is_none() {
+                    anyhow::ensure!(
+                        !record_has_runtime_claim(record),
+                        "native archive has unresolved launch claim"
+                    );
+                    // Never-started explicit native has no process to contain.
+                    anyhow::ensure!(
+                        record.runtime_generation == 0,
+                        "native archive occurrence evidence unavailable"
+                    );
+                }
+            }
+            self.native = Some(occurrence);
+            return Ok(());
+        }
         self.never_started = record.runtime_history_known
             && record.runtime_generation == 0
             && !record_has_runtime_claim(record)
@@ -131,6 +188,15 @@ impl AgentArchiveRuntime for GuardedArchiveRuntime {
             self.generation == Some(record.runtime_generation),
             "archive_generation_conflict"
         );
+        if let Some(native) = &self.native {
+            let outcome = super::native_stop::stop_processes(native, true)?;
+            anyhow::ensure!(
+                outcome.stopped,
+                "native archive stop incomplete: {}",
+                outcome.detail
+            );
+            return Ok(());
+        }
         if self.never_started {
             return Self::observations_offline(record);
         }
@@ -158,6 +224,10 @@ impl AgentArchiveRuntime for GuardedArchiveRuntime {
             self.generation == Some(record.runtime_generation),
             "archive_generation_conflict"
         );
+        if let Some(native) = &self.native {
+            super::native_stop::verify_stopped(native)?;
+            return Ok(());
+        }
         if !self.never_started {
             self.captured_scope_empty()?;
         }

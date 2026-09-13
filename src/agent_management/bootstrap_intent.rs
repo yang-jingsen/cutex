@@ -224,17 +224,15 @@ impl BootstrapExecutionPermit<'_> {
                 anyhow::ensure!(
                     !current.is_retired()
                         && current.agent_enabled
-                        && current.revision == review.subject.revision
                         && current.app_server_launch_claim_id.is_none()
                         && current.app_server_runtime == receipt.binding
                         && current.runtime_pid == receipt.binding.as_ref().map(|b| b.pid)
                         && current.runtime_generation == receipt.expected_generation
                         && current.current_runtime_agent_id.as_deref()
                             == Some(&receipt.runtime_agent_id)
-                        && current.explicit_launch.as_ref() == Some(&review.contract)
-                        && crate::launch::stock::current_configuration(&current)?
-                            == review.configuration,
-                    "captured successor occurrence/configuration changed; no reconnect"
+                        && current.codex_session_id.as_deref()
+                            == Some(review.contract.native_id.as_str()),
+                    "captured successor occurrence changed; no reconnect"
                 );
                 Ok(current)
             };

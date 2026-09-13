@@ -186,6 +186,9 @@ pub fn parse_cutex_session_quick_action_mode(
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct CutexSessionStore {
+    /// Latest proven stopped native occurrence, saved with runtime clearing.
+    #[serde(default)]
+    pub native_stop_receipts: std::collections::BTreeMap<String, NativeStopReceipt>,
     #[serde(default)]
     pub explicit_launch_receipts:
         std::collections::BTreeMap<String, crate::agent_management::ExplicitLaunchActionReceipt>,
@@ -204,6 +207,13 @@ pub struct CutexSessionStore {
     pub store_revision: Cell<u64>,
     #[serde(default)]
     pub sessions: HashMap<String, CutexSessionRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NativeStopReceipt {
+    pub native_id: Option<String>,
+    pub generation: u64,
+    pub binding: Option<CutexAppServerRuntimeBinding>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

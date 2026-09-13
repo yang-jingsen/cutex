@@ -303,7 +303,7 @@ impl ManagementControlClient {
         self.request_with_timeout(method, path, body, Duration::from_secs(5))
     }
 
-    fn request_with_timeout<T: serde::de::DeserializeOwned>(
+    pub(super) fn request_with_timeout<T: serde::de::DeserializeOwned>(
         &self,
         method: &str,
         path: &str,
@@ -339,6 +339,7 @@ mod tests {
         })).unwrap();
         let action = AgentActionId::new("lost-response-action").unwrap();
         let receipt = StockRuntimeReceipt {
+            launch_cwd: None,
             action_id: action.clone(),
             review: review.clone(),
             stage: StockRuntimeStage::Ready,

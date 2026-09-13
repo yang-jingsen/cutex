@@ -218,7 +218,8 @@ pub(crate) fn authenticate_worker_principal(
     if session.archive_state != CutexSessionArchiveState::Active {
         return Err(WorkerPrincipalError::SessionInactive);
     }
-    if session.current_runtime_agent_id.as_deref() != Some(sender.runtime_agent_id.as_str()) {
+    if crate::agent_management::native_runtime_transition_pending(&store, session)
+        || session.current_runtime_agent_id.as_deref() != Some(sender.runtime_agent_id.as_str()) {
         return Err(WorkerPrincipalError::RuntimeNotCurrent);
     }
     let stable = crate::role_revision::CutexSessionId::new(session.cutex_session_id.clone())
@@ -1112,6 +1113,10 @@ pub(crate) fn resolve_current_runtime_target(
     durable_session_id: &str,
 ) -> Option<(String, String)> {
     let sessions = load_cutex_session_store().ok();
+    if sessions.as_ref().is_some_and(|store| store.sessions.get(durable_session_id)
+        .is_some_and(|record| crate::agent_management::native_runtime_transition_pending(store, record))) {
+        return None;
+    }
     let current_runtime = sessions.as_ref().and_then(|store| {
         store
             .sessions

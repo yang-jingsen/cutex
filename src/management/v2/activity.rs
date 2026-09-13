@@ -434,7 +434,7 @@ impl TaskAttemptResolver for ProviderTaskAttemptResolver {
             crate::task_delivery::provider_adapter::default_task_service_provider_root().ok()?,
         )
         .ok()?;
-        let snapshot = provider.query().ok()?;
+        let snapshot = provider.query_assignment(&assignment_id).ok()?;
         let assignment = snapshot.assignments.get(&assignment_id)?;
         if assignment.assignee_cutex_session.as_str() != cutex_session_id {
             return None;
