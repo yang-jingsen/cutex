@@ -15,16 +15,20 @@ pub(super) const SUCCESS: Color = Color::Green;
 pub(super) const WARNING: Color = Color::Yellow;
 pub(super) const ERROR: Color = Color::Red;
 
-/// List inner >=72, Inspector inner >=38, two borders each and one gap.
-/// Right target 32%, capped at 56 inner cells; list retains primary space.
+/// Keep the list readable in normal windows, but give all growth beyond its
+/// useful column width to details. Includes borders and the selection marker.
+pub(super) const LIST_PANE_MAX_WIDTH: u16 = 130;
+
 pub(super) fn inspector_panes(area: Rect, visible: bool) -> Option<(Rect, Rect)> {
     if !visible || area.width < 115 {
         return None;
     }
-    let right = (area.width.saturating_mul(32) / 100)
-        .clamp(40, 58)
-        .min(area.width - 75);
-    let left = area.width - right - 1;
+    let available = area.width - 1;
+    let left = ((u32::from(available) * 62 / 100) as u16)
+        .max(74)
+        .min(LIST_PANE_MAX_WIDTH)
+        .min(available - 40);
+    let right = available - left;
     Some((
         Rect {
             width: left,
@@ -75,4 +79,37 @@ pub(super) fn tabs(active: PrimaryPanel, width: u16) -> Line<'static> {
         }
     }
     Line::from(spans)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wide_windows_give_all_extra_space_to_details() {
+        let (list, detail) = inspector_panes(Rect::new(3, 2, 240, 30), true).unwrap();
+        let (wider_list, wider_detail) = inspector_panes(Rect::new(3, 2, 320, 30), true).unwrap();
+        assert_eq!(list.width, LIST_PANE_MAX_WIDTH);
+        assert_eq!(wider_list, list);
+        assert_eq!(wider_detail.x, detail.x);
+        assert_eq!(wider_detail.width, detail.width + 80);
+        assert_eq!(wider_detail.right(), 323);
+    }
+
+    #[test]
+    fn split_preserves_minimums_gap_and_narrow_fallback() {
+        for width in 0..=500 {
+            let area = Rect::new(3, 2, width, 20);
+            assert!(inspector_panes(area, false).is_none());
+            if width < 115 {
+                assert!(inspector_panes(area, true).is_none());
+            } else {
+                let (list, detail) = inspector_panes(area, true).unwrap();
+                assert!(list.width >= 74 && list.width <= LIST_PANE_MAX_WIDTH);
+                assert!(detail.width >= 40);
+                assert_eq!(list.right() + 1, detail.x);
+                assert_eq!(detail.right(), area.right());
+            }
+        }
+    }
 }

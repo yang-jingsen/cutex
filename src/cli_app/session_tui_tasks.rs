@@ -773,12 +773,9 @@ fn render(frame: &mut Frame<'_>, model: &TaskModel) {
     );
     render_filter(frame, chunks[2], model);
     let wide_inspector = area.width >= super::session_tui::INSPECTOR_SPLIT_MIN_WIDTH;
-    if wide_inspector {
-        let panes = Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
-            .spacing(1)
-            .split(chunks[3]);
-        render_table(frame, panes[0], model);
-        render_detail(frame, panes[1], model, model.detail);
+    if let Some((list, inspector)) = super::session_tui_layout::inspector_panes(chunks[3], true) {
+        render_table(frame, list, model);
+        render_detail(frame, inspector, model, model.detail);
     } else {
         render_table(frame, chunks[3], model);
     }

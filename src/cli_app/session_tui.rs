@@ -9933,7 +9933,7 @@ mod tests {
             );
             if let Some((list, inspector)) = expected {
                 assert!(list.width - 2 >= 72 && inspector.width - 2 >= 38);
-                assert!(list.width > inspector.width);
+                assert!(list.width <= super::super::session_tui_layout::LIST_PANE_MAX_WIDTH);
                 assert_eq!(inspector.right(), area.right());
             }
         }
