@@ -41,6 +41,11 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum CommandKind {
+    /// Human management and recovery (also for agents acting at your request)
+    Human {
+        #[command(subcommand)]
+        command: HumanCommand,
+    },
     /// List profiles (legacy alias for `profile list`)
     #[command(hide = true)]
     List,
@@ -1541,5 +1546,31 @@ pub enum ProfileCommand {
         /// Clear the profile session override so it inherits the global default
         #[arg(long = "session-inherit")]
         session_inherit: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HumanCommand {
+    /// Inspect the result of an existing runtime action; never starts another
+    Action { action_id: String },
+    /// Clear an interrupted start after proving its process no longer exists
+    Recover {
+        id: String,
+        #[arg(long)]
+        action_id: Option<String>,
+    },
+    /// Start a managed native agent using its current configuration
+    Start { id: String },
+    /// Attach to a running agent without restarting it
+    Attach { id: String },
+    /// Existing session configuration and lifecycle commands
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
+    /// Project authority and seat administration
+    Management {
+        #[command(subcommand)]
+        command: ManagementCommand,
     },
 }

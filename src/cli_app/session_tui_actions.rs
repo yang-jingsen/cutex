@@ -10,6 +10,7 @@ use cutex::session::service::cutex_session_is_managed;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SessionTuiAction {
+    RecoverRuntime,
     ResumeAttach,
     AttachExisting,
     StockAttach,
@@ -30,11 +31,12 @@ pub(super) enum SessionTuiAction {
 impl SessionTuiAction {
     pub(super) fn label(self) -> &'static str {
         match self {
+            Self::RecoverRuntime => "Recover interrupted start",
             Self::ResumeAttach => "takeover",
             Self::AttachExisting => "attach",
-            Self::StockAttach => "attach stock TUI",
-            Self::StockStart => "start reviewed stock runtime",
-            Self::StockRestart => "restart reviewed stock runtime",
+            Self::StockAttach => "Attach",
+            Self::StockStart => "Start",
+            Self::StockRestart => "Restart",
             Self::TakeoverExisting => "takeover existing",
             Self::OpenTui => "open TUI",
             Self::Online => "online",
@@ -52,7 +54,6 @@ impl SessionTuiAction {
         matches!(
             self,
             Self::Online
-                | Self::StockStart
                 | Self::StockRestart
                 | Self::CloseAndRestart
                 | Self::CloseRuntime
@@ -82,7 +83,8 @@ impl SessionTuiAction {
             | Self::CloseRuntime
             | Self::RepairInterruptedHistory
             | Self::RetireSession
-            | Self::RestoreSession => false,
+            | Self::RestoreSession
+            | Self::RecoverRuntime => false,
         }
     }
 }
@@ -111,11 +113,20 @@ pub(super) fn session_tui_actions_for_record(
         || record.current_runtime_agent_id.is_some();
     if record.explicit_launch.is_some() {
         let mut actions = Vec::new();
+        if record.app_server_launch_claim_id.is_some() {
+            push_action(
+                &mut actions,
+                SessionTuiAction::RecoverRuntime,
+                "Clear the interrupted start only after checking that its process is gone",
+                true,
+            );
+            return actions;
+        }
         if !runtime_known {
             push_action(
                 &mut actions,
                 SessionTuiAction::StockStart,
-                "Review the sealed runtime configuration, start its exact owner, then attach",
+                "Start this agent and open its terminal",
                 true,
             );
             return actions;
@@ -127,7 +138,7 @@ pub(super) fn session_tui_actions_for_record(
             push_action(
                 &mut actions,
                 SessionTuiAction::StockAttach,
-                "Join the exact ready stock owner without creating another writer",
+                "Open the running agent’s terminal",
                 true,
             );
         }
@@ -135,7 +146,7 @@ pub(super) fn session_tui_actions_for_record(
         push_action(
             &mut actions,
             SessionTuiAction::StockRestart,
-            "Review the sealed runtime configuration, replace its exact owner, then attach",
+            "Restart this agent and open its terminal",
             restart_primary,
         );
         if runtime_known {
@@ -256,17 +267,12 @@ fn action_from_quick_kind(kind: StartQuickActionKind) -> Option<SessionTuiAction
 
 fn primary_action_detail(action: SessionTuiAction) -> &'static str {
     match action {
+        SessionTuiAction::RecoverRuntime => "Recover an interrupted start without removing history",
         SessionTuiAction::ResumeAttach => "Bring runtime online if needed, then take over TUI",
         SessionTuiAction::AttachExisting => "Join the existing TUI",
-        SessionTuiAction::StockAttach => {
-            "Join the exact ready stock owner without creating another writer"
-        }
-        SessionTuiAction::StockStart => {
-            "Review the sealed runtime configuration, start its exact owner, then attach"
-        }
-        SessionTuiAction::StockRestart => {
-            "Review the sealed runtime configuration, replace its exact owner, then attach"
-        }
+        SessionTuiAction::StockAttach => "Open the running agent’s terminal",
+        SessionTuiAction::StockStart => "Start this agent and open its terminal",
+        SessionTuiAction::StockRestart => "Restart this agent and open its terminal",
         SessionTuiAction::TakeoverExisting => "Take control of the existing TUI",
         SessionTuiAction::OpenTui => "Open the visible TUI for the managed app-server",
         SessionTuiAction::Online => "Bring the managed runtime online",
@@ -347,6 +353,23 @@ mod tests {
         let actions = session_tui_actions_for_record(&record, &[], &[]);
         assert_eq!(action_kinds(&actions), vec![SessionTuiAction::StockStart]);
         assert!(actions[0].primary);
+    }
+
+    #[test]
+    fn interrupted_start_offers_recovery_then_normal_start() {
+        let mut record = record(CutexSessionRuntimeBackend::Host);
+        mark_explicit_stock(&mut record);
+        record.app_server_launch_claim_id = Some("interrupted".into());
+        assert_eq!(
+            action_kinds(&session_tui_actions_for_record(&record, &[], &[])),
+            vec![SessionTuiAction::RecoverRuntime]
+        );
+        record.app_server_launch_claim_id = None;
+        assert_eq!(
+            action_kinds(&session_tui_actions_for_record(&record, &[], &[])),
+            vec![SessionTuiAction::StockStart]
+        );
+        assert!(!SessionTuiAction::StockStart.requires_confirmation());
     }
 
     #[test]

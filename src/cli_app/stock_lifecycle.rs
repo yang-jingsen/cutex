@@ -232,10 +232,7 @@ pub(super) fn bootstrap_native(
             &review.bundle_manifest,
             &review.bundle_sha256,
         )?;
-        ensure!(
-            bundle.version == 3 && bundle.soon_ingress(),
-            "bootstrap bundle mismatch"
-        );
+        ensure!(bundle.soon_ingress(), "bootstrap bundle mismatch");
         let spec = review
             .request
             .operation

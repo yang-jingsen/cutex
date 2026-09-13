@@ -49,6 +49,31 @@ fn explicit_launch_action(
     request: &cutex::agent_management::ExplicitLaunchRequest,
 ) -> Result<serde_json::Value, cutex::agent_management::AgentManagementError> {
     let operation = || -> anyhow::Result<_> {
+        if let cutex::agent_management::ExplicitLaunchRequest::RuntimeStatus { action_id } = request
+        {
+            return Ok(serde_json::to_value(
+                management_agent_provider()?.runtime_action_status(
+                    &cutex::session::store::cutex_sessions_path()?,
+                    action_id,
+                )?,
+            )?);
+        }
+        if let cutex::agent_management::ExplicitLaunchRequest::RecoverRuntime {
+            cutex_session_id,
+            action_id,
+        } = request
+        {
+            let mut runtime = super::stock_lifecycle::StockExecutor::default();
+            return Ok(serde_json::to_value(
+                management_agent_provider()?.recover_failed_runtime(
+                    principal,
+                    &cutex::session::store::cutex_sessions_path()?,
+                    cutex_session_id,
+                    action_id,
+                    &mut runtime,
+                )?,
+            )?);
+        }
         let tasks = cutex::task_service::TaskServiceProvider::open(
             cutex::task_delivery::provider_adapter::default_task_service_provider_root()?,
         )?;

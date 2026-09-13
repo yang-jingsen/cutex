@@ -25,6 +25,37 @@ pub(super) struct ManagementControlClient {
 }
 
 impl ManagementControlClient {
+    pub(super) fn runtime_action_status(
+        &self,
+        action_id: cutex::agent_management::AgentActionId,
+    ) -> anyhow::Result<cutex::agent_management::RuntimeActionStatus> {
+        self.request(
+            "POST",
+            "/v2/agent-management/explicit-launch",
+            Some(&serde_json::to_vec(
+                &cutex::agent_management::ExplicitLaunchRequest::RuntimeStatus { action_id },
+            )?),
+        )
+    }
+
+    pub(super) fn recover_runtime(
+        &self,
+        cutex_session_id: cutex::role_revision::CutexSessionId,
+        action_id: cutex::agent_management::AgentActionId,
+    ) -> anyhow::Result<cutex::agent_management::HumanRuntimeRecovery> {
+        self.request_with_timeout(
+            "POST",
+            "/v2/agent-management/explicit-launch",
+            Some(&serde_json::to_vec(
+                &cutex::agent_management::ExplicitLaunchRequest::RecoverRuntime {
+                    cutex_session_id,
+                    action_id,
+                },
+            )?),
+            Duration::from_secs(120),
+        )
+    }
+
     pub(super) fn review_stock_runtime(
         &self,
         cutex_session_id: cutex::role_revision::CutexSessionId,
@@ -50,14 +81,64 @@ impl ManagementControlClient {
         action_id: cutex::agent_management::AgentActionId,
         review: cutex::agent_management::StockRuntimeReview,
     ) -> anyhow::Result<cutex::agent_management::StockRuntimeReceipt> {
-        self.request_with_timeout(
+        let result = self.request_with_timeout(
             "POST",
             "/v2/agent-management/explicit-launch",
             Some(&serde_json::to_vec(
-                &cutex::agent_management::ExplicitLaunchRequest::Run { action_id, review },
+                &cutex::agent_management::ExplicitLaunchRequest::Run {
+                    action_id: action_id.clone(),
+                    review: review.clone(),
+                },
             )?),
             Duration::from_secs(120),
-        )
+        );
+        match result {
+            Ok(receipt) => Ok(receipt),
+            Err(error) => self.reconcile_runtime_action(action_id, review, error),
+        }
+    }
+
+    // A lost response does not imply a failed start. Query the original action;
+    // never resubmit Run or mint a replacement action from this transport path.
+    fn reconcile_runtime_action(
+        &self,
+        action_id: cutex::agent_management::AgentActionId,
+        review: cutex::agent_management::StockRuntimeReview,
+        original_error: anyhow::Error,
+    ) -> anyhow::Result<cutex::agent_management::StockRuntimeReceipt> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match self.runtime_action_status(action_id.clone()) {
+                Ok(status) => {
+                    anyhow::ensure!(
+                        status.action_id == action_id,
+                        "action status identity mismatch"
+                    );
+                    if let Some(receipt) = status.receipt {
+                        anyhow::ensure!(
+                            receipt.action_id == action_id && receipt.review == review,
+                            "action status request mismatch"
+                        );
+                        if receipt.stage == cutex::agent_management::StockRuntimeStage::Ready {
+                            return Ok(receipt);
+                        }
+                        if let Some(error) = receipt.error {
+                            anyhow::bail!("runtime_start_failed: {error}; action {}; inspect with cutex human action {}",
+                                action_id.as_str(), action_id.as_str());
+                        }
+                    }
+                    if status.state != "in_progress" || std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                Err(_) => break,
+            }
+        }
+        Err(original_error.context(format!(
+            "runtime_result_unknown: inspect the original action with cutex human action {}; do not start it again until its state is known",
+            action_id.as_str()
+        )))
     }
 
     pub(super) fn adopt_saved_native(
@@ -217,6 +298,85 @@ impl ManagementControlClient {
 mod tests {
     use super::*;
     use cutex::profiles::model::ManagementApiToken;
+
+    #[test]
+    fn lost_run_response_queries_same_action_without_a_second_start() {
+        use cutex::agent_management::*;
+        use std::io::{Read, Write};
+        let review: StockRuntimeReview = serde_json::from_value(serde_json::json!({
+            "subject":{"cutex_session_id":"cutex.test","formal_name":"Test","durable_sha256":"a".repeat(64),"authority_sha256":"b".repeat(64),"current_project_id":null,"revision":0,"runtime_generation":0},
+            "contract":{"version":2,"native_id":"00000000-0000-4000-8000-000000000001","native_home":"/private","bundle_manifest":"/private/manifest","bundle_sha256":"c".repeat(64)},
+            "configuration":{"profile_name":"alpha","profile_id":"private-profile","inherited":false,"profile_sha256":"c".repeat(64),"account_sha256":"d".repeat(64),"model":"private-model","reasoning":null,"model_provider":"private","provider":{"name":"private","base_url":"http://127.0.0.1:1/v1","wire_api":"responses","requires_openai_auth":false,"supports_websockets":false},"sandbox":"read-only","approval":"on-request"},"restart":false
+        })).unwrap();
+        let action = AgentActionId::new("lost-response-action").unwrap();
+        let receipt = StockRuntimeReceipt {
+            action_id: action.clone(),
+            review: review.clone(),
+            stage: StockRuntimeStage::Ready,
+            claim_id: "claim".into(),
+            runtime_agent_id: "runtime".into(),
+            expected_generation: 1,
+            binding: None,
+            publication: None,
+            error: None,
+            updated_at: "now".into(),
+        };
+        let response = serde_json::to_vec(&RuntimeActionStatus {
+            action_id: action.clone(),
+            state: "succeeded".into(),
+            receipt: Some(receipt.clone()),
+        })
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = ManagementControlClient::test_endpoint(
+            format!("http://{}", listener.local_addr().unwrap()),
+            "test-root".into(),
+        );
+        let server = std::thread::spawn(move || {
+            for expected in ["run", "runtime_status"] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let body = loop {
+                    let mut buf = [0u8; 4096];
+                    let n = socket.read(&mut buf).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                    if let Some(split) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = std::str::from_utf8(&bytes[..split]).unwrap();
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|l| l.strip_prefix("Content-Length: "))
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        if bytes.len() >= split + 4 + length {
+                            break serde_json::from_slice::<serde_json::Value>(
+                                &bytes[split + 4..split + 4 + length],
+                            )
+                            .unwrap();
+                        }
+                    }
+                };
+                assert_eq!(body["operation"], expected);
+                assert_eq!(body["action_id"], "lost-response-action");
+                if expected == "runtime_status" {
+                    write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        response.len()
+                    )
+                    .unwrap();
+                    socket.write_all(&response).unwrap();
+                }
+                // First connection intentionally closes after the server committed.
+            }
+        });
+        assert_eq!(client.run_stock_runtime(action, review).unwrap(), receipt);
+        server.join().unwrap();
+    }
 
     #[test]
     fn runtime_request_waits_for_response_beyond_old_five_second_limit() {

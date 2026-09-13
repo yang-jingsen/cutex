@@ -130,6 +130,13 @@ pub enum ExplicitLaunchActionReceipt {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExplicitLaunchRequest {
+    RuntimeStatus {
+        action_id: AgentActionId,
+    },
+    RecoverRuntime {
+        cutex_session_id: CutexSessionId,
+        action_id: AgentActionId,
+    },
     #[cfg(target_os = "linux")]
     MaintenanceReview {
         request: MaintenanceReviewRequest,
@@ -197,6 +204,12 @@ impl AgentManagementProvider {
         tasks: &crate::task_service::TaskServiceProvider,
     ) -> anyhow::Result<serde_json::Value> {
         match request {
+            ExplicitLaunchRequest::RuntimeStatus { action_id } => Ok(serde_json::to_value(
+                self.runtime_action_status(path, action_id)?,
+            )?),
+            ExplicitLaunchRequest::RecoverRuntime { .. } => {
+                anyhow::bail!("Human runtime recovery executor required")
+            }
             #[cfg(target_os = "linux")]
             ExplicitLaunchRequest::MaintenanceReview { request } => Ok(serde_json::to_value(
                 self.review_maintenance(_principal, path, request, tasks)?,

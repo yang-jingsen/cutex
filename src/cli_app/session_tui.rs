@@ -8896,12 +8896,12 @@ fn render_runtime_action_confirmation(frame: &mut Frame<'_>, area: Rect, model: 
                 .unwrap_or((0, "review pending", "review pending", "review pending".into()));
             (
                 if restart {
-                    " Confirm reviewed stock restart "
+                    " Confirm restart "
                 } else {
-                    " Confirm reviewed stock start "
+                    " Confirm start "
                 },
                 format!(
-                    "{} reviewed stock runtime for {}?",
+                    "{} {}?",
                     if restart { "Restart" } else { "Start" },
                     row.agent
                 ),
@@ -8911,7 +8911,7 @@ fn render_runtime_action_confirmation(frame: &mut Frame<'_>, area: Rect, model: 
                     "  Start & attach  "
                 },
                 format!(
-                    "Generation {generation} · profile {profile} · model {model_name} · native home {native_home}. The exact reviewed owner will be launched, then attached."
+                    "Generation {generation} · profile {profile} · model {model_name} · native home {native_home}. The agent will start and its terminal will open."
                 ),
             )
         }
@@ -9065,7 +9065,8 @@ fn homepage_action_label(action: SessionTuiAction) -> &'static str {
         SessionTuiAction::OpenTui => "open",
         SessionTuiAction::Online => "start",
         SessionTuiAction::ResumeHere | SessionTuiAction::ResumeManaged => "resume",
-        SessionTuiAction::CloseAndRestart
+        SessionTuiAction::RecoverRuntime
+        | SessionTuiAction::CloseAndRestart
         | SessionTuiAction::CloseRuntime
         | SessionTuiAction::RepairInterruptedHistory
         | SessionTuiAction::RetireSession
@@ -14257,7 +14258,7 @@ mod tests {
         model.stock_runtime_confirmation = Some(reviewed.clone());
 
         let confirmation = rendered_text_at(100, 24, &model);
-        assert!(confirmation.contains("Confirm reviewed stock start"));
+        assert!(confirmation.contains("Confirm start"));
         assert!(confirmation.contains("Generation 7"));
         assert!(confirmation.contains("profile aemeath"));
         model.handle(SelectorEvent::Down);

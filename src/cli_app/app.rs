@@ -126,6 +126,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
         Some(CommandKind::Notify { command }) => notify::run_command(command)?,
         Some(CommandKind::Im { command }) => agent::im(command)?,
         Some(CommandKind::Management { command }) => management::run_command(command)?,
+        Some(CommandKind::Human { command }) => super::human::run_command(command)?,
         Some(CommandKind::Agent { command }) => agent::run_command(command)?,
         Some(CommandKind::Wizard) => launch::wizard()?,
         None => {

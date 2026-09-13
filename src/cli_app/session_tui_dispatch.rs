@@ -17,6 +17,9 @@ use super::{root_wizard, session, session_attach};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SessionTuiDispatchPlan {
+    RecoverRuntime {
+        id: String,
+    },
     ResumeAttach {
         id: String,
         launch_profile: Option<String>,
@@ -79,7 +82,8 @@ impl SessionTuiDispatchPlan {
             Self::TakeoverExisting { key, .. } => Some((key, CutexSessionUserAction::Takeover)),
             Self::Online { key, .. } => Some((key, CutexSessionUserAction::Online)),
             Self::ResumeHere { key, .. } => Some((key, CutexSessionUserAction::ResumeHere)),
-            Self::ResumeAttach { .. }
+            Self::RecoverRuntime { .. }
+            | Self::ResumeAttach { .. }
             | Self::StockAttach { .. }
             | Self::StockRuntime { .. }
             | Self::OpenTui { .. }
@@ -142,9 +146,15 @@ fn runtime_close_output_for_surface(
 }
 
 fn dispatch_session_tui_intent_with_close_output(
-    intent: SessionTuiIntent,
+    mut intent: SessionTuiIntent,
     close_output: RuntimeCloseOutput,
 ) -> anyhow::Result<()> {
+    if intent.action == SessionTuiAction::StockStart && intent.stock_runtime.is_none() {
+        intent.stock_runtime = Some(super::stock_lifecycle::ReviewedStockRuntimeAction::review(
+            &intent.key,
+            false,
+        )?);
+    }
     let store = load_cutex_session_store()?;
     let alden_sessions = cute_alden_sessions().unwrap_or_default();
     let config = load_codez_config();
@@ -247,6 +257,9 @@ fn dispatch_plan_for_intent(
         .unwrap_or(record.cutex_session_id.as_str())
         .to_string();
     let plan = match intent.action {
+        SessionTuiAction::RecoverRuntime => SessionTuiDispatchPlan::RecoverRuntime {
+            id: record.cutex_session_id.clone(),
+        },
         SessionTuiAction::ResumeAttach => SessionTuiDispatchPlan::ResumeAttach {
             id,
             launch_profile: intent.launch_profile.clone(),
@@ -315,6 +328,9 @@ fn execute_dispatch_plan(
     }
 
     match plan {
+        SessionTuiDispatchPlan::RecoverRuntime { id } => {
+            super::human::recover(&id, None).map(|_| ())
+        }
         SessionTuiDispatchPlan::ResumeAttach { id, launch_profile } => {
             session::cmd_session_resume_alden_with_profile(&id, launch_profile.as_deref())
         }
