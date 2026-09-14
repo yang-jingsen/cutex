@@ -13,8 +13,25 @@ pub(super) const MUTED: Color = Color::DarkGray;
 pub(super) const FOCUS: Color = Color::Rgb(116, 186, 195);
 pub(super) const SELECTION: Color = Color::Rgb(38, 52, 79);
 pub(super) const SUCCESS: Color = Color::Green;
-pub(super) const WARNING: Color = Color::Yellow;
+pub(super) const WARNING: Color = Color::Rgb(217, 180, 95);
 pub(super) const ERROR: Color = Color::Red;
+
+// Status foregrounds are semantic; selection changes only the row background.
+pub(super) const STATUS_ONLINE: Color = ACCENT;
+pub(super) const STATUS_STALE: Color = FOCUS;
+pub(super) const STATUS_OFFLINE: Color = MUTED;
+pub(super) const STATUS_UNKNOWN: Color = WARNING;
+pub(super) const FOOTER_DESCRIPTION: Color = TEXT;
+
+pub(super) fn runtime_status_color(status: &str) -> Color {
+    match status.to_ascii_lowercase().as_str() {
+        "online" => STATUS_ONLINE,
+        "stale" => STATUS_STALE,
+        "offline" | "retired" => STATUS_OFFLINE,
+        "managed" | "unmanaged" => TEXT,
+        _ => STATUS_UNKNOWN,
+    }
+}
 
 /// Keep the list readable in normal windows, but give all growth beyond its
 /// useful column width to details. Includes borders and the selection marker.
@@ -46,8 +63,14 @@ pub(super) fn inspector_panes(area: Rect, visible: bool) -> Option<(Rect, Rect)>
 /// Explicit styles prevent stale colors when a shorter heading replaces another.
 pub(super) fn heading(prefix: &str, title: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(prefix.to_owned(), Style::new().fg(FOCUS).add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" {title}"), Style::new().fg(TEXT).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            prefix.to_owned(),
+            Style::new().fg(FOCUS).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {title}"),
+            Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
+        ),
     ])
 }
 

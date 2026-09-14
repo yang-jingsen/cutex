@@ -192,7 +192,12 @@ pub(super) const BINDINGS: &[Binding] = &[
         "Alt+B",
     ),
     alt(Command::Page(PrimaryPanel::Agents), 'm', "Agents", "Alt+M"),
-    alt(Command::Page(PrimaryPanel::Recent), 'r', "Sessions", "Alt+R"),
+    alt(
+        Command::Page(PrimaryPanel::Recent),
+        'r',
+        "Sessions",
+        "Alt+R",
+    ),
     alt(
         Command::Page(PrimaryPanel::Projects),
         'p',
@@ -292,9 +297,9 @@ impl LeaveReview {
         }
     }
     pub fn labels(&self) -> Vec<&'static str> {
-        let mut v = vec!["Cancel", "Discard and leave"];
+        let mut v = vec!["Keep editing", "Discard and leave"];
         if self.can_save {
-            v.push("Save (stay until result)");
+            v.push("Save");
         }
         v
     }
@@ -318,14 +323,53 @@ impl LeaveReview {
         }
     }
     pub fn render(&self, frame: &mut Frame<'_>) {
-        overlay(
-            frame,
-            " Unsaved draft ",
-            self.labels()
-                .iter()
-                .enumerate()
-                .map(|(i, s)| format!("{} {s}", if i == self.selected { ">" } else { " " }))
-                .collect(),
+        use crate::cli_app::session_tui_layout as theme;
+        use ratatui::style::{Modifier, Style};
+        use ratatui::text::Span;
+        use ratatui::widgets::Wrap;
+        let screen = frame.area();
+        let width = screen.width.min(64);
+        let height = screen.height.min(10);
+        let area = Rect::new(
+            screen.x + screen.width.saturating_sub(width) / 2,
+            screen.y + screen.height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+        let block = Block::bordered()
+            .title(" Unsaved changes ")
+            .border_style(Style::new().fg(theme::FOCUS));
+        let inner = block.inner(area);
+        frame.render_widget(Clear, area);
+        frame.render_widget(block, area);
+        let mut lines = vec![
+            Line::from("Leave this page with unsaved changes?"),
+            Line::default(),
+        ];
+        for (index, label) in self.labels().iter().enumerate() {
+            let style = if index == self.selected {
+                Style::new()
+                    .fg(theme::TEXT)
+                    .bg(theme::SELECTION)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(theme::TEXT)
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{} {label}", if index == self.selected { ">" } else { " " }),
+                style,
+            )));
+        }
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            "←/→ or Tab choose · Enter confirm · Esc keep editing",
+            Style::new().fg(theme::MUTED),
+        ));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: true })
+                .style(Style::new().fg(theme::TEXT)),
+            inner,
         );
     }
 }

@@ -707,7 +707,7 @@ fn recent_row(
             .or(thread.updated_at)
             .or(thread.created_at)
             .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
-            .map(|t| t.format("%m-%d %H:%M UTC").to_string())
+            .map(|t| t.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string())
             .unwrap_or_else(|| "Unavailable".into()),
         cwd: cwd.clone().unwrap_or_else(|| "Unavailable".into()),
         retirement_note: (state == RecentThreadState::Ambiguous)

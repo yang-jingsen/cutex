@@ -9210,11 +9210,7 @@ fn selector_default_profile_name(model: &SelectorModel) -> Option<&str> {
 }
 
 fn lifecycle_style(state: CutexSessionLifecycleState) -> Style {
-    match state {
-        CutexSessionLifecycleState::Online => Style::new().fg(Color::Green),
-        CutexSessionLifecycleState::Stale => Style::new().fg(Color::Yellow),
-        CutexSessionLifecycleState::Offline => Style::new().fg(Color::DarkGray),
-    }
+    Style::new().fg(crate::cli_app::session_tui_layout::runtime_status_color(state.label()))
 }
 
 pub(super) fn footer_hints(hints: &[(&'static str, &'static str)]) -> Vec<Span<'static>> {
@@ -9224,7 +9220,7 @@ pub(super) fn footer_hints(hints: &[(&'static str, &'static str)]) -> Vec<Span<'
         spans.push(Span::styled(*key, key_style));
         if !description.is_empty() {
             spans.push(Span::raw(" "));
-            spans.push(Span::raw(*description));
+            spans.push(Span::styled(*description, Style::new().fg(crate::cli_app::session_tui_layout::FOOTER_DESCRIPTION)));
         }
         spans.push(Span::raw("  "));
     }

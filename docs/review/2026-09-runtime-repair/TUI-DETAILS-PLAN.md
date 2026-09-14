@@ -109,3 +109,38 @@ Agent 的“最近全局活动”不一定属于这项 Task，必须保留“Age
 4. 用 80/120/180/280 列实际终端检查：无额外切换 alternate screen；两栏边界一致；筛选只占左栏；快速移动/刷新/resize 不显示旧对象；窄屏能进出 Details；首屏可看懂，无满屏 ID；不因渲染触发模型、历史解析或管理写入。
 
 本轮先修的独立缺陷：Tasks 重建终端导致的闪屏来源、Sessions 重复绘制导致的标题残色、各页标题前缀着色、Details 快捷键提示、profile 选中变色。大范围布局按本方案审阅后再做。
+
+## 6. 状态与时间补充（后续消息合并）
+
+- RECENCY 按运行 Cutex 的主机本地时区显示 `MM-DD HH:MM`；底层 epoch 不变。SSH 客户端的时区不会自动传入服务器。
+- PROJECT 查询不到显示 `N/A`；确认没有项目仍用 `-`。技术详情保留具体原因。
+- 所有底部说明文字统一白色，快捷键主题蓝。
+- Agent 生命周期只有 Online / Stale / Offline：分别用 #E08EB2 / #74BAC3 / 灰色；未知或不可用用 #D9B45F。选中行不改变语义色。
+- Sessions 还显示 managed、unmanaged（中性文字）、retired（灰），cwd unavailable、ambiguous mapping（金）。这些是关联状态，不是运行状态，不改名伪装成 Online。
+- Task 状态还有 queued、assigned（蓝）、running（当前保留绿）、review（粉）、blocked（金）、closed（灰）。本轮未把它们一概套成 Agent 的三状态；颜色引用也集中在主题模块，后续可以单独调整。
+
+## 7. Cancel / Discard / Save 确认流程
+
+已找到共用的 LeaveReview：原本清空整屏，只显示 Cancel / Discard and leave / Save 几行。创建 Project 的离开确认与设置页离开确认都走它；本轮先将它改为居中小弹窗，背景页面保留。
+
+- 标题 Unsaved changes；提示是否带着未保存修改离开。
+- Keep editing：取消本次离开，保留草稿；Esc 同义，避免单独 Cancel 容易被理解成“取消创建”。
+- Discard and leave：丢弃本地草稿再执行原来的离开动作。
+- Save：只有调用方确实支持保存才出现；沿用当前保存后处理，失败仍留在编辑页。**不承诺 Save 会自动完成原离开动作**；“保存成功后离开”需要单独梳理异步保存完成事件，再决定是否统一。
+- 默认继续编辑；可用左右/Tab 选择，Enter 确认。不要一按 Enter 就丢弃草稿。
+
+后续排查清单：Project Create/Appearance、Global/Agent settings、Profile 编辑/重命名/移除、Adopt/启动等业务确认。前四类统一草稿离开提示；涉及实际业务写入的确认保留明确对象、动作和失败结果，不把它们都叫 Cancel。已有独立居中确认框先保持，避免同时改变其保存语义。
+
+## 8. 列表边框偶发错位
+
+用户观察：Agents 和 Projects 的 List 内第三行右侧边框经常比其他行靠左，偶尔正常。此项独立于布局方案，按渲染缺陷调查。
+
+当前证据：180 列 PTY 捕获中，Agents 左列表所有数据行右边框均在第 110 列，Projects 在第 180 列；这只能说明该次捕获正常，不能排除真实终端的间歇问题。后续覆盖窗口缩放、列表更新及含宽字符内容，区分实际光标位置错误与字体/终端显示宽度差异。未定位前不通过随意补空格处理。
+
+补充观察：用户明确对应 Agents 的 scpolya-2、Projects 的 IFM（均第三条数据）；往往刚切入出现，移动选中项到该行即恢复。优先排查切入帧和增量绘制，暂不归因于名称长度。
+
+追加验证：`capture-tui-borders.py` 在同一 PTY 依次切换两页，窗口宽度 180→100→140→80→180，每个尺寸捕获切入和三次向下移动；保存 32 份最终尺寸/状态组合，数据行边框坐标均一致。该模拟终端结果未复现用户终端现象；终端种类及“切入”具体路径待确认。当前没有为此加入整屏 clear 或强制全量重绘，避免未经验证重新引入闪屏。
+
+环境已确认：PyCharm Terminal，切换顶部 Panel（不是从 cute-codex 返回）。Agents 第三条 scpolya-2 的 Online 比其他行靠前约 3 个字符；Projects 第三条 IFM 从 Director 第二列起左移约 5 个字符，边框随之后移位置错误。应检查第二列之前的输出定位及切页差分，不能仅修右边框。两个名称均为 ASCII，当前没有支持“名称含宽字符”归因的证据。
+
+JetBrains 解析验证：从 Cutex 捕获首次进入 Agents/Projects 和往返切页的原始 ANSI 输出，用本机 IntelliJ 安装自带的 `intellij.libraries.jediterm.core.jar` 在无 GUI 模式回放。四次结果均对齐：180 列时 Agents 各行 Online 为零基列 49、左列表右边框 109；Projects IFM 的 Director 为 115、右边框 179。此验证覆盖该版本 JediTerm 的逻辑缓冲区，不覆盖用户 PyCharm 的版本、终端引擎及实际字体绘制；问题仍未修复。回放程序与原始捕获仅保留本地，不上传运行内容。

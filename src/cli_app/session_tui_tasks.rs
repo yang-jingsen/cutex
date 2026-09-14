@@ -71,10 +71,10 @@ impl TaskState {
     fn style(self) -> Style {
         match self {
             Self::Queued | Self::Assigned => Style::new().fg(crate::cli_app::session_tui_layout::FOCUS),
-            Self::Running => Style::new().fg(Color::Green),
+            Self::Running => Style::new().fg(crate::cli_app::session_tui_layout::SUCCESS),
             Self::ReviewReady => Style::new().fg(crate::cli_app::session_tui_layout::ACCENT),
-            Self::Blocked => Style::new().fg(Color::Yellow),
-            Self::Closed => Style::new().fg(Color::DarkGray),
+            Self::Blocked => Style::new().fg(crate::cli_app::session_tui_layout::WARNING),
+            Self::Closed => Style::new().fg(crate::cli_app::session_tui_layout::MUTED),
         }
     }
 

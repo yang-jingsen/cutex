@@ -92,9 +92,9 @@ mod tests {
             let mut x = 3;
             for (column, w) in columns {
                 if column == Column::Status {
-                    assert_eq!(buffer[(x, 2)].fg, Color::LightGreen);
+                    assert_eq!(buffer[(x, 2)].fg, crate::cli_app::session_tui_layout::STATUS_ONLINE);
                     assert_eq!(buffer[(x, 3)].fg, Color::DarkGray);
-                    assert_eq!(buffer[(x, 4)].fg, Color::Yellow);
+                    assert_eq!(buffer[(x, 4)].fg, crate::cli_app::session_tui_layout::STATUS_UNKNOWN);
                 }
                 if column == Column::Profile {
                     assert_eq!(buffer[(x, 2)].symbol(), "~");
@@ -528,6 +528,7 @@ impl Column {
             Self::Activity => row.activity.clone(),
             Self::Project => match &row.project {
                 Observation::Known(value) if value == "unassigned" => "-".into(),
+                Observation::Unavailable(_) => "N/A".into(),
                 _ => row.project.label(),
             },
             Self::Profile => profile_label(row),
@@ -587,23 +588,11 @@ fn profile_label(row: &AgentSessionView) -> String {
     }
 }
 
-fn runtime_style(runtime: &Observation<String>, selected: bool) -> Style {
+fn runtime_style(runtime: &Observation<String>) -> Style {
     let color = match runtime {
-        Observation::Known(value) if value.eq_ignore_ascii_case("online") => {
-            if selected {
-                Color::LightGreen
-            } else {
-                Color::Green
-            }
-        }
-        Observation::Known(value) if value.eq_ignore_ascii_case("offline") => {
-            if selected {
-                Color::Gray
-            } else {
-                Color::DarkGray
-            }
-        }
-        _ => Color::Yellow,
+        Observation::Known(value) => crate::cli_app::session_tui_layout::runtime_status_color(value),
+        Observation::Stale(_, _) => crate::cli_app::session_tui_layout::STATUS_STALE,
+        Observation::Unavailable(_) => crate::cli_app::session_tui_layout::STATUS_UNKNOWN,
     };
     Style::new().fg(color)
 }
@@ -613,7 +602,7 @@ fn profile_style(row: &AgentSessionView) -> Style {
         crate::cli_app::session_tui_layout::ACCENT
     } else if matches!(row.effective_profile, Observation::Known(ref value) if !value.trim().is_empty()) {
         Color::DarkGray
-    } else { Color::Yellow })
+    } else { crate::cli_app::session_tui_layout::STATUS_UNKNOWN })
 }
 
 fn name_line(row: &AgentSessionView, width: usize) -> Line<'static> {
@@ -703,8 +692,9 @@ pub(super) fn render_table(
                     return Cell::from(name_line(row, usize::from(*w)));
                 }
                 let style = match c {
-                    Column::Status => runtime_style(&row.runtime, selected),
+                    Column::Status => runtime_style(&row.runtime),
                     Column::Profile => profile_style(row),
+                    Column::Project if matches!(row.project, Observation::Unavailable(_)) => Style::new().fg(crate::cli_app::session_tui_layout::STATUS_UNKNOWN),
                     Column::Role => Style::new().fg(crate::cli_app::session_tui_layout::FOCUS),
                     Column::Activity | Column::Updated => Style::new().fg(Color::Gray),
                     _ => Style::new(),
@@ -960,7 +950,7 @@ fn inspector_lines(row: &AgentSessionView) -> Vec<Line<'static>> {
         field(
             "Status",
             row.runtime.label(),
-            runtime_style(&row.runtime, false),
+            runtime_style(&row.runtime),
         ),
         field("Cutex Project", row.project.label(), Style::new()),
     ];
