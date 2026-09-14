@@ -458,6 +458,18 @@ pub fn run() -> anyhow::Result<()> {
         .open(root.join("outbound.lock"))?;
     lock.try_lock_exclusive()
         .context("notification worker already running")?;
+    std::thread::Builder::new().name("cutex-notification-state".into()).spawn(|| {
+        loop {
+            match super::state::tick() {
+                Ok(true) => {},
+                Ok(false) => std::thread::sleep(Duration::from_secs(1)),
+                Err(error) => {
+                    eprintln!("notification state collector: {error}");
+                    std::thread::sleep(Duration::from_secs(5));
+                }
+            }
+        }
+    })?;
     let delivery_root = root.clone();
     std::thread::spawn(move || {
         let Ok(store) = Store::open(&delivery_root) else {
@@ -592,6 +604,8 @@ pub fn handle_request(
     let path = request.path.split('?').next().unwrap_or_default();
     let result = (|| -> anyhow::Result<Value> {
         match (request.method.as_str(), path) {
+            ("GET", "/v2/notifications/states") => super::state::snapshot(),
+            ("POST", "/v2/notifications/ack") => super::state::acknowledge(serde_json::from_slice(&request.body)?),
             ("GET", "/v2/notifications/outbound") => status(),
             ("POST", "/v2/notifications/outbound") => {
                 set_config(&serde_json::from_slice(&request.body)?)

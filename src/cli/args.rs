@@ -1328,6 +1328,10 @@ pub enum ManagementSeatCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum NotifyCommand {
+    /// Full per-session notification state snapshot for external adapters
+    States,
+    /// Acknowledge only the exact reminder previously displayed to the user
+    Ack { thread_id: String, reminder_id: String },
     /// Run the independent event-to-webhook adapter
     Run,
     /// Inspect worker health and bounded outbox

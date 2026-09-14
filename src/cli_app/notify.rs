@@ -2,6 +2,8 @@ use cutex::cli::args::NotifyCommand;
 
 pub(crate) fn run_command(command: NotifyCommand) -> anyhow::Result<()> {
     let result = match command {
+        NotifyCommand::States => cutex::notify::state::snapshot(),
+        NotifyCommand::Ack { thread_id, reminder_id } => cutex::notify::state::acknowledge(cutex::notify::state::Ack { thread_id, reminder_id }),
         NotifyCommand::Run => return cutex::notify::outbound::run(),
         NotifyCommand::Status => cutex::notify::outbound::status(),
         NotifyCommand::Configure { file } => {
