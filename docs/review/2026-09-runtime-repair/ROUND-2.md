@@ -2,6 +2,8 @@
 
 本轮材料补齐实际部署的 cute-codex light 源码、独立 Job Service 和 PRH/hostctl。请以指定 commit 为审核对象，不能仅查看两仓库的 main/release。最新追加了消息显示、Task 合同交接和 Job cwd / launcher 兼容修复，详见 [修复记录](MESSAGE-TASK-JOB-FIX.md)。分隔线时间恢复详见 [时间显示记录](TIMESTAMP-FIX.md)。legacy 分页遗漏的补修详见 [修复记录](LEGACY-TIMELINE-FIX.md)。Task MCP 参数可用性修复详见 [记录](TASK-MCP-ARGUMENTS-FIX.md)。MCP resubmit 传输修复见 [记录](TASK-MCP-RESUBMIT-TRANSPORT-FIX.md)，通知恢复排序修复见 [调查](TASK-NOTIFICATION-DELAY-FINDINGS.md)，本轮全部自定义显示见 [清单](CUSTOM-EVENT-DISPLAY.md)。旧发布记录保留在 Git 历史。
 
+最新：Cutex TUI 导航/状态/配色统一与 cute-codex resume 技能竞态修复见 [记录](TUI-SHELL-AND-SKILLS.md)。Cutex release-runtime-r27 对应 `4fb7a9c`，cute-codex release-native-r8 对应 `7e1b32737`。以下较早发布表保留作历史参考。
+
 ## 源码与部署对应
 
 | 组件 | 固定源码 / 审核位置 | 说明 |
