@@ -6,7 +6,7 @@
 
 | 组件 | 固定源码 / 审核位置 | 说明 |
 | --- | --- | --- |
-| Cutex CLI、Agent Bus、Management API、Task Service | [`8f00f55`](https://github.com/yang-jingsen/cutex/tree/8f00f55f1242e8bd2137d9b51d8eaa296c5edcb2)；分支 `review/runtime-repair-20260914` | release-runtime-r21 的代码；后续提交补充审核材料。 |
+| Cutex CLI、Agent Bus、Management API、Task Service | [`8fbd40e`](https://github.com/yang-jingsen/cutex/tree/8fbd40e57062ed352d8c28317f42dec5cf75817b)；分支 `review/runtime-repair-20260914` | release-runtime-r23 使用优化的 release 构建，包含分栏修复与 attach 去重校验；后续提交补充审核材料。 |
 | cute-codex CLI、app-server、Code Mode host | [`4e3e2b1fc9b1c8931e7a472ab01b665a089f42d3`](https://github.com/yang-jingsen/cute-codex/tree/4e3e2b1fc9b1c8931e7a472ab01b665a089f42d3)；分支 `review/runtime-repair-20260914` | release-native-r4 CLI / app-server 已重建，补齐 legacy 时间线缓存；Code Mode host 未改动。用户授权重启在线 owner 使修复生效。 |
 | Cutex MCP facade | Cutex [`8f00f55f1242e8bd2137d9b51d8eaa296c5edcb2`](https://github.com/yang-jingsen/cutex/tree/8f00f55f1242e8bd2137d9b51d8eaa296c5edcb2)，`src/bin/cutex-mcp.rs` | r21 重建 facade，新增 assignee 合同读取工具；现有 MCP 进程在下次启动时换用新版本。 |
 | Job Service / Job MCP adapter | [`bbaebdd7a4ec6c05290d633d7ad2a174f53468f5`](https://github.com/yang-jingsen/cutex/tree/bbaebdd7a4ec6c05290d633d7ad2a174f53468f5)；分支 `review/job-service-20260914` | 独立 Git 历史发布在 Cutex 的专用分支。主审核分支中的 `review-sources/job-service/` 是完全相同的 tracked source。 |
