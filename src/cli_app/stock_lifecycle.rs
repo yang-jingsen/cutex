@@ -1008,7 +1008,8 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
         !bundle.common_ingress() || bundle.soon_ingress(),
         "U+S6 bundle contains only app-server; this slice has no pinned compatible CLI attach artifact"
     );
-    verify_stock_process(record, binding)?;
+    // Reuse the bundle already validated above instead of hashing it again.
+    verify_stock_process_with_bundle(binding, &bundle)?;
     super::app_server_runtime::verify_exact_live_runtime_claim(record, binding)?;
     ensure!(
         record.app_server_launch_claim_id.is_none(),
