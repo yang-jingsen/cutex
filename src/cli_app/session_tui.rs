@@ -4569,7 +4569,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
             }
             PrimaryPanel::Tasks => {
                 let (outcome, mut model) =
-                    shell.handoff(|| super::session_tui_tasks::run(tasks_model.take()))??;
+                    super::session_tui_tasks::run(shell.terminal(), &mut events, tasks_model.take())?;
                 if std::mem::take(&mut model.open_settings_requested) {
                     selector_command(&mut selector_model, Command::Settings);
                     selector_model.settings_return_panel = Some(PrimaryPanel::Tasks);
@@ -7153,7 +7153,9 @@ fn render_selector_contents(frame: &mut Frame<'_>, model: &SelectorModel) {
         Paragraph::new(crate::cli_app::session_tui_layout::tabs(active_panel, area.width)),
         chunks[0],
     );
-    render_header(frame, chunks[1], model);
+    if !matches!(model.mode, SelectorMode::RecentSessions) {
+        render_header(frame, chunks[1], model);
+    }
     let main_area = Rect {
         y: chunks[2].y,
         height: chunks[2].height.saturating_add(chunks[3].height),
@@ -7470,14 +7472,9 @@ fn render_recent_context(frame: &mut Frame<'_>, area: Rect, model: &SelectorMode
         }
         RecentLoadState::Failed(message) => format!("Catalog unavailable: {message}"),
     };
-    frame.render_widget(
-        Paragraph::new(format!(
-            "Recent Sessions {}/{} · {text}",
-            model.recent.visible_rows().len(),
-            model.recent.rows().len()
-        )),
-        area,
-    );
+    let mut heading = crate::cli_app::session_tui_layout::heading("Recent", "Sessions");
+    heading.spans.push(Span::styled(format!(" {}/{} · {text}", model.recent.visible_rows().len(), model.recent.rows().len()), Style::new().fg(Color::DarkGray)));
+    frame.render_widget(Paragraph::new(heading), area);
 }
 
 fn render_recent_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
@@ -9244,10 +9241,20 @@ fn read_only_footer_hints(hints: &[(&'static str, &'static str)]) -> Vec<Span<'s
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
+    if matches!(model.mode, SelectorMode::Agents | SelectorMode::RecentSessions)
+        && (model.inspector_overview_focused || model.recent_inspecting)
+        && !selector_modal(model)
+    {
+        frame.render_widget(Paragraph::new(Line::from(footer_hints(&[
+            ("↑/↓", "scroll"), ("PgUp/Dn", "page"), ("Home/End", "edge"),
+            ("Esc", "list"), ("F2", "details"), ("F1", "commands"),
+        ]))).wrap(Wrap { trim: true }), area);
+        return;
+    }
     if matches!(
         model.mode,
         SelectorMode::Agents | SelectorMode::RecentSessions
-    ) && !selector_modal(model)
+    ) && !selector_modal(model) && !model.inspector_overview_focused && !model.recent_inspecting
     {
         let line = if (matches!(model.mode, SelectorMode::Agents) && model.filter_focused)
             || (matches!(model.mode, SelectorMode::RecentSessions) && model.recent.filter_focused())
@@ -9255,7 +9262,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
             Line::from("Type · ←/→ Home/End · Backspace/Delete · Ctrl+U clear · Enter/Esc/Tab finish · F1 commands")
         } else {
             Line::from(footer_hints(&[
-                ("↑/↓", "select"), ("Enter", "open"), ("←/→", "panels"),
+                ("↑/↓", "select"), ("Enter", "open"), ("Alt+I", "inspect"), ("←/→", "panels"),
                 ("/", "filter"), ("Alt+A", "actions"), ("Alt+E", "edit"),
                 ("F5", "refresh"), ("F2", "details"), ("F1", "commands"), ("Esc", "back"),
             ]))

@@ -1986,10 +1986,8 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(
-                "Cutex Projects",
-                Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("Cutex", Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD)),
+            Span::styled(" Projects", Style::new().fg(Color::White).add_modifier(Modifier::BOLD)),
         ])),
         areas[1],
     );

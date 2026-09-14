@@ -33,7 +33,7 @@ pub(super) fn run(
                 areas[0],
             );
             frame.render_widget(
-                Paragraph::new("Cutex Jobs").style(Style::new().fg(theme::FOCUS)),
+                Paragraph::new(theme::heading("Cutex", "Jobs")),
                 areas[1],
             );
             frame.render_widget(

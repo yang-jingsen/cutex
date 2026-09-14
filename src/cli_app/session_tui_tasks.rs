@@ -8,18 +8,13 @@
 
 use ratatui::widgets::Wrap;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::{self, IsTerminal, Stdout};
+use std::io::Stdout;
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::Context;
 use chrono::{DateTime, Utc};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::event::{ Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use cutex::agent_bus::client::agent_bus_fetch_agents_if_healthy;
 use cutex::agent_bus::model::AgentBusAgent;
 use cutex::agent_management::{ProjectId, ProjectPaletteColor};
@@ -47,7 +42,6 @@ use super::session_tui_input::{self as input_policy, Command};
 use super::session_tui_view::{self as views, DetailScroll};
 use super::session_tui_workspace::{primary_panel_shortcut, PrimaryPanel, PrimaryPanelOutcome};
 
-const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 type TaskTerminal = Terminal<CrosstermBackend<Stdout>>;
@@ -571,26 +565,18 @@ fn director_status_label(status: DirectorActionStatus) -> &'static str {
 }
 
 pub(super) fn run(
+    terminal: &mut TaskTerminal,
+    events: &mut super::session_tui::ShellEvents,
     previous_model: Option<TaskModel>,
 ) -> anyhow::Result<(PrimaryPanelOutcome, TaskModel)> {
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        anyhow::bail!("Tasks workspace requires an interactive terminal");
-    }
-    enable_raw_mode().context("Failed to enable terminal raw mode")?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("Failed to enter alternate screen")?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).context("Failed to create Tasks terminal")?;
     let mut model = previous_model.unwrap_or_default();
-    let result = run_loop(&mut terminal, &mut model);
-    disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
-    terminal.show_cursor().ok();
-    Ok((result?, model))
+    let outcome = run_loop(terminal, events, &mut model)?;
+    Ok((outcome, model))
 }
 
 fn run_loop(
     terminal: &mut TaskTerminal,
+    events: &mut super::session_tui::ShellEvents,
     model: &mut TaskModel,
 ) -> anyhow::Result<PrimaryPanelOutcome> {
     let (sender, receiver) = mpsc::channel();
@@ -619,10 +605,7 @@ fn run_loop(
             Err(TryRecvError::Empty) => {}
         }
         terminal.draw(|frame| render(frame, model))?;
-        if !event::poll(EVENT_POLL_INTERVAL)? {
-            continue;
-        }
-        let Event::Key(key) = event::read()? else {
+        let Some(Event::Key(key)) = events.next()? else {
             continue;
         };
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
@@ -760,10 +743,8 @@ fn render(frame: &mut Frame<'_>, model: &TaskModel) {
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(
-                "Cutex Tasks",
-                Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("Cutex", Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD)),
+            Span::styled(" Tasks", Style::new().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::raw(format!("  {visible_count} {mode}")),
             Span::styled("  read-only", Style::new().fg(Color::DarkGray)),
         ])),

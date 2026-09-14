@@ -98,7 +98,7 @@ mod tests {
                 }
                 if column == Column::Profile {
                     assert_eq!(buffer[(x, 2)].symbol(), "~");
-                    assert_eq!(buffer[(x, 2)].fg, Color::Gray);
+                    assert_eq!(buffer[(x, 2)].fg, Color::DarkGray);
                     assert_eq!(buffer[(x, 3)].fg, crate::cli_app::session_tui_layout::ACCENT);
                     assert!(text(buffer).contains("~aemeath"));
                     assert!(text(buffer).contains("~?"));
@@ -608,11 +608,11 @@ fn runtime_style(runtime: &Observation<String>, selected: bool) -> Style {
     Style::new().fg(color)
 }
 
-fn profile_style(row: &AgentSessionView, selected: bool) -> Style {
+fn profile_style(row: &AgentSessionView) -> Style {
     Style::new().fg(if row.configured_profile.is_some() {
-        if selected { Color::LightMagenta } else { crate::cli_app::session_tui_layout::ACCENT }
+        crate::cli_app::session_tui_layout::ACCENT
     } else if matches!(row.effective_profile, Observation::Known(ref value) if !value.trim().is_empty()) {
-        if selected { Color::Gray } else { Color::DarkGray }
+        Color::DarkGray
     } else { Color::Yellow })
 }
 
@@ -704,7 +704,7 @@ pub(super) fn render_table(
                 }
                 let style = match c {
                     Column::Status => runtime_style(&row.runtime, selected),
-                    Column::Profile => profile_style(row, selected),
+                    Column::Profile => profile_style(row),
                     Column::Role => Style::new().fg(crate::cli_app::session_tui_layout::FOCUS),
                     Column::Activity | Column::Updated => Style::new().fg(Color::Gray),
                     _ => Style::new(),
@@ -986,12 +986,12 @@ fn inspector_lines(row: &AgentSessionView) -> Vec<Line<'static>> {
             row.configured_profile
                 .clone()
                 .unwrap_or_else(|| "inherit".into()),
-            profile_style(row, false),
+            profile_style(row),
         ),
         field(
             "Effective",
             row.effective_profile.label(),
-            profile_style(row, false),
+            profile_style(row),
         ),
         Line::default(),
         heading("Context"),

@@ -25,3 +25,13 @@ Changing only --cd did not align the local frontend configuration in this remote
 Two regression tests passed. The rebuilt CLI resumed the actual ifm session from the mismatched launch directory and rendered bio-review-bridge in the popup without submitting a prompt. The related race-prone logic was inherited from upstream; there is no evidence that the custom event display changes introduced it.
 
 Deployment uses the new CLI with unchanged app-server/Code Mode host copied beside it. 35 desired manifests updated; four online native processes restarted and verified Ready with the r8 executable path; the cute-codex shortcut now selects r8. Job Service had zero active Jobs when its launcher list was extended. No skill enable/disable rules or history storage were changed.
+
+## Follow-up: terminal handoff, heading paint, Details discoverability
+
+Tasks now borrows the same terminal and ShellEvents as Agents/Sessions/Projects/Jobs. Switching panels no longer leaves and re-enters alternate screen for Tasks. An actual PTY tour through all panels and Tasks → Jobs → Settings reports one alternate-screen entry at startup and zero exits before quitting. This fixes the identified handoff source; it does not claim every possible emulator redraw artifact has been eliminated.
+
+Sessions no longer paints the generic header first. Its `Recent` prefix and `Sessions` title now have explicit styles, as do Cutex Projects/Tasks/Jobs. Prior double painting retained the color of the five-character Cutex prefix under the first five characters of Recent. Actual captured cells verify the complete prefix color and white title.
+
+List shortcuts now advertise Alt+I, and focused Details shows scrolling/return shortcuts. At 80 columns, Alt+I opens a full-page Agent inspector and Esc returns to the same list. Enter behavior is unchanged: when filtering, first Enter finishes filtering; the next invokes the primary action. The proposed unified layout and Enter behavior are documented separately in TUI-DETAILS-PLAN.md and are not implemented in this patch.
+
+Profile foreground color no longer depends on selected-row state. Existing table rendering tests pass (6); TUI suite before this final color-only adjustment: 270 passed, the same 3 baseline failures, 2 ignored. Native notification payload tests: 2 passed; these do not validate outbound delivery. Notification investigation and proposed repair are in NOTIFICATION-OUTBOUND-PLAN.md; no notification service was enabled or external destination contacted.

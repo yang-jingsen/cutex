@@ -43,6 +43,14 @@ pub(super) fn inspector_panes(area: Rect, visible: bool) -> Option<(Rect, Rect)>
     ))
 }
 
+/// Explicit styles prevent stale colors when a shorter heading replaces another.
+pub(super) fn heading(prefix: &str, title: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(prefix.to_owned(), Style::new().fg(FOCUS).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" {title}"), Style::new().fg(TEXT).add_modifier(Modifier::BOLD)),
+    ])
+}
+
 pub(super) fn tabs(active: PrimaryPanel, width: u16) -> Line<'static> {
     let mut spans = vec![
         Span::styled("CUTEX", Style::new().fg(BRAND).add_modifier(Modifier::BOLD)),
