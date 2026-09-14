@@ -1029,13 +1029,11 @@ impl GlobalSettingsSnapshot {
                 self.editable_option("Model (selected default profile)", GlobalSettingsField::DefaultModel, draft),
                 self.editable_option("Reasoning effort", GlobalSettingsField::DefaultReasoning, draft),
                 self.editable_option("Notification", GlobalSettingsField::DefaultNotification, draft),
-                SessionTuiSettingOption::new("Scope", "New sessions / agents only; blank model follows profile"),
             ]),
             SessionTuiSettingCategory::new("Network", vec![
                 self.editable_option("Proxy enabled", GlobalSettingsField::ProxyEnabled, draft),
                 self.editable_option("Proxy URL", GlobalSettingsField::ProxyUrl, draft),
-                self.editable_option("NO_PROXY", GlobalSettingsField::ProxyNoProxy, draft),
-                SessionTuiSettingOption::new("Apply", "New sessions / next managed start"),
+                self.editable_option("Bypass proxy", GlobalSettingsField::ProxyNoProxy, draft),
             ]),
             SessionTuiSettingCategory::new("Notifications", vec![
                 SessionTuiSettingOption::new("Labels / colors / bold", "~/.cutex/notifications/config.json"),
@@ -1055,7 +1053,6 @@ impl GlobalSettingsSnapshot {
                 SessionTuiSettingOption::new("Agent Bus", "Required for managed agents"),
                 self.editable_option("Agent Bus port", GlobalSettingsField::AgentBusPort, draft),
                 self.editable_option("Agent Bus token", GlobalSettingsField::AgentBusToken, draft),
-                SessionTuiSettingOption::new("Apply", "Maintenance: coordinate service restart and clients"),
             ]),
         ]
     }

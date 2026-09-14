@@ -931,10 +931,13 @@ impl SelectorModel {
                 }
             }
             SelectorMode::Settings { target, category, option, focus, view: SettingsView::Categories } => {
-                let focus = match (focus, forward) {
+                let focus = if target.is_global_settings() {
+                    if focus == SettingsFocus::Categories { SettingsFocus::Options } else { SettingsFocus::Categories }
+                } else { match (focus, forward) {
                     (SettingsFocus::Categories, true) | (SettingsFocus::Value, false) => SettingsFocus::Options,
                     (SettingsFocus::Options, true) | (SettingsFocus::Categories, false) => SettingsFocus::Value,
                     _ => SettingsFocus::Categories,
+                }
                 };
                 self.mode = SelectorMode::Settings { target, category, option, focus, view: SettingsView::Categories };
                 SelectorControl::Continue
@@ -1009,6 +1012,18 @@ impl SelectorModel {
             SelectorMode::Agents => SelectorControl::Continue,
             SelectorMode::Actions { .. } if !expand => self.handle(SelectorEvent::Back),
             SelectorMode::Actions { .. } => SelectorControl::Continue,
+            SelectorMode::Settings { target: SelectorTarget::GlobalSettings, focus, .. } => {
+                if focus != SettingsFocus::Categories {
+                    let choice = self.active_setting_option().and_then(|o| o.global_field)
+                        .is_some_and(|f| matches!(SettingsEditField::Global(f).editor_kind(), SessionSettingsEditorKind::Choice));
+                    if choice {
+                        self.open_active_setting_editor();
+                        self.handle_settings_overlay_event(if expand { SelectorEvent::Down } else { SelectorEvent::Up }, &SelectorTarget::GlobalSettings);
+                        self.handle_settings_overlay_event(SelectorEvent::Activate, &SelectorTarget::GlobalSettings);
+                    }
+                }
+                SelectorControl::Continue
+            }
             SelectorMode::Settings { .. } => self.handle(if expand {
                 SelectorEvent::OpenActions
             } else {
@@ -2060,7 +2075,7 @@ impl SelectorModel {
         }
 
         let mut open_editor = false;
-        if matches!(event, SelectorEvent::Insert('v' | 'V')) {
+        if matches!(event, SelectorEvent::Insert('v' | 'V')) && !target.is_global_settings() {
             self.mode = SelectorMode::Settings {
                 target,
                 category: next_category,
@@ -2145,6 +2160,7 @@ impl SelectorModel {
                 },
                 SelectorEvent::OpenActions | SelectorEvent::Activate => match next_focus {
                     SettingsFocus::Categories => next_focus = SettingsFocus::Options,
+                    SettingsFocus::Options if target.is_global_settings() => open_editor = event == SelectorEvent::Activate,
                     SettingsFocus::Options => next_focus = SettingsFocus::Value,
                     SettingsFocus::Value => {
                         if event == SelectorEvent::Activate {
@@ -7194,7 +7210,6 @@ fn selector_list_panel_from_horizontal_key(
         {
             PrimaryPanel::Recent
         }
-        SelectorMode::Settings { target, .. } if target.uses_global_settings() => PrimaryPanel::Settings,
         _ => return None,
     };
     match key.code {
@@ -7488,7 +7503,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
     if let Some(settings_view) = model.settings_view() {
         let global = matches!(model.mode, SelectorMode::Settings { target: SelectorTarget::GlobalSettings, .. });
         if global {
-            spans.push(Span::styled(format!("  Layout: {}", settings_view.label()), Style::new().fg(crate::cli_app::session_tui_layout::muted())));
+            // Global Settings has one categorized layout.
         } else {
         spans.push(Span::styled("  view ", Style::new().fg(Color::DarkGray)));
         if area.width < SETTINGS_TWO_PANE_MIN_WIDTH {
@@ -8718,6 +8733,35 @@ fn render_categorized_settings(frame: &mut Frame<'_>, area: Rect, model: &Select
     let Some(focus) = model.settings_focus() else {
         return;
     };
+    if matches!(model.mode, SelectorMode::Settings { target: SelectorTarget::GlobalSettings, .. }) {
+        let render_values = |frame: &mut Frame<'_>, area: Rect| {
+            let help_height = if area.height >= 12 { 6 } else { 3 };
+            let [table, help] = Layout::vertical([Constraint::Min(3), Constraint::Length(help_height)]).areas(area);
+            render_setting_options(frame, table, model, true);
+            let category = model.active_setting_category().map(|c| c.label).unwrap_or_default();
+            let option = model.active_setting_option();
+            let detail = match option.and_then(|o| o.global_field) {
+                Some(GlobalSettingsField::ProxyNoProxy) => "NO_PROXY: comma-separated addresses that bypass the proxy, e.g. localhost,127.0.0.1,::1.",
+                _ => "",
+            };
+            let scope = match category {
+                "Defaults" => "Used for new sessions; managed creation prefills these values. Blank model follows profile.",
+                "Network" => "Takes effect for new sessions / next managed start.",
+                "Services" => "Changes require coordinating service and client restarts.",
+                _ => "",
+            };
+            let help_text = format!("{}\n{}\n{}", option.map(|o| format!("{}: {}", o.label, o.value)).unwrap_or_default(), detail, scope);
+            frame.render_widget(Paragraph::new(help_text).style(Style::new().fg(crate::cli_app::session_tui_layout::muted())).wrap(Wrap { trim: false }).block(settings_panel_block(" Details ".into(), false)), help);
+        };
+        if area.width >= 60 {
+            let [categories, values] = Layout::horizontal([Constraint::Length(20), Constraint::Min(30)]).areas(area);
+            render_setting_categories(frame, categories, model);
+            render_values(frame, values);
+        } else if focus == SettingsFocus::Categories {
+            render_setting_categories(frame, area, model);
+        } else { render_values(frame, area); }
+        return;
+    }
     if area.width >= WIDE_LAYOUT_MIN_WIDTH {
         let panes = Layout::horizontal([
             Constraint::Length(22),
@@ -9506,15 +9550,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
         frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), area);
         return;
     }
-    if matches!(&model.mode, SelectorMode::Settings { target, .. } if target.uses_global_settings())
-        && !selector_modal(model)
+    if matches!(&model.mode, SelectorMode::Settings { target: SelectorTarget::GlobalSettings, .. })
+        && model.settings_overlay.is_none() && !selector_modal(model)
     {
-        let mut hints = vec![("↑/↓", "select"), ("Enter", "open")];
-        if area.width >= 66 { hints.extend([("Tab", "focus"), ("V", "view")]); }
-        if area.width >= 66 && model.settings_are_editable() {
-            hints.extend([("S", "save"), ("D", "discard")]);
-        }
-        hints.extend([("←/→", "panels"), ("F2", "details"), ("F1", "commands"), ("Esc", "back"), ("Ctrl+C", "exit")]);
+        let mut hints = vec![("↑/↓", "select"), ("←/→", "value"), ("Enter", "edit"), ("Tab", "focus")];
+        if model.settings_are_editable() { hints.extend([("S", "save"), ("D", "discard")]); }
+        if area.width >= 66 { hints.push(("Alt+1–6", "panels")); }
+        hints.extend([("Esc", "back"), ("Ctrl+C", "exit")]);
         frame.render_widget(Paragraph::new(Line::from(footer_hints(&hints))).wrap(Wrap { trim: true }), area);
         return;
     }
@@ -9733,6 +9775,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
                 ("Up/Down", "move"),
                 ("Enter", "select"),
                 ("Left/Tab/Esc", "back"),
+            ]),
+            SelectorMode::Settings { target: SelectorTarget::GlobalSettings, .. } if very_narrow => footer_hints(&[
+                ("Tab", "focus"), ("Enter", "edit"), ("S", "save"), ("Ctrl+C", "exit"),
+            ]),
+            SelectorMode::Settings { target: SelectorTarget::GlobalSettings, .. } => footer_hints(&[
+                ("←/→", "value"), ("Enter", "edit"), ("Tab", "focus"),
+                ("S", "save"), ("D", "discard"), ("Ctrl+C", "exit"),
             ]),
             SelectorMode::Settings { target, .. }
                 if target.agent_key().is_some() && very_narrow =>
@@ -10796,7 +10845,7 @@ mod tests {
             category,
             option,
             focus: SettingsFocus::Options,
-            view: SettingsView::Expanded,
+            view: SettingsView::Categories,
         };
     }
 
@@ -15724,7 +15773,7 @@ mod tests {
         global_model.handle(SelectorEvent::Down);
         global_model.handle(SelectorEvent::Down);
         let medium = rendered_text(80, &global_model);
-        assert!(medium.contains("Layout: Categories"));
+        assert!(!medium.contains("Layout:"));
         assert!(medium.contains("Global settings"));
         assert!(medium.contains("Network options"));
         assert!(medium.contains("Proxy enabled"));
@@ -15741,16 +15790,16 @@ mod tests {
         global_model.handle(SelectorEvent::Down);
         global_model.handle(SelectorEvent::Activate);
         let medium_value = rendered_text(80, &global_model);
-        assert!(medium_value.contains("Current value"));
+        assert!(medium_value.contains("Proxy URL"));
+        global_model.handle(SelectorEvent::Escape);
         assert!(medium_value.contains("Proxy URL"));
 
         global_model.handle(SelectorEvent::Insert('v'));
-        let global_expanded = rendered_text_at(120, 24, &global_model);
-        assert!(global_expanded.contains("Layout: Expanded"));
-        assert!(global_expanded.contains("SETTING"));
-        assert!(global_expanded.contains("VALUE"));
-        assert!(global_expanded.contains("Profiles"));
-        assert!(global_expanded.contains("  Manage profiles"));
+        let unchanged = rendered_text_at(120, 24, &global_model);
+        assert!(!unchanged.contains("Layout:"));
+        assert!(!unchanged.contains("Current value"));
+        assert!(unchanged.contains("Network options"));
+        assert!(unchanged.contains("Details"));
 
         let mut narrow_model = SelectorModel::new(vec![global_row()], false, false);
         selector_command(&mut narrow_model, Command::Settings);
@@ -15767,7 +15816,7 @@ mod tests {
         assert!(narrow_options.contains("Proxy enabled"));
         narrow_model.handle(SelectorEvent::Activate);
         let narrow_value = rendered_text(50, &narrow_model);
-        assert!(narrow_value.contains("Current value"));
+        assert!(narrow_model.settings_overlay.is_some());
         assert!(narrow_value.contains("Proxy enabled"));
 
         let mut narrow_choice_model = SelectorModel::new(vec![global_row()], false, false);
@@ -15785,7 +15834,7 @@ mod tests {
         global_tail_model.handle(SelectorEvent::Last);
         let global_tail = rendered_text(120, &global_tail_model);
         assert!(global_tail.contains("Agent Bus"));
-        assert!(global_tail.contains("Maintenance"));
+        assert!(rendered_text_at(120, 30, &global_tail_model).contains("restarts"));
         assert!(global_tail.contains("Ctrl+C exit"));
     }
 
@@ -16230,15 +16279,36 @@ mod tests {
     }
 
     #[test]
+    fn global_settings_arrows_stage_choices_and_leave_text_untouched() {
+        let mut model = SelectorModel::new(vec![global_row()], false, false);
+        selector_command(&mut model, Command::Settings);
+        select_global_setting(&mut model, GlobalSettingsField::DefaultNotification);
+        let original = model.active_setting_option().unwrap().value.clone();
+        assert!(matches!(route_selector_key(&mut model, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)), SelectorKeyRoute::Control(_)));
+        assert!(model.settings_overlay.is_none());
+        assert_ne!(model.active_setting_option().unwrap().value, original);
+        assert_eq!(model.settings_dirty_count(), 1);
+        route_selector_key(&mut model, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(model.active_setting_option().unwrap().value, original);
+        select_global_setting(&mut model, GlobalSettingsField::ProxyUrl);
+        let before = model.settings_dirty_count();
+        route_selector_key(&mut model, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(model.settings_dirty_count(), before);
+        assert!(model.settings_overlay.is_none());
+        route_selector_key(&mut model, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(model.settings_overlay, Some(SettingsOverlay::Text { .. })));
+        route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(model.settings_overlay.is_none());
+    }
+
+    #[test]
     fn settings_tab_cycles_local_columns_without_leaving() {
         let mut model = SelectorModel::new(vec![global_row()], false, false);
         selector_command(&mut model, Command::Settings);
         model.settings_return_panel = Some(PrimaryPanel::Recent);
         for (key, expected) in [
             (KeyCode::Tab, SettingsFocus::Options),
-            (KeyCode::Tab, SettingsFocus::Value),
             (KeyCode::Tab, SettingsFocus::Categories),
-            (KeyCode::BackTab, SettingsFocus::Value),
             (KeyCode::BackTab, SettingsFocus::Options),
             (KeyCode::BackTab, SettingsFocus::Categories),
         ] {
@@ -16285,13 +16355,14 @@ mod tests {
     }
 
     #[test]
-    fn global_settings_arrows_navigate_panels_without_opening_options() {
+    fn global_settings_category_arrows_stay_local_without_opening_options() {
         let mut model = SelectorModel::new(vec![global_row()], false, false);
         selector_command(&mut model, Command::Settings);
         let before = format!("{:?}", model.mode);
-        assert!(matches!(route_selector_key(&mut model, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)), SelectorKeyRoute::Control(None)));
+        assert!(matches!(route_selector_key(&mut model, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)), SelectorKeyRoute::Control(_)));
         assert_eq!(format!("{:?}", model.mode), before);
-        assert!(matches!(route_selector_key(&mut model, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)), SelectorKeyRoute::Switch(PrimaryPanel::Jobs)));
+        assert!(matches!(route_selector_key(&mut model, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)), SelectorKeyRoute::Control(_)));
+        assert_eq!(format!("{:?}", model.mode), before);
     }
 
     #[test]
