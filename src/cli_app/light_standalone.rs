@@ -60,11 +60,14 @@ pub(super) fn command(
         .get("mcp_servers")
         .and_then(|servers| servers.get("cutex_job"))
         .cloned();
+    let global = cutex::config::store::load_codez_config_checked()?;
+    let new_session = !args.iter().any(|arg| matches!(arg.as_str(), "resume" | "fork"));
+    let defaults = new_session.then(|| global.new_session_defaults.get(&account.name)).flatten();
     let (mut projection, model, reasoning) = Config::parse(&toml::to_string(&value)?)?.review(
         &account.id,
         files.auth_path,
-        None,
-        None,
+        defaults.and_then(|d| d.model.as_ref()),
+        defaults.and_then(|d| d.reasoning.as_ref()),
     )?;
     if let Some(tui) = &projection.settings.tui {
         projection.status = Status::review(
@@ -128,6 +131,15 @@ pub(super) fn command(
         account, &cutex::config::store::load_codez_config_checked()?,
     ));
     command.env("CUTEX_NOTIFICATION_CONTROL", std::env::current_exe()?);
+    // The helper only initializes UUIDs created after this launch, so /resume
+    // within the foreground UI cannot change an old session's preference.
+    if new_session {
+        command.env("CUTEX_NEW_NOTIFICATION", serde_json::to_string(&global.new_session_notification)?);
+        command.env("CUTEX_NEW_NOTIFICATION_SINCE", chrono::Utc::now().timestamp_millis().to_string());
+    } else {
+        command.env_remove("CUTEX_NEW_NOTIFICATION");
+        command.env_remove("CUTEX_NEW_NOTIFICATION_SINCE");
+    }
     if let Some(secret) = projection.secret()? {
         secret.apply(&mut command);
     }

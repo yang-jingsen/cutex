@@ -6,7 +6,17 @@ use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct HumanCreationDefaults {
+    pub profile: String,
+    pub model: String,
+    pub reasoning: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HumanAdoptRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_defaults: Option<HumanCreationDefaults>,
     pub action_id: AgentActionId,
     pub native_id: String,
     pub cwd: String,
@@ -96,6 +106,12 @@ impl AgentManagementProvider {
                     .get_mut(&candidate.key)
                     .expect("adoption created exact record");
                 record.formal_agent_name = Some(request.formal_name.clone());
+                if let Some(defaults) = &request.creation_defaults {
+                    anyhow::ensure!(!defaults.profile.trim().is_empty() && !defaults.model.trim().is_empty(), "Creation profile and model required");
+                    record.profile = Some(defaults.profile.clone());
+                    record.model_defaults = Some(defaults.model.clone());
+                    record.reasoning_defaults = defaults.reasoning.clone();
+                }
                 let receipt = HumanAdoptReceipt {
                     request: request.clone(),
                     record: record.clone(),
@@ -175,6 +191,7 @@ mod tests {
             .with_current_names_path(path.clone());
         let principal = HumanManagementPrincipal::authenticated();
         let request = HumanAdoptRequest {
+            creation_defaults: Some(HumanCreationDefaults { profile: "selected-profile".into(), model: "selected-model".into(), reasoning: Some("high".into()) }),
             action_id: AgentActionId::new("partial-adopt").unwrap(),
             native_id: "native-partial".into(),
             cwd: root.to_string_lossy().into_owned(),
@@ -191,6 +208,9 @@ mod tests {
                 &no_tasks,
             )
             .unwrap();
+        assert_eq!(first.adopted.record.profile.as_deref(), Some("selected-profile"));
+        assert_eq!(first.adopted.record.model_defaults.as_deref(), Some("selected-model"));
+        assert_eq!(first.adopted.record.reasoning_defaults.as_deref(), Some("high"));
         assert!(first.error.is_some());
         assert!(first.imported.is_none());
         assert!(first.adopted.import_request.is_some());
@@ -249,6 +269,7 @@ mod tests {
             .with_current_names_path(path.clone());
         let principal = HumanManagementPrincipal::authenticated();
         let request = HumanAdoptRequest {
+            creation_defaults: None,
             action_id: AgentActionId::new("adopt-test").unwrap(),
             native_id: "native-saved".into(),
             cwd: root.to_string_lossy().into_owned(),

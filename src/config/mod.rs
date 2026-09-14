@@ -8,3 +8,5 @@ pub mod paths;
 pub mod proxy;
 pub mod store;
 pub mod text;
+
+pub mod new_session;

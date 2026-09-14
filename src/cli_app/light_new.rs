@@ -8,6 +8,10 @@ pub(super) fn create(
     formal_name: &str,
     cwd: &str,
 ) -> anyhow::Result<cutex::agent_management::HumanAdoptResult> {
+    create_configured(formal_name, cwd, cutex::launch::stock::local_configuration()?, cutex::config::store::load_codez_config_checked()?.new_session_notification)
+}
+
+fn create_configured(formal_name: &str, cwd: &str, configuration: cutex::launch::stock::StockConfiguration, notification: cutex::notify::session::Level) -> anyhow::Result<cutex::agent_management::HumanAdoptResult> {
     ensure!(
         !formal_name.trim().is_empty()
             && formal_name.trim() == formal_name
@@ -17,9 +21,15 @@ pub(super) fn create(
     );
     let cwd = std::path::Path::new(cwd).canonicalize()?;
     ensure!(cwd.is_dir(), "agent cwd must be a directory");
-    let native = create_native(&cwd, &cutex::launch::stock::local_configuration()?, |_| {})?;
+    let native = create_native(&cwd, &configuration, |_| {})?;
+    cutex::notify::session::session(&native, cutex::notify::session::Change::Set(notification))?;
     super::management_control_plane::ManagementControlClient::connect()?
         .adopt_saved_native(&cutex::agent_management::HumanAdoptRequest {
+            creation_defaults: Some(cutex::agent_management::HumanCreationDefaults {
+                profile: configuration.profile_name.clone(),
+                model: configuration.model.clone(),
+                reasoning: configuration.reasoning.clone(),
+            }),
             action_id: cutex::agent_management::AgentActionId::new(format!("human-new-{native}"))?,
             native_id: native.clone(),
             cwd: cwd.to_string_lossy().into_owned(),
@@ -123,6 +133,9 @@ pub(super) fn create_native(
         "invalid native ID"
     );
     captured(&native);
+    cutex::notify::session::session(&native, cutex::notify::session::Change::Set(
+        cutex::config::store::load_codez_config_checked()?.new_session_notification,
+    )).with_context(|| format!("Native thread {native} exists; notification initialization failed"))?;
     // Once the native ID is known, always report it on later failure so that a
     // saved thread can be adopted without generating a second identity.
     let operation = || -> anyhow::Result<_> {
@@ -156,7 +169,26 @@ pub(super) fn wizard() -> anyhow::Result<Option<cutex::agent_management::HumanAd
         "Working directory",
         &std::env::current_dir()?.to_string_lossy(),
     )?;
-    let result = create(&name, &cwd)?;
+    let defaults = cutex::config::store::load_codez_config_checked()?;
+    let profile = super::prompt::prompt_line("Profile", defaults.default_profile.as_deref().unwrap_or(""))?;
+    let mut configuration = cutex::launch::stock::local_configuration_with_profile(Some(&profile))?;
+    configuration.model = super::prompt::prompt_line("Model", &configuration.model)?;
+    let reasoning = super::prompt::prompt_line("Reasoning effort (none/minimal/low/medium/high/xhigh)", configuration.reasoning.as_deref().unwrap_or(""))?;
+    ensure!(reasoning.is_empty() || ["none", "minimal", "low", "medium", "high", "xhigh"].contains(&reasoning.as_str()), "Unknown reasoning effort");
+    configuration.reasoning = (!reasoning.is_empty()).then_some(reasoning);
+    let notification = super::prompt::prompt_line("Notification (important/normal/off)", match defaults.new_session_notification {
+        cutex::notify::session::Level::Important => "important",
+        cutex::notify::session::Level::Normal => "normal",
+        cutex::notify::session::Level::Off => "off",
+    })?;
+    let notification = match notification.as_str() {
+        "important" => cutex::notify::session::Level::Important,
+        "normal" => cutex::notify::session::Level::Normal,
+        "off" => cutex::notify::session::Level::Off,
+        _ => anyhow::bail!("Unknown notification level"),
+    };
+    ensure!(!configuration.model.trim().is_empty(), "Model required");
+    let result = create_configured(&name, &cwd, configuration, notification)?;
     if let Some(error) = &result.error {
         anyhow::bail!("Agent created, but import incomplete: {error}");
     }
@@ -185,6 +217,7 @@ pub(super) fn adopt_saved(
         .context("saved thread cwd missing")?;
     let result = super::management_control_plane::ManagementControlClient::connect()?
         .adopt_saved_native(&cutex::agent_management::HumanAdoptRequest {
+            creation_defaults: None,
             action_id: cutex::agent_management::AgentActionId::new(format!(
                 "human-adopt-{native}"
             ))?,

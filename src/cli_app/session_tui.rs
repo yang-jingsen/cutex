@@ -928,6 +928,15 @@ impl SelectorModel {
                     SelectorControl::Continue
                 }
             }
+            SelectorMode::Settings { target, category, option, focus, view: SettingsView::Categories } => {
+                let focus = match (focus, forward) {
+                    (SettingsFocus::Categories, true) | (SettingsFocus::Value, false) => SettingsFocus::Options,
+                    (SettingsFocus::Options, true) | (SettingsFocus::Categories, false) => SettingsFocus::Value,
+                    _ => SettingsFocus::Categories,
+                };
+                self.mode = SelectorMode::Settings { target, category, option, focus, view: SettingsView::Categories };
+                SelectorControl::Continue
+            }
             SelectorMode::Settings { target, .. } if target.agent_key().is_some() => {
                 if !forward {
                     self.handle(SelectorEvent::OpenSettings)
@@ -935,9 +944,12 @@ impl SelectorModel {
                     SelectorControl::Continue
                 }
             }
-            SelectorMode::Settings { .. } | SelectorMode::ProfileManager { .. } => {
-                self.handle(SelectorEvent::OpenSettings)
-            }
+            SelectorMode::Settings { .. } => SelectorControl::Continue,
+            SelectorMode::ProfileManager { focus, .. } => match (focus, forward) {
+                (ProfileWorkspaceFocus::Items, true) => self.handle(SelectorEvent::OpenActions),
+                (ProfileWorkspaceFocus::Editor, false) => self.handle(SelectorEvent::Back),
+                _ => SelectorControl::Continue,
+            },
             SelectorMode::RecentSessions if self.recent.review().is_some() => {
                 self.handle(if self.recent.review_confirmed() {
                     SelectorEvent::Up
@@ -6133,6 +6145,37 @@ fn route_selector_key(model: &mut SelectorModel, key: KeyEvent) -> SelectorKeyRo
         return SelectorKeyRoute::Control(None);
     }
     if key.code == KeyCode::Esc
+        && model.settings_overlay.is_none()
+        && model.profile_overlay.is_none()
+        && model.help.is_none()
+        && model.leave_review.is_none()
+        && matches!(model.mode, SelectorMode::ProfileManager { focus: ProfileWorkspaceFocus::Editor, .. })
+    {
+        return SelectorKeyRoute::Control(Some(model.handle(SelectorEvent::Back)));
+    }
+    // Escape unwinds the local Settings columns before leaving the page.
+    // In particular, the remembered origin must not steal cancellation.
+    if key.code == KeyCode::Esc
+        && model.settings_overlay.is_none()
+        && model.help.is_none()
+        && model.leave_review.is_none()
+    {
+        if let SelectorMode::Settings {
+            focus,
+            view: SettingsView::Categories,
+            ..
+        } = &mut model.mode
+        {
+            if *focus != SettingsFocus::Categories {
+                *focus = match *focus {
+                    SettingsFocus::Value => SettingsFocus::Options,
+                    _ => SettingsFocus::Categories,
+                };
+                return SelectorKeyRoute::Control(None);
+            }
+        }
+    }
+    if key.code == KeyCode::Esc
         && !text_input
         && !selector_modal(model)
         && !selector_dirty(model)
@@ -6757,6 +6800,7 @@ fn apply_session_management(
 fn adopt_recent_thread(request: &RecentAdoptionRequest) -> anyhow::Result<RecentAdoptionResult> {
     let client = super::management_control_plane::ManagementControlClient::connect()?;
     let result = client.adopt_saved_native(&cutex::agent_management::HumanAdoptRequest {
+            creation_defaults: None,
         action_id: cutex::agent_management::AgentActionId::new(request.action_id.clone())?, native_id:request.thread_id.clone(), cwd:request.cwd.clone(), formal_name:request.formal_name.clone(),
     }).map_err(|e| anyhow::anyhow!("Adoption response unconfirmed: {e:#}. Retry same action {}; no rollback or new identity retry claimed", request.action_id))?;
     anyhow::ensure!(
@@ -15434,6 +15478,7 @@ mod tests {
         let mut global_model = SelectorModel::new(vec![global_row()], false, false);
         selector_command(&mut global_model, Command::Settings);
         global_model.handle(SelectorEvent::Down);
+        global_model.handle(SelectorEvent::Down);
         let medium = rendered_text(80, &global_model);
         assert!(medium.contains("view Expanded [Categories]"));
         assert!(medium.contains("Global settings"));
@@ -15470,6 +15515,7 @@ mod tests {
         assert!(narrow_categories.contains("Notifications  3"));
         assert!(narrow_categories.contains("Ctrl+C exit"));
         assert!(!narrow_categories.contains("Managed sessions"));
+        narrow_model.handle(SelectorEvent::Down);
         narrow_model.handle(SelectorEvent::Down);
         narrow_model.handle(SelectorEvent::OpenActions);
         let narrow_options = rendered_text(50, &narrow_model);
@@ -15881,6 +15927,72 @@ mod tests {
         assert_eq!(rows[2].target.agent_key(), Some("cutex.unknown"));
         assert_eq!(rows[2].lifecycle, None);
         assert!(rows[3].target.uses_global_settings());
+    }
+
+    #[test]
+    fn profile_escape_returns_to_list_before_the_origin_panel() {
+        let mut model = SelectorModel::new(vec![global_row()], false, false);
+        model.mode = SelectorMode::ProfileManager { profiles: vec![], selected: 0, focus: ProfileWorkspaceFocus::Items, editor_selected: 0 };
+        model.settings_return_panel = Some(PrimaryPanel::Recent);
+        route_selector_key(&mut model, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(model.mode, SelectorMode::ProfileManager { focus: ProfileWorkspaceFocus::Editor, .. }));
+        route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(model.mode, SelectorMode::ProfileManager { focus: ProfileWorkspaceFocus::Items, .. }));
+        assert_eq!(model.settings_return_panel, Some(PrimaryPanel::Recent));
+    }
+
+    #[test]
+    fn settings_tab_cycles_local_columns_without_leaving() {
+        let mut model = SelectorModel::new(vec![global_row()], false, false);
+        selector_command(&mut model, Command::Settings);
+        model.settings_return_panel = Some(PrimaryPanel::Recent);
+        for (key, expected) in [
+            (KeyCode::Tab, SettingsFocus::Options),
+            (KeyCode::Tab, SettingsFocus::Value),
+            (KeyCode::Tab, SettingsFocus::Categories),
+            (KeyCode::BackTab, SettingsFocus::Value),
+            (KeyCode::BackTab, SettingsFocus::Options),
+            (KeyCode::BackTab, SettingsFocus::Categories),
+        ] {
+            route_selector_key(&mut model, KeyEvent::new(key, KeyModifiers::NONE));
+            assert!(matches!(model.mode, SelectorMode::Settings { focus, .. } if focus == expected));
+            assert_eq!(model.settings_return_panel, Some(PrimaryPanel::Recent));
+        }
+    }
+
+    #[test]
+    fn settings_escape_unwinds_columns_before_returning_to_origin() {
+        for origin in [PrimaryPanel::Agents, PrimaryPanel::Recent, PrimaryPanel::Projects] {
+            let mut model = SelectorModel::new(vec![global_row()], false, false);
+            selector_command(&mut model, Command::Settings);
+            model.settings_return_panel = Some(origin);
+            if let SelectorMode::Settings { focus, .. } = &mut model.mode {
+                *focus = SettingsFocus::Value;
+            }
+            for expected in [SettingsFocus::Options, SettingsFocus::Categories] {
+                assert!(matches!(route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), SelectorKeyRoute::Control(None)));
+                assert!(matches!(model.mode, SelectorMode::Settings { focus, .. } if focus == expected));
+                assert_eq!(model.settings_return_panel, Some(origin));
+            }
+            assert!(matches!(route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), SelectorKeyRoute::Switch(panel) if panel == origin));
+        }
+    }
+
+    #[test]
+    fn settings_escape_cancels_text_without_leaving_or_staging() {
+        let record = editable_record();
+        let mut model = editable_model(&record);
+        model.settings_return_panel = Some(PrimaryPanel::Recent);
+        model.handle(SelectorEvent::OpenSettings);
+        for _ in 0..5 { model.handle(SelectorEvent::Down); }
+        model.handle(SelectorEvent::Activate);
+        model.handle(SelectorEvent::Insert('x'));
+        assert!(matches!(model.settings_overlay, Some(SettingsOverlay::Text { .. })));
+        route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(model.settings_overlay.is_none());
+        assert!(matches!(model.mode, SelectorMode::Settings { .. }));
+        assert_eq!(model.settings_dirty_count(), 0);
+        assert_eq!(model.settings_return_panel, Some(PrimaryPanel::Recent));
     }
 
     #[test]

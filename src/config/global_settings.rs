@@ -12,6 +12,8 @@ pub struct GlobalConfigPatch {
     pub session_enabled: Option<bool>,
     pub default_profile: ConfigValueUpdate<String>,
     pub default_profile_direct_launch: Option<bool>,
+    pub new_session_defaults: Option<std::collections::BTreeMap<String, crate::profiles::model::NewSessionDefaults>>,
+    pub new_session_notification: Option<crate::notify::session::Level>,
     pub proxy: ConfigValueUpdate<ProxyConfig>,
     pub notify_service_url: ConfigValueUpdate<String>,
     pub notify_service_token: ConfigValueUpdate<String>,
@@ -60,6 +62,11 @@ pub fn apply_global_config_patch(
         &mut config.default_profile_direct_launch,
         patch.default_profile_direct_launch,
     );
+    if let Some(defaults) = &patch.new_session_defaults {
+        changed |= config.new_session_defaults != *defaults;
+        config.new_session_defaults = defaults.clone();
+    }
+    changed |= apply_value_update(&mut config.new_session_notification, patch.new_session_notification);
     changed |= apply_optional_update(&mut config.proxy, &patch.proxy);
     changed |= apply_optional_update(&mut config.notify_service_url, &patch.notify_service_url);
     changed |= apply_optional_update(

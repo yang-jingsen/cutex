@@ -110,7 +110,22 @@ fn read_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> anyhow::R
         .with_context(|| format!("invalid notification config: {}", path.display()))
 }
 
+fn creation_level(thread_id: &str, since: Option<&str>, level: Option<&str>) -> Option<Level> {
+    let since = since?.parse::<u128>().ok()?;
+    let stamp = uuid::Uuid::parse_str(thread_id).ok()?.get_timestamp()?;
+    let (seconds, nanos) = stamp.to_unix();
+    if u128::from(seconds) * 1000 + u128::from(nanos) / 1_000_000 < since { return None; }
+    serde_json::from_str(level?).ok()
+}
+
 fn session_at(root: &Path, thread_id: &str, change: Change) -> anyhow::Result<Preference> {
+    let initial = creation_level(thread_id,
+        std::env::var("CUTEX_NEW_NOTIFICATION_SINCE").ok().as_deref(),
+        std::env::var("CUTEX_NEW_NOTIFICATION").ok().as_deref());
+    session_at_with_initial(root, thread_id, change, initial)
+}
+
+fn session_at_with_initial(root: &Path, thread_id: &str, change: Change, initial: Option<Level>) -> anyhow::Result<Preference> {
     let thread_id = uuid::Uuid::parse_str(thread_id)
         .context("expected native session UUID")?
         .to_string();
@@ -131,7 +146,7 @@ fn session_at(root: &Path, thread_id: &str, change: Change) -> anyhow::Result<Pr
         );
     }
     let path = root.join("sessions").join(format!("{thread_id}.json"));
-    let level = if matches!(change, Change::Read) {
+    let level = if matches!(change, Change::Read) && (path.exists() || initial.is_none()) {
         read_json(&path)?
     } else {
         fs::create_dir_all(path.parent().context("missing session directory")?)?;
@@ -155,12 +170,12 @@ fn session_at(root: &Path, thread_id: &str, change: Change) -> anyhow::Result<Pr
         }
         let level = match change {
             Change::Set(level) => level,
-            Change::Cycle => match read_json(&path)? {
+            Change::Cycle => match if path.exists() { read_json(&path)? } else { initial.unwrap_or_default() } {
                 Level::Off => Level::Important,
                 Level::Important => Level::Normal,
                 Level::Normal => Level::Off,
             },
-            Change::Read => unreachable!(),
+            Change::Read => if path.exists() { read_json(&path)? } else { initial.unwrap_or_default() },
         };
         crate::config::atomic::write_private_pretty_json_atomic(
             &path,

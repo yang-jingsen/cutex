@@ -38,6 +38,15 @@ pub(crate) fn wizard() -> anyhow::Result<()> {
 }
 
 pub(crate) fn new_session(profile: Option<&str>) -> anyhow::Result<()> {
+    let Some(selected) = select_new_profile(profile)? else { return Ok(()) };
+    let store = load_store_read_only()?;
+    let account = find_account(&store, &selected)?.ok_or_else(|| anyhow!("Profile not found"))?;
+    anyhow::ensure!(!account.default_cli_args.iter().any(|arg| matches!(arg.as_str(), "resume" | "fork")),
+        "Profile default arguments resume/fork an existing session; use cutex run or remove those defaults before cutex new");
+    run_profile(&selected, vec![], LaunchOutput::Human, false, false, vec![], None, None)
+}
+
+pub(super) fn select_new_profile(profile: Option<&str>) -> anyhow::Result<Option<String>> {
     let selected = if let Some(profile) = profile {
         profile.to_owned()
     } else {
@@ -46,15 +55,15 @@ pub(crate) fn new_session(profile: Option<&str>) -> anyhow::Result<()> {
         let state = load_quick_state();
         let config = load_codez_config();
         let cwd = std::env::current_dir()?;
-        let default = determine_default_profile(&store, &state, &config, cwd.to_str());
-        let Some(selected) = prompt_for_profile_choice(&store, &default)? else { return Ok(()) };
-        selected
+        let default = config.default_profile.clone().unwrap_or_else(|| determine_default_profile(&store, &state, &config, cwd.to_str()));
+        if config.default_profile_direct_launch {
+            default
+        } else {
+            let Some(selected) = prompt_for_profile_choice(&store, &default)? else { return Ok(None) };
+            selected
+        }
     };
-    let store = load_store_read_only()?;
-    let account = find_account(&store, &selected)?.ok_or_else(|| anyhow!("Profile not found"))?;
-    anyhow::ensure!(!account.default_cli_args.iter().any(|arg| matches!(arg.as_str(), "resume" | "fork")),
-        "Profile default arguments resume/fork an existing session; use cutex run or remove those defaults before cutex new");
-    run_profile(&selected, vec![], LaunchOutput::Human, false, false, vec![], None, None)
+    Ok(Some(selected))
 }
 
 pub(crate) fn run_profile(

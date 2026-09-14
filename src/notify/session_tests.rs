@@ -74,3 +74,26 @@ fn style_overrides_reload_and_invalid_style_does_not_change_priority() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn creation_default_is_persisted_once_and_never_overrides_a_session() {
+    let dir = std::env::temp_dir().join(format!("cutex-default-notify-{}", uuid::Uuid::new_v4()));
+    let id = uuid::Uuid::new_v4().to_string();
+    let first = super::session_at_with_initial(&dir, &id, Change::Read, Some(Level::Normal)).unwrap();
+    assert_eq!(first.level, Level::Normal);
+    let later = super::session_at_with_initial(&dir, &id, Change::Read, Some(Level::Important)).unwrap();
+    assert_eq!(later.level, Level::Normal);
+    assert_eq!(super::session_at(&dir, &id, Change::Read).unwrap().level, Level::Normal);
+    let id = uuid::Uuid::new_v4().to_string();
+    assert_eq!(super::session_at_with_initial(&dir, &id, Change::Cycle, Some(Level::Normal)).unwrap().level, Level::Off);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn old_or_non_timestamped_sessions_never_receive_creation_defaults() {
+    let id = "01900000-0000-7000-8000-000000000000";
+    let stamp = u128::from_str_radix("019000000000", 16).unwrap();
+    assert_eq!(creation_level(id, Some(&(stamp + 1).to_string()), Some("\"normal\"")), None);
+    assert_eq!(creation_level(id, Some(&stamp.to_string()), Some("\"normal\"")), Some(Level::Normal));
+    assert_eq!(creation_level(&uuid::Uuid::new_v4().to_string(), Some("0"), Some("\"normal\"")), None);
+}

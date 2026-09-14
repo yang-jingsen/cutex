@@ -656,13 +656,21 @@ pub fn local_bootstrap_configuration(
 
 /// Human new-agent defaults resolve the installed profile without inventing an identity.
 pub fn local_configuration() -> anyhow::Result<StockConfiguration> {
+    local_configuration_with_profile(None)
+}
+
+pub fn local_configuration_with_profile(profile: Option<&String>) -> anyhow::Result<StockConfiguration> {
+    let config = crate::config::store::load_codez_config_checked()?;
+    let name = profile.or(config.default_profile.as_ref()).context("Select a default profile in Settings / Defaults")?;
+    let inherited = crate::config::new_session::inherited(name)?;
+    let defaults = config.new_session_defaults.get(name);
     configuration_for_selection(
-        None,
+        Some(name),
         Some("danger-full-access"),
         Some("danger-full-access".into()),
         Some("never".into()),
-        None,
-        None,
+        defaults.and_then(|d| d.model.as_ref()).or(inherited.model.as_ref()),
+        defaults.and_then(|d| d.reasoning.as_ref()).or(inherited.reasoning.as_ref()),
         true,
     )
 }

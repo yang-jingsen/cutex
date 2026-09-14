@@ -837,6 +837,9 @@ pub(super) enum GlobalSettingsField {
     DockerSudo,
     DefaultProfile,
     DefaultProfileDirectLaunch,
+    DefaultModel,
+    DefaultReasoning,
+    DefaultNotification,
     ProxyEnabled,
     ProxyUrl,
     ProxyNoProxy,
@@ -865,7 +868,7 @@ pub(super) enum GlobalSettingsField {
 impl GlobalSettingsField {
     pub(super) fn editor_kind(self) -> SessionSettingsEditorKind {
         match self {
-            Self::ManagedSessions
+            Self::DefaultReasoning | Self::DefaultNotification | Self::ManagedSessions
             | Self::DockerSudo
             | Self::DefaultProfile
             | Self::DefaultProfileDirectLaunch
@@ -876,7 +879,7 @@ impl GlobalSettingsField {
             | Self::RateLimitThresholdWarning
             | Self::RateLimitModelNudge
             | Self::AgentBusEnabled => SessionSettingsEditorKind::Choice,
-            Self::ProxyUrl
+            Self::DefaultModel | Self::ProxyUrl
             | Self::ProxyNoProxy
             | Self::NotifyServiceUrl
             | Self::NotifyIdleTimeout
@@ -932,6 +935,7 @@ impl fmt::Debug for SecretSettingsAction {
 pub(super) struct GlobalSettingsSnapshot {
     config: CodezConfig,
     profile_names: Vec<String>,
+    inherited_defaults: std::collections::BTreeMap<String, cutex::profiles::model::NewSessionDefaults>,
 }
 
 impl GlobalSettingsSnapshot {
@@ -947,6 +951,9 @@ impl GlobalSettingsSnapshot {
         Self {
             config: config.clone(),
             profile_names: profile_names.to_vec(),
+            inherited_defaults: profile_names.iter().filter_map(|name| {
+                cutex::config::new_session::inherited(name).ok().map(|values| (name.clone(), values))
+            }).collect(),
         }
     }
 
@@ -960,6 +967,8 @@ impl GlobalSettingsSnapshot {
 
     pub(super) fn choices(&self, field: GlobalSettingsField) -> Vec<SessionSettingsChoice> {
         match field {
+            GlobalSettingsField::DefaultReasoning => &[("Follow profile", None), ("none", Some("none")), ("minimal", Some("minimal")), ("low", Some("low")), ("medium", Some("medium")), ("high", Some("high")), ("xhigh", Some("xhigh"))][..],
+            GlobalSettingsField::DefaultNotification => &[("CIAO!", Some("important")), ("ON", Some("normal")), ("OFF", Some("off"))][..],
             GlobalSettingsField::ManagedSessions
             | GlobalSettingsField::DockerSudo
             | GlobalSettingsField::DefaultProfileDirectLaunch
@@ -981,7 +990,7 @@ impl GlobalSettingsSnapshot {
                 }))
                 .collect();
             }
-            GlobalSettingsField::ProxyUrl
+            GlobalSettingsField::DefaultModel | GlobalSettingsField::ProxyUrl
             | GlobalSettingsField::ProxyNoProxy
             | GlobalSettingsField::NotifyServiceUrl
             | GlobalSettingsField::NotifyServiceToken
@@ -1013,8 +1022,14 @@ impl GlobalSettingsSnapshot {
                     navigation: Some(super::session_tui_input::Command::Profiles),
                     ..SessionTuiSettingOption::new("Manage profiles", "Enter to open")
                 },
+            ]),
+            SessionTuiSettingCategory::new("Defaults", vec![
                 self.editable_option("Default profile", GlobalSettingsField::DefaultProfile, draft),
-                self.editable_option("Skip default-launch picker", GlobalSettingsField::DefaultProfileDirectLaunch, draft),
+                self.editable_option("Skip new-session picker", GlobalSettingsField::DefaultProfileDirectLaunch, draft),
+                self.editable_option("Model (selected default profile)", GlobalSettingsField::DefaultModel, draft),
+                self.editable_option("Reasoning effort", GlobalSettingsField::DefaultReasoning, draft),
+                self.editable_option("Notification", GlobalSettingsField::DefaultNotification, draft),
+                SessionTuiSettingOption::new("Scope", "New sessions / agents only; blank model follows profile"),
             ]),
             SessionTuiSettingCategory::new("Network", vec![
                 self.editable_option("Proxy enabled", GlobalSettingsField::ProxyEnabled, draft),
@@ -1051,9 +1066,20 @@ impl GlobalSettingsSnapshot {
         field: GlobalSettingsField,
         draft: &GlobalSettingsDraft,
     ) -> SessionTuiSettingOption {
+        let mut value = draft.value(self, field);
+        if matches!(field, GlobalSettingsField::DefaultModel | GlobalSettingsField::DefaultReasoning) {
+            if value.is_empty() {
+                let name = effective_optional_value(self.config.default_profile.as_ref(), &draft.default_profile);
+                let inherited = name.as_ref().and_then(|n| self.inherited_defaults.get(n));
+                let resolved = inherited.and_then(|d| if field == GlobalSettingsField::DefaultModel { d.model.as_deref() } else { d.reasoning.as_deref() });
+                value = format!("{} · follow profile", resolved.unwrap_or("Default"));
+            } else {
+                value.push_str(" · new-session override");
+            }
+        }
         SessionTuiSettingOption::global_editable(
             label,
-            draft.value(self, field),
+            value,
             field,
             draft.field_is_dirty(field),
         )
@@ -1066,6 +1092,10 @@ pub(super) struct GlobalSettingsDraft {
     docker_sudo: Option<bool>,
     default_profile: ConfigValueUpdate<String>,
     default_profile_direct_launch: Option<bool>,
+    new_session_defaults: Option<std::collections::BTreeMap<String, cutex::profiles::model::NewSessionDefaults>>,
+    new_session_notification: Option<cutex::notify::session::Level>,
+    default_model_dirty: bool,
+    default_reasoning_dirty: bool,
     proxy_enabled: Option<bool>,
     proxy_url: ConfigValueUpdate<String>,
     proxy_no_proxy: ConfigValueUpdate<String>,
@@ -1099,6 +1129,33 @@ impl GlobalSettingsDraft {
         value: Option<String>,
     ) -> anyhow::Result<()> {
         match field {
+            GlobalSettingsField::DefaultModel | GlobalSettingsField::DefaultReasoning => {
+                let name = effective_optional_value(snapshot.config.default_profile.as_ref(), &self.default_profile)
+                    .ok_or_else(|| anyhow::anyhow!("Select a default profile first"))?;
+                let value = value.filter(|s| !s.trim().is_empty());
+                if let Some(value) = &value {
+                    anyhow::ensure!(!value.chars().any(char::is_control), "Control characters are not allowed");
+                    if field == GlobalSettingsField::DefaultReasoning {
+                        anyhow::ensure!(["none", "minimal", "low", "medium", "high", "xhigh"].contains(&value.as_str()), "Unknown reasoning effort");
+                    }
+                }
+                let mut defaults = self.new_session_defaults.clone().unwrap_or_else(|| snapshot.config.new_session_defaults.clone());
+                let entry = defaults.entry(name.clone()).or_default();
+                if field == GlobalSettingsField::DefaultModel { entry.model = value; } else { entry.reasoning = value; }
+                if entry.model.is_none() && entry.reasoning.is_none() { defaults.remove(&name); }
+                self.default_model_dirty = defaults.keys().chain(snapshot.config.new_session_defaults.keys()).any(|name| defaults.get(name).and_then(|d| d.model.as_ref()) != snapshot.config.new_session_defaults.get(name).and_then(|d| d.model.as_ref()));
+                self.default_reasoning_dirty = defaults.keys().chain(snapshot.config.new_session_defaults.keys()).any(|name| defaults.get(name).and_then(|d| d.reasoning.as_ref()) != snapshot.config.new_session_defaults.get(name).and_then(|d| d.reasoning.as_ref()));
+                self.new_session_defaults = (defaults != snapshot.config.new_session_defaults).then_some(defaults);
+            }
+            GlobalSettingsField::DefaultNotification => {
+                let level = match value.as_deref() {
+                    Some("important") => cutex::notify::session::Level::Important,
+                    Some("normal") => cutex::notify::session::Level::Normal,
+                    Some("off") => cutex::notify::session::Level::Off,
+                    _ => anyhow::bail!("Unknown notification level"),
+                };
+                self.new_session_notification = (level != snapshot.config.new_session_notification).then_some(level);
+            }
             GlobalSettingsField::ManagedSessions => {
                 self.managed_sessions = changed_bool(
                     snapshot.config.session.enabled,
@@ -1365,6 +1422,17 @@ impl GlobalSettingsDraft {
         field: GlobalSettingsField,
     ) -> String {
         match field {
+            GlobalSettingsField::DefaultModel | GlobalSettingsField::DefaultReasoning => {
+                let name = effective_optional_value(snapshot.config.default_profile.as_ref(), &self.default_profile);
+                let defaults = self.new_session_defaults.as_ref().unwrap_or(&snapshot.config.new_session_defaults);
+                let entry = name.as_ref().and_then(|n| defaults.get(n));
+                entry.and_then(|e| if field == GlobalSettingsField::DefaultModel { e.model.clone() } else { e.reasoning.clone() }).unwrap_or_default()
+            }
+            GlobalSettingsField::DefaultNotification => match self.new_session_notification.unwrap_or(snapshot.config.new_session_notification) {
+                cutex::notify::session::Level::Important => "important",
+                cutex::notify::session::Level::Normal => "normal",
+                cutex::notify::session::Level::Off => "off",
+            }.into(),
             GlobalSettingsField::ManagedSessions => enabled(
                 self.managed_sessions
                     .unwrap_or(snapshot.config.session.enabled),
@@ -1531,6 +1599,9 @@ impl GlobalSettingsDraft {
 
     pub(super) fn field_is_dirty(&self, field: GlobalSettingsField) -> bool {
         match field {
+            GlobalSettingsField::DefaultModel => self.default_model_dirty,
+            GlobalSettingsField::DefaultReasoning => self.default_reasoning_dirty,
+            GlobalSettingsField::DefaultNotification => self.new_session_notification.is_some(),
             GlobalSettingsField::ManagedSessions => self.managed_sessions.is_some(),
             GlobalSettingsField::DockerSudo => self.docker_sudo.is_some(),
             GlobalSettingsField::DefaultProfile => {
@@ -1610,6 +1681,9 @@ impl GlobalSettingsDraft {
             GlobalSettingsField::DockerSudo,
             GlobalSettingsField::DefaultProfile,
             GlobalSettingsField::DefaultProfileDirectLaunch,
+            GlobalSettingsField::DefaultModel,
+            GlobalSettingsField::DefaultReasoning,
+            GlobalSettingsField::DefaultNotification,
             GlobalSettingsField::ProxyEnabled,
             GlobalSettingsField::ProxyUrl,
             GlobalSettingsField::ProxyNoProxy,
@@ -1691,6 +1765,8 @@ impl GlobalSettingsDraft {
             session_enabled: self.managed_sessions,
             default_profile: self.default_profile.clone(),
             default_profile_direct_launch: self.default_profile_direct_launch,
+            new_session_defaults: self.new_session_defaults.clone(),
+            new_session_notification: self.new_session_notification,
             proxy,
             notify_service_url: self.notify_service_url.clone(),
             notify_service_token: self.notify_service_token.clone(),
@@ -2471,12 +2547,12 @@ mod tests {
                 .map(|category| category.label)
                 .collect::<Vec<_>>(),
             vec![
-                "Profiles", "Network", "Notifications", "Appearance", "Messages", "Services",
+                "Profiles", "Defaults", "Network", "Notifications", "Appearance", "Messages", "Services",
             ]
         );
         let settings = flattened(&categories);
 
-        assert!(settings.contains("Profiles:Default profile="));
+        assert!(settings.contains("Defaults:Default profile="));
         assert!(settings.contains("Manage profiles"));
         assert_eq!(settings.matches("=(set)").count(), 1);
         assert!(!settings.contains("notify-secret"));
@@ -2489,8 +2565,32 @@ mod tests {
                 .flat_map(|category| category.options.iter())
                 .filter(|option| option.global_field.is_some())
                 .count(),
-            7
+            10
         );
+    }
+
+    #[test]
+    fn new_defaults_keep_models_scoped_and_discard_without_writes() {
+        let config = CodezConfig { default_profile: Some("alpha".into()), ..Default::default() };
+        let snapshot = GlobalSettingsSnapshot::from_config_with_profiles(&config, &["alpha".into(), "beta".into()]);
+        let mut draft = GlobalSettingsDraft::default();
+        draft.stage(&snapshot, GlobalSettingsField::DefaultModel, Some("model-a".into())).unwrap();
+        draft.stage(&snapshot, GlobalSettingsField::DefaultReasoning, Some("high".into())).unwrap();
+        draft.stage(&snapshot, GlobalSettingsField::DefaultProfile, Some("beta".into())).unwrap();
+        assert_eq!(draft.value(&snapshot, GlobalSettingsField::DefaultModel), "");
+        draft.stage(&snapshot, GlobalSettingsField::DefaultModel, Some("model-b".into())).unwrap();
+        draft.stage(&snapshot, GlobalSettingsField::DefaultNotification, Some("normal".into())).unwrap();
+        let mut saved = config.clone();
+        cutex::config::global_settings::apply_global_config_patch(&mut saved, &draft.patch(&config).unwrap()).unwrap();
+        assert_eq!(saved.new_session_defaults["alpha"].model.as_deref(), Some("model-a"));
+        assert_eq!(saved.new_session_defaults["alpha"].reasoning.as_deref(), Some("high"));
+        assert_eq!(saved.new_session_defaults["beta"].model.as_deref(), Some("model-b"));
+        assert_eq!(saved.new_session_defaults["beta"].reasoning, None);
+        assert_eq!(saved.new_session_notification, cutex::notify::session::Level::Normal);
+        assert!(config.new_session_defaults.is_empty());
+        assert!(draft.is_dirty());
+        draft = GlobalSettingsDraft::default();
+        assert!(!draft.is_dirty());
     }
 
     #[test]

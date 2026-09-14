@@ -204,6 +204,13 @@ pub struct QuickRunState {
     pub per_directory: HashMap<String, String>,
 }
 
+/// Defaults scoped to a profile; absence follows the profile's own configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewSessionDefaults {
+    pub model: Option<String>,
+    pub reasoning: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CodezConfig {
     #[serde(default)]
@@ -219,6 +226,10 @@ pub struct CodezConfig {
     pub default_profile: Option<String>,
     #[serde(default)]
     pub default_profile_direct_launch: bool,
+    #[serde(default)]
+    pub new_session_defaults: std::collections::BTreeMap<String, NewSessionDefaults>,
+    #[serde(default)]
+    pub new_session_notification: crate::notify::session::Level,
     #[serde(default)]
     #[serde(skip)]
     pub notify_service_url: Option<String>,
@@ -291,6 +302,8 @@ impl Default for CodezConfig {
             session: default_session_config(),
             default_profile: None,
             default_profile_direct_launch: false,
+            new_session_defaults: Default::default(),
+            new_session_notification: Default::default(),
             notify_service_url: None,
             notify_service_token: None,
             notify_service_idle_timeout_secs: None,
