@@ -22,7 +22,14 @@ pub(crate) fn run_command(command: NotifyCommand) -> anyhow::Result<()> {
             };
             let preference = session::session(&thread_id, change)?;
             if json {
-                println!("{}", serde_json::to_string(&preference)?);
+                let mut value = serde_json::to_value(&preference)?;
+                if preference.level != session::Level::Off {
+                    match cutex::notify::state::current_reminder(&thread_id) {
+                        Ok(reminder) => value["reminder_id"] = serde_json::to_value(reminder)?,
+                        Err(_) => value["reminder_id"] = serde_json::Value::Null,
+                    }
+                }
+                println!("{}", value);
             } else {
                 println!("{} · {}", preference.thread_id, preference.label);
             }

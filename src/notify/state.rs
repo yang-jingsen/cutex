@@ -300,7 +300,32 @@ pub fn snapshot() -> anyhow::Result<Value> {
         sessions.push(json!({"agentId":s.agent_id,"agentName":name,"threadId":s.thread_id,"priority":level.as_ref().ok(),"preferenceError":level.is_err(),"state":if reason.is_some(){"inactive"}else{&s.state},"reason":reason,"lastActivityAt":s.activity,"inactiveAt":s.activity+IDLE_SECONDS,"reminderId":s.reminder,"unread":enabled && reason.is_none() && s.reminder.is_some() && !s.acknowledged}));
     }
     Ok(
-        json!({"schema":"cutex/notification-state/v1","generatedAt":now,"expiresAt":now+HEALTH_SECONDS,"healthy":healthy,"sourceHeartbeat":heartbeat,"checkpoint":meta(&db,"checkpoint")?.and_then(|s|serde_json::from_str::<Value>(&s).ok()),"retentionGapObserved":meta(&db,"gap")?.is_some(),"sessions":sessions,"coverage":"managed_runtime_events","automaticInteractionAck":false}),
+        json!({"schema":"cutex/notification-state/v1","generatedAt":now,"expiresAt":now+HEALTH_SECONDS,"healthy":healthy,"sourceHeartbeat":heartbeat,"checkpoint":meta(&db,"checkpoint")?.and_then(|s|serde_json::from_str::<Value>(&s).ok()),"retentionGapObserved":meta(&db,"gap")?.is_some(),"sessions":sessions,"coverage":"managed_runtime_events","automaticInteractionAck":true,"interactionAckScope":"updated_cute_codex_frontends","interactionAckInputs":["key","paste"]}),
+    )
+}
+
+/// Current unread reminder for the session control, without loading the agent catalog.
+pub fn current_reminder(thread: &str) -> anyhow::Result<Option<String>> {
+    uuid::Uuid::parse_str(thread)?;
+    let db = open()?;
+    let now = Utc::now().timestamp();
+    let healthy = meta(&db, "heartbeat")?
+        .and_then(|v| v.parse::<i64>().ok())
+        .is_some_and(|t| now - t < HEALTH_SECONDS)
+        && meta(&db, "caughtUp")?.as_deref() == Some("true");
+    let value: Option<String> = db
+        .query_row("SELECT value FROM state WHERE thread=?1", [thread], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    let Some(value) = value else { return Ok(None) };
+    let s: Session = serde_json::from_str(&value)?;
+    Ok(
+        if !s.acknowledged && inactive_reason(&s, now, healthy).is_none() {
+            s.reminder
+        } else {
+            None
+        },
     )
 }
 
