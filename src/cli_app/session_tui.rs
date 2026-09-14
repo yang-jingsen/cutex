@@ -1655,6 +1655,7 @@ impl SelectorModel {
                             PrimaryPanel::Recent,
                         );
                     }
+                    self.recent_inspecting = false;
                     self.recent.begin_review();
                 }
             }
@@ -1809,13 +1810,32 @@ impl SelectorModel {
     }
 
     fn open_retired_sessions(&mut self, rows: Vec<SelectorRow>) {
-        self.archive_return_panel = if matches!(self.mode, SelectorMode::RecentSessions) {
-            PrimaryPanel::Recent
-        } else { PrimaryPanel::Agents };
-        self.retired_rows = rows;
-        self.mode = SelectorMode::RetiredSessions { selected: 0 };
+        let already_open = matches!(self.mode, SelectorMode::RetiredSessions { .. } | SelectorMode::ConfirmRuntimeAction { action: SessionTuiAction::RestoreSession, .. });
+        if !already_open {
+            self.archive_return_panel = if matches!(self.mode, SelectorMode::RecentSessions) { PrimaryPanel::Recent } else { PrimaryPanel::Agents };
+            self.mode = SelectorMode::RetiredSessions { selected: 0 };
+        }
         self.notice = None;
         self.warning = None;
+        self.replace_retired_rows(rows);
+    }
+
+    fn replace_retired_rows(&mut self, rows: Vec<SelectorRow>) {
+        let target = self.active_row().map(|r| r.target.clone());
+        let stale = if let SelectorMode::ConfirmRuntimeAction { agent_key, action: SessionTuiAction::RestoreSession, .. } = &self.mode {
+            let old = self.retired_rows.iter().find(|r| r.target.agent_key() == Some(agent_key));
+            let new = rows.iter().find(|r| r.target.agent_key() == Some(agent_key));
+            old.zip(new).is_none_or(|(a,b)| a.revision != b.revision || a.agent != b.agent || a.lifecycle != b.lifecycle)
+        } else { false };
+        let selected = target.and_then(|target| rows.iter().position(|r| r.target == target)).unwrap_or(0);
+        self.retired_rows = rows;
+        if stale || matches!(self.mode, SelectorMode::RetiredSessions { .. }) {
+            self.mode = SelectorMode::RetiredSessions { selected };
+        }
+        if stale {
+            self.archive_confirmation = None;
+            self.notice = Some("Archived target changed; review it again".into());
+        }
     }
 
     fn handle_action_event(
@@ -3345,6 +3365,10 @@ impl SelectorModel {
         self.settings_draft = SessionSettingsDraft::default();
         self.global_settings_draft = GlobalSettingsDraft::default();
         self.profile_settings_draft = ProfileSettingsDraft::default();
+        for row in self.rows.iter_mut().chain(self.context.settings.iter_mut()) {
+            if let Some(snapshot) = &row.settings_snapshot { row.settings = snapshot.categories(&self.settings_draft); }
+            if let Some(snapshot) = &row.global_settings_snapshot { row.settings = snapshot.categories(&self.global_settings_draft); }
+        }
         self.settings_overlay = None;
         self.profile_overlay = None;
         self.mode = SelectorMode::Agents;
@@ -3864,16 +3888,14 @@ impl SelectorModel {
     fn replace_snapshot(&mut self, snapshot: SelectorSnapshot) {
         let previous_index = self.selected_visible_index().unwrap_or(0);
         let stale_confirmation =
-            if let SelectorMode::ConfirmRuntimeAction { agent_key, .. } = &self.mode {
+            if let SelectorMode::ConfirmRuntimeAction { agent_key, action, .. } = &self.mode {
                 let old = self
                     .rows
                     .iter()
                     .chain(self.retired_rows.iter())
                     .find(|r| r.target.agent_key() == Some(agent_key.as_str()));
-                let new = snapshot
-                    .rows
-                    .iter()
-                    .find(|r| r.target.agent_key() == Some(agent_key.as_str()));
+                let candidates = if *action == SessionTuiAction::RestoreSession { &self.retired_rows } else { &snapshot.rows };
+                let new = candidates.iter().find(|r| r.target.agent_key() == Some(agent_key.as_str()));
                 old.zip(new).is_none_or(|(old, new)| {
                     old.revision != new.revision
                         || old.agent != new.agent
@@ -4404,9 +4426,8 @@ impl SelectorModel {
                 launch_profile,
                 confirmed,
             } => {
-                let still_available = self
-                    .rows
-                    .iter()
+                let candidates = if action == SessionTuiAction::RestoreSession { &self.retired_rows } else { &self.rows };
+                let still_available = candidates.iter()
                     .find(|row| row.target.agent_key() == Some(agent_key.as_str()))
                     .is_some_and(|row| {
                         row.control_index_for_action(action).is_some()
@@ -5898,6 +5919,9 @@ fn selector_commands(model: &SelectorModel) -> Vec<(Command, Option<&'static str
                 {
                     Some("No next Recent page")
                 }
+                Command::Inspect if matches!(model.mode, SelectorMode::RetiredSessions { .. }) => {
+                    model.active_row().is_none().then_some("Select an archived identity")
+                }
                 Command::Actions | Command::Inspect | Command::Edit | Command::Titles
                     if !matches!(model.mode, SelectorMode::RecentSessions)
                         && model.selected_managed_agent().is_none() =>
@@ -6053,6 +6077,8 @@ fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyR
                 .map(SelectorKeyRoute::Switch)
                 .unwrap_or(SelectorKeyRoute::Control(None))
         }
+        Command::Refresh if matches!(model.mode, SelectorMode::RetiredSessions { .. }) =>
+            SelectorKeyRoute::Control(Some(SelectorControl::OpenRetiredSessions)),
         Command::Refresh => SelectorKeyRoute::Refresh,
         Command::Scope => {
             model.managed_scope = (model.managed_scope + 1) % 3;
@@ -6216,6 +6242,7 @@ fn route_selector_key(model: &mut SelectorModel, key: KeyEvent) -> SelectorKeyRo
         && model.help.is_none()
         && model.leave_review.is_none()
         && !matches!(model.mode, SelectorMode::ClosingRuntime { .. })
+        && matches!(model.mode, SelectorMode::Settings { .. } | SelectorMode::ProfileManager { .. })
         && model.settings_return_panel.is_some()
     {
         model.leave_settings();
@@ -6282,7 +6309,7 @@ fn route_selector_key(model: &mut SelectorModel, key: KeyEvent) -> SelectorKeyRo
     {
         return SelectorKeyRoute::Control(None);
     }
-    if recent && model.recent_inspecting {
+    if recent && model.recent_inspecting && model.recent.review().is_none() {
         if model.recent_detail_scroll.handle(key) {
             return SelectorKeyRoute::Control(None);
         }
@@ -7687,7 +7714,7 @@ fn render_recent_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorMo
         );
         return;
     }
-    let panes = crate::cli_app::session_tui_layout::list_details(area, true);
+    let panes = crate::cli_app::session_tui_layout::list_details(area, model.inspector_visible);
     if model.recent_inspecting && panes.details.is_none() {
         render_recent_details(frame, area, model);
         return;
@@ -7717,8 +7744,9 @@ fn render_recent_details(frame: &mut Frame<'_>, area: Rect, model: &SelectorMode
     let rows = model.recent.visible_rows();
     let lines = rows.get(model.recent.selected_visible()).map(|row| {
         let field = |label: &str, value: String| Line::from(vec![Span::styled(format!("{label}: "), Style::new().fg(Color::Gray)), Span::raw(value)]);
-        vec![
+        let mut lines = vec![
             Line::styled(row.title.clone(), Style::new().fg(crate::cli_app::session_tui_layout::text()).add_modifier(Modifier::BOLD)),
+            field("Status", row.view.runtime.label()),
             field("Association", row.state.label().into()),
             field("Updated", row.view.updated.clone()),
             Line::default(),
@@ -7731,7 +7759,13 @@ fn render_recent_details(frame: &mut Frame<'_>, area: Rect, model: &SelectorMode
             Line::default(),
             Line::styled("Technical identifiers", Style::new().fg(crate::cli_app::session_tui_layout::focus())),
             field("Session ID", row.thread_id.clone()),
-        ]
+        ];
+        for (name, observation) in [("Status", &row.view.runtime), ("Project", &row.view.project), ("Profile", &row.view.effective_profile)] {
+            if let Observation::Unavailable(reason) | Observation::Stale(_, reason) = observation {
+                lines.push(field(&format!("{name} observation"), reason.clone()));
+            }
+        }
+        lines
     }).unwrap_or_else(|| vec![Line::from("No session selected.")]);
     views::render_entity_details(frame, area, "Session Details", lines, &model.recent_detail_scroll, model.recent_inspecting);
 }
@@ -7974,13 +8008,9 @@ fn render_profile_details(frame: &mut Frame<'_>, area: Rect, model: &SelectorMod
                 } else {
                     format!("  {}", option.label)
                 };
-                let value_style = if option.profile_field.is_some() {
-                    Style::new().fg(Color::Gray)
-                } else {
-                    Style::new().fg(Color::DarkGray)
-                };
+                let value_style = setting_option_style(option);
                 Row::new([
-                    Cell::from(label),
+                    Cell::from(label).style(value_style),
                     Cell::from(option.value.as_str()).style(value_style),
                 ])
             }))
@@ -8051,7 +8081,7 @@ fn render_profile_default_editor(frame: &mut Frame<'_>, area: Rect, model: &Sele
         };
         Row::new([
             Cell::from(label),
-            Cell::from(value).style(Style::new().fg(Color::Gray)),
+            Cell::from(value).style(Style::new().fg(Color::White)),
         ])
     }));
     let active = model.profile_workspace_focus() == Some(ProfileWorkspaceFocus::Editor);
@@ -9947,6 +9977,121 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pro_review_profile_values_keep_semantic_colors_when_focus_changes() {
+        let mut model = SelectorModel::new(vec![global_row()], false, false);
+        model.mode = SelectorMode::ProfileManager {
+            profiles: vec![profile_catalog_entry("review-profile", true)], selected: 1,
+            focus: ProfileWorkspaceFocus::Editor, editor_selected: 2,
+        };
+        for focus in [ProfileWorkspaceFocus::Editor, ProfileWorkspaceFocus::Items] {
+            if let SelectorMode::ProfileManager { focus: current, .. } = &mut model.mode { *current = focus; }
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 36)).unwrap();
+            terminal.draw(|frame| render_profile_details(frame, frame.area(), &model)).unwrap();
+            let buffer = terminal.backend().buffer();
+            for (label, value, expected) in [("Active home", "yes", crate::cli_app::session_tui_layout::muted()), ("Name", "review-profile", Color::White)] {
+                let y = (0..36).find(|y| (0..160).map(|x| buffer[(x,*y)].symbol()).collect::<String>().contains(label)).unwrap();
+                let line = (0..160).map(|x| buffer[(x,y)].symbol()).collect::<String>();
+                let x = line.find(value).unwrap() as u16;
+                let value_cell = &buffer[(x,y)];
+                assert_eq!(value_cell.fg, expected, "{label}, {focus:?}");
+                assert_ne!(value_cell.fg, value_cell.bg);
+            }
+        }
+    }
+
+    #[test]
+    fn pro_review_agent_discard_restores_visible_snapshot() {
+        let record = editable_record();
+        let mut model = editable_model(&record);
+        stage_full_access(&mut model);
+        assert!(model.settings_draft.is_dirty());
+        selector_command(&mut model, Command::Page(PrimaryPanel::Recent));
+        contract_key(&mut model, KeyCode::Right);
+        route_selector_key(&mut model, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let row = model.rows.iter().find(|r| r.target.agent_key() == Some(EDITABLE_AGENT_KEY)).unwrap();
+        assert!(row.settings.iter().flat_map(|c| &c.options).all(|o| !o.dirty));
+        assert!(!model.settings_draft.is_dirty());
+    }
+
+    #[test]
+    fn pro_review_discard_navigation_rebuilds_settings_projection() {
+        let mut model = SelectorModel::new(vec![global_row()], false, false);
+        selector_command(&mut model, Command::Settings);
+        select_global_setting(&mut model, GlobalSettingsField::DefaultNotification);
+        let original = model.active_setting_option().unwrap().value.clone();
+        model.handle(SelectorEvent::Activate);
+        contract_key(&mut model, KeyCode::Home);
+        contract_key(&mut model, KeyCode::Enter);
+        assert!(model.global_settings_draft.is_dirty());
+        selector_command(&mut model, Command::Page(PrimaryPanel::Agents));
+        assert!(model.leave_review.is_some());
+        contract_key(&mut model, KeyCode::Right);
+        route_selector_key(&mut model, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        selector_command(&mut model, Command::Settings);
+        select_global_setting(&mut model, GlobalSettingsField::DefaultNotification);
+        let option = model.active_setting_option().unwrap();
+        assert_eq!(option.value, original);
+        assert!(!option.dirty);
+        assert!(!model.global_settings_draft.is_dirty());
+    }
+
+    #[test]
+    fn pro_review_recent_inspector_adoption_consumes_confirmation_keys() {
+        let mut model = contract_recent_model();
+        selector_command(&mut model, Command::Inspect);
+        assert!(model.recent_inspecting);
+        selector_command(&mut model, Command::Actions);
+        assert!(!model.recent_inspecting);
+        assert!(model.recent.review().is_some());
+        for c in "review-worker".chars() { contract_key(&mut model, KeyCode::Char(c)); }
+        contract_key(&mut model, KeyCode::Tab);
+        contract_key(&mut model, KeyCode::Right);
+        assert!(matches!(route_selector_key(&mut model, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), SelectorKeyRoute::Control(Some(SelectorControl::AdoptRecent(_)))));
+    }
+
+    #[test]
+    fn pro_review_archive_inspect_refresh_origin_and_restore_snapshot() {
+        let record = editable_record();
+        let a = retired_selector_row("archive-a", &record, None);
+        let mut b = a.clone(); b.target = SelectorTarget::RetiredAgent("archive-b".into()); b.agent = "B".into();
+        let mut model = SelectorModel::new(vec![], false, false);
+        model.activate_primary_panel(PrimaryPanel::Recent);
+        model.open_retired_sessions(vec![a.clone(), b.clone()]);
+        model.mode = SelectorMode::RetiredSessions { selected: 1 };
+        selector_command(&mut model, Command::Inspect);
+        assert!(model.details.as_deref().unwrap().starts_with("B"));
+        contract_key(&mut model, KeyCode::Esc);
+        assert!(matches!(route_selector_key(&mut model, KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)), SelectorKeyRoute::Control(Some(SelectorControl::OpenRetiredSessions))));
+        model.open_retired_sessions(vec![b.clone()]);
+        assert_eq!(model.archive_return_panel, PrimaryPanel::Recent);
+        assert_eq!(model.active_row().unwrap().agent, "B");
+        model.handle(SelectorEvent::Activate);
+        assert!(matches!(model.mode, SelectorMode::ConfirmRuntimeAction { action: SessionTuiAction::RestoreSession, .. }));
+        model.replace_snapshot(SelectorSnapshot { rows: vec![], warning: None });
+        assert!(matches!(model.mode, SelectorMode::ConfirmRuntimeAction { action: SessionTuiAction::RestoreSession, .. }));
+        b.revision += 1;
+        model.replace_retired_rows(vec![b]);
+        assert!(matches!(model.mode, SelectorMode::RetiredSessions { .. }));
+        contract_key(&mut model, KeyCode::Esc);
+        assert!(matches!(model.mode, SelectorMode::RecentSessions));
+    }
+
+    #[test]
+    fn pro_review_recent_visibility_and_observation_details() {
+        let mut model = contract_recent_model();
+        let mut view = model.recent.rows()[0].view.clone();
+        view.runtime = Observation::Unavailable("unique-runtime-diagnostic".into());
+        view.native_thread = Some("native-one".into());
+        model.recent.enrich_views(&[view]);
+        model.inspector_visible = true;
+        assert!(rendered_text_at(160, 36, &model).contains("unique-runtime-diagnostic"));
+        selector_command(&mut model, Command::Appearance);
+        assert!(!rendered_text_at(160, 36, &model).contains("unique-runtime-diagnostic"));
+        selector_command(&mut model, Command::Inspect);
+        assert!(rendered_text_at(80, 24, &model).contains("unique-runtime-diagnostic"));
+    }
+
     #[test]
     fn new_session_shortcut_does_not_create_a_managed_agent() {
         assert_eq!(input_policy::resolve(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT)), Some(Command::NewProject));

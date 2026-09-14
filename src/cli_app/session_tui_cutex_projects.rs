@@ -1279,7 +1279,8 @@ fn project_commands(model: &CutexProjectsModel) -> Vec<(Command, Option<&'static
                 | Command::Appearance => {
                     Some("Open Settings (Alt+6), then F1 management navigation")
                 }
-                Command::NewProject | Command::Archived if model.view != ProjectView::List => {
+                Command::Archived if !(model.view == ProjectView::List || (model.view == ProjectView::Details && model.section == ProjectSection::Members)) => Some("Open the Project list or Members"),
+                Command::NewProject if model.view != ProjectView::List => {
                     Some("Return to the Project list")
                 }
                 Command::Actions | Command::Edit | Command::Inspect
@@ -1611,7 +1612,7 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
     }
     if model.view == ProjectView::Details
         && model.member_inspecting
-        && model.detail_scroll.handle(key)
+        && (model.detail_scroll.handle(key) || key.code == KeyCode::Enter)
     {
         return None;
     }
@@ -1649,6 +1650,7 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                 return None;
             }
             KeyCode::Tab | KeyCode::BackTab => {
+                model.project_inspecting = false;
                 model.filter_focused = true;
                 return None;
             }
@@ -1658,6 +1660,7 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
                     .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
                     && !c.is_control() =>
             {
+                model.project_inspecting = false;
                 model.filter_focused = true;
                 if c != '/' {
                     input_policy::edit(&mut model.query, key);
@@ -3420,6 +3423,8 @@ mod tests {
         );
         project_command(&mut model, Command::Inspect);
         assert!(model.member_inspecting);
+        handle_key(&mut model, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(model.member_action_requested.is_none(), "Inspector Enter must not activate the real selected member");
         assert!(rendered(&model, 80, 30).contains("Inspector"));
         let selected_member = model.member_selected.clone();
         let offset = model.member_table.borrow().offset();
@@ -3888,6 +3893,28 @@ mod tests {
         handle_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!model.project_inspecting);
         assert_eq!(model.selected, 1);
+    }
+
+    #[test]
+    fn pro_review_inspectors_own_enter_and_filter_focus() {
+        for key in [KeyCode::Tab, KeyCode::Char('/'), KeyCode::Char('x')] {
+            let mut model = model_with_projects();
+            model.project_inspecting = true;
+            handle_key(&mut model, KeyEvent::new(key, KeyModifiers::NONE));
+            assert!(model.filter_focused);
+            assert!(!model.project_inspecting);
+            assert!(rendered(&model, 80, 24).contains("Filter"));
+        }
+        let mut model = model_with_projects();
+        model.view = ProjectView::Details;
+        model.section = ProjectSection::Members;
+        model.member_inspecting = true;
+        handle_key(&mut model, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(model.member_action_requested.is_none());
+        handle_key(&mut model, KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert!(model.show_archived_members);
+        handle_key(&mut model, KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert!(!model.show_archived_members);
     }
 
     fn model_with_projects() -> CutexProjectsModel {

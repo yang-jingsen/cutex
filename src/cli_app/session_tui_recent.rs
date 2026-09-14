@@ -430,7 +430,7 @@ impl RecentSessionsWorkspace {
                 } else {
                     RecentLoadState::Ready
                 };
-                self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+                self.normalize_visible_selection();
             }
             Err(CatalogError::ProviderIncompatible(message)) => {
                 self.failed_cursor = cursor;
@@ -493,6 +493,7 @@ impl RecentSessionsWorkspace {
                 row.view.configured_profile = None;
             }
         }
+        self.normalize_visible_selection();
     }
 
     pub(super) fn move_selection(&mut self, direction: isize) {
@@ -628,6 +629,10 @@ impl RecentSessionsWorkspace {
                 matches.then_some(index)
             })
             .collect()
+    }
+
+    fn normalize_visible_selection(&mut self) {
+        if !self.visible_indices().contains(&self.selected) { self.select_first_visible(); }
     }
 
     fn select_first_visible(&mut self) {
@@ -847,7 +852,9 @@ mod tests {
         );
         assert_eq!(workspace.rows.len(), 2);
         assert_eq!(workspace.visible_rows().len(), 1);
-        workspace.selected = workspace.visible_indices()[0];
+        assert!(workspace.begin_review());
+        assert_eq!(workspace.review().unwrap().thread_id, "same");
+        workspace.cancel_review();
         workspace.receive(
             CatalogReply::Page {
                 cursor: Some("next".into()),

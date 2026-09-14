@@ -718,7 +718,7 @@ fn handle_key(
             model.detail = model.selected_row().is_some();
             model.detail_scroll.reset();
         }
-        KeyCode::Char('/') => model.filter_focused = true,
+        KeyCode::Char('/') => { model.detail = false; model.filter_focused = true; },
         _ => {}
     }
     None
@@ -1068,6 +1068,17 @@ fn detail_field(label: &str, value: String) -> Line<'static> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pro_review_task_filter_leaves_details() {
+        let mut model = TaskModel { rows: vec![row("one", TaskState::Running, "2026-01-01T00:00:00Z")], selected_assignment_id: Some("one".into()), detail: true, ..Default::default() };
+        let mut cadence = RefreshCadence::new(Instant::now());
+        handle_key(&mut model, &mut cadence, KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(model.filter_focused);
+        assert!(!model.detail);
+        handle_key(&mut model, &mut cadence, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(model.query.value(), "x");
+    }
+
     #[test]
     fn ui_contract_b2_legacy_navigation_keeps_task_local_state() {
         let mut model = TaskModel::default();
