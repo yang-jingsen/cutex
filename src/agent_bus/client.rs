@@ -548,10 +548,15 @@ fn submit_authenticated_agent_control_with_fence(
     } else {
         u64::MAX
     };
-    Read::by_ref(&mut stream)
-        .take(limit)
-        .read_to_end(&mut response)
-        .with_context(|| format!("Failed to read Cutex {label} response"))?;
+    if bounded_mcp {
+        response = mcp_http_response::read_response(&mut stream)
+            .with_context(|| format!("Failed to read Cutex {label} response"))?;
+    } else {
+        Read::by_ref(&mut stream)
+            .take(limit)
+            .read_to_end(&mut response)
+            .with_context(|| format!("Failed to read Cutex {label} response"))?;
+    }
     let split = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -728,6 +733,28 @@ mod tests {
             "/api/task/v2/query", &body).unwrap();
         assert_eq!(result, response);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn mcp_complete_receipt_returns_while_peer_remains_open() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (done, wait) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_simple_http_request(&mut stream).unwrap();
+            write_json_response(&mut stream, 200, "OK", &json!({"receipt":"complete"})).unwrap();
+            let _ = wait.recv_timeout(Duration::from_secs(2));
+        });
+        let result = submit_authenticated_agent_control_with_fence(
+            port, "test-token", &RuntimeAgentId::new("stock.worker").unwrap(),
+            "/api/task/v2/worker-prepare", b"{}", "test",
+            Duration::from_millis(100),
+            Some(&crate::agent_bus::mcp::CallerFence { thread_id:"11111111-1111-4111-8111-111111111111".into(), generation:3 }),
+        );
+        done.send(()).unwrap();
+        server.join().unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&result.unwrap()).unwrap(), json!({"receipt":"complete"}));
     }
 
     #[test]
@@ -1029,3 +1056,6 @@ mod tests {
         server.join().expect("test bus server");
     }
 }
+
+#[path = "mcp_http_response.rs"]
+mod mcp_http_response;

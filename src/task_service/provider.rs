@@ -5249,6 +5249,31 @@ mod tests {
     }
 
     #[test]
+    fn resubmit_prepare_requires_review_changes_then_replays_exactly() {
+        let fixture = Fixture::new("resubmit-prepare");
+        fixture.provision();
+        fixture.start("start");
+        fixture.submit("original", "result-1");
+        let request: WorkerPrepareRequest = serde_json::from_value(serde_json::json!({
+            "schema":"cutex/task-service-worker-prepare/v2",
+            "action":{"operation":"submit", "body":{
+                "schema":"cutex/task-service-action/v2", "action_id":"revision",
+                "assignment_id":"assignment-1", "result_sha256":sha("result-2"),
+                "result_reference":"result-2"
+            }}
+        })).unwrap();
+        assert_eq!(fixture.provider.prepare_worker_action(&fixture.worker, &request),
+            Err(ProviderError::IllegalState("submit_requires_running")));
+        fixture.terminal_action(TerminalAuthorityRequest::RequestChanges(TerminalActionRequest {
+            schema: ProviderActionSchema::V2, action_id: action("changes"),
+            assignment_id: assignment_id(), decision_reference: Some("revise report".into()),
+        }));
+        let WorkerPrepareOutcome::Prepared(envelope) = fixture.provider.prepare_worker_action(&fixture.worker, &request).unwrap() else { panic!("expected prepared revision") };
+        let committed = fixture.provider.execute_worker_action(&fixture.worker, &envelope).unwrap();
+        assert_eq!(fixture.provider.prepare_worker_action(&fixture.worker, &request).unwrap(), WorkerPrepareOutcome::Committed(committed));
+    }
+
+    #[test]
     fn review_changes_and_accept_complete_one_attempt() {
         let fixture = Fixture::new("review-loop");
         fixture.provision();

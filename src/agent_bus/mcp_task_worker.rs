@@ -158,9 +158,7 @@ pub(super) fn invoke(args: Value, transport: &mut impl Transport) -> Value {
         let response = match transport.post("/api/task/v2/worker-prepare", &prepare) {
             Ok(response) => response,
             Err(_) => {
-                return json!(ModelReceipt::no_write("response_uncertain")
-                    .with_status("response_uncertain")
-                    .for_action(&args))
+                return uncertain_response(&args, "prepare")
             }
         };
         if response.get("http_status").is_some() {
@@ -194,11 +192,18 @@ pub(super) fn invoke(args: Value, transport: &mut impl Transport) -> Value {
             Ok(response) => return json!(sanitize_provider_response(&args, response)),
             Err(_) if retry == 0 => continue,
             Err(_) => {
-                return json!(ModelReceipt::no_write("response_uncertain")
-                    .with_status("response_uncertain")
-                    .for_action(&args))
+                return uncertain_response(&args, "action")
             }
         }
     }
     unreachable!()
+}
+
+fn uncertain_response(args: &TaskServiceArgs, phase: &str) -> Value {
+    let mut response = json!(ModelReceipt::no_write("response_uncertain")
+        .with_status("response_uncertain")
+        .for_action(args));
+    response["phase"] = json!(phase);
+    response["retry_guidance"] = json!("Retry the same action_id with the identical payload to reconcile the outcome; do not create a replacement action.");
+    response
 }

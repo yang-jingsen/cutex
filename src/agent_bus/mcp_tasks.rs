@@ -74,7 +74,7 @@ pub(super) fn tools() -> Vec<Value> {
     vec![
         json!({"name":READ,"description":"Read the full immutable contract of your own assignment, including its revision and SHA-256. Available before start; does not start an attempt or modify task state.","inputSchema":{"type":"object","properties":{"assignment_id":{"type":"string"}},"required":["assignment_id"],"additionalProperties":false}}),
         json!({"name":TERMINAL,"description":"Explicit completion-seat decision (including Release). accept_result/request_changes/fail_result only; request_changes requires decision_reference. Current runtime, seat and mechanical revisions are resolved by Cutex, never tool arguments. Reuse exact action_id/payload after uncertainty.","inputSchema":{"type":"object","properties":{"operation":{"type":"string","enum":["accept_result","request_changes","fail_result"]},"action_id":{"type":"string"},"assignment_id":{"type":"string"},"decision_reference":{"type":"string","maxLength":4096}},"required":["operation","action_id","assignment_id"],"additionalProperties":false}}),
-        json!({"name":WORKER,"description":format!("Semantic Worker action. Runtime and assignment authority are provider-authenticated. {worker_help}"),"inputSchema":{"type":"object","properties":worker,"required":["operation","action_id","assignment_id"],"additionalProperties":false}}),
+        json!({"name":WORKER,"description":format!("Semantic Worker action. Runtime and assignment authority are provider-authenticated. Submit requires a running attempt. To revise an already submitted result, the reviewer must request_changes first; closed assignments cannot be resubmitted. After response_uncertain, retry the identical payload with the same action_id to reconcile the outcome. {worker_help}"),"inputSchema":{"type":"object","properties":worker,"required":["operation","action_id","assignment_id"],"additionalProperties":false}}),
         json!({"name":DIRECTOR,"description":format!("Semantic Director action. {director_help} create_and_assign is recoverable, NOT atomic. Reuse the exact action_id AND payload after an uncertain response. Example acceptance: {{\"operation\":\"accept_result\",\"action_id\":\"accept-1\",\"assignment_id\":\"assignment-1\",\"decision_reference\":\"/path/to/acceptance.md\"}}. For decisions, summary/project_id/task_id/task_revision are forbidden; decision_reference is optional for accept_result/fail_result/cancel, required for request_changes."),"inputSchema":{"type":"object","properties":director,"required":["operation","action_id"],"additionalProperties":false}}),
     ]
 }
@@ -179,6 +179,23 @@ mod tests {
             self.replies.pop_front().unwrap_or_else(|| Ok(json!({})))
         }
     }
+    #[test]
+    fn worker_resubmit_state_refusal_is_not_transport_uncertainty() {
+        let args = json!({"operation":"submit", "assignment_id":"assignment-1", "action_id":"resubmit", "result_sha256":"a".repeat(64), "result_reference":"revision"});
+        let mut wire = Wire::default();
+        wire.replies.push_back(Ok(json!({"schema":"cutex/task-service-worker-prepare-response/v2", "outcome":{"kind":"no_write", "body":{"code":"illegal_state", "detail":"submit_requires_running"}}})));
+        let result = worker::invoke(args.clone(), &mut wire);
+        assert_eq!(result["status"], "current_state");
+        assert_eq!(result["code"], "illegal_state");
+        assert_eq!(wire.sent.len(), 1);
+        let mut wire = Wire::default();
+        wire.replies.push_back(Err(anyhow::anyhow!("timeout")));
+        let result = worker::invoke(args, &mut wire);
+        assert_eq!(result["status"], "response_uncertain");
+        assert_eq!(result["phase"], "prepare");
+        assert!(result["retry_guidance"].as_str().unwrap().contains("same action_id"));
+    }
+
     #[test]
     fn contract_read_uses_authenticated_query_and_preserves_full_body() {
         let contract = "合同\n".repeat(10000);
