@@ -797,6 +797,7 @@ struct SelectorModel {
     recent_inspecting: bool,
     settings_navigation: Option<Help>,
     settings_return_panel: Option<PrimaryPanel>,
+    profiles_from_settings: bool,
     confirmation_returns_to_list: bool,
     archive_confirmation: Option<cutex::agent_management::AgentArchiveRequest>,
     stock_runtime_confirmation: Option<super::stock_lifecycle::ReviewedStockRuntimeAction>,
@@ -850,6 +851,7 @@ impl SelectorModel {
             recent_inspecting: false,
             settings_navigation: None,
             settings_return_panel: None,
+            profiles_from_settings: false,
             confirmation_returns_to_list: false,
             archive_confirmation: None,
             stock_runtime_confirmation: None,
@@ -5908,6 +5910,10 @@ fn selector_commands(model: &SelectorModel) -> Vec<(Command, Option<&'static str
         .collect()
 }
 fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyRoute {
+    let command = if command == Command::Back && model.profiles_from_settings
+        && matches!(model.mode, SelectorMode::ProfileManager { .. }) {
+        Command::Settings
+    } else { command };
     if command == Command::Details {
         model.status_scroll.reset();
         model.details = Some(format!(
@@ -5972,7 +5978,10 @@ fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyR
         }
     }
     match command {
-        Command::Profiles => SelectorKeyRoute::Control(Some(SelectorControl::OpenProfileManager)),
+        Command::Profiles => {
+            model.profiles_from_settings = matches!(model.mode, SelectorMode::Settings { target: SelectorTarget::GlobalSettings, .. });
+            SelectorKeyRoute::Control(Some(SelectorControl::OpenProfileManager))
+        },
         Command::Workspaces => SelectorKeyRoute::Control(Some(SelectorControl::OpenProjects)),
         Command::Archive => SelectorKeyRoute::Control(Some(SelectorControl::OpenRetiredSessions)),
         Command::Appearance => {
@@ -6003,6 +6012,7 @@ fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyR
             SelectorKeyRoute::Switch(panel)
         }
         Command::Settings => {
+            model.profiles_from_settings = false;
             if let Some(origin) = model.finish_subject_context() {
                 model.settings_return_panel = Some(origin);
             }
@@ -6152,6 +6162,12 @@ fn route_selector_key(model: &mut SelectorModel, key: KeyEvent) -> SelectorKeyRo
         && matches!(model.mode, SelectorMode::ProfileManager { focus: ProfileWorkspaceFocus::Editor, .. })
     {
         return SelectorKeyRoute::Control(Some(model.handle(SelectorEvent::Back)));
+    }
+    if key.code == KeyCode::Esc && model.profiles_from_settings
+        && matches!(model.mode, SelectorMode::ProfileManager { focus: ProfileWorkspaceFocus::Items, .. })
+        && !text_input && !selector_modal(model) && model.help.is_none() && model.leave_review.is_none()
+    {
+        return selector_command(model, Command::Back);
     }
     // Escape unwinds the local Settings columns before leaving the page.
     // In particular, the remembered origin must not steal cancellation.
@@ -15927,6 +15943,21 @@ mod tests {
         assert_eq!(rows[2].target.agent_key(), Some("cutex.unknown"));
         assert_eq!(rows[2].lifecycle, None);
         assert!(rows[3].target.uses_global_settings());
+    }
+
+    #[test]
+    fn profiles_opened_from_settings_return_through_settings() {
+        for origin in [PrimaryPanel::Agents, PrimaryPanel::Recent, PrimaryPanel::Projects] {
+            let mut model = SelectorModel::new(vec![global_row()], false, false);
+            selector_command(&mut model, Command::Settings);
+            model.settings_return_panel = Some(origin);
+            selector_command(&mut model, Command::Profiles);
+            model.open_profile_manager(vec![]);
+            route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert!(matches!(model.mode, SelectorMode::Settings { target: SelectorTarget::GlobalSettings, .. }));
+            assert_eq!(model.settings_return_panel, Some(origin));
+            assert!(matches!(route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), SelectorKeyRoute::Switch(panel) if panel == origin));
+        }
     }
 
     #[test]
