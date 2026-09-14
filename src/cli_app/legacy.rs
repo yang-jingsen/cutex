@@ -1469,54 +1469,6 @@ status_line = ["launch-profile", "current-dir"]
     }
 
     #[test]
-    fn docker_command_defaults_to_plain_docker() {
-        let _guard = env_lock().lock().expect("env lock should not be poisoned");
-        let old_cutex = std::env::var_os(CUTEX_DOCKER_USE_SUDO_ENV_VAR);
-        let old_codez = std::env::var_os(CODEZ_DOCKER_USE_SUDO_ENV_VAR);
-        unsafe {
-            std::env::set_var(CUTEX_DOCKER_USE_SUDO_ENV_VAR, "0");
-            std::env::remove_var(CODEZ_DOCKER_USE_SUDO_ENV_VAR);
-        }
-
-        let launch = docker_command();
-        assert_eq!(launch.program, "docker");
-        assert!(launch.args.is_empty());
-
-        match old_cutex {
-            Some(value) => unsafe { std::env::set_var(CUTEX_DOCKER_USE_SUDO_ENV_VAR, value) },
-            None => unsafe { std::env::remove_var(CUTEX_DOCKER_USE_SUDO_ENV_VAR) },
-        }
-        match old_codez {
-            Some(value) => unsafe { std::env::set_var(CODEZ_DOCKER_USE_SUDO_ENV_VAR, value) },
-            None => unsafe { std::env::remove_var(CODEZ_DOCKER_USE_SUDO_ENV_VAR) },
-        }
-    }
-
-    #[test]
-    fn docker_command_can_be_prefixed_with_sudo() {
-        let _guard = env_lock().lock().expect("env lock should not be poisoned");
-        let old_cutex = std::env::var_os(CUTEX_DOCKER_USE_SUDO_ENV_VAR);
-        let old_codez = std::env::var_os(CODEZ_DOCKER_USE_SUDO_ENV_VAR);
-        unsafe {
-            std::env::set_var(CUTEX_DOCKER_USE_SUDO_ENV_VAR, "1");
-            std::env::remove_var(CODEZ_DOCKER_USE_SUDO_ENV_VAR);
-        }
-
-        let launch = docker_command();
-        assert_eq!(launch.program, "sudo");
-        assert_eq!(launch.args, vec!["docker".to_string()]);
-
-        match old_cutex {
-            Some(value) => unsafe { std::env::set_var(CUTEX_DOCKER_USE_SUDO_ENV_VAR, value) },
-            None => unsafe { std::env::remove_var(CUTEX_DOCKER_USE_SUDO_ENV_VAR) },
-        }
-        match old_codez {
-            Some(value) => unsafe { std::env::set_var(CODEZ_DOCKER_USE_SUDO_ENV_VAR, value) },
-            None => unsafe { std::env::remove_var(CODEZ_DOCKER_USE_SUDO_ENV_VAR) },
-        }
-    }
-
-    #[test]
     fn codez_config_defaults_match_expected_runtime_behavior() {
         let config = CodezConfig::default();
 
@@ -2110,39 +2062,6 @@ request_max_retries = 7
                 "{expected_key} should be explicitly removed for login"
             );
         }
-    }
-
-    #[test]
-    fn sandbox_user_home_falls_back_to_legacy_runtime_home_when_new_path_missing() {
-        let _guard = env_lock().lock().expect("env lock should not be poisoned");
-        let temp_home = std::env::temp_dir().join(format!("codez-home-{}", Uuid::new_v4()));
-        let old_home = std::env::var_os("HOME");
-        let legacy_runtime_home = temp_home
-            .join(".cutex")
-            .join("runtime")
-            .join("thirdparty")
-            .join("userhome");
-        let new_runtime_home = temp_home.join(".cutex").join("runtime").join("docker-home");
-
-        fs::create_dir_all(&legacy_runtime_home).expect("legacy runtime home should be created");
-        fs::write(legacy_runtime_home.join(".write-test"), "demo")
-            .expect("legacy runtime marker should be written");
-
-        unsafe {
-            std::env::set_var("HOME", &temp_home);
-        }
-
-        let resolved = sandbox_user_home("demo").expect("runtime home should resolve");
-
-        assert_eq!(resolved, legacy_runtime_home);
-        assert!(legacy_runtime_home.exists());
-        assert!(!new_runtime_home.exists());
-
-        match old_home {
-            Some(value) => unsafe { std::env::set_var("HOME", value) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-        let _ = fs::remove_dir_all(temp_home);
     }
 
     #[test]

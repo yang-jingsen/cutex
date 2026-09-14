@@ -349,19 +349,6 @@ fn try_load_agent_reservation_absence_evidence(
             .context("failed to resolve legacy Docker native index")?
             .join(".codex"),
     );
-    for account in &accounts.accounts {
-        if !matches!(account.cli_kind, cutex::profiles::model::CliKind::Codex) {
-            continue;
-        }
-        if let cutex::profiles::model::RuntimeConfig::Docker { user_name, .. } = &account.runtime {
-            let user_name = cutex::launch::docker::docker_user_name(user_name.as_deref())?;
-            codex_homes.insert(
-                cutex::launch::docker::DockerLaunchPaths::new(&user_name, &account.id)?
-                    .host_user_home
-                    .join(".codex"),
-            );
-        }
-    }
     for codex_home in codex_homes {
         match cutex::runtime::codex_home::correlate_codex_session_between_in_home(
             &codex_home,
@@ -1710,14 +1697,7 @@ fn selected_profile_codex_home(
 ) -> anyhow::Result<PathBuf> {
     match &resolved.account.runtime {
         cutex::profiles::model::RuntimeConfig::Host => cutex::config::paths::host_codex_home_dir(),
-        cutex::profiles::model::RuntimeConfig::Docker { user_name, .. } => {
-            let user_name = cutex::launch::docker::docker_user_name(user_name.as_deref())?;
-            Ok(
-                cutex::launch::docker::DockerLaunchPaths::new(&user_name, &resolved.account.id)?
-                    .host_user_home
-                    .join(".codex"),
-            )
-        }
+        cutex::profiles::model::RuntimeConfig::Docker { .. } => anyhow::bail!("Cutex Docker integration was retired"),
     }
 }
 

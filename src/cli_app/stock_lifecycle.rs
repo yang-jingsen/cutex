@@ -625,6 +625,12 @@ impl StockRuntimeExecutor for StockExecutor {
             (matches!(receipt.review.contract.version, 3 | 4))
                 .then_some(receipt.review.contract.native_home.as_path()),
         )?;
+        let accounts = super::account_store::load_store_read_only()?;
+        let account = accounts.accounts.iter().find(|account| account.id == profile.profile_id)
+            .context("launch profile unavailable for proxy configuration")?;
+        for (key, value) in cutex::config::proxy::native_proxy_envs(account, &config) {
+            launch = launch.env(key, value);
+        }
         if bundle.soon_ingress() {
             launch = option(
                 launch,

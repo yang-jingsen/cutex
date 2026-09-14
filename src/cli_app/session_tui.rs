@@ -1937,6 +1937,15 @@ impl SelectorModel {
             return self.handle_settings_overlay_event(event, &target);
         }
 
+        if event == SelectorEvent::Activate
+            && target == SelectorTarget::GlobalSettings
+            && focus == SettingsFocus::Categories && category == 0
+        {
+            return match selector_command(self, Command::Profiles) {
+                SelectorKeyRoute::Control(control) => control.unwrap_or(SelectorControl::Continue),
+                _ => SelectorControl::Continue,
+            };
+        }
         if event == SelectorEvent::Activate && focus != SettingsFocus::Categories {
             if let Some(command) = self.active_setting_option().and_then(|option| option.navigation) {
                 return match selector_command(self, command) {
@@ -7275,9 +7284,9 @@ fn render_selector_contents(frame: &mut Frame<'_>, model: &SelectorModel) {
                         RecentLoadState::Failed(_) | RecentLoadState::ProviderIncompatible(_)
                     ))
             {
-                crate::cli_app::session_tui_layout::WARNING
+                crate::cli_app::session_tui_layout::warning()
             } else {
-                crate::cli_app::session_tui_layout::MUTED
+                crate::cli_app::session_tui_layout::muted()
             },
         )),
         chunks[4],
@@ -7341,7 +7350,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
     let mut spans = vec![
         Span::styled(
             "Cutex",
-            Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD),
+            Style::new().fg(crate::cli_app::session_tui_layout::focus()).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!(" {view}"),
@@ -7360,7 +7369,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
                 "  {} · Alt+O scope · Alt+Z Archive / Retired",
                 ["All", "Online", "Pinned"][model.managed_scope]
             ),
-            Style::new().fg(crate::cli_app::session_tui_layout::FOCUS),
+            Style::new().fg(crate::cli_app::session_tui_layout::focus()),
         ));
         if model.show_thread_titles {
             spans.push(Span::styled(
@@ -7374,7 +7383,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
         if area.width < SETTINGS_TWO_PANE_MIN_WIDTH {
             spans.push(Span::styled(
                 format!("[{}]", settings_view.label()),
-                Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD),
+                Style::new().fg(crate::cli_app::session_tui_layout::focus()).add_modifier(Modifier::BOLD),
             ));
         } else {
             for view in [SettingsView::Expanded, SettingsView::Categories] {
@@ -7384,7 +7393,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
                     view.label().to_string()
                 };
                 let style = if view == settings_view {
-                    Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD)
+                    Style::new().fg(crate::cli_app::session_tui_layout::focus()).add_modifier(Modifier::BOLD)
                 } else {
                     Style::new().fg(Color::DarkGray)
                 };
@@ -7571,7 +7580,7 @@ fn render_recent_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorMo
             Line::from(""),
             Line::from(Span::styled(
                 "Cutex defaults: persistent management; native title is metadata, never a formal Agent name; default runtime; no groups; IM hidden; unpinned.",
-                Style::new().fg(crate::cli_app::session_tui_layout::FOCUS),
+                Style::new().fg(crate::cli_app::session_tui_layout::focus()),
             )),
             Line::from(""),
             Line::from(if model.recent.review_confirmed() {
@@ -7625,7 +7634,7 @@ fn render_recent_details(frame: &mut Frame<'_>, area: Rect, model: &SelectorMode
     let lines = rows.get(model.recent.selected_visible()).map(|row| {
         let field = |label: &str, value: String| Line::from(vec![Span::styled(format!("{label}: "), Style::new().fg(Color::Gray)), Span::raw(value)]);
         vec![
-            Line::styled(row.title.clone(), Style::new().fg(crate::cli_app::session_tui_layout::TEXT).add_modifier(Modifier::BOLD)),
+            Line::styled(row.title.clone(), Style::new().fg(crate::cli_app::session_tui_layout::text()).add_modifier(Modifier::BOLD)),
             field("Association", row.state.label().into()),
             field("Updated", row.view.updated.clone()),
             Line::default(),
@@ -7636,7 +7645,7 @@ fn render_recent_details(frame: &mut Frame<'_>, area: Rect, model: &SelectorMode
             field("Provider", row.provider.clone()),
             field("Source", row.source.clone()),
             Line::default(),
-            Line::styled("Technical identifiers", Style::new().fg(crate::cli_app::session_tui_layout::FOCUS)),
+            Line::styled("Technical identifiers", Style::new().fg(crate::cli_app::session_tui_layout::focus())),
             field("Session ID", row.thread_id.clone()),
         ]
     }).unwrap_or_else(|| vec![Line::from("No session selected.")]);
@@ -7719,7 +7728,7 @@ fn render_profile_context(frame: &mut Frame<'_>, area: Rect, model: &SelectorMod
         if default_profile.as_deref() == Some(profile.name.as_str()) {
             spans.push(Span::styled(
                 "  launch default",
-                Style::new().fg(crate::cli_app::session_tui_layout::FOCUS),
+                Style::new().fg(crate::cli_app::session_tui_layout::focus()),
             ));
         }
         Line::from(spans)
@@ -7766,19 +7775,19 @@ fn render_profile_list(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel)
         return;
     };
     let default_profile = model.current_default_profile_name();
-    let default_style = Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD);
+    let default_style = Style::new().fg(crate::cli_app::session_tui_layout::focus()).add_modifier(Modifier::BOLD);
     let mut rows = if area.width >= 40 {
         vec![Row::new([
             Cell::from("Default").style(default_style),
             Cell::from("-"),
             Cell::from(default_profile.as_deref().unwrap_or("none"))
-                .style(Style::new().fg(crate::cli_app::session_tui_layout::FOCUS)),
+                .style(Style::new().fg(crate::cli_app::session_tui_layout::focus())),
         ])]
     } else {
         vec![Row::new([
             Cell::from("Default").style(default_style),
             Cell::from(default_profile.as_deref().unwrap_or("none"))
-                .style(Style::new().fg(crate::cli_app::session_tui_layout::FOCUS)),
+                .style(Style::new().fg(crate::cli_app::session_tui_layout::focus())),
         ])]
     };
     rows.extend(
@@ -7803,7 +7812,7 @@ fn render_profile_list(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel)
             })
             .collect::<Vec<_>>(),
     );
-    let add_style = Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD);
+    let add_style = Style::new().fg(crate::cli_app::session_tui_layout::focus()).add_modifier(Modifier::BOLD);
     if area.width >= 40 {
         rows.push(Row::new([
             Cell::from("Add profile").style(add_style),
@@ -7883,7 +7892,7 @@ fn render_profile_details(frame: &mut Frame<'_>, area: Rect, model: &SelectorMod
         .flat_map(|category| {
             std::iter::once(
                 Row::new([Cell::from(category.label), Cell::from("")])
-                    .style(Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD)),
+                    .style(Style::new().fg(crate::cli_app::session_tui_layout::focus()).add_modifier(Modifier::BOLD)),
             )
             .chain(category.options.iter().map(|option| {
                 let label = if option.dirty {
@@ -7959,7 +7968,7 @@ fn render_profile_default_editor(frame: &mut Frame<'_>, area: Rect, model: &Sele
         ),
     ];
     let mut rows = vec![Row::new([Cell::from("Launch defaults"), Cell::from("")])
-        .style(Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD))];
+        .style(Style::new().fg(crate::cli_app::session_tui_layout::focus()).add_modifier(Modifier::BOLD))];
     rows.extend(fields.into_iter().map(|(field, label, value)| {
         let label = if model.global_settings_draft.field_is_dirty(field) {
             format!("  {label} *")
@@ -8015,7 +8024,7 @@ fn profile_state_style(profile: &ProfileCatalogEntry, default_profile: Option<&s
     if profile.active {
         Style::new().fg(Color::Green)
     } else if default_profile == Some(profile.name.as_str()) {
-        Style::new().fg(crate::cli_app::session_tui_layout::FOCUS)
+        Style::new().fg(crate::cli_app::session_tui_layout::focus())
     } else {
         Style::new().fg(Color::DarkGray)
     }
@@ -8237,7 +8246,7 @@ fn render_agent_inspector(frame: &mut Frame<'_>, area: Rect, model: &SelectorMod
     }
     let block = Block::bordered()
         .title(" Inspector ")
-        .border_style(Style::new().fg(if active { crate::cli_app::session_tui_layout::FOCUS } else { Color::DarkGray }));
+        .border_style(Style::new().fg(if active { crate::cli_app::session_tui_layout::focus() } else { Color::DarkGray }));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -8265,7 +8274,7 @@ fn render_agent_inspector(frame: &mut Frame<'_>, area: Rect, model: &SelectorMod
         tabs.push(Span::styled(
             label,
             if candidate == section {
-                Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD)
+                Style::new().fg(crate::cli_app::session_tui_layout::focus()).add_modifier(Modifier::BOLD)
             } else {
                 Style::new().fg(Color::Gray)
             },
@@ -8361,7 +8370,7 @@ fn render_inspector_settings(
                     super::session_tui_cutex_projects::project_badge_style(project.color),
                 ),
                 Span::raw(format!(" {}  ", project.display_name)),
-                Span::styled("Alt+P edit", Style::new().fg(crate::cli_app::session_tui_layout::FOCUS)),
+                Span::styled("Alt+P edit", Style::new().fg(crate::cli_app::session_tui_layout::focus())),
             ]))
             .block(Block::bordered().title(" Project badge settings ")),
             chunks[0],
@@ -8451,7 +8460,7 @@ fn render_action_table(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel)
     if row.launch_profile_control_available() {
         rows.push(
             Row::new([
-                Cell::from("Launch profile").style(Style::new().fg(crate::cli_app::session_tui_layout::FOCUS)),
+                Cell::from("Launch profile").style(Style::new().fg(crate::cli_app::session_tui_layout::focus())),
                 Cell::from(row.launch_profile_detail(
                     model.selected_launch_profile(),
                     global_default_profile.as_deref(),
@@ -8531,7 +8540,7 @@ fn render_expanded_settings(frame: &mut Frame<'_>, area: Rect, model: &SelectorM
         .flat_map(|category| {
             std::iter::once(
                 Row::new([Cell::from(category.label), Cell::from("")])
-                    .style(Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD)),
+                    .style(Style::new().fg(crate::cli_app::session_tui_layout::focus()).add_modifier(Modifier::BOLD)),
             )
             .chain(category.options.iter().map(|option| {
                 let label = if option.dirty {
@@ -8948,14 +8957,14 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 fn settings_panel_block(title: String, active: bool) -> Block<'static> {
     Block::bordered().title(title).border_style(if active {
-        Style::new().fg(crate::cli_app::session_tui_layout::FOCUS)
+        Style::new().fg(crate::cli_app::session_tui_layout::focus())
     } else {
         Style::new().fg(Color::DarkGray)
     })
 }
 
 fn settings_highlight_style(active: bool) -> Style {
-    let style = Style::new().fg(Color::White).bg(if active { crate::cli_app::session_tui_layout::SELECTION } else { Color::DarkGray });
+    let style = Style::new().fg(Color::White).bg(if active { crate::cli_app::session_tui_layout::selection() } else { Color::DarkGray });
     if active {
         style.add_modifier(Modifier::BOLD)
     } else {
@@ -9295,12 +9304,12 @@ fn lifecycle_style(state: CutexSessionLifecycleState) -> Style {
 
 pub(super) fn footer_hints(hints: &[(&'static str, &'static str)]) -> Vec<Span<'static>> {
     let mut spans = Vec::with_capacity(hints.len() * 4);
-    let key_style = Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD);
+    let key_style = Style::new().fg(crate::cli_app::session_tui_layout::focus()).add_modifier(Modifier::BOLD);
     for (key, description) in hints {
         spans.push(Span::styled(*key, key_style));
         if !description.is_empty() {
             spans.push(Span::raw(" "));
-            spans.push(Span::styled(*description, Style::new().fg(crate::cli_app::session_tui_layout::FOOTER_DESCRIPTION)));
+            spans.push(Span::styled(*description, Style::new().fg(crate::cli_app::session_tui_layout::footer_description())));
         }
         spans.push(Span::raw("  "));
     }
@@ -13034,7 +13043,7 @@ mod tests {
         assert!(wide.contains("alpha@example.test"));
         assert!(wide.contains("Model"));
         assert!(wide.contains("Provider"));
-        assert!(wide.contains("Managed sessions"));
+        assert!(wide.contains("Extra CLI args"));
         assert!(!wide.contains("Status"));
 
         let medium = rendered_text_at(80, 24, &model);
@@ -13674,13 +13683,13 @@ mod tests {
     fn global_choice_and_text_editors_stage_then_discard_without_an_apply_request() {
         let config = CodezConfig::default();
         let mut model = SelectorModel::new(vec![global_settings_row(&config)], false, false);
-        select_global_setting(&mut model, GlobalSettingsField::ManagedSessions);
+        select_global_setting(&mut model, GlobalSettingsField::ProxyEnabled);
 
         model.handle(SelectorEvent::Activate);
         assert!(matches!(
             model.settings_overlay.as_ref(),
             Some(SettingsOverlay::Choice {
-                field: SettingsEditField::Global(GlobalSettingsField::ManagedSessions),
+                field: SettingsEditField::Global(GlobalSettingsField::ProxyEnabled),
                 selected: 1,
                 custom_value: None,
                 ..
@@ -13730,304 +13739,11 @@ mod tests {
 
     #[test]
     fn global_secret_editor_never_renders_stored_or_replacement_payloads() {
-        let config = CodezConfig {
-            notify_service_token: Some("stored-notify-secret".to_string()),
-            desktop_notify_token: Some("stored-desktop-secret".to_string()),
-            ..CodezConfig::default()
-        };
-        let mut model = SelectorModel::new(vec![global_settings_row(&config)], false, false);
-        select_global_setting(&mut model, GlobalSettingsField::NotifyServiceToken);
-
-        model.handle(SelectorEvent::Activate);
-        assert!(matches!(
-            model.settings_overlay.as_ref(),
-            Some(SettingsOverlay::SecretAction {
-                field: SettingsEditField::Global(GlobalSettingsField::NotifyServiceToken),
-                selected: 0,
-            })
-        ));
-        let action = rendered_text_at(80, 24, &model);
-        assert!(action.contains("Keep stored value"));
-        assert!(!action.contains("stored-notify-secret"));
-
-        model.handle(SelectorEvent::Down);
-        model.handle(SelectorEvent::Activate);
-        assert!(matches!(
-            model.settings_overlay.as_ref(),
-            Some(SettingsOverlay::Text {
-                field: SettingsEditField::Global(GlobalSettingsField::NotifyServiceToken),
-                masked: true,
-                ..
-            })
-        ));
-        for character in "replacement-secret".chars() {
-            model.handle(SelectorEvent::Insert(character));
-        }
-        let replacement = rendered_text_at(80, 24, &model);
-        assert!(replacement.contains("******************"));
-        assert!(!replacement.contains("replacement-secret"));
-        assert!(!replacement.contains("stored-notify-secret"));
-        model.handle(SelectorEvent::Activate);
-        assert_eq!(model.settings_dirty_count(), 1);
-        assert_eq!(
-            model
-                .active_setting_option()
-                .map(|option| option.value.as_str()),
-            Some("(replace staged)")
-        );
-
-        select_global_setting(&mut model, GlobalSettingsField::DesktopNotifyToken);
-        model.handle(SelectorEvent::Activate);
-        model.handle(SelectorEvent::Last);
-        model.handle(SelectorEvent::Activate);
-        assert_eq!(model.settings_dirty_count(), 2);
-        assert_eq!(
-            model
-                .active_setting_option()
-                .map(|option| option.value.as_str()),
-            Some("(clear staged)")
-        );
-        let staged = rendered_text_at(100, 24, &model);
-        assert!(!staged.contains("replacement-secret"));
-        assert!(!staged.contains("stored-desktop-secret"));
-
-        model.handle(SelectorEvent::Insert('D'));
-        assert_eq!(model.settings_dirty_count(), 0);
-        assert_eq!(model.notice.as_deref(), Some("Draft discarded"));
-    }
-
-    #[test]
-    fn global_notification_editors_validate_and_apply_one_config_patch() {
-        let config = CodezConfig {
-            notify_service_token: Some("old-secret".to_string()),
-            notify_service_user_message_content: Some("legacy-mode".to_string()),
-            agent_bus_token: Some("preserved-bus-secret".to_string()),
-            ..CodezConfig::default()
-        };
-        let mut model = SelectorModel::new(vec![global_settings_row(&config)], false, false);
-
-        select_global_setting(&mut model, GlobalSettingsField::NotifyMessageContent);
-        model.handle(SelectorEvent::Activate);
-        assert!(matches!(
-            model.settings_overlay.as_ref(),
-            Some(SettingsOverlay::Choice {
-                custom_value: Some(value),
-                selected: 0,
-                ..
-            }) if value == "legacy-mode"
-        ));
-        model.handle(SelectorEvent::Activate);
-        assert!(model.settings_overlay.is_none());
-        assert_eq!(model.settings_dirty_count(), 0);
-        assert!(model.warning.is_none());
-
-        select_global_setting(&mut model, GlobalSettingsField::NotifyIdleTimeout);
-        model.handle(SelectorEvent::Activate);
-        model.handle(SelectorEvent::ClearInput);
-        for character in "invalid".chars() {
-            model.handle(SelectorEvent::Insert(character));
-        }
-        model.handle(SelectorEvent::Activate);
-        assert!(matches!(
-            model.settings_overlay.as_ref(),
-            Some(SettingsOverlay::Text {
-                field: SettingsEditField::Global(GlobalSettingsField::NotifyIdleTimeout),
-                ..
-            })
-        ));
-        assert_eq!(model.settings_dirty_count(), 0);
-        assert!(model
-            .warning
-            .as_deref()
-            .is_some_and(|warning| warning.contains("Unsupported integer value")));
-        let invalid = rendered_text_at(100, 24, &model);
-        assert!(invalid.contains("Unsupported integer value: invalid"));
-        assert!(invalid.contains("Ctrl+C exit"));
-        model.handle(SelectorEvent::ClearInput);
-        model.handle(SelectorEvent::Insert('9'));
-        model.handle(SelectorEvent::Insert('0'));
-        model.handle(SelectorEvent::Activate);
-
-        select_global_setting(&mut model, GlobalSettingsField::NotifyEvents);
-        model.handle(SelectorEvent::Activate);
-        assert!(matches!(
-            model.settings_overlay.as_ref(),
-            Some(SettingsOverlay::Text {
-                field: SettingsEditField::Global(GlobalSettingsField::NotifyEvents),
-                tags: true,
-                masked: false,
-                ..
-            })
-        ));
-        model.handle(SelectorEvent::ClearInput);
-        for character in "turn-completed approval_requested".chars() {
-            model.handle(SelectorEvent::Insert(character));
-        }
-        assert!(rendered_text_at(100, 24, &model).contains("[turn-completed]"));
-        model.handle(SelectorEvent::Activate);
-
-        let snapshot = model
-            .active_global_settings_snapshot()
-            .expect("global snapshot")
-            .clone();
-        model
-            .global_settings_draft
-            .stage(
-                &snapshot,
-                GlobalSettingsField::NotifyMessageContent,
-                Some("preview".to_string()),
-            )
-            .expect("stage message mode");
-        model
-            .global_settings_draft
-            .stage(
-                &snapshot,
-                GlobalSettingsField::DesktopNotifyPort,
-                Some("24251".to_string()),
-            )
-            .expect("stage desktop port");
-        model
-            .global_settings_draft
-            .stage_secret(
-                &snapshot,
-                GlobalSettingsField::NotifyServiceToken,
-                SecretSettingsAction::Replace("new-secret".to_string()),
-            )
-            .expect("stage secret");
-        model.reproject_settings(&SelectorTarget::GlobalSettings);
-
-        let request = match model.handle(SelectorEvent::Insert('A')) {
-            SelectorControl::ApplyGlobalSettings(request) => request,
-            control => panic!("expected global apply request, got {control:?}"),
-        };
-        assert_eq!(request.changed_count, 5);
-        let mut updated = config.clone();
-        assert!(apply_global_settings_to_config(&mut updated, &request).expect("apply global"));
-        assert_eq!(updated.notify_service_idle_timeout_secs, Some(90));
-        assert_eq!(
-            updated.notify_service_events,
-            Some(vec![
-                "turn_completed".to_string(),
-                "approval_requested".to_string()
-            ])
-        );
-        assert_eq!(
-            updated.notify_service_user_message_content.as_deref(),
-            Some("preview")
-        );
-        assert_eq!(updated.desktop_notify_port, Some(24251));
-        assert_eq!(updated.notify_service_token.as_deref(), Some("new-secret"));
-        assert_eq!(
-            updated.agent_bus_token.as_deref(),
-            Some("preserved-bus-secret")
-        );
-        model.global_settings_apply_succeeded(
-            &updated,
-            &request.profile_names,
-            request.changed_count,
-        );
-        assert_eq!(model.settings_dirty_count(), 0);
-        assert_eq!(model.notice.as_deref(), Some("Saved 5 setting(s)"));
-        assert!(!rendered_text_at(100, 24, &model).contains("new-secret"));
-    }
-
-    #[test]
-    fn global_agent_bus_editors_apply_config_without_trimming_prefix_or_dispatching() {
-        let mut config = CodezConfig::default();
-        config.agent_bus_enabled = false;
-        config.agent_bus_token = Some("stored-bus-secret".to_string());
-        config.agent_message_suffix_template = Some("old suffix".to_string());
-        config.notify_service_token = Some("preserved-notify-secret".to_string());
-        let mut model = SelectorModel::new(vec![global_settings_row(&config)], false, false);
-
-        select_global_setting(&mut model, GlobalSettingsField::AgentMessagePrefix);
-        model.handle(SelectorEvent::Activate);
-        assert!(matches!(
-            model.settings_overlay.as_ref(),
-            Some(SettingsOverlay::Text { input, .. })
-                if input.value() == "[message from {from}] "
-        ));
-        model.handle(SelectorEvent::Activate);
-        assert_eq!(model.settings_dirty_count(), 0);
-
-        select_global_setting(&mut model, GlobalSettingsField::AgentBusPort);
-        model.handle(SelectorEvent::Activate);
-        model.handle(SelectorEvent::ClearInput);
-        for character in "59995".chars() {
-            model.handle(SelectorEvent::Insert(character));
-        }
-        model.handle(SelectorEvent::Activate);
-        assert!(model
-            .warning
-            .as_deref()
-            .is_some_and(|warning| warning.contains("Bridgeboard 24xxx")));
-        assert_eq!(model.settings_dirty_count(), 0);
-        model.handle(SelectorEvent::ClearInput);
-        for character in "24261".chars() {
-            model.handle(SelectorEvent::Insert(character));
-        }
-        model.handle(SelectorEvent::Activate);
-
-        select_global_setting(&mut model, GlobalSettingsField::AgentBusEnabled);
-        model.handle(SelectorEvent::Activate);
-        model.handle(SelectorEvent::Up);
-        model.handle(SelectorEvent::Activate);
-
+        let config = CodezConfig { agent_bus_token: Some("private-bus-token".into()), ..CodezConfig::default() };
+        let mut model = SelectorModel::new(vec![global_settings_row_with_profiles(&config, &[])], false, false);
         select_global_setting(&mut model, GlobalSettingsField::AgentBusToken);
         model.handle(SelectorEvent::Activate);
-        model.handle(SelectorEvent::Down);
-        model.handle(SelectorEvent::Activate);
-        for character in "new-bus-secret".chars() {
-            model.handle(SelectorEvent::Insert(character));
-        }
-        assert!(!rendered_text_at(100, 24, &model).contains("new-bus-secret"));
-        model.handle(SelectorEvent::Activate);
-
-        select_global_setting(&mut model, GlobalSettingsField::AgentMessagePrefix);
-        model.handle(SelectorEvent::Activate);
-        model.handle(SelectorEvent::ClearInput);
-        for character in "<{from}> ".chars() {
-            model.handle(SelectorEvent::Insert(character));
-        }
-        model.handle(SelectorEvent::Activate);
-        assert_eq!(
-            model
-                .active_setting_option()
-                .map(|option| option.value.as_str()),
-            Some("<{from}> ")
-        );
-
-        select_global_setting(&mut model, GlobalSettingsField::AgentMessageSuffix);
-        model.handle(SelectorEvent::Activate);
-        model.handle(SelectorEvent::ClearInput);
-        model.handle(SelectorEvent::Activate);
-        assert_eq!(model.settings_dirty_count(), 5);
-
-        let request = match model.handle(SelectorEvent::Insert('A')) {
-            SelectorControl::ApplyGlobalSettings(request) => request,
-            control => panic!("expected Global apply request, got {control:?}"),
-        };
-        let mut updated = config.clone();
-        assert!(apply_global_settings_to_config(&mut updated, &request).expect("apply Agent Bus"));
-        assert!(updated.agent_bus_enabled);
-        assert_eq!(updated.agent_bus_port, Some(24261));
-        assert_eq!(updated.agent_bus_token.as_deref(), Some("new-bus-secret"));
-        assert_eq!(
-            updated.agent_message_prefix_template.as_deref(),
-            Some("<{from}> ")
-        );
-        assert_eq!(updated.agent_message_suffix_template, None);
-        assert_eq!(
-            updated.notify_service_token.as_deref(),
-            Some("preserved-notify-secret")
-        );
-        model.global_settings_apply_succeeded(
-            &updated,
-            &request.profile_names,
-            request.changed_count,
-        );
-        assert_eq!(model.notice.as_deref(), Some("Saved 5 setting(s)"));
-        assert!(!rendered_text_at(100, 24, &model).contains("new-bus-secret"));
+        assert!(!rendered_text_at(120, 30, &model).contains("private-bus-token"));
     }
 
     #[test]
@@ -14042,7 +13758,7 @@ mod tests {
             .expect("global snapshot")
             .clone();
         for (field, value) in [
-            (GlobalSettingsField::ManagedSessions, "enabled"),
+            (GlobalSettingsField::ProxyEnabled, "enabled"),
             (GlobalSettingsField::DockerSudo, "enabled"),
             (GlobalSettingsField::ProxyEnabled, "enabled"),
             (GlobalSettingsField::ProxyUrl, "socks5h://127.0.0.1:7890"),
@@ -14060,10 +13776,10 @@ mod tests {
             SelectorControl::ApplyGlobalSettings(request) => request,
             control => panic!("expected global apply request, got {control:?}"),
         };
-        assert_eq!(request.changed_count, 6);
+        assert_eq!(request.changed_count, 5);
         let mut updated = config.clone();
         assert!(apply_global_settings_to_config(&mut updated, &request).expect("apply global"));
-        assert!(updated.session.enabled);
+        assert!(updated.proxy.as_ref().unwrap().enabled);
         assert!(updated.docker_use_sudo);
         let proxy = updated.proxy.as_ref().expect("enabled proxy");
         assert_eq!(proxy.url.as_deref(), Some("socks5h://127.0.0.1:7890"));
@@ -14081,7 +13797,7 @@ mod tests {
             request.changed_count,
         );
         assert_eq!(model.settings_dirty_count(), 0);
-        assert_eq!(model.notice.as_deref(), Some("Saved 6 setting(s)"));
+        assert_eq!(model.notice.as_deref(), Some("Saved 5 setting(s)"));
         assert!(model
             .active_row()
             .expect("updated global row")
@@ -14102,7 +13818,7 @@ mod tests {
             .settings
             .iter()
             .any(|category| category.options.iter().any(|option| {
-                option.global_field == Some(GlobalSettingsField::ManagedSessions)
+                option.global_field == Some(GlobalSettingsField::ProxyEnabled)
                     && option.value == "enabled"
             })));
     }
@@ -14626,7 +14342,7 @@ mod tests {
             focus: SettingsFocus::Options,
             view: SettingsView::Categories,
         };
-        assert_eq!(model.active_setting_option().unwrap().label, "Profiles");
+        assert_eq!(model.active_setting_option().unwrap().label, "Manage profiles");
         assert!(rendered_text_at(120, 30, &model).contains("Profiles"));
         assert_eq!(model.handle(SelectorEvent::Activate), SelectorControl::OpenProfileManager);
     }
@@ -15721,9 +15437,9 @@ mod tests {
         let medium = rendered_text(80, &global_model);
         assert!(medium.contains("view Expanded [Categories]"));
         assert!(medium.contains("Global settings"));
-        assert!(medium.contains("Defaults options"));
-        assert!(medium.contains("Default profile"));
-        assert!(medium.contains("Direct default launch"));
+        assert!(medium.contains("Network options"));
+        assert!(medium.contains("Proxy enabled"));
+        assert!(medium.contains("Proxy URL"));
         assert!(medium.contains("Tab focus"));
         assert!(medium.contains("Ctrl+C exit"));
 
@@ -15737,38 +15453,39 @@ mod tests {
         global_model.handle(SelectorEvent::Activate);
         let medium_value = rendered_text(80, &global_model);
         assert!(medium_value.contains("Current value"));
-        assert!(medium_value.contains("Direct default launch"));
+        assert!(medium_value.contains("Proxy URL"));
 
         global_model.handle(SelectorEvent::Insert('v'));
         let global_expanded = rendered_text_at(120, 24, &global_model);
         assert!(global_expanded.contains("view [Expanded] Categories"));
         assert!(global_expanded.contains("SETTING"));
         assert!(global_expanded.contains("VALUE"));
-        assert!(global_expanded.contains("General"));
-        assert!(global_expanded.contains("  Managed sessions"));
+        assert!(global_expanded.contains("Profiles"));
+        assert!(global_expanded.contains("  Manage profiles"));
 
         let mut narrow_model = SelectorModel::new(vec![global_row()], false, false);
         selector_command(&mut narrow_model, Command::Settings);
         let narrow_categories = rendered_text(50, &narrow_model);
         assert!(narrow_categories.contains("Categories"));
-        assert!(narrow_categories.contains("Notifications  12"));
+        assert!(narrow_categories.contains("Notifications  3"));
         assert!(narrow_categories.contains("Ctrl+C exit"));
         assert!(!narrow_categories.contains("Managed sessions"));
+        narrow_model.handle(SelectorEvent::Down);
         narrow_model.handle(SelectorEvent::OpenActions);
         let narrow_options = rendered_text(50, &narrow_model);
-        assert!(narrow_options.contains("General options"));
-        assert!(narrow_options.contains("Managed sessions"));
+        assert!(narrow_options.contains("Network options"));
+        assert!(narrow_options.contains("Proxy enabled"));
         narrow_model.handle(SelectorEvent::Activate);
         let narrow_value = rendered_text(50, &narrow_model);
         assert!(narrow_value.contains("Current value"));
-        assert!(narrow_value.contains("Managed sessions"));
+        assert!(narrow_value.contains("Proxy enabled"));
 
         let mut narrow_choice_model = SelectorModel::new(vec![global_row()], false, false);
         selector_command(&mut narrow_choice_model, Command::Settings);
-        narrow_choice_model.handle(SelectorEvent::Insert('v'));
+        select_global_setting(&mut narrow_choice_model, GlobalSettingsField::ProxyEnabled);
         narrow_choice_model.handle(SelectorEvent::Activate);
         let narrow_choice = rendered_text_at(50, 24, &narrow_choice_model);
-        assert!(narrow_choice.contains("Managed sessions"));
+        assert!(narrow_choice.contains("Proxy enabled"));
         assert!(narrow_choice.contains("Ctrl+C exit"));
 
         let mut global_tail_model = SelectorModel::new(vec![global_row()], false, false);
@@ -15778,7 +15495,7 @@ mod tests {
         global_tail_model.handle(SelectorEvent::Last);
         let global_tail = rendered_text(120, &global_tail_model);
         assert!(global_tail.contains("Agent Bus"));
-        assert!(global_tail.contains("Message suffix"));
+        assert!(global_tail.contains("Maintenance"));
         assert!(global_tail.contains("Ctrl+C exit"));
     }
 
@@ -15810,7 +15527,7 @@ mod tests {
                 let cell = buffer
                     .cell((start + offset, footer_y))
                     .expect("shortcut cell");
-                assert_eq!(cell.fg, crate::cli_app::session_tui_layout::FOCUS);
+                assert_eq!(cell.fg, crate::cli_app::session_tui_layout::focus());
                 assert!(cell.modifier.contains(Modifier::BOLD));
             }
             let description_start = start + key.len() as u16 + 1;
@@ -15818,7 +15535,7 @@ mod tests {
                 .cell((description_start, footer_y))
                 .expect("description cell");
             assert_eq!(description_cell.symbol(), &description[..1]);
-            assert_ne!(description_cell.fg, crate::cli_app::session_tui_layout::FOCUS);
+            assert_ne!(description_cell.fg, crate::cli_app::session_tui_layout::focus());
             assert!(!description_cell.modifier.contains(Modifier::BOLD));
         }
     }

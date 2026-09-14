@@ -208,19 +208,9 @@ impl ProfileSettingsSnapshot {
         &self,
         draft: &ProfileSettingsDraft,
     ) -> Vec<SessionTuiSettingCategory> {
-        let mut launch =
-            vec![self.editable_option("Runtime", ProfileSettingsField::Runtime, draft)];
-        if draft.effective_runtime_kind(self) == ProfileRuntimeKind::Docker {
-            launch.extend([
-                self.editable_option("Docker image", ProfileSettingsField::DockerImage, draft),
-                self.editable_option("Docker user", ProfileSettingsField::DockerUser, draft),
-            ]);
-        }
-        launch.push(self.editable_option(
-            "Extra CLI args",
-            ProfileSettingsField::ExtraCliArgs,
-            draft,
-        ));
+        let launch = vec![self.editable_option(
+            "Extra CLI args", ProfileSettingsField::ExtraCliArgs, draft,
+        )];
 
         let mut proxy =
             vec![self.editable_option("Override", ProfileSettingsField::ProxyMode, draft)];
@@ -228,11 +218,6 @@ impl ProfileSettingsSnapshot {
             proxy.extend([
                 self.editable_option("URL", ProfileSettingsField::ProxyUrl, draft),
                 self.editable_option("NO_PROXY", ProfileSettingsField::ProxyNoProxy, draft),
-                self.editable_option(
-                    "Force HTTP transport",
-                    ProfileSettingsField::ProxyForceHttpTransport,
-                    draft,
-                ),
             ]);
         }
 
@@ -401,14 +386,6 @@ impl ProfileSettingsSnapshot {
         categories.extend([
             SessionTuiSettingCategory::profile("Launch", launch),
             SessionTuiSettingCategory::profile("Proxy", proxy),
-            SessionTuiSettingCategory::profile(
-                "Managed sessions",
-                vec![self.editable_option(
-                    "Default behavior",
-                    ProfileSettingsField::ManagedSessions,
-                    draft,
-                )],
-            ),
         ]);
         categories
     }
@@ -1562,7 +1539,6 @@ mod tests {
                 "Provider",
                 "Launch",
                 "Proxy",
-                "Managed sessions",
             ]
         );
         assert!(categories[0]
@@ -1673,8 +1649,6 @@ mod tests {
             .unwrap();
         let categories = snapshot.categories(&draft);
         let fields = option_fields(&categories);
-        assert!(fields.contains(&Some(ProfileSettingsField::DockerImage)));
-        assert!(fields.contains(&Some(ProfileSettingsField::DockerUser)));
         assert!(fields.contains(&Some(ProfileSettingsField::ProxyUrl)));
         assert_eq!(draft.dirty_count(), 2);
 

@@ -212,6 +212,21 @@ mod tests {
     }
 
     #[test]
+    fn native_proxy_inherits_global_and_explicit_profile_disable_clears_variables() {
+        let mut account = sample_account();
+        let mut config = CodezConfig::default();
+        set_global_proxy_config(&mut config, "http://127.0.0.1:12345".into(), Some("localhost".into()), false).unwrap();
+        let inherited: std::collections::BTreeMap<_, _> = native_proxy_envs(&account, &config).into_iter().collect();
+        assert_eq!(inherited.get("HTTP_PROXY").map(String::as_str), Some("http://127.0.0.1:12345"));
+        assert_eq!(inherited.get("NO_PROXY").map(String::as_str), Some("localhost"));
+        disable_account_proxy_config(&mut account).unwrap();
+        let disabled = native_proxy_envs(&account, &config);
+        assert_eq!(disabled.len(), 8);
+        assert!(disabled.iter().all(|(_, value)| value.is_empty()));
+        assert!(native_proxy_envs(&sample_account(), &CodezConfig::default()).is_empty());
+    }
+
+    #[test]
     fn global_proxy_mutators_report_changed_state() {
         let mut config = CodezConfig::default();
 
@@ -279,4 +294,12 @@ mod tests {
         assert!(account.proxy.is_none());
         assert!(!clear_account_proxy_config(&mut account));
     }
+}
+
+/// Standard proxy variables consumed by native Codex, without retired fork switches.
+pub fn native_proxy_envs(account: &StoredAccount, config: &CodezConfig) -> Vec<(String, String)> {
+    proxy_envs(effective_proxy_config(account, config), None)
+        .into_iter()
+        .filter(|(key, _)| key != CUTE_CODEX_FORCE_HTTP_TRANSPORT_ENV_VAR)
+        .collect()
 }

@@ -42,13 +42,13 @@ pub(super) fn run(
                     .block(
                         Block::bordered()
                             .title(" Jobs ")
-                            .border_style(Style::new().fg(theme::MUTED)),
+                            .border_style(Style::new().fg(theme::muted())),
                     ),
                 areas[2],
             );
             frame.render_widget(
                 Paragraph::new("Preview · Job list not connected")
-                    .style(Style::new().fg(theme::MUTED)),
+                    .style(Style::new().fg(theme::muted())),
                 areas[3],
             );
             frame.render_widget(

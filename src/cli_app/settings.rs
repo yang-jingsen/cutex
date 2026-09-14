@@ -38,7 +38,6 @@ pub(crate) fn global(command: GlobalCommand) -> anyhow::Result<()> {
         GlobalCommand::Show => cmd_global_show(),
         GlobalCommand::Edit => cmd_global_edit(),
         GlobalCommand::Set {
-            docker_use_sudo,
             session_enable,
             default_profile,
             clear_default_profile,
@@ -47,22 +46,13 @@ pub(crate) fn global(command: GlobalCommand) -> anyhow::Result<()> {
             proxy_no_proxy,
             proxy_force_http_transport,
             proxy_clear,
-            notify_idle_timeout,
-            notify_composer_idle_timeout,
-            notify_approval_timeout,
-            notify_startup_idle_timeout,
-            notify_events,
-            notify_user_message_content,
-            notify_user_message_preview_chars,
-            rate_limit_threshold_warning_mode,
-            rate_limit_model_nudge_mode,
             agent_bus_enable,
             agent_bus_port,
             agent_bus_token,
             agent_message_prefix,
             agent_message_suffix,
         } => cmd_global_set(GlobalSetOptions {
-            docker_use_sudo,
+            docker_use_sudo: None,
             session_enable,
             default_profile,
             clear_default_profile,
@@ -71,15 +61,15 @@ pub(crate) fn global(command: GlobalCommand) -> anyhow::Result<()> {
             proxy_no_proxy,
             proxy_force_http_transport,
             proxy_clear,
-            notify_idle_timeout,
-            notify_composer_idle_timeout,
-            notify_approval_timeout,
-            notify_startup_idle_timeout,
-            notify_events,
-            notify_user_message_content,
-            notify_user_message_preview_chars,
-            rate_limit_threshold_warning_mode,
-            rate_limit_model_nudge_mode,
+            notify_idle_timeout: None,
+            notify_composer_idle_timeout: None,
+            notify_approval_timeout: None,
+            notify_startup_idle_timeout: None,
+            notify_events: None,
+            notify_user_message_content: None,
+            notify_user_message_preview_chars: None,
+            rate_limit_threshold_warning_mode: None,
+            rate_limit_model_nudge_mode: None,
             agent_bus_enable,
             agent_bus_port,
             agent_bus_token,
@@ -110,352 +100,9 @@ pub(crate) fn proxy(command: ProxyCommand) -> anyhow::Result<()> {
 }
 
 pub(crate) fn cmd_global_edit() -> anyhow::Result<()> {
-    loop {
-        let config = load_codez_config_checked()?;
-        println!();
-        println!("{BOLD}{CYAN}Global Settings Wizard{RESET}");
-        println!("{DIM}Boolean rows toggle immediately. Text rows prompt for a new value. Use `-` to clear optional values.{RESET}");
-        println!(
-            "  1. {} docker_use_sudo                         {}",
-            checkbox(config.docker_use_sudo),
-            bool_label(config.docker_use_sudo)
-        );
-        println!(
-            "  2. {} managed sessions                        {}",
-            checkbox(config.session.enabled),
-            session_config_label(&config.session)
-        );
-        println!(
-            "  3. {} direct launch default profile          {}",
-            checkbox(config.default_profile_direct_launch),
-            bool_label(config.default_profile_direct_launch)
-        );
-        println!(
-            "  4.     default profile                        {}",
-            config.default_profile.as_deref().unwrap_or("-")
-        );
-        println!(
-            "  5. {} global proxy enabled                    {}",
-            checkbox(config.proxy.as_ref().is_some_and(|proxy| proxy.enabled)),
-            proxy_config_label(config.proxy.as_ref())
-        );
-        println!(
-            "  6.     proxy url                              {}",
-            config
-                .proxy
-                .as_ref()
-                .and_then(|proxy| proxy.url.as_deref())
-                .unwrap_or("-")
-        );
-        println!(
-            "  7.     proxy no_proxy                         {}",
-            config
-                .proxy
-                .as_ref()
-                .and_then(|proxy| proxy.no_proxy.as_deref())
-                .unwrap_or("-")
-        );
-        println!(
-            "  8. {} proxy force_http                        {}",
-            checkbox(
-                config
-                    .proxy
-                    .as_ref()
-                    .is_some_and(|proxy| proxy.force_http_transport)
-            ),
-            config
-                .proxy
-                .as_ref()
-                .map(|proxy| bool_label(proxy.force_http_transport))
-                .unwrap_or("-")
-        );
-        println!(
-            "  9.     notify service url                     {}",
-            config.notify_service_url.as_deref().unwrap_or("-")
-        );
-        println!(
-            " 10.     notify service token                   {}",
-            if config
-                .notify_service_token
-                .as_ref()
-                .is_some_and(|token| !token.is_empty())
-            {
-                "(set)"
-            } else {
-                "-"
-            }
-        );
-        println!(
-            " 11.     notify idle timeout                    {}",
-            optional_u64_label(config.notify_service_idle_timeout_secs)
-        );
-        println!(
-            " 12.     notify composer idle timeout           {}",
-            optional_u64_label(config.notify_service_composer_idle_timeout_secs)
-        );
-        println!(
-            " 13.     notify approval timeout                {}",
-            optional_u64_label(config.notify_service_approval_timeout_secs)
-        );
-        println!(
-            " 14.     notify startup idle timeout            {}",
-            optional_u64_label(config.notify_service_startup_idle_timeout_secs)
-        );
-        println!(
-            " 15.     notify events                          {}",
-            config
-                .notify_service_events
-                .as_ref()
-                .map(|events| events.join(","))
-                .unwrap_or_else(|| "-".to_string())
-        );
-        println!(
-            " 16.     notify user message content            {}",
-            config
-                .notify_service_user_message_content
-                .as_deref()
-                .unwrap_or("-")
-        );
-        println!(
-            " 17.     notify user message preview chars      {}",
-            optional_u64_label(config.notify_service_user_message_preview_chars)
-        );
-        println!(
-            " 18.     rate limit threshold warning mode      {}",
-            config
-                .rate_limit_threshold_warning_mode
-                .as_deref()
-                .unwrap_or("-")
-        );
-        println!(
-            " 19.     rate limit model nudge mode            {}",
-            config.rate_limit_model_nudge_mode.as_deref().unwrap_or("-")
-        );
-        println!(
-            " 20. {} agent bus enabled                     {}",
-            checkbox(config.agent_bus_enabled),
-            bool_label(config.agent_bus_enabled)
-        );
-        println!(
-            " 21.     agent bus port                        {}",
-            config.agent_bus_port.unwrap_or(DEFAULT_AGENT_BUS_PORT)
-        );
-        println!(
-            " 22.     agent bus token                       {}",
-            if config
-                .agent_bus_token
-                .as_ref()
-                .is_some_and(|token| !token.is_empty())
-            {
-                "(set)"
-            } else {
-                "-"
-            }
-        );
-        println!(
-            " 23.     agent message prefix                  {}",
-            config
-                .agent_message_prefix_template
-                .as_deref()
-                .unwrap_or("-")
-        );
-        println!(
-            " 24.     agent message suffix                  {}",
-            config
-                .agent_message_suffix_template
-                .as_deref()
-                .unwrap_or("-")
-        );
-        println!(" 25.     show current settings");
-
-        let Some(choice) = read_wizard_choice(25)? else {
-            println!("Done.");
-            return Ok(());
-        };
-
-        let mut next = config.clone();
-        match choice {
-            1 => next.docker_use_sudo = !next.docker_use_sudo,
-            2 => next.session.enabled = !next.session.enabled,
-            3 => next.default_profile_direct_launch = !next.default_profile_direct_launch,
-            4 => {
-                let store = load_store()?;
-                let value = prompt_optional_string(
-                    "Default profile name or id",
-                    next.default_profile.as_deref(),
-                )?;
-                next.default_profile = resolve_configured_default_profile_name(&store, value)?;
-            }
-            5 => {
-                if next.proxy.as_ref().is_some_and(|proxy| proxy.enabled) {
-                    next.proxy = None;
-                } else {
-                    let url = prompt_line("Proxy URL", "socks5h://127.0.0.1:7890")?;
-                    next.proxy = Some(proxy_config_from_parts(
-                        true,
-                        Some(url),
-                        None,
-                        /*force_http_transport*/ true,
-                    )?);
-                }
-            }
-            6 => {
-                let url = prompt_optional_string(
-                    "Proxy URL",
-                    next.proxy.as_ref().and_then(|proxy| proxy.url.as_deref()),
-                )?;
-                next.proxy = url
-                    .map(|url| {
-                        proxy_config_from_parts(
-                            true,
-                            Some(url),
-                            next.proxy.as_ref().and_then(|proxy| proxy.no_proxy.clone()),
-                            next.proxy
-                                .as_ref()
-                                .map(|proxy| proxy.force_http_transport)
-                                .unwrap_or(true),
-                        )
-                    })
-                    .transpose()?;
-            }
-            7 => {
-                let Some(proxy) = next.proxy.as_mut() else {
-                    println!("{YELLOW}Enable proxy first.{RESET}");
-                    continue;
-                };
-                proxy.no_proxy =
-                    prompt_optional_string("Proxy NO_PROXY", proxy.no_proxy.as_deref())?;
-            }
-            8 => {
-                let Some(proxy) = next.proxy.as_mut() else {
-                    println!("{YELLOW}Enable proxy first.{RESET}");
-                    continue;
-                };
-                proxy.force_http_transport = !proxy.force_http_transport;
-            }
-            9 => {
-                next.notify_service_url = prompt_optional_string(
-                    "Notify service URL",
-                    next.notify_service_url.as_deref(),
-                )?;
-            }
-            10 => {
-                next.notify_service_token = prompt_optional_string(
-                    "Notify service token",
-                    next.notify_service_token.as_deref(),
-                )?;
-            }
-            11 => {
-                next.notify_service_idle_timeout_secs = prompt_optional_u64(
-                    "Notify idle timeout seconds",
-                    next.notify_service_idle_timeout_secs,
-                )?;
-            }
-            12 => {
-                next.notify_service_composer_idle_timeout_secs = prompt_optional_u64(
-                    "Notify composer idle timeout seconds",
-                    next.notify_service_composer_idle_timeout_secs,
-                )?;
-            }
-            13 => {
-                next.notify_service_approval_timeout_secs = prompt_optional_u64(
-                    "Notify approval timeout seconds",
-                    next.notify_service_approval_timeout_secs,
-                )?;
-            }
-            14 => {
-                next.notify_service_startup_idle_timeout_secs = prompt_optional_u64(
-                    "Notify startup idle timeout seconds",
-                    next.notify_service_startup_idle_timeout_secs,
-                )?;
-            }
-            15 => {
-                let current = next.notify_service_events.as_deref();
-                let events = prompt_optional_csv("Notify event CSV", current)?;
-                next.notify_service_events = events;
-                if next.notify_service_events.is_none() {
-                    println!(
-                        "{DIM}Using cute-codex default events: {DEFAULT_NOTIFY_EVENTS}{RESET}"
-                    );
-                }
-            }
-            16 => {
-                let current = next
-                    .notify_service_user_message_content
-                    .as_deref()
-                    .unwrap_or("-");
-                let value = prompt_line(
-                    "Notify user message content: none, preview, full (`-` clears)",
-                    current,
-                )?;
-                next.notify_service_user_message_content =
-                    parse_notify_user_message_content(&value)?;
-            }
-            17 => {
-                next.notify_service_user_message_preview_chars = prompt_optional_u64(
-                    "Notify user message preview chars",
-                    next.notify_service_user_message_preview_chars,
-                )?;
-            }
-            18 => {
-                let current = next
-                    .rate_limit_threshold_warning_mode
-                    .as_deref()
-                    .unwrap_or("-");
-                let value = prompt_line(
-                    "Rate limit threshold warning mode: off, daily, always (`-` clears)",
-                    current,
-                )?;
-                next.rate_limit_threshold_warning_mode = parse_rate_limit_mode(&value)?;
-            }
-            19 => {
-                let current = next.rate_limit_model_nudge_mode.as_deref().unwrap_or("-");
-                let value = prompt_line(
-                    "Rate limit model nudge mode: off, daily, always (`-` clears)",
-                    current,
-                )?;
-                next.rate_limit_model_nudge_mode = parse_rate_limit_mode(&value)?;
-            }
-            20 => next.agent_bus_enabled = !next.agent_bus_enabled,
-            21 => {
-                let current = next
-                    .agent_bus_port
-                    .unwrap_or(DEFAULT_AGENT_BUS_PORT)
-                    .to_string();
-                let value = prompt_line("Agent bus port", &current)?;
-                let port = value
-                    .trim()
-                    .parse::<u16>()
-                    .with_context(|| format!("Invalid agent bus port: {value}"))?;
-                validate_agent_bus_port(port)?;
-                next.agent_bus_port = Some(port);
-            }
-            22 => {
-                next.agent_bus_token =
-                    prompt_optional_string("Agent bus token", next.agent_bus_token.as_deref())?;
-            }
-            23 => {
-                next.agent_message_prefix_template = prompt_optional_string(
-                    "Agent message prefix template",
-                    next.agent_message_prefix_template.as_deref(),
-                )?;
-            }
-            24 => {
-                next.agent_message_suffix_template = prompt_optional_string(
-                    "Agent message suffix template",
-                    next.agent_message_suffix_template.as_deref(),
-                )?;
-            }
-            25 => {
-                profile_settings_presenter::print_global_settings(&config);
-                continue;
-            }
-            _ => unreachable!(),
-        }
-
-        save_codez_config(&next)?;
-        println!("{GREEN}Saved.{RESET}");
-    }
+    cmd_global_show()?;
+    println!("Edit ~/.cutex/config.json; use Cutex Settings for profiles, network and service configuration.");
+    Ok(())
 }
 
 pub(crate) struct GlobalSetOptions {
@@ -485,8 +132,12 @@ pub(crate) struct GlobalSetOptions {
 }
 
 pub(crate) fn cmd_global_show() -> anyhow::Result<()> {
-    let config = load_codez_config();
-    profile_settings_presenter::print_global_settings(&config);
+    let config = load_codez_config_checked()?;
+    println!("Default profile: {}", config.default_profile.as_deref().unwrap_or("automatic"));
+    println!("Skip default-launch picker: {}", config.default_profile_direct_launch);
+    println!("Agent Bus port: {}", config.agent_bus_port.unwrap_or(DEFAULT_AGENT_BUS_PORT));
+    println!("Agent Bus token: {}", if config.agent_bus_token.is_some() { "(set)" } else { "(unset)" });
+    println!("Config: ~/.cutex/config.json\nTheme: ~/.cutex/theme.json\nNotification labels/styles: ~/.cutex/notifications/config.json");
     Ok(())
 }
 

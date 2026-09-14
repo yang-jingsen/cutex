@@ -86,20 +86,20 @@ mod tests {
             assert_eq!(buffer[(4, 2)].fg, Color::Black);
             assert_eq!(buffer[(8, 2)].symbol(), "c");
             assert_eq!(buffer[(8, 3)].symbol(), "U", "aligned empty badge slot");
-            assert_eq!(buffer[(8, 2)].bg, crate::cli_app::session_tui_layout::SELECTION);
+            assert_eq!(buffer[(8, 2)].bg, crate::cli_app::session_tui_layout::selection());
             let columns = visible_columns(width - 4, ListKind::Managed);
             assert!(columns[0].1 <= 47);
             let mut x = 3;
             for (column, w) in columns {
                 if column == Column::Status {
-                    assert_eq!(buffer[(x, 2)].fg, crate::cli_app::session_tui_layout::STATUS_ONLINE);
+                    assert_eq!(buffer[(x, 2)].fg, crate::cli_app::session_tui_layout::status_online());
                     assert_eq!(buffer[(x, 3)].fg, Color::DarkGray);
-                    assert_eq!(buffer[(x, 4)].fg, crate::cli_app::session_tui_layout::STATUS_UNKNOWN);
+                    assert_eq!(buffer[(x, 4)].fg, crate::cli_app::session_tui_layout::status_unknown());
                 }
                 if column == Column::Profile {
                     assert_eq!(buffer[(x, 2)].symbol(), "~");
                     assert_eq!(buffer[(x, 2)].fg, Color::DarkGray);
-                    assert_eq!(buffer[(x, 3)].fg, crate::cli_app::session_tui_layout::ACCENT);
+                    assert_eq!(buffer[(x, 3)].fg, crate::cli_app::session_tui_layout::accent());
                     assert!(text(buffer).contains("~aemeath"));
                     assert!(text(buffer).contains("~?"));
                 }
@@ -175,7 +175,7 @@ mod tests {
         assert!(pieces.iter().any(|p| p.contains("👩‍💻")));
         let row = visual_row();
         assert!(inspector_lines(&row).iter().any(
-            |l| l.style.fg == Some(crate::cli_app::session_tui_layout::FOCUS) && l.spans.iter().any(|s| s.content == "Profile")
+            |l| l.style.fg == Some(crate::cli_app::session_tui_layout::focus()) && l.spans.iter().any(|s| s.content == "Profile")
         ));
         if std::env::var_os("CUTEX_UI_CAPTURE_DIR").is_some() {
             terminal.backend_mut().resize(60, 30);
@@ -591,18 +591,18 @@ fn profile_label(row: &AgentSessionView) -> String {
 fn runtime_style(runtime: &Observation<String>) -> Style {
     let color = match runtime {
         Observation::Known(value) => crate::cli_app::session_tui_layout::runtime_status_color(value),
-        Observation::Stale(_, _) => crate::cli_app::session_tui_layout::STATUS_STALE,
-        Observation::Unavailable(_) => crate::cli_app::session_tui_layout::STATUS_UNKNOWN,
+        Observation::Stale(_, _) => crate::cli_app::session_tui_layout::status_stale(),
+        Observation::Unavailable(_) => crate::cli_app::session_tui_layout::status_unknown(),
     };
     Style::new().fg(color)
 }
 
 fn profile_style(row: &AgentSessionView) -> Style {
     Style::new().fg(if row.configured_profile.is_some() {
-        crate::cli_app::session_tui_layout::ACCENT
+        crate::cli_app::session_tui_layout::accent()
     } else if matches!(row.effective_profile, Observation::Known(ref value) if !value.trim().is_empty()) {
         Color::DarkGray
-    } else { crate::cli_app::session_tui_layout::STATUS_UNKNOWN })
+    } else { crate::cli_app::session_tui_layout::status_unknown() })
 }
 
 fn name_line(row: &AgentSessionView, width: usize) -> Line<'static> {
@@ -694,8 +694,8 @@ pub(super) fn render_table(
                 let style = match c {
                     Column::Status => runtime_style(&row.runtime),
                     Column::Profile => profile_style(row),
-                    Column::Project if matches!(row.project, Observation::Unavailable(_)) => Style::new().fg(crate::cli_app::session_tui_layout::STATUS_UNKNOWN),
-                    Column::Role => Style::new().fg(crate::cli_app::session_tui_layout::FOCUS),
+                    Column::Project if matches!(row.project, Observation::Unavailable(_)) => Style::new().fg(crate::cli_app::session_tui_layout::status_unknown()),
+                    Column::Role => Style::new().fg(crate::cli_app::session_tui_layout::focus()),
                     Column::Activity | Column::Updated => Style::new().fg(Color::Gray),
                     _ => Style::new(),
                 };
@@ -709,7 +709,7 @@ pub(super) fn render_table(
             }))
             .style(if selected {
                 Style::new()
-                    .bg(crate::cli_app::session_tui_layout::SELECTION)
+                    .bg(crate::cli_app::session_tui_layout::selection())
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD)
             } else {
@@ -898,7 +898,7 @@ pub(super) fn render_styled_details(
         format!("↑↓ Pg · lines {first}–{last}/{total} · Esc")
     };
     frame.render_widget(
-        Paragraph::new(footer).style(Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD)),
+        Paragraph::new(footer).style(Style::new().fg(crate::cli_app::session_tui_layout::focus()).add_modifier(Modifier::BOLD)),
         Rect {
             y: inner.y + inner.height - 1,
             height: 1,
@@ -912,7 +912,7 @@ pub(super) fn render_entity_details(
     lines: Vec<Line<'static>>, scroll: &DetailScroll, focused: bool,
 ) {
     let block = Block::bordered().title(format!(" {title} "))
-        .border_style(Style::new().fg(if focused { crate::cli_app::session_tui_layout::FOCUS } else { Color::DarkGray }));
+        .border_style(Style::new().fg(if focused { crate::cli_app::session_tui_layout::focus() } else { Color::DarkGray }));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if !focused { scroll.offset.set(0); }
@@ -920,7 +920,7 @@ pub(super) fn render_entity_details(
     if !focused && inner.height > 0 {
         let footer = Rect { y: inner.bottom() - 1, height: 1, ..inner };
         frame.render_widget(Clear, footer);
-        frame.render_widget(Paragraph::new("Alt+I inspect").style(Style::new().fg(crate::cli_app::session_tui_layout::FOCUS)), footer);
+        frame.render_widget(Paragraph::new("Alt+I inspect").style(Style::new().fg(crate::cli_app::session_tui_layout::focus())), footer);
     }
 }
 
@@ -956,7 +956,7 @@ fn inspector_lines(row: &AgentSessionView) -> Vec<Line<'static>> {
     let heading = |text: &str| {
         Line::styled(
             text.to_owned(),
-            Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD),
+            Style::new().fg(crate::cli_app::session_tui_layout::focus()).add_modifier(Modifier::BOLD),
         )
     };
     let field = |label: &str, value: String, style: Style| {
@@ -978,7 +978,7 @@ fn inspector_lines(row: &AgentSessionView) -> Vec<Line<'static>> {
         lines.push(field(
             "Role",
             row.role.clone(),
-            Style::new().fg(crate::cli_app::session_tui_layout::FOCUS),
+            Style::new().fg(crate::cli_app::session_tui_layout::focus()),
         ));
     }
     if let Some(activity) = &row.activity_details {

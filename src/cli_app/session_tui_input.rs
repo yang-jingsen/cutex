@@ -101,9 +101,9 @@ pub(super) fn render_input(
                 Block::bordered()
                     .title(title)
                     .border_style(ratatui::style::Style::new().fg(if focused {
-                        crate::cli_app::session_tui_layout::FOCUS
+                        crate::cli_app::session_tui_layout::focus()
                     } else {
-                        crate::cli_app::session_tui_layout::MUTED
+                        crate::cli_app::session_tui_layout::muted()
                     })),
             ),
         area,
@@ -243,7 +243,7 @@ pub(super) fn footer(entries: &[(Command, Option<&'static str>)]) -> Line<'stati
         spans.push(ratatui::text::Span::styled(
             binding.hint,
             ratatui::style::Style::new()
-                .fg(crate::cli_app::session_tui_layout::FOCUS)
+                .fg(crate::cli_app::session_tui_layout::focus())
                 .add_modifier(ratatui::style::Modifier::BOLD),
         ));
         spans.push(ratatui::text::Span::raw(format!(" {}", binding.label)));
@@ -334,7 +334,7 @@ impl LeaveReview {
         );
         let block = Block::bordered()
             .title(" Unsaved changes ")
-            .border_style(Style::new().fg(theme::FOCUS));
+            .border_style(Style::new().fg(theme::focus()));
         let inner = block.inner(area);
         frame.render_widget(Clear, area);
         frame.render_widget(block, area);
@@ -345,11 +345,11 @@ impl LeaveReview {
         for (index, label) in self.labels().iter().enumerate() {
             let style = if index == self.selected {
                 Style::new()
-                    .fg(theme::TEXT)
-                    .bg(theme::SELECTION)
+                    .fg(theme::text())
+                    .bg(theme::selection())
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::new().fg(theme::TEXT)
+                Style::new().fg(theme::text())
             };
             lines.push(Line::from(Span::styled(
                 format!("{} {label}", if index == self.selected { ">" } else { " " }),
@@ -359,12 +359,12 @@ impl LeaveReview {
         lines.push(Line::default());
         lines.push(Line::styled(
             "←/→ or Tab choose · Enter confirm · Esc keep editing",
-            Style::new().fg(theme::MUTED),
+            Style::new().fg(theme::muted()),
         ));
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: true })
-                .style(Style::new().fg(theme::TEXT)),
+                .style(Style::new().fg(theme::text())),
             inner,
         );
     }
@@ -456,7 +456,7 @@ mod tests {
         use ratatui::style::Modifier;
         let line = footer(&[(Command::Help, None), (Command::Settings, None)]);
         assert!(line.spans.iter().any(|s| s.content == "F1"
-            && s.style.fg == Some(crate::cli_app::session_tui_layout::FOCUS)
+            && s.style.fg == Some(crate::cli_app::session_tui_layout::focus())
             && s.style.add_modifier.contains(Modifier::BOLD)));
         assert!(line.to_string().contains("Alt+6"));
         let mut terminal =
@@ -468,7 +468,7 @@ mod tests {
             .unwrap();
         let cell = &terminal.backend().buffer()[(0, 0)];
         assert_eq!(cell.symbol(), "F");
-        assert_eq!(cell.fg, crate::cli_app::session_tui_layout::FOCUS);
+        assert_eq!(cell.fg, crate::cli_app::session_tui_layout::focus());
         assert!(cell.modifier.contains(Modifier::BOLD));
         assert_eq!(
             resolve(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)),

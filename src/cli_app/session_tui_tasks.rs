@@ -71,11 +71,11 @@ impl TaskState {
 
     fn style(self) -> Style {
         match self {
-            Self::Queued | Self::Assigned => Style::new().fg(crate::cli_app::session_tui_layout::FOCUS),
-            Self::Running => Style::new().fg(crate::cli_app::session_tui_layout::SUCCESS),
-            Self::ReviewReady => Style::new().fg(crate::cli_app::session_tui_layout::ACCENT),
-            Self::Blocked => Style::new().fg(crate::cli_app::session_tui_layout::WARNING),
-            Self::Closed => Style::new().fg(crate::cli_app::session_tui_layout::MUTED),
+            Self::Queued | Self::Assigned => Style::new().fg(crate::cli_app::session_tui_layout::focus()),
+            Self::Running => Style::new().fg(crate::cli_app::session_tui_layout::success()),
+            Self::ReviewReady => Style::new().fg(crate::cli_app::session_tui_layout::accent()),
+            Self::Blocked => Style::new().fg(crate::cli_app::session_tui_layout::warning()),
+            Self::Closed => Style::new().fg(crate::cli_app::session_tui_layout::muted()),
         }
     }
 
@@ -749,7 +749,7 @@ fn render(frame: &mut Frame<'_>, model: &TaskModel) {
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("Cutex", Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD)),
+            Span::styled("Cutex", Style::new().fg(crate::cli_app::session_tui_layout::focus()).add_modifier(Modifier::BOLD)),
             Span::styled(" Tasks", Style::new().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::raw(format!("  {visible_count} {mode}")),
             Span::styled("  read-only", Style::new().fg(Color::DarkGray)),
@@ -790,7 +790,7 @@ fn render(frame: &mut Frame<'_>, model: &TaskModel) {
         Paragraph::new(Line::from(footer)).wrap(Wrap { trim: true }).style(Style::new().fg(Color::DarkGray)),
         chunks[4],
     );
-    frame.render_widget(Paragraph::new(model.warning.as_deref().unwrap_or("Ready")).style(Style::new().fg(if model.warning.is_some() { crate::cli_app::session_tui_layout::WARNING } else { crate::cli_app::session_tui_layout::MUTED })), chunks[3]);
+    frame.render_widget(Paragraph::new(model.warning.as_deref().unwrap_or("Ready")).style(Style::new().fg(if model.warning.is_some() { crate::cli_app::session_tui_layout::warning() } else { crate::cli_app::session_tui_layout::muted() })), chunks[3]);
     if model.detail && !wide_inspector {
         render_detail(frame, chunks[2], model, true);
     }
@@ -994,7 +994,7 @@ fn task_table_row(row: &TaskRow, selected: bool, columns: &[(TaskColumn, u16)]) 
     }))
     .style(if selected {
         Style::new()
-            .bg(crate::cli_app::session_tui_layout::SELECTION)
+            .bg(crate::cli_app::session_tui_layout::selection())
             .fg(Color::White)
             .add_modifier(Modifier::BOLD)
     } else {
@@ -1028,7 +1028,7 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, model: &TaskModel, focused: 
         .selected_row()
         .map(|row| {
             vec![
-                Line::styled(row.task_id.clone(), Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD)),
+                Line::styled(row.task_id.clone(), Style::new().fg(crate::cli_app::session_tui_layout::focus()).add_modifier(Modifier::BOLD)),
                 Line::from(vec![detail_label("State"), Span::styled(row.state.label(), row.state.style())]),
                 detail_field("Task updated", row.updated_at.clone()),
                 detail_field("Agent", row.agent_label()),
@@ -1043,7 +1043,7 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, model: &TaskModel, focused: 
                 detail_field("Last output", row.last_output.clone().unwrap_or_else(|| "-".into())),
                 detail_field("Last tool", row.last_tool_call.clone().unwrap_or_else(|| "-".into())),
                 Line::default(),
-                Line::styled("Technical identifiers", Style::new().fg(crate::cli_app::session_tui_layout::FOCUS)),
+                Line::styled("Technical identifiers", Style::new().fg(crate::cli_app::session_tui_layout::focus())),
                 detail_field("Revision", row.task_revision.to_string()),
                 detail_field("Assignment", row.assignment_id.clone()),
                 detail_field("Project ID", row.project_id.clone()),
@@ -1058,7 +1058,7 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, model: &TaskModel, focused: 
 fn detail_label(label: &str) -> Span<'static> {
     Span::styled(
         format!("{label}: "),
-        Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD),
+        Style::new().fg(crate::cli_app::session_tui_layout::focus()).add_modifier(Modifier::BOLD),
     )
 }
 
@@ -1341,7 +1341,7 @@ mod tests {
             assert_eq!(buffer[(3, 8)].fg, Color::Black);
             assert_eq!(
                 buffer[(12, 8)].bg,
-                crate::cli_app::session_tui_layout::SELECTION
+                crate::cli_app::session_tui_layout::selection()
             );
         }
     }

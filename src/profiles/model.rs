@@ -207,6 +207,7 @@ pub struct QuickRunState {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CodezConfig {
     #[serde(default)]
+    #[serde(skip)]
     pub docker_use_sudo: bool,
     #[serde(default)]
     pub custom_status_items: Vec<CustomStatusItemCatalogEntry>,
@@ -219,32 +220,46 @@ pub struct CodezConfig {
     #[serde(default)]
     pub default_profile_direct_launch: bool,
     #[serde(default)]
+    #[serde(skip)]
     pub notify_service_url: Option<String>,
     #[serde(default)]
+    #[serde(skip)]
     pub notify_service_token: Option<String>,
     #[serde(default)]
+    #[serde(skip)]
     pub notify_service_idle_timeout_secs: Option<u64>,
     #[serde(default)]
+    #[serde(skip)]
     pub notify_service_composer_idle_timeout_secs: Option<u64>,
     #[serde(default)]
+    #[serde(skip)]
     pub notify_service_approval_timeout_secs: Option<u64>,
     #[serde(default)]
+    #[serde(skip)]
     pub notify_service_startup_idle_timeout_secs: Option<u64>,
     #[serde(default)]
+    #[serde(skip)]
     pub notify_service_events: Option<Vec<String>>,
     #[serde(default)]
+    #[serde(skip)]
     pub notify_service_user_message_content: Option<String>,
     #[serde(default)]
+    #[serde(skip)]
     pub notify_service_user_message_preview_chars: Option<u64>,
     #[serde(default)]
+    #[serde(skip)]
     pub rate_limit_threshold_warning_mode: Option<String>,
     #[serde(default)]
+    #[serde(skip)]
     pub rate_limit_model_nudge_mode: Option<String>,
     #[serde(default)]
+    #[serde(skip)]
     pub desktop_notify_enabled: bool,
     #[serde(default)]
+    #[serde(skip)]
     pub desktop_notify_port: Option<u16>,
     #[serde(default)]
+    #[serde(skip)]
     pub desktop_notify_token: Option<String>,
     #[serde(default = "default_true")]
     pub agent_bus_enabled: bool,

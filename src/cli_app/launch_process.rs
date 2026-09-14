@@ -5,7 +5,6 @@ use cutex::launch::args::{
 };
 use cutex::launch::program::cli_program;
 use cutex::management::service::DEFAULT_MANAGEMENT_PORT;
-use cutex::notify::desktop::ensure_desktop_notify_bridge_for_launch;
 use cutex::profiles::model::{CliKind, RuntimeConfig, StoredAccount};
 
 use super::agent_bus_config;
@@ -58,7 +57,6 @@ pub(crate) fn run_codex_process(
         }
     }
     launch_session::warn_if_resume_target_is_already_running(&effective_codex_args, output)?;
-    ensure_desktop_notify_bridge_for_launch(account)?;
     ensure_management_api_for_launch(account)?;
     if agent_mode {
         ensure_agent_bus_for_launch(account)?;

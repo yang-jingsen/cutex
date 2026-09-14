@@ -19,8 +19,6 @@ use crate::config::paths::config_dir;
 use crate::config::proxy::{effective_proxy_config, proxy_envs};
 use crate::config::store::load_codez_config;
 use crate::launch::command::LaunchCommand;
-use crate::notify::launch::launch_notify_envs;
-use crate::notify::service::{desktop_notify_bridge_url, desktop_notify_port};
 use crate::profiles::model::{runtime_label, CliKind, CodezConfig, RuntimeConfig, StoredAccount};
 
 pub struct LaunchEnvContext<'a> {
@@ -34,17 +32,10 @@ pub fn default_launch_env_context<'a>(
     global_config: &'a CodezConfig,
     host_id: String,
 ) -> LaunchEnvContext<'a> {
-    let desktop_notify_url = if global_config.desktop_notify_enabled {
-        Some(desktop_notify_bridge_url(desktop_notify_port(
-            global_config,
-        )))
-    } else {
-        None
-    };
 
     LaunchEnvContext {
         global_config,
-        desktop_notify_url,
+        desktop_notify_url: None,
         agent_bus_url: agent_bus_base_url(agent_bus_port(global_config)),
         host_id,
     }
@@ -73,10 +64,6 @@ pub fn profile_launch_envs(
         ),
     };
 
-    envs.extend(launch_notify_envs(
-        context.global_config,
-        context.desktop_notify_url.clone(),
-    ));
     if agent_mode
         && context.global_config.agent_bus_enabled
         && matches!(account.runtime, RuntimeConfig::Host)

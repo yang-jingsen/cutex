@@ -124,6 +124,9 @@ pub(super) fn command(
         super::notify::status_line(projection.settings.tui.as_ref().and_then(|t| t.status_line.as_ref())))?;
     // Explicit invocation options take precedence over the selected profile.
     let mut command = launch.args(args.iter().cloned()).to_command();
+    command.envs(cutex::config::proxy::native_proxy_envs(
+        account, &cutex::config::store::load_codez_config_checked()?,
+    ));
     command.env("CUTEX_NOTIFICATION_CONTROL", std::env::current_exe()?);
     if let Some(secret) = projection.secret()? {
         secret.apply(&mut command);

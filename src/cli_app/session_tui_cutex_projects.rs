@@ -2009,7 +2009,7 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("Cutex", Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD)),
+            Span::styled("Cutex", Style::new().fg(crate::cli_app::session_tui_layout::focus()).add_modifier(Modifier::BOLD)),
             Span::styled(" Projects", Style::new().fg(Color::White).add_modifier(Modifier::BOLD)),
         ])),
         areas[1],
@@ -2134,9 +2134,9 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
                 .unwrap_or("Ready"),
         ))
         .style(Style::new().fg(if model.failure.is_some() {
-            crate::cli_app::session_tui_layout::ERROR
+            crate::cli_app::session_tui_layout::error()
         } else {
-            crate::cli_app::session_tui_layout::MUTED
+            crate::cli_app::session_tui_layout::muted()
         })),
         areas[3],
     );
@@ -2268,7 +2268,7 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel) {
         )
         .style(if row_index == model.selected {
             Style::new()
-                .bg(crate::cli_app::session_tui_layout::SELECTION)
+                .bg(crate::cli_app::session_tui_layout::selection())
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD)
         } else {
@@ -2329,7 +2329,7 @@ fn render_project_summary(frame: &mut Frame<'_>, area: Rect, model: &CutexProjec
             Line::from("Enter opens the project workspace."),
             Line::from("Alt+A actions · Alt+E appearance"),
             Line::default(),
-            Line::styled("Technical identifiers", Style::new().fg(crate::cli_app::session_tui_layout::FOCUS)),
+            Line::styled("Technical identifiers", Style::new().fg(crate::cli_app::session_tui_layout::focus())),
             field("Project ID", project.project_id.to_string()),
             field("Authority epoch", project.authority_epoch.to_string()),
         ]
@@ -2400,7 +2400,7 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel)
         tabs.push(Span::styled(
             section.label(),
             if section == model.section {
-                Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD)
+                Style::new().fg(crate::cli_app::session_tui_layout::focus()).add_modifier(Modifier::BOLD)
             } else {
                 Style::new().fg(Color::Gray)
             },
@@ -2572,7 +2572,7 @@ fn render_editor(frame: &mut Frame<'_>, area: Rect, editor: Option<&Presentation
         Line::from(vec![
             Span::styled(
                 if editor.field == index { "> " } else { "  " },
-                Style::new().fg(crate::cli_app::session_tui_layout::FOCUS),
+                Style::new().fg(crate::cli_app::session_tui_layout::focus()),
             ),
             Span::styled(
                 format!("{label}: "),
@@ -2609,9 +2609,9 @@ fn render_import_confirmation(frame: &mut Frame<'_>, area: Rect, model: &CutexPr
         Line::from(vec![
             Span::styled(
                 format!("{label:<14}"),
-                Style::new().fg(crate::cli_app::session_tui_layout::MUTED),
+                Style::new().fg(crate::cli_app::session_tui_layout::muted()),
             ),
-            Span::styled(value, Style::new().fg(crate::cli_app::session_tui_layout::TEXT)),
+            Span::styled(value, Style::new().fg(crate::cli_app::session_tui_layout::text())),
         ])
     };
     let assignment = request
@@ -2626,9 +2626,9 @@ fn render_import_confirmation(frame: &mut Frame<'_>, area: Rect, model: &CutexPr
         .unwrap_or_else(|| "None".into());
     let selected = Style::new()
         .fg(Color::White)
-        .bg(crate::cli_app::session_tui_layout::SELECTION)
+        .bg(crate::cli_app::session_tui_layout::selection())
         .add_modifier(Modifier::BOLD);
-    let idle = Style::new().fg(crate::cli_app::session_tui_layout::MUTED);
+    let idle = Style::new().fg(crate::cli_app::session_tui_layout::muted());
     let buttons = Line::from(vec![
         Span::styled(
             " [ Cancel ] ",
@@ -2649,7 +2649,7 @@ fn render_import_confirmation(frame: &mut Frame<'_>, area: Rect, model: &CutexPr
         ),
     ]);
     let block = Block::bordered()
-        .border_style(Style::new().fg(crate::cli_app::session_tui_layout::FOCUS))
+        .border_style(Style::new().fg(crate::cli_app::session_tui_layout::focus()))
         .title(" Confirm durable Agent import / Project assignment ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -2659,7 +2659,7 @@ fn render_import_confirmation(frame: &mut Frame<'_>, area: Rect, model: &CutexPr
             Line::from(Span::styled(
                 "Review the exact Agent and Project plan",
                 Style::new()
-                    .fg(crate::cli_app::session_tui_layout::FOCUS)
+                    .fg(crate::cli_app::session_tui_layout::focus())
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
@@ -2721,7 +2721,7 @@ fn render_import_confirmation(frame: &mut Frame<'_>, area: Rect, model: &CutexPr
             Line::from(""),
             Line::from(Span::styled(
                 "Completed steps are retained if a later step fails. The server never retries this action automatically.",
-                Style::new().fg(crate::cli_app::session_tui_layout::WARNING),
+                Style::new().fg(crate::cli_app::session_tui_layout::warning()),
             )),
             field("Action ID", request.action_id.to_string()),
         ])
@@ -2757,7 +2757,7 @@ fn render_create_editor(frame: &mut Frame<'_>, area: Rect, model: &CutexProjects
         Line::from(vec![
             Span::styled(
                 if editor.field == index { "> " } else { "  " },
-                Style::new().fg(crate::cli_app::session_tui_layout::FOCUS),
+                Style::new().fg(crate::cli_app::session_tui_layout::focus()),
             ),
             Span::styled(
                 format!("{label}: "),
@@ -2781,7 +2781,7 @@ fn render_create_editor(frame: &mut Frame<'_>, area: Rect, model: &CutexProjects
             )),
         ])
         .wrap(Wrap { trim: true })
-        .block(Block::bordered().border_style(Style::new().fg(crate::cli_app::session_tui_layout::FOCUS)).title(" Create Cutex Project ")),
+        .block(Block::bordered().border_style(Style::new().fg(crate::cli_app::session_tui_layout::focus())).title(" Create Cutex Project ")),
         area,
     );
 }
@@ -2872,7 +2872,7 @@ fn render_director_picker(frame: &mut Frame<'_>, area: Rect, model: &CutexProjec
     let rows = rows.collect::<Vec<_>>();
     frame.render_widget(
         Table::new(rows, widths)
-            .header(header.style(Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD)))
+            .header(header.style(Style::new().fg(crate::cli_app::session_tui_layout::focus()).add_modifier(Modifier::BOLD)))
             .column_spacing(1)
             .block(Block::bordered().title(title)),
         chunks[1],
@@ -2901,7 +2901,7 @@ fn render_project_actions(frame: &mut Frame<'_>, area: Rect, model: &CutexProjec
                         action.label
                     ),
                     if index == model.action_selected {
-                        Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD)
+                        Style::new().fg(crate::cli_app::session_tui_layout::focus()).add_modifier(Modifier::BOLD)
                     } else {
                         Style::new()
                     },
@@ -2912,7 +2912,7 @@ fn render_project_actions(frame: &mut Frame<'_>, area: Rect, model: &CutexProjec
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: true }).block(
             Block::bordered()
-                .border_style(Style::new().fg(crate::cli_app::session_tui_layout::FOCUS))
+                .border_style(Style::new().fg(crate::cli_app::session_tui_layout::focus()))
                 .title(" Project Actions "),
         ),
         popup,
@@ -2940,7 +2940,7 @@ fn render_project_mutation_confirmation(
                     .bg(if confirmed {
                         Color::Yellow
                     } else {
-                        crate::cli_app::session_tui_layout::FOCUS
+                        crate::cli_app::session_tui_layout::focus()
                     })
                     .add_modifier(Modifier::BOLD)
             } else {
@@ -2989,7 +2989,7 @@ fn render_operator_confirmation(frame: &mut Frame<'_>, area: Rect, model: &Cutex
                     .bg(if confirmed {
                         Color::Yellow
                     } else {
-                        crate::cli_app::session_tui_layout::FOCUS
+                        crate::cli_app::session_tui_layout::focus()
                     })
                     .add_modifier(Modifier::BOLD)
             } else {
@@ -4022,7 +4022,7 @@ mod tests {
             let (x, y) = badge_cell(&buffer, "Confirm import + Project step");
             assert_eq!(
                 buffer[(x, y)].bg,
-                crate::cli_app::session_tui_layout::SELECTION
+                crate::cli_app::session_tui_layout::selection()
             );
             model.details_text = Some(project_status_details(&model));
             let details = model.details_text.as_deref().unwrap();
@@ -4691,7 +4691,7 @@ mod tests {
         let (cx, cy) = badge_cell(&wide, "CX");
         assert_eq!(wide[(cx, cy)].bg, Color::LightMagenta);
         assert_eq!(wide[(cx, cy)].fg, Color::Black);
-        assert_eq!(wide[(cx + 4, cy)].bg, crate::cli_app::session_tui_layout::SELECTION, "selected row base");
+        assert_eq!(wide[(cx + 4, cy)].bg, crate::cli_app::session_tui_layout::selection(), "selected row base");
 
         let text = (0..wide.area.height)
             .map(|y| {

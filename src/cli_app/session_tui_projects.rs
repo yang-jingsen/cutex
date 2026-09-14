@@ -663,7 +663,7 @@ fn render(frame: &mut Frame<'_>, model: &ProjectModel) {
         Paragraph::new(Line::from(vec![
             Span::styled(
                 "Workspaces",
-                Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD),
+                Style::new().fg(crate::cli_app::session_tui_layout::focus()).add_modifier(Modifier::BOLD),
             ),
             Span::styled(status, Style::new().fg(Color::Yellow)),
         ])),
@@ -812,7 +812,7 @@ fn render_form(frame: &mut Frame<'_>, area: Rect, form: &Form) {
             .block(
                 Block::bordered()
                     .title(title)
-                    .border_style(Style::new().fg(crate::cli_app::session_tui_layout::FOCUS)),
+                    .border_style(Style::new().fg(crate::cli_app::session_tui_layout::focus())),
             )
             .wrap(Wrap { trim: false }),
         popup,

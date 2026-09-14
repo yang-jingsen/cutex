@@ -1007,149 +1007,41 @@ impl GlobalSettingsSnapshot {
     }
 
     pub(super) fn categories(&self, draft: &GlobalSettingsDraft) -> Vec<SessionTuiSettingCategory> {
-        let config = &self.config;
         vec![
-            SessionTuiSettingCategory::new(
-                "General",
-                vec![
-                    SessionTuiSettingOption {
-                        navigation: Some(super::session_tui_input::Command::Profiles),
-                        ..SessionTuiSettingOption::new("Profiles", "Enter to manage profiles")
-                    },
-                    self.editable_option(
-                        "Managed sessions",
-                        GlobalSettingsField::ManagedSessions,
-                        draft,
-                    ),
-                    self.editable_option("Docker sudo", GlobalSettingsField::DockerSudo, draft),
-                    SessionTuiSettingOption::new(
-                        "Custom status items",
-                        config.custom_status_items.len().to_string(),
-                    ),
-                ],
-            ),
-            SessionTuiSettingCategory::new(
-                "Defaults",
-                vec![
-                    self.editable_option(
-                        "Default profile",
-                        GlobalSettingsField::DefaultProfile,
-                        draft,
-                    ),
-                    self.editable_option(
-                        "Direct default launch",
-                        GlobalSettingsField::DefaultProfileDirectLaunch,
-                        draft,
-                    ),
-                ],
-            ),
-            SessionTuiSettingCategory::new(
-                "Proxy",
-                vec![
-                    self.editable_option("Enabled", GlobalSettingsField::ProxyEnabled, draft),
-                    self.editable_option("URL", GlobalSettingsField::ProxyUrl, draft),
-                    self.editable_option("NO_PROXY", GlobalSettingsField::ProxyNoProxy, draft),
-                    self.editable_option(
-                        "Force HTTP transport",
-                        GlobalSettingsField::ProxyForceHttp,
-                        draft,
-                    ),
-                ],
-            ),
-            SessionTuiSettingCategory::new(
-                "Notifications",
-                vec![
-                    self.editable_option(
-                        "Service URL",
-                        GlobalSettingsField::NotifyServiceUrl,
-                        draft,
-                    ),
-                    self.editable_option(
-                        "Service token",
-                        GlobalSettingsField::NotifyServiceToken,
-                        draft,
-                    ),
-                    self.editable_option(
-                        "Idle timeout",
-                        GlobalSettingsField::NotifyIdleTimeout,
-                        draft,
-                    ),
-                    self.editable_option(
-                        "Composer timeout",
-                        GlobalSettingsField::NotifyComposerTimeout,
-                        draft,
-                    ),
-                    self.editable_option(
-                        "Approval timeout",
-                        GlobalSettingsField::NotifyApprovalTimeout,
-                        draft,
-                    ),
-                    self.editable_option(
-                        "Startup timeout",
-                        GlobalSettingsField::NotifyStartupTimeout,
-                        draft,
-                    ),
-                    self.editable_option("Events", GlobalSettingsField::NotifyEvents, draft),
-                    self.editable_option(
-                        "Message content",
-                        GlobalSettingsField::NotifyMessageContent,
-                        draft,
-                    ),
-                    self.editable_option(
-                        "Preview chars",
-                        GlobalSettingsField::NotifyPreviewChars,
-                        draft,
-                    ),
-                    self.editable_option(
-                        "Desktop notifications",
-                        GlobalSettingsField::DesktopNotifyEnabled,
-                        draft,
-                    ),
-                    self.editable_option(
-                        "Desktop port",
-                        GlobalSettingsField::DesktopNotifyPort,
-                        draft,
-                    ),
-                    self.editable_option(
-                        "Desktop token",
-                        GlobalSettingsField::DesktopNotifyToken,
-                        draft,
-                    ),
-                ],
-            ),
-            SessionTuiSettingCategory::new(
-                "Rate limits",
-                vec![
-                    self.editable_option(
-                        "Threshold warning",
-                        GlobalSettingsField::RateLimitThresholdWarning,
-                        draft,
-                    ),
-                    self.editable_option(
-                        "Model nudge",
-                        GlobalSettingsField::RateLimitModelNudge,
-                        draft,
-                    ),
-                ],
-            ),
-            SessionTuiSettingCategory::new(
-                "Agent Bus",
-                vec![
-                    self.editable_option("Enabled", GlobalSettingsField::AgentBusEnabled, draft),
-                    self.editable_option("Port", GlobalSettingsField::AgentBusPort, draft),
-                    self.editable_option("Token", GlobalSettingsField::AgentBusToken, draft),
-                    self.editable_option(
-                        "Message prefix",
-                        GlobalSettingsField::AgentMessagePrefix,
-                        draft,
-                    ),
-                    self.editable_option(
-                        "Message suffix",
-                        GlobalSettingsField::AgentMessageSuffix,
-                        draft,
-                    ),
-                ],
-            ),
+            SessionTuiSettingCategory::new("Profiles", vec![
+                SessionTuiSettingOption {
+                    navigation: Some(super::session_tui_input::Command::Profiles),
+                    ..SessionTuiSettingOption::new("Manage profiles", "Enter to open")
+                },
+                self.editable_option("Default profile", GlobalSettingsField::DefaultProfile, draft),
+                self.editable_option("Skip default-launch picker", GlobalSettingsField::DefaultProfileDirectLaunch, draft),
+            ]),
+            SessionTuiSettingCategory::new("Network", vec![
+                self.editable_option("Proxy enabled", GlobalSettingsField::ProxyEnabled, draft),
+                self.editable_option("Proxy URL", GlobalSettingsField::ProxyUrl, draft),
+                self.editable_option("NO_PROXY", GlobalSettingsField::ProxyNoProxy, draft),
+                SessionTuiSettingOption::new("Apply", "New sessions / next managed start"),
+            ]),
+            SessionTuiSettingCategory::new("Notifications", vec![
+                SessionTuiSettingOption::new("Labels / colors / bold", "~/.cutex/notifications/config.json"),
+                SessionTuiSettingOption::new("Session priority", "CIAO! / ON / OFF; Alt+N in cute-codex"),
+                SessionTuiSettingOption::new("Delivery", "External event delivery is not configured"),
+            ]),
+            SessionTuiSettingCategory::new("Appearance", vec![
+                SessionTuiSettingOption::new("Theme colors", "~/.cutex/theme.json (next Cutex launch)"),
+                SessionTuiSettingOption::new("Status items", "~/.cutex/config.json: custom_status_items"),
+                SessionTuiSettingOption::new("Inspector", "Alt+B to toggle"),
+            ]),
+            SessionTuiSettingCategory::new("Messages", vec![
+                SessionTuiSettingOption::new("Sender identity", "Structured Agent Bus provenance"),
+                SessionTuiSettingOption::new("Message display", "Sender and delivery timing are shown with each message"),
+            ]),
+            SessionTuiSettingCategory::new("Services", vec![
+                SessionTuiSettingOption::new("Agent Bus", "Required for managed agents"),
+                self.editable_option("Agent Bus port", GlobalSettingsField::AgentBusPort, draft),
+                self.editable_option("Agent Bus token", GlobalSettingsField::AgentBusToken, draft),
+                SessionTuiSettingOption::new("Apply", "Maintenance: coordinate service restart and clients"),
+            ]),
         ]
     }
 
@@ -2579,19 +2471,14 @@ mod tests {
                 .map(|category| category.label)
                 .collect::<Vec<_>>(),
             vec![
-                "General",
-                "Defaults",
-                "Proxy",
-                "Notifications",
-                "Rate limits",
-                "Agent Bus",
+                "Profiles", "Network", "Notifications", "Appearance", "Messages", "Services",
             ]
         );
         let settings = flattened(&categories);
 
-        assert!(settings.contains("Defaults:Default profile="));
-        assert!(!settings.contains("Manage profiles"));
-        assert_eq!(settings.matches("=(set)").count(), 3);
+        assert!(settings.contains("Profiles:Default profile="));
+        assert!(settings.contains("Manage profiles"));
+        assert_eq!(settings.matches("=(set)").count(), 1);
         assert!(!settings.contains("notify-secret"));
         assert!(!settings.contains("desktop-secret"));
         assert!(!settings.contains("bus-secret"));
@@ -2602,7 +2489,7 @@ mod tests {
                 .flat_map(|category| category.options.iter())
                 .filter(|option| option.global_field.is_some())
                 .count(),
-            27
+            7
         );
     }
 
@@ -2760,8 +2647,7 @@ mod tests {
             }
         );
         let projected = flattened(&snapshot.categories(&draft));
-        assert!(projected.contains("General:Managed sessions=enabled"));
-        assert!(projected.contains("Proxy:Force HTTP transport=disabled"));
+
     }
 
     #[test]

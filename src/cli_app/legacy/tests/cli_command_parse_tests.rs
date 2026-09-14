@@ -7,27 +7,6 @@ fn config_alias_opens_wizard() {
 }
 
 #[test]
-fn ubuntu_desktop_notify_install_command_parses() {
-    let cli = Cli::try_parse_from([
-        "cutex",
-        "notify",
-        "desktop",
-        "install-ubuntu",
-        "--port",
-        "24250",
-    ])
-    .expect("install-ubuntu should parse");
-    assert!(matches!(
-        cli.command,
-        Some(CommandKind::Notify {
-            command: NotifyCommand::Desktop {
-                command: DesktopNotifyCommand::InstallUbuntu { port: Some(24250) }
-            }
-        })
-    ));
-}
-
-#[test]
 fn agent_send_command_parses() {
     let cli = Cli::try_parse_from([
         "cutex",

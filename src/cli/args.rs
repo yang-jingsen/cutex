@@ -72,7 +72,7 @@ pub enum CommandKind {
         /// Account name or id
         profile: String,
         /// Force this invocation to run the selected CLI on the host.
-        #[arg(long = "host", conflicts_with = "docker_image")]
+        #[arg(long = "host")]
         host: bool,
         /// Enable cutex inter-agent collaboration for this launch.
         #[arg(long = "agent", visible_alias = "collab")]
@@ -81,10 +81,10 @@ pub enum CommandKind {
         #[arg(long = "group", value_name = "GROUP", num_args = 1.., action = ArgAction::Append)]
         groups: Vec<String>,
         /// Override the Docker image only for this invocation.
-        #[arg(long, value_name = "IMAGE")]
+        #[arg(skip)]
         docker_image: Option<String>,
         /// Override the Docker user name only for this invocation.
-        #[arg(long, value_name = "NAME", requires = "docker_image")]
+        #[arg(skip)]
         docker_user_name: Option<String>,
         /// Arguments to pass to the selected CLI
         #[arg(last = true, value_name = "CLI_ARGS")]
@@ -110,10 +110,10 @@ pub enum CommandKind {
         #[arg(long, value_name = "PATH")]
         from_config: Option<String>,
         /// Run this profile inside a Docker image
-        #[arg(long, value_name = "IMAGE")]
+        #[arg(skip)]
         docker_image: Option<String>,
         /// Logical username used for the Docker home path
-        #[arg(long, value_name = "NAME", requires = "docker_image")]
+        #[arg(skip)]
         docker_user_name: Option<String>,
         /// Friendly account name (e.g., "work", "personal")
         #[arg(long)]
@@ -190,13 +190,13 @@ pub enum CommandKind {
         /// Account name or id
         target: String,
         /// Run this profile on the host
-        #[arg(long, conflicts_with = "docker_image")]
+        #[arg(long)]
         host: bool,
         /// Run this profile inside a Docker image
-        #[arg(long, value_name = "IMAGE")]
+        #[arg(skip)]
         docker_image: Option<String>,
         /// Logical username used for the Docker home path
-        #[arg(long, value_name = "NAME", requires = "docker_image")]
+        #[arg(skip)]
         docker_user_name: Option<String>,
     },
 
@@ -291,9 +291,6 @@ pub enum GlobalCommand {
 
     /// Update global settings in one command
     Set {
-        /// Use `sudo docker` for Docker runtime launches by default
-        #[arg(long = "docker-use-sudo", value_name = "BOOL")]
-        docker_use_sudo: Option<bool>,
         /// Enable or disable managed cute-alden sessions by default
         #[arg(long = "session-enable", value_name = "BOOL")]
         session_enable: Option<bool>,
@@ -322,33 +319,6 @@ pub enum GlobalCommand {
         /// Clear the global proxy fallback
         #[arg(long = "proxy-clear", conflicts_with = "proxy_url")]
         proxy_clear: bool,
-        /// Set the short idle notify timeout in seconds
-        #[arg(long = "notify-idle-timeout", value_name = "SECS")]
-        notify_idle_timeout: Option<u64>,
-        /// Set the long composer idle notify timeout in seconds
-        #[arg(long = "notify-composer-idle-timeout", value_name = "SECS")]
-        notify_composer_idle_timeout: Option<u64>,
-        /// Set the approval prompt notify timeout in seconds
-        #[arg(long = "notify-approval-timeout", value_name = "SECS")]
-        notify_approval_timeout: Option<u64>,
-        /// Set the startup idle notify timeout in seconds
-        #[arg(long = "notify-startup-idle-timeout", value_name = "SECS")]
-        notify_startup_idle_timeout: Option<u64>,
-        /// Set notify event allowlist as comma-separated snake_case names
-        #[arg(long = "notify-events", value_name = "CSV")]
-        notify_events: Option<String>,
-        /// Set user message content mode for notify payloads: none, preview, full
-        #[arg(long = "notify-user-message-content", value_name = "MODE")]
-        notify_user_message_content: Option<String>,
-        /// Set user message preview length in chars
-        #[arg(long = "notify-user-message-preview-chars", value_name = "CHARS")]
-        notify_user_message_preview_chars: Option<u64>,
-        /// Set threshold warning reminder mode: off, daily, always
-        #[arg(long = "rate-limit-threshold-warning-mode", value_name = "MODE")]
-        rate_limit_threshold_warning_mode: Option<String>,
-        /// Set model nudge reminder mode: off, daily, always
-        #[arg(long = "rate-limit-model-nudge-mode", value_name = "MODE")]
-        rate_limit_model_nudge_mode: Option<String>,
         /// Enable or disable the local inter-agent message bus
         #[arg(long = "agent-bus-enable", value_name = "BOOL")]
         agent_bus_enable: Option<bool>,
@@ -1357,53 +1327,6 @@ pub enum NotifyCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Manage the native desktop notification bridge
-    Desktop {
-        #[command(subcommand)]
-        command: DesktopNotifyCommand,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum DesktopNotifyCommand {
-    /// Enable desktop notifications and start the shared bridge if needed
-    Enable {
-        /// Fixed localhost port for the bridge
-        #[arg(long)]
-        port: Option<u16>,
-    },
-    /// Disable desktop notifications without changing the external notify service
-    Disable,
-    /// Start the shared bridge service if it is not already running
-    Start {
-        /// Fixed localhost port for the bridge
-        #[arg(long)]
-        port: Option<u16>,
-    },
-    /// Show bridge config and health
-    Status,
-    /// Run the bridge HTTP server in the foreground
-    Serve {
-        /// Port to bind on 127.0.0.1
-        #[arg(long)]
-        port: Option<u16>,
-        /// Bearer token accepted from cute-codex
-        #[arg(long)]
-        token: Option<String>,
-    },
-    /// Send a test desktop notification through notify-send
-    Test {
-        /// Optional message body
-        message: Option<String>,
-    },
-    /// Install and start an Ubuntu/Kubuntu systemd user service
-    InstallUbuntu {
-        /// Fixed localhost port for the bridge
-        #[arg(long)]
-        port: Option<u16>,
-    },
-    /// Stop and remove the Ubuntu/Kubuntu systemd user service
-    UninstallUbuntu,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1521,17 +1444,13 @@ pub enum ProfileCommand {
         #[arg(long = "clear-agent-name", conflicts_with = "agent_name")]
         clear_agent_name: bool,
         /// Run this profile on the host
-        #[arg(long = "host", conflicts_with = "docker_image")]
+        #[arg(long = "host")]
         host: bool,
         /// Run this profile inside a Docker image
-        #[arg(long = "docker-image", value_name = "IMAGE")]
+        #[arg(skip)]
         docker_image: Option<String>,
         /// Logical username used for the Docker home path
-        #[arg(
-            long = "docker-user-name",
-            value_name = "NAME",
-            requires = "docker_image"
-        )]
+        #[arg(skip)]
         docker_user_name: Option<String>,
         /// Set a profile proxy override URL (enables override)
         #[arg(

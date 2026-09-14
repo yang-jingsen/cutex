@@ -6,30 +6,45 @@ use ratatui::{
     text::{Line, Span},
 };
 
-pub(super) const BRAND: Color = Color::Rgb(247, 179, 205);
-pub(super) const ACCENT: Color = Color::Rgb(224, 142, 178);
-pub(super) const TEXT: Color = Color::White;
-pub(super) const MUTED: Color = Color::DarkGray;
-pub(super) const FOCUS: Color = Color::Rgb(116, 186, 195);
-pub(super) const SELECTION: Color = Color::Rgb(38, 52, 79);
-pub(super) const SUCCESS: Color = Color::Green;
-pub(super) const WARNING: Color = Color::Rgb(217, 180, 95);
-pub(super) const ERROR: Color = Color::Red;
-
-// Status foregrounds are semantic; selection changes only the row background.
-pub(super) const STATUS_ONLINE: Color = ACCENT;
-pub(super) const STATUS_STALE: Color = FOCUS;
-pub(super) const STATUS_OFFLINE: Color = MUTED;
-pub(super) const STATUS_UNKNOWN: Color = WARNING;
-pub(super) const FOOTER_DESCRIPTION: Color = TEXT;
+// Theme overrides are loaded once per Cutex process; absent keys retain defaults.
+static THEME: std::sync::LazyLock<std::collections::BTreeMap<String, String>> = std::sync::LazyLock::new(|| {
+    let value = (|| -> anyhow::Result<_> {
+        let path = cutex::config::paths::config_dir()?.join("theme.json");
+        if !path.exists() { return Ok(std::collections::BTreeMap::new()); }
+        anyhow::ensure!(std::fs::metadata(&path)?.len() <= 8192, "theme.json exceeds 8 KiB");
+        Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+    })();
+    value.unwrap_or_default()
+});
+fn theme_color(key: &str, fallback: Color) -> Color {
+    THEME.get(key).and_then(|value| {
+        let hex = value.strip_prefix('#')?;
+        if hex.len() != 6 { return None; }
+        u32::from_str_radix(hex, 16).ok().map(|rgb| Color::Rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8))
+    }).unwrap_or(fallback)
+}
+pub(super) fn brand() -> Color { theme_color("brand", Color::Rgb(247, 179, 205)) }
+pub(super) fn accent() -> Color { theme_color("accent", Color::Rgb(224, 142, 178)) }
+pub(super) fn text() -> Color { theme_color("text", Color::White) }
+pub(super) fn muted() -> Color { theme_color("muted", Color::DarkGray) }
+pub(super) fn focus() -> Color { theme_color("focus", Color::Rgb(116, 186, 195)) }
+pub(super) fn selection() -> Color { theme_color("selection", Color::Rgb(38, 52, 79)) }
+pub(super) fn success() -> Color { theme_color("success", Color::Green) }
+pub(super) fn warning() -> Color { theme_color("warning", Color::Rgb(217, 180, 95)) }
+pub(super) fn error() -> Color { theme_color("error", Color::Red) }
+pub(super) fn status_online() -> Color { accent() }
+pub(super) fn status_stale() -> Color { focus() }
+pub(super) fn status_offline() -> Color { muted() }
+pub(super) fn status_unknown() -> Color { warning() }
+pub(super) fn footer_description() -> Color { text() }
 
 pub(super) fn runtime_status_color(status: &str) -> Color {
     match status.to_ascii_lowercase().as_str() {
-        "online" => STATUS_ONLINE,
-        "stale" => STATUS_STALE,
-        "offline" | "retired" => STATUS_OFFLINE,
-        "managed" | "unmanaged" => TEXT,
-        _ => STATUS_UNKNOWN,
+        "online" => status_online(),
+        "stale" => status_stale(),
+        "offline" | "retired" => status_offline(),
+        "managed" | "unmanaged" => text(),
+        _ => status_unknown(),
     }
 }
 
@@ -87,24 +102,24 @@ pub(super) fn heading(prefix: &str, title: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             prefix.to_owned(),
-            Style::new().fg(FOCUS).add_modifier(Modifier::BOLD),
+            Style::new().fg(focus()).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!(" {title}"),
-            Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
+            Style::new().fg(text()).add_modifier(Modifier::BOLD),
         ),
     ])
 }
 
 pub(super) fn tabs(active: PrimaryPanel, width: u16) -> Line<'static> {
     let mut spans = vec![
-        Span::styled("CUTEX", Style::new().fg(BRAND).add_modifier(Modifier::BOLD)),
+        Span::styled("CUTEX", Style::new().fg(brand()).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
     ];
     if width < 60 {
         spans.push(Span::styled(
             active.label().to_owned(),
-            Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
+            Style::new().fg(text()).add_modifier(Modifier::BOLD),
         ));
     } else {
         for panel in PrimaryPanel::ALL {
@@ -117,11 +132,11 @@ pub(super) fn tabs(active: PrimaryPanel, width: u16) -> Line<'static> {
                 format!(" {label} "),
                 if panel == active {
                     Style::new()
-                        .fg(TEXT)
-                        .bg(SELECTION)
+                        .fg(text())
+                        .bg(selection())
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::new().fg(MUTED)
+                    Style::new().fg(muted())
                 },
             ));
         }
