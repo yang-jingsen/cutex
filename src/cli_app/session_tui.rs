@@ -8752,8 +8752,14 @@ fn render_categorized_settings(frame: &mut Frame<'_>, area: Rect, model: &Select
     };
     if matches!(model.mode, SelectorMode::Settings { target: SelectorTarget::GlobalSettings, .. }) {
         let render_values = |frame: &mut Frame<'_>, area: Rect| {
+            let title = format!(" {} ", model.active_setting_category().map(|c| c.label).unwrap_or_default());
+            let active = model.settings_focus() == Some(SettingsFocus::Options);
+            let outer = settings_panel_block(title.clone(), active);
+            let inner = outer.inner(area);
+            frame.render_widget(outer, area);
+            input_policy::refresh_title(frame, area, &title, active);
             let help_height = if area.height >= 12 { 6 } else { 3 };
-            let [table, help] = Layout::vertical([Constraint::Min(3), Constraint::Length(help_height)]).areas(area);
+            let [table, help] = Layout::vertical([Constraint::Min(3), Constraint::Length(help_height)]).areas(inner);
             render_setting_options(frame, table, model, true);
             let category = model.active_setting_category().map(|c| c.label).unwrap_or_default();
             let option = model.active_setting_option();
@@ -8840,7 +8846,13 @@ fn render_setting_options(
         let mut items = Vec::new();
         let mut group = None;
         let mut selected = None;
-        let key_width = usize::from(area.width.saturating_sub(6)) * 48 / 100;
+        let key_width = (usize::from(area.width.saturating_sub(4)) * 42 / 100).max(10);
+        let heading = Style::new().fg(crate::cli_app::session_tui_layout::text()).add_modifier(Modifier::BOLD);
+        let [header_area, area] = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).areas(area);
+        frame.render_widget(Paragraph::new(Line::from(vec![
+            Span::styled(format!("{:<width$}", "SETTING", width = key_width + 2), heading),
+            Span::styled("VALUE", heading),
+        ])).block(Block::default().padding(ratatui::widgets::Padding::new(3,1,1,0))), header_area);
         for (index, option) in category.options.iter().enumerate() {
             if option.presentation.group != group {
                 group = option.presentation.group;
@@ -8850,26 +8862,28 @@ fn render_setting_options(
                 }
             }
             if Some(index) == model.selected_setting_option_index() { selected = Some(items.len()); }
+            let label_style = if active && Some(index) == model.selected_setting_option_index() {
+                setting_option_style(option).bg(crate::cli_app::session_tui_layout::selection())
+            } else { setting_option_style(option) };
             let name = option.presentation.name.as_deref().unwrap_or(option.label);
-            let mut name = if option.dirty { format!("{name} *") } else { name.to_owned() };
+            let mut name = if option.dirty { format!("  {name} *") } else { format!("  {name}") };
             if option.presentation.group == Some("Custom status items") {
-                items.push(ListItem::new(Line::styled(name, setting_option_style(option))));
+                items.push(ListItem::new(Line::styled(name, label_style)));
             } else {
                 if Line::from(name.as_str()).width() > key_width {
                     while Line::from(name.as_str()).width() + 1 > key_width && !name.is_empty() { name.pop(); }
                     name.push('…');
                 }
                 let padding = key_width.saturating_sub(Line::from(name.as_str()).width()) + 2;
-                let mut spans = vec![Span::styled(name, setting_option_style(option)), Span::raw(" ".repeat(padding))];
+                let mut spans = vec![Span::styled(name, label_style), Span::raw(" ".repeat(padding))];
                 let value = setting_value_line(option);
                 spans.extend(value.spans.into_iter().map(|span| span.patch_style(value.style)));
                 items.push(ListItem::new(Line::from(spans)));
             }
         }
         let mut state = ListState::default().with_selected(selected);
-        frame.render_stateful_widget(List::new(items).block(settings_panel_block(title.clone(), active).borders(ratatui::widgets::Borders::TOP | ratatui::widgets::Borders::LEFT | ratatui::widgets::Borders::RIGHT).padding(ratatui::widgets::Padding::new(1,1,1,0)))
-            .highlight_style(settings_highlight_style(active)).highlight_symbol(if active { "> " } else { "  " }), area, &mut state);
-        input_policy::refresh_title(frame, area, &title, active);
+        frame.render_stateful_widget(List::new(items).block(Block::default().padding(ratatui::widgets::Padding::new(1,1,0,0)))
+            .highlight_style(Style::default()).highlight_symbol(if active { "> " } else { "  " }), area, &mut state);
         return;
     }
     let mut state = TableState::default().with_selected(model.selected_setting_option_index());
@@ -16333,6 +16347,29 @@ mod tests {
         select_global_setting(&mut model, GlobalSettingsField::DefaultReasoning);
         model.handle(SelectorEvent::Activate);
         assert!(matches!(&model.settings_overlay, Some(SettingsOverlay::Choice { choices, selected: 0, custom_value: None, .. }) if choices[0].label == "Follow profile"));
+    }
+
+    #[test]
+    fn settings_frame_encloses_details_and_keeps_selected_color_swatch() {
+        let mut model = SelectorModel::new(vec![global_row()], false, false);
+        selector_command(&mut model, Command::Settings);
+        for _ in 0..4 { model.handle(SelectorEvent::Down); }
+        for focused in [false, true] {
+            if focused { model.handle(SelectorEvent::OpenActions); }
+            for width in [80, 120, 160] {
+                let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 24)).unwrap();
+                terminal.draw(|frame| render_categorized_settings(frame, frame.area(), &model)).unwrap();
+                let buffer = terminal.backend().buffer();
+                for x in [0, 25, 26, width - 1] {
+                    for y in 1..23 { assert_eq!(buffer[(x,y)].symbol(), "│", "broken edge at {x},{y}"); }
+                }
+                assert_eq!(buffer[(0,23)].symbol(), "└");
+                assert_eq!(buffer[(26,23)].symbol(), "└");
+                assert_eq!(buffer[(width-1,23)].symbol(), "┘");
+                let swatch = model.active_setting_option().unwrap().presentation.swatch.unwrap();
+                assert_eq!((0..width).filter(|x| buffer[(*x,5)].bg == swatch).count(), 2, "Brand swatch lost when focused={focused}");
+            }
+        }
     }
 
     #[test]
