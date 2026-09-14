@@ -61,6 +61,12 @@ pub enum CommandKind {
         target: String,
     },
 
+    /// Start a new ordinary session, selecting a profile when omitted
+    New {
+        /// Profile name or id
+        profile: Option<String>,
+    },
+
     /// Switch account and then run the selected CLI
     Run {
         /// Account name or id

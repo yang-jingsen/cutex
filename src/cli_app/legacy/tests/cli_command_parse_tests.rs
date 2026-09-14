@@ -258,3 +258,12 @@ fn global_agent_message_template_set_command_parses() {
         }) if prefix == "[message from {from}] " && suffix == "-"
     ));
 }
+
+#[test]
+fn ordinary_new_session_accepts_optional_profile_without_agent_flags() {
+    let picker = Cli::try_parse_from(["cutex", "new"]).unwrap();
+    assert!(matches!(picker.command, Some(CommandKind::New { profile: None })));
+    let selected = Cli::try_parse_from(["cutex", "new", "aemeath"]).unwrap();
+    assert!(matches!(selected.command, Some(CommandKind::New { profile: Some(name) }) if name == "aemeath"));
+    assert!(Cli::try_parse_from(["cutex", "new", "--agent"]).is_err());
+}

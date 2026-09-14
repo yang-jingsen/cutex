@@ -60,6 +60,28 @@ pub(super) fn inspector_panes(area: Rect, visible: bool) -> Option<(Rect, Rect)>
     ))
 }
 
+/// Shared geometry: split horizontally first, then put the filter above the list.
+pub(super) struct ListDetailsLayout {
+    pub filter: Rect,
+    pub list: Rect,
+    pub details: Option<Rect>,
+}
+
+pub(super) fn list_details(area: Rect, visible: bool) -> ListDetailsLayout {
+    let (left, details) =
+        inspector_panes(area, visible).map_or((area, None), |(left, right)| (left, Some(right)));
+    let [filter, list] = ratatui::layout::Layout::vertical([
+        ratatui::layout::Constraint::Length(if left.height < 7 { 1 } else { 3 }),
+        ratatui::layout::Constraint::Min(1),
+    ])
+    .areas(left);
+    ListDetailsLayout {
+        filter,
+        list,
+        details,
+    }
+}
+
 /// Explicit styles prevent stale colors when a shorter heading replaces another.
 pub(super) fn heading(prefix: &str, title: &str) -> Line<'static> {
     Line::from(vec![
@@ -110,6 +132,26 @@ pub(super) fn tabs(active: PrimaryPanel, width: u16) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filters_stay_in_the_left_column_and_details_span_full_body() {
+        for width in [80, 120, 180, 280] {
+            let area = Rect::new(0, 2, width, 25);
+            let panes = list_details(area, true);
+            assert_eq!(panes.filter.x, panes.list.x);
+            assert_eq!(panes.filter.width, panes.list.width);
+            assert_eq!(panes.filter.bottom(), panes.list.y);
+            assert_eq!(panes.list.bottom(), area.bottom());
+            if let Some(details) = panes.details {
+                assert_eq!(details.y, panes.filter.y);
+                assert_eq!(details.bottom(), panes.list.bottom());
+                assert_eq!(panes.list.right() + 1, details.x);
+                assert!(panes.list.width <= LIST_PANE_MAX_WIDTH);
+            } else {
+                assert_eq!(width, 80);
+            }
+        }
+    }
 
     #[test]
     fn wide_windows_give_all_extra_space_to_details() {

@@ -77,12 +77,12 @@ pub(super) fn primary_panel_shortcut(key: KeyEvent) -> Option<PrimaryPanel> {
         return None;
     }
     match key.code {
-        KeyCode::Char('m' | 'M') => Some(PrimaryPanel::Agents),
-        KeyCode::Char('r' | 'R') => Some(PrimaryPanel::Recent),
-        KeyCode::Char('p' | 'P') => Some(PrimaryPanel::Projects),
-        KeyCode::Char('t' | 'T') => Some(PrimaryPanel::Tasks),
-        KeyCode::Char('j' | 'J') => Some(PrimaryPanel::Jobs),
-        KeyCode::Char('s' | 'S') => Some(PrimaryPanel::Settings),
+        KeyCode::Char('1') => Some(PrimaryPanel::Agents),
+        KeyCode::Char('2') => Some(PrimaryPanel::Recent),
+        KeyCode::Char('3') => Some(PrimaryPanel::Projects),
+        KeyCode::Char('4') => Some(PrimaryPanel::Tasks),
+        KeyCode::Char('5') => Some(PrimaryPanel::Jobs),
+        KeyCode::Char('6') => Some(PrimaryPanel::Settings),
         _ => None,
     }
 }
@@ -193,12 +193,14 @@ mod tests {
     }
 
     #[test]
-    fn only_alt_m_r_p_t_select_top_level_workspaces() {
+    fn alt_digits_select_all_six_top_level_workspaces() {
         for (character, expected) in [
-            ('m', PrimaryPanel::Agents),
-            ('r', PrimaryPanel::Recent),
-            ('p', PrimaryPanel::Projects),
-            ('t', PrimaryPanel::Tasks),
+            ('1', PrimaryPanel::Agents),
+            ('2', PrimaryPanel::Recent),
+            ('3', PrimaryPanel::Projects),
+            ('4', PrimaryPanel::Tasks),
+            ('5', PrimaryPanel::Jobs),
+            ('6', PrimaryPanel::Settings),
         ] {
             assert_eq!(
                 primary_panel_shortcut(KeyEvent::new(KeyCode::Char(character), KeyModifiers::ALT,)),

@@ -125,6 +125,7 @@ pub(super) enum Command {
     Inspect,
     Edit,
     NewProject,
+    NewManagedAgent,
     LoadMore,
     Scope,
     Titles,
@@ -191,25 +192,16 @@ pub(super) const BINDINGS: &[Binding] = &[
         "Appearance: toggle Inspector",
         "Alt+B",
     ),
-    alt(Command::Page(PrimaryPanel::Agents), 'm', "Agents", "Alt+M"),
-    alt(
-        Command::Page(PrimaryPanel::Recent),
-        'r',
-        "Sessions",
-        "Alt+R",
-    ),
-    alt(
-        Command::Page(PrimaryPanel::Projects),
-        'p',
-        "Projects",
-        "Alt+P",
-    ),
-    alt(Command::Page(PrimaryPanel::Tasks), 't', "Tasks", "Alt+T"),
-    alt(Command::Page(PrimaryPanel::Jobs), 'j', "Jobs", "Alt+J"),
-    alt(Command::Settings, 's', "Settings", "Alt+S"),
+    alt(Command::Page(PrimaryPanel::Agents), '1', "Agents", "Alt+1"),
+    alt(Command::Page(PrimaryPanel::Recent), '2', "Sessions", "Alt+2"),
+    alt(Command::Page(PrimaryPanel::Projects), '3', "Projects", "Alt+3"),
+    alt(Command::Page(PrimaryPanel::Tasks), '4', "Tasks", "Alt+4"),
+    alt(Command::Page(PrimaryPanel::Jobs), '5', "Jobs", "Alt+5"),
+    alt(Command::Settings, '6', "Settings", "Alt+6"),
     alt(Command::Actions, 'a', "Object actions", "Alt+A"),
     alt(Command::Inspect, 'i', "Inspect", "Alt+I"),
     alt(Command::Edit, 'e', "Edit object", "Alt+E"),
+    alt(Command::NewManagedAgent, 'm', "New managed Agent", "Alt+M"),
     alt(Command::NewProject, 'n', "New", "Alt+N"),
     alt(Command::LoadMore, 'l', "Load more recent rows", "Alt+L"),
     alt(
@@ -462,7 +454,7 @@ mod tests {
         assert!(line.spans.iter().any(|s| s.content == "F1"
             && s.style.fg == Some(crate::cli_app::session_tui_layout::FOCUS)
             && s.style.add_modifier.contains(Modifier::BOLD)));
-        assert!(line.to_string().contains("Alt+S"));
+        assert!(line.to_string().contains("Alt+6"));
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
         terminal

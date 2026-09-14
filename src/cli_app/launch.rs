@@ -37,6 +37,26 @@ pub(crate) fn wizard() -> anyhow::Result<()> {
     root_wizard::cmd_wizard()
 }
 
+pub(crate) fn new_session(profile: Option<&str>) -> anyhow::Result<()> {
+    let selected = if let Some(profile) = profile {
+        profile.to_owned()
+    } else {
+        let store = load_store_read_only()?;
+        anyhow::ensure!(!store.accounts.is_empty(), "No profiles configured; use cutex profile add");
+        let state = load_quick_state();
+        let config = load_codez_config();
+        let cwd = std::env::current_dir()?;
+        let default = determine_default_profile(&store, &state, &config, cwd.to_str());
+        let Some(selected) = prompt_for_profile_choice(&store, &default)? else { return Ok(()) };
+        selected
+    };
+    let store = load_store_read_only()?;
+    let account = find_account(&store, &selected)?.ok_or_else(|| anyhow!("Profile not found"))?;
+    anyhow::ensure!(!account.default_cli_args.iter().any(|arg| matches!(arg.as_str(), "resume" | "fork")),
+        "Profile default arguments resume/fork an existing session; use cutex run or remove those defaults before cutex new");
+    run_profile(&selected, vec![], LaunchOutput::Human, false, false, vec![], None, None)
+}
+
 pub(crate) fn run_profile(
     profile: &str,
     codex_args: Vec<String>,
@@ -197,6 +217,10 @@ pub(crate) fn determine_default_profile(
 }
 
 fn prompt_for_profile(store: &AccountsStore, default_name: &str) -> anyhow::Result<String> {
+    prompt_for_profile_choice(store, default_name)?.ok_or_else(|| anyhow!("Profile selection cancelled"))
+}
+
+fn prompt_for_profile_choice(store: &AccountsStore, default_name: &str) -> anyhow::Result<Option<String>> {
     println!("{BOLD}{CYAN}Choose a profile{RESET}");
     for (idx, acc) in store.accounts.iter().enumerate() {
         let is_active = Some(&acc.id) == store.active_account_id.as_ref();
@@ -226,15 +250,16 @@ fn prompt_for_profile(store: &AccountsStore, default_name: &str) -> anyhow::Resu
         );
     }
 
-    print!("Profile to use [{default_name}]: ");
+    print!("Profile to use [{default_name}] (q to cancel): ");
     io::stdout().flush()?;
 
     let mut line = String::new();
-    io::stdin().read_line(&mut line)?;
+    if io::stdin().read_line(&mut line)? == 0 { return Ok(None); }
     let input = line.trim();
 
+    if input == "q" { return Ok(None); }
     if input.is_empty() {
-        return Ok(default_name.to_string());
+        return Ok(Some(default_name.to_string()));
     }
 
     if let Some(acc) = store
@@ -242,12 +267,12 @@ fn prompt_for_profile(store: &AccountsStore, default_name: &str) -> anyhow::Resu
         .iter()
         .find(|account| account.name == input || account.id == input)
     {
-        return Ok(acc.name.clone());
+        return Ok(Some(acc.name.clone()));
     }
 
     if let Ok(idx) = input.parse::<usize>() {
         if idx >= 1 && idx <= store.accounts.len() {
-            return Ok(store.accounts[idx - 1].name.clone());
+            return Ok(Some(store.accounts[idx - 1].name.clone()));
         }
     }
 

@@ -51,6 +51,12 @@ pub(crate) fn run_codex_process(
             program
         ));
     }
+    if !agent_mode {
+        if let Some(mut command) = super::light_standalone::command(account, &effective_codex_args)? {
+            let status = command.status().context("Failed to start ordinary light session")?;
+            std::process::exit(exit_code_from_status(status));
+        }
+    }
     launch_session::warn_if_resume_target_is_already_running(&effective_codex_args, output)?;
     ensure_desktop_notify_bridge_for_launch(account)?;
     ensure_management_api_for_launch(account)?;

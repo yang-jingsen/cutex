@@ -647,6 +647,12 @@ fn handle_key(
         model.retain_selection();
         return None;
     }
+    if input_policy::resolve(key) == Some(Command::Inspect) {
+        model.filter_focused = false;
+        model.detail = model.selected_row().is_some();
+        model.detail_scroll.reset();
+        return None;
+    }
     if model.filter_focused {
         match key.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab => {
@@ -723,7 +729,6 @@ fn render(frame: &mut Frame<'_>, model: &TaskModel) {
     let chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Length(3),
         Constraint::Min(4),
         Constraint::Length(1),
         Constraint::Length(2),
@@ -751,13 +756,12 @@ fn render(frame: &mut Frame<'_>, model: &TaskModel) {
         ])),
         chunks[1],
     );
-    render_filter(frame, chunks[2], model);
-    let wide_inspector = area.width >= super::session_tui::INSPECTOR_SPLIT_MIN_WIDTH;
-    if let Some((list, inspector)) = crate::cli_app::session_tui_layout::inspector_panes(chunks[3], true) {
-        render_table(frame, list, model);
-        render_detail(frame, inspector, model, model.detail);
-    } else {
-        render_table(frame, chunks[3], model);
+    let panes = crate::cli_app::session_tui_layout::list_details(chunks[2], true);
+    render_filter(frame, panes.filter, model);
+    render_table(frame, panes.list, model);
+    let wide_inspector = panes.details.is_some();
+    if let Some(details) = panes.details {
+        render_detail(frame, details, model, model.detail);
     }
     let footer = if model.filter_focused {
         footer_hints(&[
@@ -774,7 +778,7 @@ fn render(frame: &mut Frame<'_>, model: &TaskModel) {
     } else {
         footer_hints(&[
             ("↑/↓", "select"),
-            ("Enter/Tab", "inspect"),
+            ("Enter/Alt+I", "inspect"),
             ("←/→", "panels"),
             ("/", "filter"),
             ("Ctrl+A", "history"),
@@ -784,11 +788,11 @@ fn render(frame: &mut Frame<'_>, model: &TaskModel) {
     };
     frame.render_widget(
         Paragraph::new(Line::from(footer)).wrap(Wrap { trim: true }).style(Style::new().fg(Color::DarkGray)),
-        chunks[5],
+        chunks[4],
     );
-    frame.render_widget(Paragraph::new(model.warning.as_deref().unwrap_or("Ready")).style(Style::new().fg(if model.warning.is_some() { crate::cli_app::session_tui_layout::WARNING } else { crate::cli_app::session_tui_layout::MUTED })), chunks[4]);
+    frame.render_widget(Paragraph::new(model.warning.as_deref().unwrap_or("Ready")).style(Style::new().fg(if model.warning.is_some() { crate::cli_app::session_tui_layout::WARNING } else { crate::cli_app::session_tui_layout::MUTED })), chunks[3]);
     if model.detail && !wide_inspector {
-        render_detail(frame, chunks[3], model, true);
+        render_detail(frame, chunks[2], model, true);
     }
 }
 
@@ -1024,80 +1028,36 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, model: &TaskModel, focused: 
         .selected_row()
         .map(|row| {
             vec![
-                detail_field("Task", row.task_id.clone()),
-                Line::from(vec![
-                    detail_label("State"),
-                    Span::styled(row.state.label(), row.state.style()),
-                ]),
+                Line::styled(row.task_id.clone(), Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD)),
+                Line::from(vec![detail_label("State"), Span::styled(row.state.label(), row.state.style())]),
                 detail_field("Task updated", row.updated_at.clone()),
                 detail_field("Agent", row.agent_label()),
-                detail_field(
-                    "Agent activity (last observed)",
-                    row.agent_activity_label().to_string(),
-                ),
-                detail_field(
-                    "Status summary",
-                    row.status_summary
-                        .clone()
-                        .unwrap_or_else(|| "-".to_string()),
-                ),
+                detail_field("Attempt", row.attempt_number.map(|v| v.to_string()).unwrap_or_else(|| "-".into())),
+                detail_field("Project", row.project_label()),
+                Line::default(),
+                detail_field("Status summary", row.status_summary.clone().unwrap_or_else(|| "-".into())),
+                detail_field("Result ref", row.result_reference.clone().unwrap_or_else(|| "-".into())),
+                Line::default(),
                 detail_field("Task activity", row.activity.clone()),
-                detail_field(
-                    "Last output",
-                    row.last_output.clone().unwrap_or_else(|| "-".to_string()),
-                ),
-                detail_field(
-                    "Last tool",
-                    row.last_tool_call
-                        .clone()
-                        .unwrap_or_else(|| "-".to_string()),
-                ),
-                detail_field(
-                    "Result ref",
-                    row.result_reference
-                        .clone()
-                        .unwrap_or_else(|| "-".to_string()),
-                ),
-                Line::from(""),
+                detail_field("Agent activity (last observed)", row.agent_activity_label().into()),
+                detail_field("Last output", row.last_output.clone().unwrap_or_else(|| "-".into())),
+                detail_field("Last tool", row.last_tool_call.clone().unwrap_or_else(|| "-".into())),
+                Line::default(),
+                Line::styled("Technical identifiers", Style::new().fg(crate::cli_app::session_tui_layout::FOCUS)),
                 detail_field("Revision", row.task_revision.to_string()),
                 detail_field("Assignment", row.assignment_id.clone()),
-                detail_field("Project", row.project_label()),
                 detail_field("Project ID", row.project_id.clone()),
                 detail_field("Assignee", row.assignee_session_id.clone()),
-                detail_field(
-                    "Phase",
-                    row.phase.clone().unwrap_or_else(|| "-".to_string()),
-                ),
-                detail_field(
-                    "Attempt",
-                    row.attempt_number
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "-".to_string()),
-                ),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "Read-only · ↑/↓ PgUp/PgDn scroll · Esc closes",
-                    Style::new().fg(Color::DarkGray),
-                )),
+                detail_field("Phase", row.phase.clone().unwrap_or_else(|| "-".into())),
             ]
         })
         .unwrap_or_else(|| vec![Line::from("Selected task is no longer visible.")]);
-    views::render_styled_details(
-        frame,
-        area,
-        Some(if focused {
-            " Task Inspector · focused "
-        } else {
-            " Task Inspector "
-        }),
-        content,
-        &model.detail_scroll,
-    );
+    views::render_entity_details(frame, area, "Task Details", content, &model.detail_scroll, focused);
 }
 
 fn detail_label(label: &str) -> Span<'static> {
     Span::styled(
-        format!("{label:<16}"),
+        format!("{label}: "),
         Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD),
     )
 }
@@ -1128,7 +1088,7 @@ mod tests {
             handle_key(
                 &mut model,
                 &mut cadence,
-                KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT)
+                KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT)
             ),
             Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Agents))
         );
@@ -1243,7 +1203,7 @@ mod tests {
         for expected in [
             "AGENT ACT",
             "EDIT  2s",
-            "Task Inspector",
+            "Task Details",
             "Task updated",
             "Agent activity (last observed)",
             "Task semantic progress",
@@ -1469,7 +1429,7 @@ mod tests {
         let detail = buffer_text(terminal.backend().buffer());
         assert!(detail.contains("CUTEX"));
         assert!(detail.contains("Settings"));
-        assert!(detail.contains("Task Inspector"));
+        assert!(detail.contains("Task Details"));
 
         handle_key(
             &mut model,
@@ -1525,7 +1485,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(74, 14)).unwrap();
         terminal.draw(|frame| render(frame, &model)).unwrap();
         let first = buffer_text(terminal.backend().buffer());
-        assert!(first.contains("Task Inspector"));
+        assert!(first.contains("Task Details"));
         assert!(first.contains("Task updated"));
         handle_key(
             &mut model,
@@ -1548,8 +1508,8 @@ mod tests {
         );
         terminal.draw(|frame| render(frame, &model)).unwrap();
         let last = buffer_text(terminal.backend().buffer());
-        assert!(visited.contains("ESSION-END"), "{visited}");
-        assert!(last.contains("Read-only"), "{last}");
+        assert!(visited.contains("-SESSION") && visited.contains("-END"), "{visited}");
+        assert!(last.contains("Phase:"), "{last}");
         assert_eq!(
             model.selected_assignment_id.as_deref(),
             Some(model.rows[0].assignment_id.as_str())
@@ -1650,7 +1610,7 @@ mod tests {
             handle_key(
                 &mut model,
                 &mut cadence,
-                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT),
+                KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT),
             ),
             Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Projects))
         );
@@ -1665,7 +1625,7 @@ mod tests {
         let outcome = handle_key(
             &mut model,
             &mut RefreshCadence::new(Instant::now()),
-            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('6'), KeyModifiers::ALT),
         );
         assert_eq!(
             outcome,

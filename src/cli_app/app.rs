@@ -21,6 +21,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
         Some(CommandKind::List) => profile::list()?,
         Some(CommandKind::Current) => profile::current()?,
         Some(CommandKind::Use { target }) => profile::use_profile(&target)?,
+        Some(CommandKind::New { profile }) => launch::new_session(profile.as_deref())?,
         Some(CommandKind::Run {
             profile,
             host,

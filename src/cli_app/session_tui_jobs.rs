@@ -55,7 +55,7 @@ pub(super) fn run(
                 Paragraph::new(ratatui::text::Line::from(super::session_tui::footer_hints(
                     &[
                         ("←/→", "panels"),
-                        ("Alt+S", "settings"),
+                        ("Alt+6", "settings"),
                         ("Esc", "agents"),
                         ("Ctrl+C", "exit"),
                     ],

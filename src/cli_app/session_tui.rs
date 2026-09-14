@@ -365,6 +365,7 @@ pub(super) type SelectorEvent = WorkspaceEvent;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SelectorControl {
+    NewSession,
     NewAgent,
     NativeResume {
         catalog: String,
@@ -476,6 +477,7 @@ struct ProfileManagerStartup {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SessionTuiCycleOutcome {
+    NewSession,
     NewAgent,
     NativeResume {
         catalog: String,
@@ -4586,6 +4588,18 @@ pub(crate) fn run() -> anyhow::Result<()> {
             }
         };
         match outcome {
+            SessionTuiCycleOutcome::NewSession => {
+                match shell.handoff(|| -> anyhow::Result<std::process::ExitStatus> {
+                    Ok(std::process::Command::new(std::env::current_exe()?)
+                        .arg("new").status()?)
+                })? {
+                    Ok(status) => selector_model.notice = Some(format!("New session returned ({status})")),
+                    Err(error) => selector_model.warning = Some(format!("New session: {error:#}")),
+                }
+                if recent_catalog.as_ref().is_some_and(|catalog| catalog.request(RecentCommand::Retry, None)) {
+                    selector_model.recent_loading_started();
+                }
+            }
             SessionTuiCycleOutcome::NewAgent => {
                 match shell.handoff(super::light_new::wizard)? {
                     Ok(Some(result)) => {
@@ -5818,10 +5832,13 @@ fn selector_commands(model: &SelectorModel) -> Vec<(Command, Option<&'static str
         .map(|b| {
             let reason = match b.command {
                 Command::Archived => Some("Available on Projects"),
+                Command::NewProject | Command::NewManagedAgent
+                    if !matches!(model.mode, SelectorMode::Agents | SelectorMode::RecentSessions) =>
+                    Some("Available on Agents / Sessions"),
                 Command::Scope if !matches!(model.mode, SelectorMode::Agents) => {
                     Some("Available on Managed")
                 }
-                Command::NewProject if cutex::launch::local_deployment::LocalDeployment::selected().ok().flatten().is_none() => Some("Install a local runtime to create an Agent"),
+                Command::NewManagedAgent if cutex::launch::local_deployment::LocalDeployment::selected().ok().flatten().is_none() => Some("Install a local runtime to create an Agent"),
                 Command::LoadMore
                     if !matches!(model.mode, SelectorMode::RecentSessions)
                         || model.recent.next_cursor().is_none()
@@ -5991,7 +6008,8 @@ fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyR
                 SelectorKeyRoute::Control(None)
             }
         }
-        Command::NewProject => SelectorKeyRoute::Control(Some(SelectorControl::NewAgent)),
+        Command::NewManagedAgent => SelectorKeyRoute::Control(Some(SelectorControl::NewAgent)),
+        Command::NewProject => SelectorKeyRoute::Control(Some(SelectorControl::NewSession)),
         Command::Details => SelectorKeyRoute::Control(None),
         Command::Titles => {
             if matches!(model.mode, SelectorMode::Agents) {
@@ -6440,6 +6458,7 @@ fn run_event_loop(
                 };
                 if let Some(control) = control {
                     match control {
+                        SelectorControl::NewSession => return Ok(SessionTuiCycleOutcome::NewSession),
                         SelectorControl::NewAgent => return Ok(SessionTuiCycleOutcome::NewAgent),
                         SelectorControl::NativeResume {
                             catalog,
@@ -7482,16 +7501,6 @@ fn render_recent_context(frame: &mut Frame<'_>, area: Rect, model: &SelectorMode
 }
 
 fn render_recent_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
-    if model.recent_inspecting {
-        if let Some(row) = model
-            .recent
-            .visible_rows()
-            .get(model.recent.selected_visible())
-        {
-            views::render_inspector(frame, area, &row.view, &model.recent_detail_scroll);
-        }
-        return;
-    }
     if let Some(row) = model.recent.review() {
         let [name_area, area] =
             Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).areas(area);
@@ -7558,11 +7567,14 @@ fn render_recent_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorMo
         );
         return;
     }
-    let [filter_area, table_area] = Layout::vertical([
-        Constraint::Length(if area.height < 7 { 1 } else { 3 }),
-        Constraint::Min(1),
-    ])
-    .areas(area);
+    let panes = crate::cli_app::session_tui_layout::list_details(area, true);
+    if model.recent_inspecting && panes.details.is_none() {
+        render_recent_details(frame, area, model);
+        return;
+    }
+    if let Some(details) = panes.details { render_recent_details(frame, details, model); }
+    let filter_area = panes.filter;
+    let table_area = panes.list;
     input_policy::render_input(
         frame,
         filter_area,
@@ -7579,6 +7591,29 @@ fn render_recent_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorMo
     let mut state = model.recent_table.borrow_mut();
     state.select((!rows.is_empty()).then_some(model.recent.selected_visible()));
     views::render_table(frame, table_area, &rows, ListKind::Recent, &mut state);
+}
+
+fn render_recent_details(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
+    let rows = model.recent.visible_rows();
+    let lines = rows.get(model.recent.selected_visible()).map(|row| {
+        let field = |label: &str, value: String| Line::from(vec![Span::styled(format!("{label}: "), Style::new().fg(Color::Gray)), Span::raw(value)]);
+        vec![
+            Line::styled(row.title.clone(), Style::new().fg(crate::cli_app::session_tui_layout::TEXT).add_modifier(Modifier::BOLD)),
+            field("Association", row.state.label().into()),
+            field("Updated", row.view.updated.clone()),
+            Line::default(),
+            field("Agent", row.managed_name.clone().unwrap_or_else(|| "No linked Agent".into())),
+            field("Project", row.view.project.label()),
+            field("Directory", row.cwd.clone().unwrap_or_else(|| "N/A".into())),
+            Line::default(),
+            field("Provider", row.provider.clone()),
+            field("Source", row.source.clone()),
+            Line::default(),
+            Line::styled("Technical identifiers", Style::new().fg(crate::cli_app::session_tui_layout::FOCUS)),
+            field("Session ID", row.thread_id.clone()),
+        ]
+    }).unwrap_or_else(|| vec![Line::from("No session selected.")]);
+    views::render_entity_details(frame, area, "Session Details", lines, &model.recent_detail_scroll, model.recent_inspecting);
 }
 
 fn truncate_recent_display(value: &str) -> String {
@@ -8159,6 +8194,11 @@ fn render_managed_list_pane(
 fn render_agent_inspector(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
     let active = model.inspector_is_focused();
     let overview = matches!(model.mode, SelectorMode::Agents);
+    if overview {
+        if let Some(row) = model.active_row() { render_inspector_overview(frame, area, model, row); }
+        else { views::render_entity_details(frame, area, "Agent Details", vec![Line::from("No Agent selected.")], &model.detail_scroll, active); }
+        return;
+    }
     let block = Block::bordered()
         .title(" Inspector ")
         .border_style(Style::new().fg(if active { crate::cli_app::session_tui_layout::FOCUS } else { Color::DarkGray }));
@@ -8267,7 +8307,7 @@ fn render_inspector_overview(
     view.configured_profile = row.configured_profile.clone();
     view.native_title = row.thread_title.clone();
     view.activity_details = selector_activity_details(row.activity.as_ref());
-    views::render_inspector_body(frame, area, &view, &model.detail_scroll);
+    views::render_agent_details(frame, area, &view, &model.detail_scroll, model.inspector_is_focused());
 }
 
 fn render_inspector_settings(
@@ -9260,9 +9300,16 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
             || (matches!(model.mode, SelectorMode::RecentSessions) && model.recent.filter_focused())
         {
             Line::from("Type · ←/→ Home/End · Backspace/Delete · Ctrl+U clear · Enter/Esc/Tab finish · F1 commands")
+        } else if area.width < 120 {
+            Line::from(footer_hints(&[
+                ("↑/↓", "select"), ("Enter", "open"), ("Alt+I", "inspect"),
+                ("Alt+M", "agent"), ("Alt+N", "session"), ("←/→", "panels"),
+                ("/", "filter"), ("F1", "help"), ("Esc", "back"),
+            ]))
         } else {
             Line::from(footer_hints(&[
                 ("↑/↓", "select"), ("Enter", "open"), ("Alt+I", "inspect"), ("Alt+A", "actions"), ("Alt+E", "edit"),
+                ("Alt+M", "new agent"), ("Alt+N", "new session"),
                 ("←/→", "panels"), ("/", "filter"),
                 ("F5", "refresh"), ("F2", "details"), ("F1", "commands"), ("Esc", "back"),
             ]))
@@ -9734,9 +9781,15 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn new_session_shortcut_does_not_create_a_managed_agent() {
+        assert_eq!(input_policy::resolve(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT)), Some(Command::NewProject));
+        assert_eq!(input_policy::resolve(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT)), Some(Command::NewManagedAgent));
+    }
+
+    #[test]
     fn new_agent_without_install_explains_runtime_selection() {
         let mut model = SelectorModel::new(Vec::new(), false, false);
-        assert!(matches!(selector_command(&mut model, Command::NewProject), SelectorKeyRoute::Control(None)));
+        assert!(matches!(selector_command(&mut model, Command::NewManagedAgent), SelectorKeyRoute::Control(None)));
         assert!(model.notice.as_deref().is_some_and(|notice| notice.contains("Install a local runtime")));
     }
 
@@ -9892,7 +9945,7 @@ mod tests {
         assert!(offset > 0);
         selector_command(&mut model, Command::Inspect);
         let detail = rendered_text_at(60, 18, &model);
-        assert!(detail.contains("Inspector"));
+        assert!(detail.contains("Agent Details"));
         route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(model.selected_target(), selected);
         assert_eq!(model.query.value(), "agent");
@@ -10656,7 +10709,7 @@ mod tests {
         let selected = model.selected_target();
         route_selector_key(
             &mut model,
-            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('6'), KeyModifiers::ALT),
         );
         model.settings_return_panel = Some(PrimaryPanel::Projects);
         let text = rendered_text_at(100, 30, &model);
@@ -10670,7 +10723,7 @@ mod tests {
         assert_eq!(model.selected_target(), selected);
         route_selector_key(
             &mut model,
-            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('6'), KeyModifiers::ALT),
         );
         model.settings_return_panel = Some(PrimaryPanel::Tasks);
         assert!(rendered_text_at(100, 30, &model).contains("Global settings"));
@@ -11049,7 +11102,7 @@ mod tests {
         assert_eq!(model.mode, SelectorMode::Agents);
         assert!(model.inspector_overview_focused);
         assert_eq!(model.inspector_section(), InspectorSection::Overview);
-        assert!(rendered_text_at(120, 18, &model).contains("Inspector"));
+        assert!(rendered_text_at(120, 18, &model).contains("Agent Details"));
         assert_eq!(
             selector_navigation_control_from_key(
                 &mut model,
@@ -15745,7 +15798,7 @@ mod tests {
         ));
         assert!(model.recent_inspecting);
         assert!(model.recent.review().is_none());
-        assert!(rendered_text_at(80, 30, &model).contains("Inspector"));
+        assert!(rendered_text_at(80, 30, &model).contains("Session Details"));
         route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!model.recent_inspecting);
         assert_eq!(model.recent.query(), "N");
@@ -15812,7 +15865,7 @@ mod tests {
         assert!(matches!(
             route_selector_key(
                 &mut model,
-                KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT)
+                KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT)
             ),
             SelectorKeyRoute::Switch(PrimaryPanel::Agents)
         ));
@@ -16246,7 +16299,7 @@ mod tests {
         assert!(matches!(model.mode, SelectorMode::Settings { .. }));
         route_selector_key(
             &mut model,
-            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT),
         );
         contract_key(&mut model, KeyCode::Right);
         assert!(matches!(

@@ -163,7 +163,7 @@ mod tests {
                 .draw(|f| render_inspector(f, f.area(), &row, &scroll))
                 .unwrap();
             let name_line: String = (1..width - 1)
-                .map(|x| terminal.backend().buffer()[(x, 2)].symbol())
+                .map(|x| terminal.backend().buffer()[(x, 1)].symbol())
                 .collect();
             assert!(
                 name_line.contains("Short name") && !name_line.contains("019fd081"),
@@ -175,7 +175,7 @@ mod tests {
         assert!(pieces.iter().any(|p| p.contains("👩‍💻")));
         let row = visual_row();
         assert!(inspector_lines(&row).iter().any(
-            |l| l.style.fg == Some(crate::cli_app::session_tui_layout::FOCUS) && l.spans.iter().any(|s| s.content == "Agent")
+            |l| l.style.fg == Some(crate::cli_app::session_tui_layout::FOCUS) && l.spans.iter().any(|s| s.content == "Profile")
         ));
         if std::env::var_os("CUTEX_UI_CAPTURE_DIR").is_some() {
             terminal.backend_mut().resize(60, 30);
@@ -907,6 +907,27 @@ pub(super) fn render_styled_details(
     );
 }
 
+pub(super) fn render_entity_details(
+    frame: &mut Frame<'_>, area: Rect, title: &str,
+    lines: Vec<Line<'static>>, scroll: &DetailScroll, focused: bool,
+) {
+    let block = Block::bordered().title(format!(" {title} "))
+        .border_style(Style::new().fg(if focused { crate::cli_app::session_tui_layout::FOCUS } else { Color::DarkGray }));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if !focused { scroll.offset.set(0); }
+    render_styled_details(frame, inner, None, lines, scroll);
+    if !focused && inner.height > 0 {
+        let footer = Rect { y: inner.bottom() - 1, height: 1, ..inner };
+        frame.render_widget(Clear, footer);
+        frame.render_widget(Paragraph::new("Alt+I inspect").style(Style::new().fg(crate::cli_app::session_tui_layout::FOCUS)), footer);
+    }
+}
+
+pub(super) fn render_agent_details(frame: &mut Frame<'_>, area: Rect, row: &AgentSessionView, scroll: &DetailScroll, focused: bool) {
+    render_entity_details(frame, area, "Agent Details", inspector_lines(row), scroll, focused);
+}
+
 pub(super) fn render_inspector(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -945,7 +966,6 @@ fn inspector_lines(row: &AgentSessionView) -> Vec<Line<'static>> {
         ])
     };
     let mut lines = vec![
-        heading("Agent"),
         name_line(row, row.name.width() + 5),
         field(
             "Status",

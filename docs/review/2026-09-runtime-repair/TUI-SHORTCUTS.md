@@ -1,15 +1,15 @@
 # Cutex 主页面快捷键顺序
 
-更新：2026-09-14。本轮只统一主页面提示和 Settings 方向键，不实施尚待审阅的布局重构。
+更新：2026-09-14。本轮实施已批准的布局重构；Settings 保留三列。
 
 固定顺序：**选择/打开 → 详情与对象操作 → 切换 Panel → 筛选/刷新 → 状态详情/帮助 → 返回/退出**。页面没有实现的功能不添加假快捷键。
 
 | 页面 | 主页面提示顺序 |
 | --- | --- |
-| Agents / Sessions | ↑/↓ select · Enter open · Alt+I inspect · Alt+A actions · Alt+E edit · ←/→ panels · / filter · F5 refresh · F2 details · F1 commands · Esc back |
-| Projects | ↑/↓ select · Enter details · Alt+N create · ←/→ panels · / filter · F5 refresh · F2 details · F1 commands · Esc agents |
-| Tasks | ↑/↓ select · Enter/Tab inspect · ←/→ panels · / filter · Ctrl+A history · F5 refresh · Esc back |
-| Jobs（占位） | ←/→ panels · Alt+S settings · Esc agents · Ctrl+C exit |
+| Agents / Sessions | ↑/↓ select · Enter open · Alt+I inspect · Alt+A actions · Alt+E edit · Alt+M new agent · Alt+N new session · ←/→ panels · / filter · F5 refresh · F2 details · F1 commands · Esc back |
+| Projects | ↑/↓ select · Enter open · Alt+I inspect · Alt+N create · ←/→ panels · / filter · F5 refresh · F2 details · F1 commands · Esc agents |
+| Tasks | ↑/↓ select · Enter/Alt+I inspect · ←/→ panels · / filter · Ctrl+A history · F5 refresh · Esc back |
+| Jobs（占位） | ←/→ panels · Alt+6 settings · Esc agents · Ctrl+C exit |
 | Settings | ↑/↓ select · Enter open · Tab focus · V view · S save · D discard · ←/→ panels · F2 details · F1 commands · Esc back · Ctrl+C exit |
 
 Settings 不足 66 列时省略部分辅助提示，保留选择、打开、切页、帮助和退出。只读内容不显示 Save/Discard。
@@ -27,3 +27,12 @@ Settings 不足 66 列时省略部分辅助提示，保留选择、打开、切�
 实际 PTY 从多个 Panel 切到 Settings 时复现退出 101：`session_tui.rs` 的 `sort_rows` 对 `lifecycle` 调用 `expect("agent lifecycle")`。初始快照未完成、Agent Bus 查询失败时，投影会合法地将 lifecycle 设置为 None，因此这一假设不成立。
 
 修复：已观测状态仍按原顺序排，未知状态排在其后、系统入口之前；保留未知含义，不伪造 Offline。新增混合已知/未知/系统行排序回归。此项与键位修复共同进入 r31，不能仅归因于用户操作或 PyCharm。
+
+## 页面与创建入口
+
+- Alt+1 / 2 / 3 / 4 / 5 / 6：Agents / Sessions / Projects / Tasks / Jobs / Settings。旧字母跳页键移除；数字直达放在 F1 帮助，底栏保留左右切页提示。
+- Agents、Sessions：Alt+M 新建 managed Agent；Alt+N 新建普通 Session。普通 Session 先选择 profile，退出后回到 Cutex；不会自动登记为 Agent。
+- Projects：Alt+N 仍创建 Project。
+- `cutex new` 选择 profile；`cutex new aemeath` 直接以该 profile 新建。`cutex run aemeath -- …` 保留传递 CLI 参数的入口。
+- 窄窗口底栏省略部分辅助快捷键，但保留 F1；完整动作仍可在 F1 找到。
+- 新建 managed Agent 内部自动创建空 native thread 再 adopt，不要求用户手动先 adopt。

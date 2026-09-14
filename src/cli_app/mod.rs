@@ -21,6 +21,7 @@ mod launch_output;
 mod launch_presenter;
 mod launch_process;
 mod launch_session;
+mod light_standalone;
 #[cfg(test)]
 mod legacy;
 mod management;

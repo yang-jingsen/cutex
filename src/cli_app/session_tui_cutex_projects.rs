@@ -126,6 +126,8 @@ pub(super) struct CutexProjectsModel {
     member_selected: Option<SubjectRef>,
     member_index: usize,
     member_inspecting: bool,
+    project_inspecting: bool,
+    project_scroll: views::DetailScroll,
     member_table: std::cell::RefCell<TableState>,
     table_state: std::cell::RefCell<TableState>,
     help: Option<Help>,
@@ -168,6 +170,8 @@ impl CutexProjectsModel {
             member_selected: None,
             member_index: 0,
             member_inspecting: false,
+            project_inspecting: false,
+            project_scroll: Default::default(),
             detail_scroll: Default::default(),
             details_text: None,
             status_scroll: Default::default(),
@@ -525,6 +529,8 @@ fn load_model() -> anyhow::Result<CutexProjectsModel> {
         member_selected: None,
         member_index: 0,
         member_inspecting: false,
+            project_inspecting: false,
+            project_scroll: Default::default(),
         detail_scroll: Default::default(),
         details_text: None,
         status_scroll: Default::default(),
@@ -1266,11 +1272,12 @@ fn project_commands(model: &CutexProjectsModel) -> Vec<(Command, Option<&'static
         .iter()
         .map(|b| {
             let reason = match b.command {
+                Command::NewManagedAgent => Some("Available on Agents / Sessions"),
                 Command::Profiles
                 | Command::Workspaces
                 | Command::Archive
                 | Command::Appearance => {
-                    Some("Open Settings (Alt+S), then F1 management navigation")
+                    Some("Open Settings (Alt+6), then F1 management navigation")
                 }
                 Command::NewProject | Command::Archived if model.view != ProjectView::List => {
                     Some("Return to the Project list")
@@ -1386,6 +1393,12 @@ fn project_command(
             }
             None
         }
+        Command::Inspect if model.view == ProjectView::List => {
+            model.filter_focused = false;
+            model.project_inspecting = model.selected_project().is_some();
+            model.project_scroll.reset();
+            None
+        }
         Command::Inspect
             if model.view == ProjectView::Details && model.section == ProjectSection::Members =>
         {
@@ -1482,6 +1495,15 @@ fn handle_key(model: &mut CutexProjectsModel, key: KeyEvent) -> Option<PrimaryPa
     if input_policy::resolve(key) == Some(Command::Help) && !project_modal(model) {
         model.help = Some(Help::default());
         return None;
+    }
+    if model.view == ProjectView::List && model.project_inspecting {
+        if matches!(key.code, KeyCode::Esc | KeyCode::BackTab) {
+            model.project_inspecting = false;
+            return None;
+        }
+        if model.project_scroll.handle(key) || matches!(key.code, KeyCode::Enter | KeyCode::Left | KeyCode::Right) {
+            return None;
+        }
     }
     if model.view == ProjectView::List && model.filter_focused {
         if input_policy::edit(&mut model.query, key) {
@@ -1874,7 +1896,7 @@ fn handle_project_widget_key(
                 {
                     model.create_editor.as_mut().unwrap().field += 1;
                 } else if model.available_agents.is_empty() {
-                    model.notice = Some("Draft kept. Create an Agent with Alt+N or Adopt a saved session in Recent, then Alt+P returns here.".into());
+                    model.notice = Some("Draft kept. Create an Agent with Alt+M or Adopt a saved session in Recent, then Alt+3 returns here.".into());
                     return Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Recent));
                 } else if model
                     .create_editor
@@ -2028,9 +2050,13 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
                 ("Tab/Enter", "finish"),
                 ("Esc", "cancel"),
             ]),
+            ProjectView::List if model.project_inspecting => footer_hints(&[
+                ("↑/↓", "scroll"), ("PgUp/Dn", "page"), ("F2", "details"), ("F1", "commands"), ("Esc", "list"),
+            ]),
             ProjectView::List => footer_hints(&[
                 ("↑/↓", "select"),
-                ("Enter", "details"),
+                ("Enter", "open"),
+                ("Alt+I", "inspect"),
                 ("Alt+N", "create"),
                 ("←/→", "panels"),
                 ("/", "filter"),
@@ -2194,11 +2220,13 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
 }
 
 fn render_list(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel) {
-    let chunks = Layout::vertical([
-        Constraint::Length(if area.height < 7 { 1 } else { 3 }),
-        Constraint::Min(1),
-    ])
-    .split(area);
+    let panes = crate::cli_app::session_tui_layout::list_details(area, true);
+    if model.project_inspecting && panes.details.is_none() {
+        render_project_summary(frame, area, model);
+        return;
+    }
+    if let Some(details) = panes.details { render_project_summary(frame, details, model); }
+    let chunks = [panes.filter, panes.list];
     let filter_title = " Filter projects / id / badge [/] ";
     input_policy::render_input(
         frame,
@@ -2285,6 +2313,28 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel) {
             },
         );
     }
+}
+
+fn render_project_summary(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel) {
+    let lines = model.selected_project().map(|project| {
+        let field = |label: &str, value: String| Line::from(vec![Span::styled(format!("{label}: "), Style::new().fg(Color::Gray)), Span::raw(value)]);
+        vec![
+            project_name_line(project, usize::from(area.width.saturating_sub(2))),
+            field("State", format!("{:?}", project.lifecycle)),
+            field("Director", project.director_name.clone().unwrap_or_else(|| project.director_cutex_session_id.as_str().to_owned())),
+            field("Members", project.active_member_count.to_string()),
+            field("Archived members", project.archived_member_count.to_string()),
+            field("Operators", project.operator_count.to_string()),
+            Line::default(),
+            Line::from("Enter opens the project workspace."),
+            Line::from("Alt+A actions · Alt+E appearance"),
+            Line::default(),
+            Line::styled("Technical identifiers", Style::new().fg(crate::cli_app::session_tui_layout::FOCUS)),
+            field("Project ID", project.project_id.to_string()),
+            field("Authority epoch", project.authority_epoch.to_string()),
+        ]
+    }).unwrap_or_else(|| vec![Line::from("No project selected.")]);
+    views::render_entity_details(frame, area, "Project Details", lines, &model.project_scroll, model.project_inspecting);
 }
 
 fn project_name_line(project: &CutexProjectSummary, width: usize) -> Line<'static> {
@@ -2697,7 +2747,7 @@ fn render_create_editor(frame: &mut Frame<'_>, area: Rect, model: &CutexProjects
         .map(|agent| format!("{} ({})", agent.name, agent.cutex_session_id.as_str()))
         .unwrap_or_else(|| {
             if model.available_agents.is_empty() {
-                "None — Enter: Recent, then Alt+N creates an Agent"
+                "None — Enter: Recent, then Alt+M creates an Agent"
                     .to_string()
             } else {
                 "Choose… Enter opens searchable candidates".to_string()
@@ -3094,7 +3144,7 @@ mod tests {
             .notice
             .as_ref()
             .unwrap()
-            .contains("Alt+N"));
+            .contains("Alt+M"));
     }
     use super::*;
     use std::time::Duration;
@@ -3816,6 +3866,28 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn project_summary_inspection_is_local_and_preserves_list_selection() {
+        let mut model = model_with_projects();
+        model.selected = 1;
+        assert!(model.client.is_none());
+        let wide = rendered(&model, 180, 30);
+        assert!(wide.contains("Project Details"));
+        assert!(wide.contains("Filter projects"));
+        assert!(project_command(&mut model, Command::Inspect).is_none());
+        assert!(model.project_inspecting);
+        assert!(model.details.is_none());
+        assert!(model.failure.is_none());
+        let narrow = rendered(&model, 80, 30);
+        assert!(narrow.contains("Project Details"));
+        assert!(!narrow.contains("Filter projects"));
+        handle_key(&mut model, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(model.selected, 1);
+        handle_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!model.project_inspecting);
+        assert_eq!(model.selected, 1);
+    }
+
     fn model_with_projects() -> CutexProjectsModel {
         let mut model = CutexProjectsModel::empty_with_failure("fixture");
         model.failure = None;
@@ -4376,7 +4448,7 @@ mod tests {
         assert_eq!(model.view, ProjectView::Create);
         handle_key(
             &mut model,
-            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT),
         );
         assert!(model.leave_review.is_some());
         handle_key(
@@ -4386,7 +4458,7 @@ mod tests {
         assert!(model.create_editor.is_some()); // Cancel is default
         handle_key(
             &mut model,
-            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('6'), KeyModifiers::ALT),
         );
         handle_key(
             &mut model,
@@ -4403,7 +4475,7 @@ mod tests {
         assert!(model.create_editor.is_none());
         model.view = ProjectView::ConfirmProjectMutation;
         for key in [
-            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT),
             KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE),
         ] {
             assert_eq!(handle_key(&mut model, key), None);
@@ -4513,7 +4585,7 @@ mod tests {
         assert_eq!(
             handle_key(
                 &mut model,
-                KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT)
+                KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT)
             ),
             None
         );
@@ -4881,7 +4953,7 @@ mod tests {
         assert_eq!(
             handle_key(
                 &mut model,
-                KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT),
+                KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT),
             ),
             None
         );
