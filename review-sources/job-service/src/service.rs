@@ -21,6 +21,7 @@ pub struct ServiceConfig {
     pub max_active_jobs: usize,
     pub allowed_launchers: std::collections::BTreeMap<String, String>,
     pub completion_wire_version: CompletionWireVersion,
+    pub completion_enabled: bool,
 }
 
 impl ServiceConfig {
@@ -110,8 +111,11 @@ pub(crate) struct CompletionAttemptResult {
 impl JobService {
     pub fn open(config: ServiceConfig) -> Result<Self, JobError> {
         config.validate()?;
-        let (store, state) =
-            Store::open(config.state_root.clone(), config.completion_wire_version)?;
+        let (store, state) = Store::open(
+            config.state_root.clone(),
+            config.completion_wire_version,
+            config.completion_enabled,
+        )?;
         store.ensure_output_dir()?;
         let executable = config.runner_executable.clone();
         Ok(Self {
@@ -190,7 +194,15 @@ impl JobService {
                 truncated: false,
             },
             output_reference,
-            completion_delivery: CompletionDeliverySummary::default(),
+            completion_delivery: CompletionDeliverySummary {
+                enabled: self.inner.config.completion_enabled,
+                state: if self.inner.config.completion_enabled {
+                    CompletionDeliveryState::AwaitingTerminal
+                } else {
+                    CompletionDeliveryState::Disabled
+                },
+                ..Default::default()
+            },
         };
         {
             let mut state = self.inner.state.lock().expect("state mutex poisoned");
@@ -384,7 +396,7 @@ impl JobService {
         Ok(
             serde_json::json!({"schema":"cutex/job-service-capabilities/v1",
             "allowedLaunchers":self.inner.config.allowed_launchers,
-            "independentExecutionCwd":true}),
+            "independentExecutionCwd":true,"completionDelivery":{"enabled":self.inner.config.completion_enabled,"wireVersion":match self.inner.config.completion_wire_version { CompletionWireVersion::V1 => 1, CompletionWireVersion::V2 => 2 }}}),
         )
     }
 

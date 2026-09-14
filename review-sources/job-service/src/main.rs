@@ -72,6 +72,7 @@ fn serve(args: &[String]) -> Result<(), JobError> {
         allowed_launchers.insert(path.to_string_lossy().into_owned(), digest);
     }
     let service = JobService::open(ServiceConfig {
+        completion_enabled: completion.is_some(),
         state_root: args[0].clone().into(),
         grant_key: grant,
         api_token: api,

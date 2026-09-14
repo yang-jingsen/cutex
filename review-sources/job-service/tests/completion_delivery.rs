@@ -261,6 +261,7 @@ fn v2_outbox_freezes_facts_and_retries_identical_bytes_across_restart() {
     let token_file = temp.path().join("completion.key");
     write_private(&token_file, COMPLETION);
     let make_config = |completion_wire_version| ServiceConfig {
+        completion_enabled: true,
         state_root: state_root.clone(),
         grant_key: GRANT.into(),
         api_token: API.into(),
@@ -564,6 +565,7 @@ fn run_scripted_case(
     let token_file = temp.path().join("completion.key");
     write_private(&token_file, COMPLETION);
     let service = JobService::open(ServiceConfig {
+        completion_enabled: true,
         state_root: temp.path().join("state"),
         grant_key: GRANT.into(),
         api_token: API.into(),
@@ -793,6 +795,7 @@ fn accepted_cutex_route_persists_real_pending_receipt_when_fixture_is_supplied()
     std::fs::set_permissions(&launcher_file, std::fs::Permissions::from_mode(0o700)).unwrap();
     let launcher_file = std::fs::canonicalize(launcher_file).unwrap();
     let service = JobService::open(ServiceConfig {
+        completion_enabled: true,
         state_root: job_home.path().join("state"),
         grant_key: GRANT.into(),
         api_token: API.into(),

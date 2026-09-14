@@ -11,7 +11,7 @@
 | Cutex CLI、Agent Bus、Management API、Task Service | [`9c4af47`](https://github.com/yang-jingsen/cutex/tree/9c4af47)；分支 `review/runtime-repair-20260914` | release-runtime-r26 优化构建，新增通知恢复排序、发生时间和 Task 展示事实。 |
 | cute-codex CLI、app-server、Code Mode host | [`382431657`](https://github.com/yang-jingsen/cute-codex/tree/382431657)；分支 `review/runtime-repair-20260914` | release-native-r7 CLI 新增统一事件样式；app-server 与 Code Mode host 复用 r4 的相同二进制（同包复制）。legacy 缓存保留。 |
 | Cutex MCP facade | Cutex `2dbdf1f`，`src/agent_bus/mcp_tasks.rs` / `mcp_http_response.rs` | release-runtime-r25 优化构建，包含逐操作参数说明、完整 HTTP 回执读取和不确定响应阶段诊断；native-r7 继续引用该 facade。 |
-| Job Service / Job MCP adapter | [`bbaebdd7a4ec6c05290d633d7ad2a174f53468f5`](https://github.com/yang-jingsen/cutex/tree/bbaebdd7a4ec6c05290d633d7ad2a174f53468f5)；分支 `review/job-service-20260914` | 独立 Git 历史发布在 Cutex 的专用分支。主审核分支中的 `review-sources/job-service/` 是完全相同的 tracked source。 |
+| Job Service / Job MCP adapter | [`cdac8c5fb8538b31447c7c62f10918935ca6cda1`](https://github.com/yang-jingsen/cutex/tree/cdac8c5fb8538b31447c7c62f10918935ca6cda1)；分支 `review/job-service-20260914` | 独立 Git 历史发布在 Cutex 的专用分支。主审核分支中的 `review-sources/job-service/` 是完全相同的 tracked source。 |
 | PRH、hostctl、Linux sentinel / Windows host | [`2fcb9c4b09d44e1010cfed2983e094aa53261ebe`](https://github.com/yang-jingsen/cutex/tree/2fcb9c4b09d44e1010cfed2983e094aa53261ebe/persistent-runtime-host)；分支 `review/persistent-runtime-host-20260914` | 对应 `persistent-runtime-host/` 子项目。主审核分支 `review-sources/persistent-runtime-host/` 为相同源码树；当前 PRH host 文件 hash 与该部署清单一致。 |
 
 Job 主 daemon 和新安装的 adapter 为 bbaebdd；旧 native 的 adapter 进程保留。daemon 同时接受旧、新 launcher，旧进程在下次启动时换用新版本。

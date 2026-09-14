@@ -215,6 +215,7 @@ pub struct JobRecord {
 pub enum CompletionDeliveryState {
     #[default]
     Disabled,
+    AwaitingTerminal,
     Ready,
     Sending,
     RetryPending,
@@ -231,6 +232,9 @@ pub enum CompletionDeliveryState {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CompletionDeliverySummary {
+    /// Whether this daemon has a configured completion delivery worker.
+    #[serde(default)]
+    pub enabled: bool,
     pub state: CompletionDeliveryState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,

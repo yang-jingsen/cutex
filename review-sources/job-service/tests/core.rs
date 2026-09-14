@@ -35,6 +35,7 @@ fn sandbox(cwd: &std::path::Path) -> serde_json::Value {
 
 fn config(root: &std::path::Path) -> ServiceConfig {
     ServiceConfig {
+        completion_enabled: false,
         state_root: root.into(),
         grant_key: GRANT.into(),
         api_token: API.into(),
@@ -106,6 +107,64 @@ fn await_terminal(service: &JobService, id: &str) -> JobRecord {
         assert!(Instant::now() < until, "job did not become terminal");
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn configured_completion_waits_for_terminal_and_normalizes_legacy_queue() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let mut cfg = config(root.path());
+    cfg.completion_enabled = true;
+    let service = JobService::open(cfg.clone()).unwrap();
+    let request = job_request(cwd.path(), "awaiting-completion", "sleep 0.3; printf done");
+    let receipt = service
+        .submit(API, request.clone(), issue(&request))
+        .unwrap();
+    assert!(receipt.job.completion_delivery.enabled);
+    assert_eq!(
+        receipt.job.completion_delivery.state,
+        CompletionDeliveryState::AwaitingTerminal
+    );
+    let terminal = await_terminal(&service, &receipt.job.job_id);
+    assert_eq!(
+        terminal.completion_delivery.state,
+        CompletionDeliveryState::Ready
+    );
+    service
+        .read_output(API, &terminal.job_id, "stdout", 0, 1024)
+        .unwrap();
+    assert_eq!(
+        service
+            .query(API, &terminal.job_id)
+            .unwrap()
+            .completion_delivery
+            .state,
+        CompletionDeliveryState::Ready
+    );
+    drop(service);
+    let path = root.path().join("state.json");
+    let mut old: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    old["jobs"][&terminal.job_id]["completionDelivery"]
+        .as_object_mut()
+        .unwrap()
+        .remove("enabled");
+    for item in old["outbox"].as_object_mut().unwrap().values_mut() {
+        item["deliveryState"] = "disabled".into();
+    }
+    std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+    let restored = JobService::open(cfg).unwrap();
+    let actual = restored.query(API, &terminal.job_id).unwrap();
+    assert!(actual.completion_delivery.enabled);
+    assert_eq!(
+        actual.completion_delivery.state,
+        CompletionDeliveryState::Ready
+    );
+    assert_eq!(actual.revision, terminal.revision);
+    assert_eq!(
+        actual.completion_delivery.event_id,
+        terminal.completion_delivery.event_id
+    );
 }
 
 #[test]

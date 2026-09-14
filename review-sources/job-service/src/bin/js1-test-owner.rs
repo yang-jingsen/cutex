@@ -43,6 +43,7 @@ fn own_and_abort(args: &[String]) -> Result<(), JobError> {
         .into_owned();
     let launcher_sha256 = cutex_job_service::file_sha256(std::path::Path::new(&launcher_path))?;
     let service = JobService::open(ServiceConfig {
+        completion_enabled: false,
         state_root: envelope.state_root.into(),
         grant_key: grant_key.clone(),
         api_token: api.clone(),

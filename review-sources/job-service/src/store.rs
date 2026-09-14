@@ -29,6 +29,7 @@ impl Store {
     pub fn open(
         root: PathBuf,
         completion_wire_version: CompletionWireVersion,
+        completion_enabled: bool,
     ) -> Result<(Self, StoredState), JobError> {
         fs::create_dir_all(&root)?;
         if fs::symlink_metadata(&root)?.file_type().is_symlink() {
@@ -99,6 +100,10 @@ impl Store {
         let now = crate::service::now_secs();
         let mut changed = false;
         for job in state.jobs.values_mut() {
+            if job.completion_delivery.enabled != completion_enabled {
+                job.completion_delivery.enabled = completion_enabled;
+                changed = true;
+            }
             let next = match job.state {
                 JobState::LaunchPending => {
                     Some((JobState::LaunchUnknown, "service restarted during launch"))
@@ -121,6 +126,20 @@ impl Store {
             }
         }
         for item in state.outbox.values_mut() {
+            // Normalize legacy unattempted Disabled entries; retain their exact
+            // frozen payload, event ID, acknowledgement and delivered receipts.
+            if matches!(
+                item.delivery_state,
+                CompletionDeliveryState::Disabled | CompletionDeliveryState::Ready
+            ) {
+                let next = if completion_enabled {
+                    CompletionDeliveryState::Ready
+                } else {
+                    CompletionDeliveryState::Disabled
+                };
+                changed |= item.delivery_state != next;
+                item.delivery_state = next;
+            }
             if item.delivery_state == CompletionDeliveryState::Sending {
                 item.delivery_state = CompletionDeliveryState::RetryPending;
                 item.next_attempt_at_epoch_millis = 0;
@@ -235,7 +254,11 @@ pub(crate) fn insert_outbox(
         wire_version: stored_wire,
         frozen_request_v2: frozen_request,
         acknowledged: false,
-        delivery_state: CompletionDeliveryState::Disabled,
+        delivery_state: if job.completion_delivery.enabled {
+            CompletionDeliveryState::Ready
+        } else {
+            CompletionDeliveryState::Disabled
+        },
         attempt_count: 0,
         next_attempt_at_epoch_millis: 0,
         last_attempt_at_epoch_millis: None,
@@ -393,6 +416,7 @@ pub(crate) fn terminal_status(state: JobState) -> &'static str {
 
 pub(crate) fn project_outbox(job: &mut JobRecord, outbox: &OutboxRecord) {
     job.completion_delivery = CompletionDeliverySummary {
+        enabled: job.completion_delivery.enabled,
         state: outbox.delivery_state,
         event_id: Some(outbox.event_id.clone()),
         last_error: outbox.last_error.clone(),

@@ -129,7 +129,7 @@ fn dispatch_mcp(
                 "tools":{},
                 "experimental":{SANDBOX_META_KEY:{}}
             },
-            "instructions":"Submit noninteractive jobs; completion delivery is service-owned when configured, so do not poll.",
+            "instructions":"Submit noninteractive jobs. completionDelivery.enabled reports channel configuration; awaiting_terminal means the job is still running, not notifications disabled. Completion events arrive after the current turn. Read/query do not consume notifications; do not poll.",
             "ttlMs":0,
             "cacheScope":"private",
             "_meta":{"io.modelcontextprotocol/serverInfo":{"name":"cutex-job-service","version":env!("CARGO_PKG_VERSION")}}
@@ -146,7 +146,7 @@ fn dispatch_mcp(
                     "experimental":{SANDBOX_META_KEY:{}}
                 },
                 "serverInfo":{"name":"cutex-job-service","version":env!("CARGO_PKG_VERSION")},
-                "instructions":"Submit noninteractive jobs; completion delivery is service-owned when configured, so do not poll."
+                "instructions":"Submit noninteractive jobs. completionDelivery.enabled reports channel configuration; awaiting_terminal means the job is still running, not notifications disabled. Completion events arrive after the current turn. Read/query do not consume notifications; do not poll."
             }))
         }
         Some("tools/list") => {
@@ -429,7 +429,7 @@ fn tools() -> Vec<Value> {
     vec![
         tool(
             "submit",
-            "Submit one noninteractive job and return its durable receipt immediately.",
+            "Submit one noninteractive job and return its durable receipt immediately. completionDelivery.enabled is channel configuration; state=awaiting_terminal means completion has not occurred yet. Completion is delivered after the current turn.",
             json!({"type":"object","properties":{"actionId":{"type":"string"},"argv":{"type":"array","items":{"type":"string"}},"cwd":{"type":"string"}},"required":["actionId","argv","cwd"],"additionalProperties":false}),
         ),
         tool(
@@ -444,7 +444,7 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "read_output",
-            "Read a bounded output page from one owned job.",
+            "Read a bounded output page from one owned job. This does not consume or suppress its eventual completion notification.",
             json!({"type":"object","properties":{"jobId":{"type":"string"},"stream":{"type":"string","enum":["stdout","stderr"]},"offset":{"type":"integer","minimum":0},"maxBytes":{"type":"integer","minimum":1,"maximum":1048576}},"required":["jobId","stream"],"additionalProperties":false}),
         ),
     ]
