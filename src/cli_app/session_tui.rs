@@ -1937,6 +1937,15 @@ impl SelectorModel {
             return self.handle_settings_overlay_event(event, &target);
         }
 
+        if event == SelectorEvent::Activate && focus != SettingsFocus::Categories {
+            if let Some(command) = self.active_setting_option().and_then(|option| option.navigation) {
+                return match selector_command(self, command) {
+                    SelectorKeyRoute::Control(control) => control.unwrap_or(SelectorControl::Continue),
+                    _ => SelectorControl::Continue,
+                };
+            }
+        }
+
         if matches!(event, SelectorEvent::Insert('a' | 'A' | 's' | 'S')) {
             if let Some(key) = target.agent_key() {
                 let changed_count = self.settings_draft.dirty_count();
@@ -8505,23 +8514,6 @@ fn render_action_overlay(frame: &mut Frame<'_>, area: Rect, model: &SelectorMode
 }
 
 fn render_settings_browser(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
-    let area = if matches!(
-        model.mode,
-        SelectorMode::Settings {
-            target: SelectorTarget::GlobalSettings,
-            ..
-        }
-    ) {
-        let [navigation, body] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
-        frame.render_widget(
-            Paragraph::new(Line::from(footer_hints(&[("Alt+G", "Profiles")]))),
-            navigation,
-        );
-        body
-    } else {
-        area
-    };
     match model.settings_view() {
         Some(SettingsView::Expanded) => render_expanded_settings(frame, area, model),
         Some(SettingsView::Categories) => render_categorized_settings(frame, area, model),
@@ -10258,6 +10250,7 @@ mod tests {
                             global_field: None,
                             profile_field: None,
                             command: None,
+                            navigation: None,
                             dirty: false,
                         },
                         SessionTuiSettingOption {
@@ -10267,6 +10260,7 @@ mod tests {
                             global_field: None,
                             profile_field: None,
                             command: None,
+                            navigation: None,
                             dirty: false,
                         },
                     ],
@@ -10280,6 +10274,7 @@ mod tests {
                         global_field: None,
                         profile_field: None,
                         command: None,
+                        navigation: None,
                         dirty: false,
                     }],
                 },
@@ -14617,6 +14612,23 @@ mod tests {
 
         model.handle(SelectorEvent::Activate);
         assert!(matches!(model.mode, SelectorMode::Actions { .. }));
+    }
+
+    #[test]
+    fn profiles_entry_in_global_settings_opens_manager_on_enter() {
+        let mut model = SelectorModel::new(
+            vec![global_settings_row_with_profiles(&CodezConfig::default(), &[])], false, false,
+        );
+        model.mode = SelectorMode::Settings {
+            target: SelectorTarget::GlobalSettings,
+            category: 0,
+            option: 0,
+            focus: SettingsFocus::Options,
+            view: SettingsView::Categories,
+        };
+        assert_eq!(model.active_setting_option().unwrap().label, "Profiles");
+        assert!(rendered_text_at(120, 30, &model).contains("Profiles"));
+        assert_eq!(model.handle(SelectorEvent::Activate), SelectorControl::OpenProfileManager);
     }
 
     #[test]

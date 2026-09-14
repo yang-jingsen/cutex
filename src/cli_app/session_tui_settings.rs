@@ -32,6 +32,7 @@ pub(super) struct SessionTuiSettingOption {
     pub(super) global_field: Option<GlobalSettingsField>,
     pub(super) profile_field: Option<ProfileSettingsField>,
     pub(super) command: Option<SessionSettingsCommand>,
+    pub(super) navigation: Option<super::session_tui_input::Command>,
     pub(super) dirty: bool,
 }
 
@@ -44,6 +45,7 @@ impl SessionTuiSettingOption {
             global_field: None,
             profile_field: None,
             command: None,
+            navigation: None,
             dirty: false,
         }
     }
@@ -61,6 +63,7 @@ impl SessionTuiSettingOption {
             global_field: None,
             profile_field: None,
             command: None,
+            navigation: None,
             dirty,
         }
     }
@@ -77,6 +80,7 @@ impl SessionTuiSettingOption {
             global_field: None,
             profile_field: None,
             command: Some(command),
+            navigation: None,
             dirty: false,
         }
     }
@@ -94,6 +98,7 @@ impl SessionTuiSettingOption {
             global_field: Some(field),
             profile_field: None,
             command: None,
+            navigation: None,
             dirty,
         }
     }
@@ -111,6 +116,7 @@ impl SessionTuiSettingOption {
             global_field: None,
             profile_field: Some(field),
             command: None,
+            navigation: None,
             dirty,
         }
     }
@@ -1006,6 +1012,10 @@ impl GlobalSettingsSnapshot {
             SessionTuiSettingCategory::new(
                 "General",
                 vec![
+                    SessionTuiSettingOption {
+                        navigation: Some(super::session_tui_input::Command::Profiles),
+                        ..SessionTuiSettingOption::new("Profiles", "Enter to manage profiles")
+                    },
                     self.editable_option(
                         "Managed sessions",
                         GlobalSettingsField::ManagedSessions,
