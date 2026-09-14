@@ -202,10 +202,11 @@ fn dispatch(
             let max = params
                 .get("maxBytes")
                 .and_then(Value::as_u64)
-                .unwrap_or(65536) as usize;
-            Ok(serde_json::to_value(service.read_output_for(
-                token, &grant, id, stream, offset, max,
-            )?)?)
+                .unwrap_or(8192)
+                .clamp(1, 8192) as usize;
+            crate::mcp_adapter::readable_output(serde_json::to_value(
+                service.read_output_for(token, &grant, id, stream, offset, max)?,
+            )?)
         }
         "pendingOutbox" => Ok(serde_json::to_value(service.pending_outbox(token)?)?),
         "acknowledgeOutbox" => {

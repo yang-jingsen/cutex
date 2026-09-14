@@ -478,11 +478,7 @@ impl JobService {
         }
         let max = max_bytes.min(self.inner.config.max_read_bytes);
         let path = self.inner.store.output_path(job_id, stream);
-        let (bytes, from) = if path.exists() {
-            read_bounded(&path, offset, max)?
-        } else {
-            (Vec::new(), 0)
-        };
+        let (bytes, from, next, omitted) = read_output_ranges(&path, offset, max)?;
         let summary = if stream == "stdout" {
             &job.stdout
         } else {
@@ -492,9 +488,12 @@ impl JobService {
             job_id: job_id.into(),
             stream: stream.into(),
             from_offset: from,
-            next_offset: from + bytes.len() as u64,
-            bytes_hex: hex::encode(bytes),
-            gap: offset > summary.retained_bytes,
+            next_offset: next,
+            bytes_hex: hex::encode(&bytes),
+            gap: omitted > 0,
+            omitted_bytes: omitted,
+            eof: bytes.is_empty()
+                && !matches!(job.state, JobState::Running | JobState::LaunchPending),
             truncated: summary.truncated,
         })
     }
@@ -717,6 +716,13 @@ fn summary(observed: u64, path: &std::path::Path) -> StreamSummary {
     let retained = std::fs::metadata(path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
+    let retained = retained
+        + std::fs::metadata(path.with_file_name(format!(
+            "{}.tail",
+            path.file_name().expect("output filename").to_string_lossy()
+        )))
+        .map(|m| m.len().saturating_sub(8))
+        .unwrap_or(0);
     StreamSummary {
         retained_bytes: retained.min(observed),
         observed_bytes: observed,
@@ -729,4 +735,82 @@ pub(crate) fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+// Offsets always refer to the original stream, including skipped bytes.
+fn read_output_ranges(
+    path: &std::path::Path,
+    offset: u64,
+    max: usize,
+) -> Result<(Vec<u8>, u64, u64, u64), JobError> {
+    let head_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let tail_path = path.with_file_name(format!(
+        "{}.tail",
+        path.file_name().expect("output filename").to_string_lossy()
+    ));
+    let tail_start = if tail_path.exists() {
+        let (header, _) = read_bounded(&tail_path, 0, 8)?;
+        Some(u64::from_le_bytes(header.try_into().map_err(|_| {
+            JobError::Invalid("invalid output tail header".into())
+        })?))
+    } else {
+        None
+    };
+    if offset < head_len {
+        let (bytes, from) = read_bounded(path, offset, max)?;
+        let end = from + bytes.len() as u64;
+        // Expose the gap on the following read; never silently advance over it.
+        return Ok((bytes, from, end, 0));
+    }
+    if let Some(start) = tail_start {
+        let from = offset.max(start);
+        let (bytes, _) = read_bounded(&tail_path, 8 + from.saturating_sub(start), max)?;
+        let next = from + bytes.len() as u64;
+        return Ok((bytes, from, next, start.saturating_sub(offset)));
+    }
+    Ok((Vec::new(), offset, offset, offset.saturating_sub(head_len)))
+}
+
+#[cfg(test)]
+mod output_alignment_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+    #[test]
+    fn retained_head_tail_has_original_offsets_and_survives_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        for stream in ["stdout", "stderr"] {
+            let path = root.path().join(format!("job.{stream}"));
+            let bytes = [b"HEAD".as_slice(), &vec![b'x'; 20_000], b"FINAL ERROR"].concat();
+            let observed = Arc::new(AtomicU64::new(0));
+            process::drain_bounded(std::io::Cursor::new(bytes.clone()), &path, 4096, observed)
+                .unwrap()
+                .join()
+                .unwrap()
+                .unwrap();
+            let stats = summary(bytes.len() as u64, &path);
+            assert_eq!(stats.retained_bytes, 4096);
+            assert!(stats.truncated);
+            let (head, from, next, gap) = read_output_ranges(&path, 0, 8192).unwrap();
+            assert_eq!((from, next, gap), (0, 2048, 0));
+            assert!(head.starts_with(b"HEAD"));
+            let (tail, from, next, gap) = read_output_ranges(&path, next, 8192).unwrap();
+            assert_eq!(from, bytes.len() as u64 - 2048);
+            assert_eq!(gap, bytes.len() as u64 - 4096);
+            assert_eq!(next, bytes.len() as u64);
+            assert!(tail.ends_with(b"FINAL ERROR"));
+            assert!(read_output_ranges(&path, next, 8192).unwrap().0.is_empty());
+        }
+        // Separate stream sidecars must never collide.
+        assert!(root.path().join("job.stdout.tail").exists());
+        assert!(root.path().join("job.stderr.tail").exists());
+    }
+    #[test]
+    fn short_output_and_legacy_prefix_remain_readable() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("old.stdout");
+        std::fs::write(&path, b"legacy").unwrap();
+        let (bytes, from, next, gap) = read_output_ranges(&path, 0, 3).unwrap();
+        assert_eq!((bytes, from, next, gap), (b"leg".to_vec(), 0, 3, 0));
+        assert_eq!(read_output_ranges(&path, next, 100).unwrap().0, b"acy");
+    }
 }

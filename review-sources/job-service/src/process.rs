@@ -160,7 +160,7 @@ pub(crate) fn spawn_contained(
     })
 }
 
-fn drain_bounded<R: Read + Send + 'static>(
+pub(crate) fn drain_bounded<R: Read + Send + 'static>(
     mut input: R,
     path: &Path,
     limit: u64,
@@ -171,7 +171,13 @@ fn drain_bounded<R: Read + Send + 'static>(
         .write(true)
         .mode(0o600)
         .open(path)?;
+    let tail_path = path.with_file_name(format!(
+        "{}.tail",
+        path.file_name().expect("output filename").to_string_lossy()
+    ));
     Ok(thread::spawn(move || {
+        let mut tail = std::collections::VecDeque::new();
+        let tail_limit = (limit / 2) as usize;
         let mut kept = 0u64;
         let mut buffer = [0u8; 8192];
         loop {
@@ -180,11 +186,31 @@ fn drain_bounded<R: Read + Send + 'static>(
                 break;
             }
             observed.fetch_add(n as u64, Ordering::Relaxed);
+            tail.extend(&buffer[..n]);
+            if tail.len() > tail_limit {
+                tail.drain(..tail.len() - tail_limit);
+            }
             if kept < limit {
                 let take = n.min((limit - kept) as usize);
                 output.write_all(&buffer[..take])?;
                 kept += take as u64;
             }
+        }
+        let total = observed.load(Ordering::Relaxed);
+        if total > limit {
+            // Sidecar starts with the original byte offset, followed by the final tail.
+            // Publish only once drained; running reads retain their prefix semantics.
+            let temporary = tail_path.with_extension("tail.tmp");
+            let mut saved = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            saved.write_all(&(total - tail.len() as u64).to_le_bytes())?;
+            saved.write_all(tail.make_contiguous())?;
+            saved.sync_all()?;
+            output.set_len(limit - tail_limit as u64)?;
+            std::fs::rename(temporary, tail_path)?;
         }
         output.flush()?;
         output.sync_all()

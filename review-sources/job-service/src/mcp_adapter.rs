@@ -250,10 +250,15 @@ fn call_tool(
                 subject,
                 CallerOperation::ReadOutput,
                 &args.job_id,
-                json!({"stream":args.stream,"offset":args.offset,"maxBytes":args.max_bytes}),
+                json!({"stream":args.stream,"offset":args.offset,"maxBytes":args.max_bytes.clamp(1, 8192)}),
             )?
         }
         _ => return Err(JobError::Invalid("unknown Job Service tool".into())),
+    };
+    let result = if name == "read_output" {
+        readable_output(result)?
+    } else {
+        result
     };
     let mut response = json!({
         "content":[{"type":"text","text":serde_json::to_string(&result)?}],
@@ -264,6 +269,40 @@ fn call_tool(
         response["resultType"] = json!("complete");
     }
     Ok(response)
+}
+
+pub(crate) fn readable_output(mut result: Value) -> Result<Value, JobError> {
+    if let Some(object) = result.as_object_mut() {
+        if let Some(encoded) = object.remove("bytesHex") {
+            let bytes = hex::decode(encoded.as_str().unwrap_or_default())
+                .map_err(|_| JobError::Invalid("invalid output encoding".into()))?;
+            let from = object
+                .get("fromOffset")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let mut consumed = bytes.len();
+            loop {
+                // Keep valid multibyte characters whole, and original-byte offsets exact.
+                if let Err(error) = std::str::from_utf8(&bytes[..consumed]) {
+                    if error.error_len().is_none() && error.valid_up_to() > 0 {
+                        consumed = error.valid_up_to();
+                    }
+                }
+                object.insert("nextOffset".into(), json!(from + consumed as u64));
+                object.insert(
+                    "text".into(),
+                    json!(String::from_utf8_lossy(&bytes[..consumed])),
+                );
+                object.insert("encoding".into(), json!("utf-8-lossy"));
+                object.insert("pageLimited".into(), json!(consumed < bytes.len()));
+                if serde_json::to_vec(&object)?.len() <= 12 * 1024 || consumed <= 1 {
+                    break;
+                }
+                consumed /= 2;
+            }
+        }
+    }
+    Ok(result)
 }
 
 fn caller_core_call(
@@ -444,8 +483,8 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "read_output",
-            "Read a bounded output page from one owned job. This does not consume or suppress its eventual completion notification.",
-            json!({"type":"object","properties":{"jobId":{"type":"string"},"stream":{"type":"string","enum":["stdout","stderr"]},"offset":{"type":"integer","minimum":0},"maxBytes":{"type":"integer","minimum":1,"maximum":1048576}},"required":["jobId","stream"],"additionalProperties":false}),
+            "Read UTF-8 text (default/max 8192 original bytes). Follow nextOffset in original stream bytes; gap/omittedBytes report discarded middle output. Invalid UTF-8 is replaced for display. Completed oversized streams retain head and tail. Reads do not consume completion notifications.",
+            json!({"type":"object","properties":{"jobId":{"type":"string"},"stream":{"type":"string","enum":["stdout","stderr"]},"offset":{"type":"integer","minimum":0},"maxBytes":{"type":"integer","minimum":1,"maximum":8192}},"required":["jobId","stream"],"additionalProperties":false}),
         ),
     ]
 }
@@ -491,7 +530,7 @@ fn validate_config(config: &McpAdapterConfig) -> Result<(), JobError> {
 }
 
 fn default_read_size() -> usize {
-    64 * 1024
+    8 * 1024
 }
 
 fn now_secs() -> u64 {
@@ -591,6 +630,40 @@ mod tests {
                 assert_eq!(result.unwrap(), "cutex.private");
             }
             server.join().unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod output_alignment_tests {
+    use super::*;
+    fn page(bytes: &[u8], offset: usize) -> Value {
+        json!({"bytesHex":hex::encode(bytes),"fromOffset":offset,"nextOffset":offset+bytes.len(),"gap":false,"truncated":false})
+    }
+    #[test]
+    fn text_pages_preserve_unicode_and_bound_escaped_output() {
+        for bytes in [
+            "中文日志\n".repeat(5000).into_bytes(),
+            vec![0; 20000],
+            vec![255; 20000],
+            vec![b'x'; 20000],
+        ] {
+            let mut offset = 0;
+            let mut rendered = String::new();
+            while offset < bytes.len() {
+                let out = readable_output(page(
+                    &bytes[offset..(offset + 8192).min(bytes.len())],
+                    offset,
+                ))
+                .unwrap();
+                assert!(out.get("bytesHex").is_none());
+                assert!(serde_json::to_vec(&out).unwrap().len() <= 12 * 1024);
+                let next = out["nextOffset"].as_u64().unwrap() as usize;
+                assert!(next > offset && next <= bytes.len());
+                rendered.push_str(out["text"].as_str().unwrap());
+                offset = next;
+            }
+            assert_eq!(rendered, String::from_utf8_lossy(&bytes));
         }
     }
 }

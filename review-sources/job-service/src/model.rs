@@ -305,6 +305,10 @@ pub struct OutputPage {
     pub next_offset: u64,
     pub bytes_hex: String,
     pub gap: bool,
+    #[serde(default)]
+    pub omitted_bytes: u64,
+    #[serde(default)]
+    pub eof: bool,
     pub truncated: bool,
 }
 

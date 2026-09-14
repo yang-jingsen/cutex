@@ -27,7 +27,7 @@ impl FrozenProjection {
     pub fn new(request: CompletionV2) -> anyhow::Result<Self> {
         request.validate()?;
         Ok(Self {
-            version: 1,
+            version: 2,
             native_version: 2,
             model_text: request.model_text(),
             view: request.view()?,
@@ -36,13 +36,13 @@ impl FrozenProjection {
     }
     pub fn validate(&self) -> anyhow::Result<()> {
         ensure!(
-            self.version == 1 && self.native_version == 2,
+            matches!(self.version, 1 | 2) && self.native_version == 2,
             "unsupported frozen Job projection"
         );
         self.request.validate()?;
         // Version1 is immutable; a future formatter must use a new version.
         ensure!(
-            self.model_text == self.request.model_text() && self.view == self.request.view()?,
+            self.model_text == (if self.version == 1 { self.request.legacy_model_text() } else { self.request.model_text() }) && self.view == self.request.view()?,
             "frozen Job projection conflict"
         );
         Ok(())
@@ -177,7 +177,9 @@ impl CompletionV2 {
         self.view()?;
         Ok(())
     }
-    pub fn model_text(&self) -> String {
+    fn legacy_model_text(&self) -> String { self.format_model_text(false) }
+
+    fn format_model_text(&self, concise: bool) -> String {
         let label = match (&self.terminal_status, self.facts.exit_code) {
             (JobServiceTerminalStatus::Exited, Some(0)) => "completed",
             (JobServiceTerminalStatus::Exited, _) => "exited",
@@ -199,7 +201,7 @@ impl CompletionV2 {
             .as_ref()
             .and_then(|e| e.observed_run_duration_millis)
         {
-            text.push_str(&format!("\nObserved run: {duration} ms"));
+            text.push_str(&if concise { format!("\ndurationMillis: {duration}") } else { format!("\nObserved run: {duration} ms") });
         }
         if let Some(reason) = self
             .facts
@@ -209,6 +211,16 @@ impl CompletionV2 {
         {
             text.push_str(&format!("\nReason (external data): {reason}"));
         }
+        text
+    }
+
+    pub fn model_text(&self) -> String {
+        let mut text = self.format_model_text(true);
+        text.push_str(&format!("\nstate: {}", serde_json::to_value(&self.terminal_status).expect("status").as_str().expect("status string")));
+        for (name, stream) in [("stdout", &self.facts.stdout), ("stderr", &self.facts.stderr)] {
+            text.push_str(&format!("\n{name}: observedBytes={}, retainedBytes={}, truncated={}", stream.observed_bytes, stream.retained_bytes, stream.truncated));
+        }
+        text.push_str(&format!("\noutputReference: {}", self.output_reference));
         text
     }
 
@@ -261,16 +273,31 @@ mod tests {
         .unwrap()
     }
     #[test]
+    fn old_frozen_text_replays_and_new_projection_includes_output_metadata() {
+        let request = fixture();
+        let mut old = FrozenProjection::new(request.clone()).unwrap();
+        old.version = 1;
+        old.model_text = request.legacy_model_text();
+        old.validate().unwrap();
+        let new = FrozenProjection::new(request).unwrap();
+        assert_eq!(new.version, 2);
+        new.validate().unwrap();
+        assert!(new.model_text.contains("stderr: observedBytes=0, retainedBytes=0, truncated=false"));
+        assert!(new.model_text.contains("state: exited"));
+        old.model_text = new.model_text;
+        assert!(old.validate().is_err());
+    }
+    #[test]
     fn unknown_exit_is_not_success_and_default_id_once() {
         let request = fixture();
         let text = request.model_text();
-        assert_eq!(text, "Job exited. jobId: job_123\nAction: human-job-1");
-        assert_eq!(text.matches("job_123").count(), 1);
+        assert!(text.starts_with("Job exited. jobId: job_123\nAction: human-job-1"));
+        assert_eq!(text.matches("job_123").count(), 2);
         let view = request.view().unwrap();
         assert!(view.data.get("exitCode").is_none());
         assert!(view.data.get("execution").is_none());
         assert_eq!(view.data["outputReference"], "job-output:job_123");
-        assert!(!text.contains("outputReference"));
+        assert!(text.contains("outputReference"));
     }
     #[test]
     fn replay_and_real_zero_duration_preserved() {
@@ -287,7 +314,7 @@ mod tests {
         assert_eq!(request.model_text(), restored.model_text());
         assert_eq!(request.view().unwrap(), restored.view().unwrap());
         assert!(restored.model_text().contains("Job completed."));
-        assert!(restored.model_text().contains("Observed run: 0 ms"));
+        assert!(restored.model_text().contains("durationMillis: 0"));
         request.terminal_status = JobServiceTerminalStatus::Cancelled;
         assert!(request.model_text().starts_with("Job cancelled."));
     }
