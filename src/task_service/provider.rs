@@ -3456,6 +3456,10 @@ fn schedule_completion_notification_with_detail(
             attempt_label,
         ),
     };
+    let human_readable_content = format!(
+        "{human_readable_content}\nOccurred at: {}. Notification ID: {}. Transition action: {}.\nThis records a historical transition; delivery may be delayed. Query the assignment before acting on it as current state.",
+        now.as_str(), notification_id.as_str(), transition_action_id.as_str(),
+    );
     let notification = CompletionNotification {
         project_id: assignment.project_id,
         notification_id: notification_id.clone(),

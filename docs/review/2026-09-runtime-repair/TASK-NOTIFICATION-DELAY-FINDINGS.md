@@ -31,3 +31,17 @@ Existing queued records and their audit history must not be rewritten or silentl
 dropped. Validate using an isolated submit/close/offline/recovery fixture.
 
 This document records investigation, not deployment of a notification-order fix.
+
+## Follow-up implementation
+
+Recovery now sorts by parsed occurrence timestamp (notification ID only breaks
+exact timestamp ties). The project-scoped recovery fixture checks ReviewReady
+before TerminalClosure for both directors. New notification model text carries
+occurrence time, notification ID, transition action ID and a historical-state
+reminder. Frozen existing messages are retained byte-for-byte. A display-only
+Task view is frozen for newly delivered canonical completion notifications; its
+occurrence time is read by indexed notification ID rather than querying all tasks.
+
+See CUSTOM-EVENT-DISPLAY.md for the corresponding native TUI presentation. These
+changes address batch recovery order and legibility, not the unidentified cause
+of the original six-hour backlog or global ordering across delivery modes.

@@ -252,7 +252,14 @@ impl TaskServiceAgentBusDispatcher {
     ) -> Result<CompletionNotificationDispatchSummary, ProviderError> {
         let snapshot = provider.query_live()?;
         let mut summary = CompletionNotificationDispatchSummary::default();
-        for notification in snapshot.completion_notifications.values() {
+        // Notification IDs are hashes, not event order. Recovery must enqueue
+        // older transitions first, including when both review and closure waited.
+        let mut notifications = snapshot.completion_notifications.values().collect::<Vec<_>>();
+        notifications.sort_by_key(|notification| (
+            chrono::DateTime::parse_from_rfc3339(notification.created_at.as_str()).expect("validated notification timestamp"),
+            notification.notification_id.as_str(),
+        ));
+        for notification in notifications {
             if notification.is_delivered() {
                 continue;
             }
@@ -1912,6 +1919,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first.queued, 4);
+        for runtime in ["r13", "beta-director"] {
+            let kinds = state.lock().unwrap().messages[runtime].iter().map(|message| {
+                serde_json::from_value::<TaskServiceCompletionMetadata>(message.control_payload.clone().unwrap()).unwrap().kind
+            }).collect::<Vec<_>>();
+            assert_eq!(kinds, vec![crate::task_service::CompletionNotificationKind::ReviewReady,
+                crate::task_service::CompletionNotificationKind::TerminalClosure]);
+        }
+
         assert!(state.lock().unwrap().messages.get("r12").is_none());
         assert_eq!(state.lock().unwrap().messages["r13"].len(), 2);
         assert_eq!(state.lock().unwrap().messages["beta-director"].len(), 2);

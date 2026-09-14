@@ -1396,6 +1396,7 @@ fn send_payload_response_with_projection(
         "from": send_record.from,
         "to": send_record.to,
         "to_name": send_record.to_name,
+        "created_at_epoch_secs": send_record.created_at_epoch_secs,
         "from_session_id": sender_session_id,
         "to_session_id": target_session_id,
         "from_runtime_agent_id": payload.from_agent_id,

@@ -791,6 +791,13 @@ pub(super) fn deliver(
                         sender_name.as_deref(),
                         m.delivery_mode.event_label(),
                     )?;
+                    if let Some(view) = e.view.as_mut().filter(|view| view.schema == "cutex.agent-message.v1") {
+                        if m.created_at_epoch_secs > 0 {
+                            view.data["occurredAtEpochSeconds"] = serde_json::json!(m.created_at_epoch_secs);
+                        }
+                        e.semantic_sha256 = e.digest();
+                    }
+                    task_display::apply(&mut e, m)?;
                     client.require_delivery(&e.message.delivery)?;
                     Ok(e)
                 })?;
@@ -1080,3 +1087,6 @@ mod tests {
         );
     }
 }
+
+#[path = "bus_bridge_task_display.rs"]
+mod task_display;
