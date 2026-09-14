@@ -6,3 +6,5 @@
 pub mod desktop;
 pub mod launch;
 pub mod service;
+
+pub mod session;

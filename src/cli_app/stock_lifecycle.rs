@@ -1020,7 +1020,9 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
     // substitute local OpenAI defaults or a newly selected durable profile.
     let cli = bundle.cli.as_ref().unwrap_or(&bundle.executable);
     let actual_cwd = cutex::session::reviewed_registration::occurrence_launch_cwd(ready)?;
-    let launch = clean_launch(&cli.path, &contract.native_home)?.args([
+    let launch = clean_launch(&cli.path, &contract.native_home)?
+        .env("CUTEX_NOTIFICATION_CONTROL", std::env::current_exe()?.to_string_lossy())
+        .args([
         "resume",
         "--remote",
         &binding.endpoint,

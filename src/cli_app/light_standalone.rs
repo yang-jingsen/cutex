@@ -122,6 +122,7 @@ pub(super) fn command(
     }
     // Explicit invocation options take precedence over the selected profile.
     let mut command = launch.args(args.iter().cloned()).to_command();
+    command.env("CUTEX_NOTIFICATION_CONTROL", std::env::current_exe()?);
     if let Some(secret) = projection.secret()? {
         secret.apply(&mut command);
     }

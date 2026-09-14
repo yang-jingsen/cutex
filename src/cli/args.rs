@@ -1345,6 +1345,18 @@ pub enum ManagementSeatCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum NotifyCommand {
+    /// Read or change a native session's external notification priority
+    Session {
+        /// Native session UUID (shown by cute-codex /status)
+        thread_id: String,
+        #[arg(long, value_enum, conflicts_with = "cycle")]
+        level: Option<crate::notify::session::Level>,
+        /// Cycle OFF -> CIAO! -> ON -> OFF
+        #[arg(long)]
+        cycle: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage the native desktop notification bridge
     Desktop {
         #[command(subcommand)]

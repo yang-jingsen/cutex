@@ -14,6 +14,21 @@ const CYAN: &str = "\x1b[36m";
 pub(crate) fn run_command(command: NotifyCommand) -> anyhow::Result<()> {
     match command {
         NotifyCommand::Desktop { command } => desktop(command),
+        NotifyCommand::Session { thread_id, level, cycle, json } => {
+            use cutex::notify::session::{self, Change};
+            let change = match (level, cycle) {
+                (Some(level), _) => Change::Set(level),
+                (None, true) => Change::Cycle,
+                (None, false) => Change::Read,
+            };
+            let preference = session::session(&thread_id, change)?;
+            if json {
+                println!("{}", serde_json::to_string(&preference)?);
+            } else {
+                println!("{} · {}", preference.thread_id, preference.label);
+            }
+            Ok(())
+        },
     }
 }
 
