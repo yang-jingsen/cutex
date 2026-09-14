@@ -901,7 +901,7 @@ pub(super) fn verify_stock_process(
 ) -> anyhow::Result<()> {
     let sessions = cutex::session::store::load_cutex_session_store()?;
     let contract = running_stock_contract(record, binding, &sessions)?;
-    let bundle = StockBundle::load(&contract)?;
+    let bundle = StockBundle::load_running(&contract)?;
     verify_stock_process_with_bundle(binding, &bundle)
 }
 
@@ -1003,7 +1003,7 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
         .as_ref()
         .context("stock runtime is offline")?;
     let contract = running_stock_contract(record, binding, &store)?;
-    let bundle = StockBundle::load(&contract)?;
+    let bundle = StockBundle::load_running(&contract)?;
     ensure!(
         !bundle.common_ingress() || bundle.soon_ingress(),
         "U+S6 bundle contains only app-server; this slice has no pinned compatible CLI attach artifact"
@@ -1018,7 +1018,19 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
     let ready = matching_ready_receipt(record, &store).context("runtime Ready receipt missing")?;
     // Remote CLI config must describe the running occurrence, not silently
     // substitute local OpenAI defaults or a newly selected durable profile.
-    let cli = bundle.cli.as_ref().unwrap_or(&bundle.executable);
+    // A frontend-only update does not require restarting its app-server owner.
+    // Keep validating the running occurrence above; select the desired CLI only
+    // when its server, host and wire schema are byte-identical to that owner.
+    let desired = record.explicit_launch.as_ref()
+        .filter(|desired| desired.bundle_sha256 != contract.bundle_sha256)
+        .map(StockBundle::load).transpose()?;
+    let frontend = desired.as_ref().filter(|desired| {
+        desired.version == 4 && bundle.version == 4
+            && desired.executable.sha256 == bundle.executable.sha256
+            && desired.code_mode_host.sha256 == bundle.code_mode_host.sha256
+            && desired.schema.sha256 == bundle.schema.sha256
+    }).unwrap_or(&bundle);
+    let cli = frontend.cli.as_ref().unwrap_or(&frontend.executable);
     let actual_cwd = cutex::session::reviewed_registration::occurrence_launch_cwd(ready)?;
     let launch = clean_launch(&cli.path, &contract.native_home)?
         .env("CUTEX_NOTIFICATION_CONTROL", std::env::current_exe()?.to_string_lossy())

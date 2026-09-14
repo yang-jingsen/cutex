@@ -214,6 +214,9 @@ pub struct StockBundle {
     /// The authoritative shared config is reviewed, never rewritten on launch.
     pub shared_config: VerifiedFile,
 }
+#[derive(Clone, Copy)]
+enum ConfigCheck { Launch, Running }
+
 impl StockBundle {
     pub fn common_ingress(&self) -> bool {
         (self.version == 2
@@ -269,11 +272,22 @@ impl StockBundle {
         Ok(())
     }
     pub fn load(contract: &ExplicitLaunchContract) -> anyhow::Result<Self> {
+        Self::load_contract(contract, ConfigCheck::Launch)
+    }
+
+    /// Verify an existing owner without treating mutable TUI preferences as
+    /// changed executable evidence. New launches still require exact config.
+    pub fn load_running(contract: &ExplicitLaunchContract) -> anyhow::Result<Self> {
+        Self::load_contract(contract, ConfigCheck::Running)
+    }
+
+    fn load_contract(contract: &ExplicitLaunchContract, config: ConfigCheck) -> anyhow::Result<Self> {
         contract.validate()?;
-        let bundle = Self::load_references(
+        let bundle = Self::load_references_with_config(
             &contract.native_home,
             &contract.bundle_manifest,
             &contract.bundle_sha256,
+            config,
         )?;
         ensure!(contract.version == if contract.version == 4 && bundle.version == 4 {4} else if bundle.soon_ingress() { if contract.migration_action_id.is_some() {3} else {2} } else { 1 },
             "new coherent Soon bundle requires explicit version-2 activation; old markers cannot opt in");
@@ -287,6 +301,12 @@ impl StockBundle {
         manifest: &Path,
         digest: &Sha256,
     ) -> anyhow::Result<Self> {
+        Self::load_references_with_config(native_home, manifest, digest, ConfigCheck::Launch)
+    }
+
+    fn load_references_with_config(
+        native_home: &Path, manifest: &Path, digest: &Sha256, config: ConfigCheck,
+    ) -> anyhow::Result<Self> {
         canonical(native_home)?;
         canonical(manifest)?;
         ensure!(native_home.is_dir(), "native home missing");
@@ -294,8 +314,11 @@ impl StockBundle {
             &file_sha256(manifest)? == digest,
             "bundle evidence missing or changed"
         );
-        let bundle: Self = serde_json::from_slice(&std::fs::read(manifest)?)
+        let mut bundle: Self = serde_json::from_slice(&std::fs::read(manifest)?)
             .context("invalid stock bundle manifest")?;
+        if matches!(config, ConfigCheck::Running) {
+            bundle.shared_config.sha256 = file_sha256(&bundle.shared_config.path)?;
+        }
         bundle.validate_components()?;
         ensure!(
             bundle.shared_config.path == native_home.join("config.toml"),
