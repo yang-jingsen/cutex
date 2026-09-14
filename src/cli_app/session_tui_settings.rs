@@ -24,6 +24,15 @@ use cutex::session::service::{
 use super::prompt::{cli_args_label, parse_cli_args_value};
 use super::session_tui_profile_settings::ProfileSettingsField;
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(super) struct SettingPresentation {
+    pub group: Option<&'static str>,
+    pub name: Option<String>,
+    pub detail: Option<String>,
+    pub style: Option<ratatui::style::Style>,
+    pub swatch: Option<ratatui::style::Color>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SessionTuiSettingOption {
     pub(super) label: &'static str,
@@ -34,6 +43,7 @@ pub(super) struct SessionTuiSettingOption {
     pub(super) command: Option<SessionSettingsCommand>,
     pub(super) navigation: Option<super::session_tui_input::Command>,
     pub(super) dirty: bool,
+    pub(super) presentation: SettingPresentation,
 }
 
 impl SessionTuiSettingOption {
@@ -46,6 +56,7 @@ impl SessionTuiSettingOption {
             profile_field: None,
             command: None,
             navigation: None,
+            presentation: SettingPresentation::default(),
             dirty: false,
         }
     }
@@ -64,6 +75,7 @@ impl SessionTuiSettingOption {
             profile_field: None,
             command: None,
             navigation: None,
+            presentation: SettingPresentation::default(),
             dirty,
         }
     }
@@ -81,6 +93,7 @@ impl SessionTuiSettingOption {
             profile_field: None,
             command: Some(command),
             navigation: None,
+            presentation: SettingPresentation::default(),
             dirty: false,
         }
     }
@@ -99,6 +112,7 @@ impl SessionTuiSettingOption {
             profile_field: None,
             command: None,
             navigation: None,
+            presentation: SettingPresentation::default(),
             dirty,
         }
     }
@@ -117,6 +131,7 @@ impl SessionTuiSettingOption {
             profile_field: Some(field),
             command: None,
             navigation: None,
+            presentation: SettingPresentation::default(),
             dirty,
         }
     }
@@ -1035,16 +1050,8 @@ impl GlobalSettingsSnapshot {
                 self.editable_option("Proxy URL", GlobalSettingsField::ProxyUrl, draft),
                 self.editable_option("Bypass proxy", GlobalSettingsField::ProxyNoProxy, draft),
             ]),
-            SessionTuiSettingCategory::new("Notifications", vec![
-                SessionTuiSettingOption::new("Labels / colors / bold", "~/.cutex/notifications/config.json"),
-                SessionTuiSettingOption::new("Session priority", "CIAO! / ON / OFF; Alt+N in cute-codex"),
-                SessionTuiSettingOption::new("Delivery", "External event delivery is not configured"),
-            ]),
-            SessionTuiSettingCategory::new("Appearance", vec![
-                SessionTuiSettingOption::new("Theme colors", "~/.cutex/theme.json (next Cutex launch)"),
-                SessionTuiSettingOption::new("Status items", "~/.cutex/config.json: custom_status_items"),
-                SessionTuiSettingOption::new("Inspector", "Alt+B to toggle"),
-            ]),
+            SessionTuiSettingCategory::new("Notifications", self.notification_display_options()),
+            SessionTuiSettingCategory::new("Appearance", self.appearance_display_options()),
             SessionTuiSettingCategory::new("Messages", vec![
                 SessionTuiSettingOption::new("Sender identity", "Structured Agent Bus provenance"),
                 SessionTuiSettingOption::new("Message display", "Sender and delivery timing are shown with each message"),
@@ -1055,6 +1062,66 @@ impl GlobalSettingsSnapshot {
                 self.editable_option("Agent Bus token", GlobalSettingsField::AgentBusToken, draft),
             ]),
         ]
+    }
+
+    fn notification_display_options(&self) -> Vec<SessionTuiSettingOption> {
+        let labels = cutex::notify::session::labels();
+        let error = labels.as_ref().err().map(|e| format!("Cannot read notification labels: {e}"));
+        let labels = labels.unwrap_or_default();
+        [("Important", labels.important, labels.styles.important),
+         ("Normal", labels.normal, labels.styles.normal),
+         ("Off", labels.off, labels.styles.off)].into_iter().map(|(name, value, style)| {
+            let mut option = SessionTuiSettingOption::new(name, value);
+            let mut rendered = ratatui::style::Style::new().fg(style.fg.parse().unwrap_or(ratatui::style::Color::White));
+            if style.bold { rendered = rendered.add_modifier(ratatui::style::Modifier::BOLD); }
+            option.presentation = SettingPresentation {
+                group: Some("Session priority labels"),
+                detail: Some(error.clone().unwrap_or_else(|| "Read-only label preview · ~/.cutex/notifications/config.json".into())),
+                style: Some(rendered), ..Default::default()
+            };
+            option
+        }).collect()
+    }
+
+    fn appearance_display_options(&self) -> Vec<SessionTuiSettingOption> {
+        use super::session_tui_layout as theme;
+        use ratatui::style::Color;
+        let mut options = Vec::new();
+        for (name, color) in [("Brand", theme::brand()), ("Accent", theme::accent()),
+            ("Focus", theme::focus()), ("Warning", theme::warning()),
+            ("Selection", theme::selection()), ("Text", theme::text()),
+            ("Muted", theme::muted()), ("Success", theme::success()), ("Error", theme::error())] {
+            let value = match color {
+                Color::Rgb(r,g,b) => format!("#{r:02X}{g:02X}{b:02X}"),
+                _ => format!("Terminal {color:?}"),
+            };
+            let mut option = SessionTuiSettingOption::new(name, value);
+            option.presentation = SettingPresentation {
+                group: Some("Theme colors"), swatch: Some(color),
+                detail: Some("Effective Cutex theme · read-only · ~/.cutex/theme.json · changes apply next launch".into()),
+                ..Default::default()
+            };
+            options.push(option);
+        }
+        for item in cutex::profiles::materialize::normalize_custom_status_items(&self.config.custom_status_items) {
+            let mut option = SessionTuiSettingOption::new("Status item", "");
+            option.presentation = SettingPresentation {
+                group: Some("Custom status items"), name: Some(item.title.clone()),
+                detail: Some(format!("ID: {} · ~/.cutex/config.json · custom_status_items", item.id)),
+                ..Default::default()
+            };
+            options.push(option);
+        }
+        if !options.iter().any(|option| option.presentation.detail.as_deref().is_some_and(|detail| detail.starts_with("ID: cutex_notification ·"))) {
+            let mut option = SessionTuiSettingOption::new("Status item", "");
+            option.presentation = SettingPresentation {
+                group: Some("Custom status items"), name: Some("Cutex Notification".into()),
+                detail: Some("ID: cutex_notification · built-in cute-codex status item".into()),
+                ..Default::default()
+            };
+            options.push(option);
+        }
+        options
     }
 
     fn editable_option(

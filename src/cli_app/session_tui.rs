@@ -7363,6 +7363,10 @@ fn render_selector_contents(frame: &mut Frame<'_>, model: &SelectorModel) {
                 render_action_table(frame, chunks[3], model);
                 render_action_overlay(frame, chunks[3], model);
             }
+            SelectorMode::Settings { target: SelectorTarget::GlobalSettings, .. } => {
+                render_settings_browser(frame, main_area, model);
+                render_settings_overlay(frame, main_area, model);
+            }
             SelectorMode::Settings { .. } => {
                 render_item_context(frame, chunks[2], model);
                 render_settings_browser(frame, chunks[3], model);
@@ -7441,6 +7445,13 @@ fn render_selector_contents(frame: &mut Frame<'_>, model: &SelectorModel) {
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
+    if matches!(model.mode, SelectorMode::Settings { target: SelectorTarget::GlobalSettings, .. }) {
+        let mut spans = vec![Span::styled("Settings", Style::new().fg(crate::cli_app::session_tui_layout::text()).add_modifier(Modifier::BOLD))];
+        let dirty = model.settings_dirty_count();
+        if dirty > 0 { spans.push(Span::styled(format!("  Unsaved: {dirty}"), Style::new().fg(crate::cli_app::session_tui_layout::warning()))); }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
     let (view, count) = match &model.mode {
         SelectorMode::Agents => ("Agents", model.visible_indices().len()),
         SelectorMode::RecentSessions => ("recent sessions", model.recent.visible_rows().len()),
@@ -8661,6 +8672,12 @@ fn notification_span(label: String, style: &cutex::notify::session::ItemStyle) -
 }
 
 fn setting_value_line(option: &SessionTuiSettingOption) -> Line<'static> {
+    if let Some(color) = option.presentation.swatch {
+        return Line::from(vec![Span::styled("  ", Style::new().bg(color)), Span::raw("  "), Span::styled(option.value.clone(), setting_option_style(option))]);
+    }
+    if let Some(style) = option.presentation.style {
+        return Line::styled(option.value.clone(), style);
+    }
     if option.label == "Session priority" {
         let labels = notification_preview();
         return Line::from(vec![
@@ -8750,11 +8767,11 @@ fn render_categorized_settings(frame: &mut Frame<'_>, area: Rect, model: &Select
                 "Services" => "Changes require coordinating service and client restarts.",
                 _ => "",
             };
-            let help_text = format!("{}\n{}\n{}", option.map(|o| format!("{}: {}", o.label, o.value)).unwrap_or_default(), detail, scope);
-            frame.render_widget(Paragraph::new(help_text).style(Style::new().fg(crate::cli_app::session_tui_layout::muted())).wrap(Wrap { trim: false }).block(settings_panel_block(" Details ".into(), false)), help);
+            let help_text = option.and_then(|o| o.presentation.detail.clone()).unwrap_or_else(|| format!("{}\n{}\n{}", option.map(|o| format!("{}: {}", o.label, o.value)).unwrap_or_default(), detail, scope));
+            frame.render_widget(Paragraph::new(help_text).style(Style::new().fg(crate::cli_app::session_tui_layout::muted())).wrap(Wrap { trim: false }).block(Block::new().borders(ratatui::widgets::Borders::TOP).border_style(Style::new().fg(crate::cli_app::session_tui_layout::muted()))), help);
         };
         if area.width >= 60 {
-            let [categories, values] = Layout::horizontal([Constraint::Length(20), Constraint::Min(30)]).areas(area);
+            let [categories, values] = Layout::horizontal([Constraint::Length(26), Constraint::Min(30)]).areas(area);
             render_setting_categories(frame, categories, model);
             render_values(frame, values);
         } else if focus == SettingsFocus::Categories {
@@ -8797,10 +8814,10 @@ fn render_setting_categories(frame: &mut Frame<'_>, area: Rect, model: &Selector
     let items = row
         .settings
         .iter()
-        .map(|category| ListItem::new(format!("{}  {}", category.label, category.options.len())))
+        .map(|category| ListItem::new(format!("  {}", category.label)))
         .collect::<Vec<_>>();
     let list = List::new(items)
-        .block(settings_panel_block(" Categories ".to_string(), active))
+        .block(settings_panel_block(String::new(), active).padding(ratatui::widgets::Padding::vertical(1)))
         .highlight_style(settings_highlight_style(active))
         .highlight_symbol(if active { "> " } else { "  " });
     let mut state = ListState::default().with_selected(model.selected_setting_category_index());
@@ -8817,7 +8834,44 @@ fn render_setting_options(
         return;
     };
     let active = model.settings_focus() == Some(SettingsFocus::Options);
-    let title = format!(" {} options ", category.label);
+    let global = matches!(model.mode, SelectorMode::Settings { target: SelectorTarget::GlobalSettings, .. });
+    let title = if global { format!(" {} ", category.label) } else { format!(" {} options ", category.label) };
+    if global {
+        let mut items = Vec::new();
+        let mut group = None;
+        let mut selected = None;
+        let key_width = usize::from(area.width.saturating_sub(6)) * 48 / 100;
+        for (index, option) in category.options.iter().enumerate() {
+            if option.presentation.group != group {
+                group = option.presentation.group;
+                if let Some(title) = group {
+                    if !items.is_empty() { items.push(ListItem::new("")); }
+                    items.push(ListItem::new(Line::styled(title, Style::new().fg(crate::cli_app::session_tui_layout::focus()).add_modifier(Modifier::BOLD))));
+                }
+            }
+            if Some(index) == model.selected_setting_option_index() { selected = Some(items.len()); }
+            let name = option.presentation.name.as_deref().unwrap_or(option.label);
+            let mut name = if option.dirty { format!("{name} *") } else { name.to_owned() };
+            if option.presentation.group == Some("Custom status items") {
+                items.push(ListItem::new(Line::styled(name, setting_option_style(option))));
+            } else {
+                if Line::from(name.as_str()).width() > key_width {
+                    while Line::from(name.as_str()).width() + 1 > key_width && !name.is_empty() { name.pop(); }
+                    name.push('…');
+                }
+                let padding = key_width.saturating_sub(Line::from(name.as_str()).width()) + 2;
+                let mut spans = vec![Span::styled(name, setting_option_style(option)), Span::raw(" ".repeat(padding))];
+                let value = setting_value_line(option);
+                spans.extend(value.spans.into_iter().map(|span| span.patch_style(value.style)));
+                items.push(ListItem::new(Line::from(spans)));
+            }
+        }
+        let mut state = ListState::default().with_selected(selected);
+        frame.render_stateful_widget(List::new(items).block(settings_panel_block(title.clone(), active).borders(ratatui::widgets::Borders::TOP | ratatui::widgets::Borders::LEFT | ratatui::widgets::Borders::RIGHT).padding(ratatui::widgets::Padding::new(1,1,1,0)))
+            .highlight_style(settings_highlight_style(active)).highlight_symbol(if active { "> " } else { "  " }), area, &mut state);
+        input_policy::refresh_title(frame, area, &title, active);
+        return;
+    }
     let mut state = TableState::default().with_selected(model.selected_setting_option_index());
     if show_values {
         let rows = category
@@ -10569,6 +10623,7 @@ mod tests {
                             profile_field: None,
                             command: None,
                             navigation: None,
+                            presentation: Default::default(),
                             dirty: false,
                         },
                         SessionTuiSettingOption {
@@ -10579,6 +10634,7 @@ mod tests {
                             profile_field: None,
                             command: None,
                             navigation: None,
+                            presentation: Default::default(),
                             dirty: false,
                         },
                     ],
@@ -10593,6 +10649,7 @@ mod tests {
                         profile_field: None,
                         command: None,
                         navigation: None,
+                        presentation: Default::default(),
                         dirty: false,
                     }],
                 },
@@ -11071,7 +11128,7 @@ mod tests {
         );
         model.settings_return_panel = Some(PrimaryPanel::Projects);
         let text = rendered_text_at(100, 30, &model);
-        for label in ["Settings", "Global settings"] {
+        for label in ["Settings"] {
             assert!(text.contains(label), "{label}: {text}");
         }
         assert!(matches!(
@@ -11084,7 +11141,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('6'), KeyModifiers::ALT),
         );
         model.settings_return_panel = Some(PrimaryPanel::Tasks);
-        assert!(rendered_text_at(100, 30, &model).contains("Global settings"));
+        assert!(rendered_text_at(100, 30, &model).contains("Settings"));
         assert!(matches!(
             route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             SelectorKeyRoute::Control(None)
@@ -15774,8 +15831,8 @@ mod tests {
         global_model.handle(SelectorEvent::Down);
         let medium = rendered_text(80, &global_model);
         assert!(!medium.contains("Layout:"));
-        assert!(medium.contains("Global settings"));
-        assert!(medium.contains("Network options"));
+        assert!(medium.contains("Settings"));
+        assert!(medium.contains("Network"));
         assert!(medium.contains("Proxy enabled"));
         assert!(medium.contains("Proxy URL"));
         assert!(medium.contains("Tab focus"));
@@ -15798,21 +15855,21 @@ mod tests {
         let unchanged = rendered_text_at(120, 24, &global_model);
         assert!(!unchanged.contains("Layout:"));
         assert!(!unchanged.contains("Current value"));
-        assert!(unchanged.contains("Network options"));
-        assert!(unchanged.contains("Details"));
+        assert!(unchanged.contains("Network"));
+        assert!(!unchanged.contains("Categories"));
 
         let mut narrow_model = SelectorModel::new(vec![global_row()], false, false);
         selector_command(&mut narrow_model, Command::Settings);
         let narrow_categories = rendered_text(50, &narrow_model);
-        assert!(narrow_categories.contains("Categories"));
-        assert!(narrow_categories.contains("Notifications  3"));
+        assert!(!narrow_categories.contains("Categories"));
+        assert!(narrow_categories.contains("Notifications"));
         assert!(narrow_categories.contains("Ctrl+C exit"));
         assert!(!narrow_categories.contains("Managed sessions"));
         narrow_model.handle(SelectorEvent::Down);
         narrow_model.handle(SelectorEvent::Down);
         narrow_model.handle(SelectorEvent::OpenActions);
         let narrow_options = rendered_text(50, &narrow_model);
-        assert!(narrow_options.contains("Network options"));
+        assert!(narrow_options.contains("Network"));
         assert!(narrow_options.contains("Proxy enabled"));
         narrow_model.handle(SelectorEvent::Activate);
         let narrow_value = rendered_text(50, &narrow_model);
@@ -16276,6 +16333,30 @@ mod tests {
         select_global_setting(&mut model, GlobalSettingsField::DefaultReasoning);
         model.handle(SelectorEvent::Activate);
         assert!(matches!(&model.settings_overlay, Some(SettingsOverlay::Choice { choices, selected: 0, custom_value: None, .. }) if choices[0].label == "Follow profile"));
+    }
+
+    #[test]
+    fn settings_display_groups_do_not_resolve_status_item_values() {
+        let mut config = CodezConfig::default();
+        config.custom_status_items.push(serde_json::from_value(serde_json::json!({
+            "id": "cutex_fixture", "title": "Fixture Status Name",
+            "source": {"kind": "static", "value": "DO_NOT_RENDER_DYNAMIC_VALUE"}
+        })).unwrap());
+        let mut model = SelectorModel::new(vec![global_settings_row(&config)], false, false);
+        selector_command(&mut model, Command::Settings);
+        for _ in 0..4 { model.handle(SelectorEvent::Down); }
+        model.handle(SelectorEvent::OpenActions);
+        let screen = rendered_text_at(80, 36, &model);
+        for text in ["Theme colors", "Custom status items", "Fixture Status Name", "#E08EB2"] { assert!(screen.contains(text), "{screen}"); }
+        for text in ["DO_NOT_RENDER_DYNAMIC_VALUE", "20 settings", "Categories", "Global settings", "Inspector"] { assert!(!screen.contains(text), "{screen}"); }
+        let first = model.active_setting_option().unwrap().label;
+        model.handle(SelectorEvent::Down);
+        assert_ne!(model.active_setting_option().unwrap().label, first);
+        while model.active_setting_option().unwrap().presentation.name.as_deref() != Some("Fixture Status Name") {
+            model.handle(SelectorEvent::Down);
+        }
+        assert_eq!(model.active_setting_option().unwrap().presentation.name.as_deref(), Some("Fixture Status Name"));
+        assert!(rendered_text_at(80, 24, &model).contains("ID: cutex_fixture"));
     }
 
     #[test]
