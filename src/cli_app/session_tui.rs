@@ -3124,7 +3124,7 @@ impl SelectorModel {
                             return;
                         };
                         let current = self.global_settings_draft.value(snapshot, field);
-                        (snapshot.choices(field), (current != "-").then_some(current))
+                        (snapshot.choices(field), (current != "-" && !current.is_empty()).then_some(current))
                     }
                     SettingsEditField::Profile(field) => {
                         let Some(snapshot) = self.selected_profile_settings_snapshot() else {
@@ -15939,6 +15939,15 @@ mod tests {
         route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(model.mode, SelectorMode::ProfileManager { focus: ProfileWorkspaceFocus::Items, .. }));
         assert_eq!(model.settings_return_panel, Some(PrimaryPanel::Recent));
+    }
+
+    #[test]
+    fn inherited_default_effort_selects_follow_profile_without_a_blank_choice() {
+        let mut model = SelectorModel::new(vec![global_row()], false, false);
+        selector_command(&mut model, Command::Settings);
+        select_global_setting(&mut model, GlobalSettingsField::DefaultReasoning);
+        model.handle(SelectorEvent::Activate);
+        assert!(matches!(&model.settings_overlay, Some(SettingsOverlay::Choice { choices, selected: 0, custom_value: None, .. }) if choices[0].label == "Follow profile"));
     }
 
     #[test]
