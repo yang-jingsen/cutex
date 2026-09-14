@@ -70,6 +70,27 @@ pub(super) fn paste_string(value: &mut String, cursor: &mut Option<usize>, text:
     *value = input.value().to_owned();
     *cursor = Some(input.cursor());
 }
+pub(super) fn title_style(focused: bool) -> ratatui::style::Style {
+    let color = if focused { crate::cli_app::session_tui_layout::focus() } else { crate::cli_app::session_tui_layout::muted() };
+    // Explicit RGB avoids terminal bold/intensity remapping of ANSI gray.
+    let color = match color { ratatui::style::Color::DarkGray => ratatui::style::Color::Rgb(128,128,128), other => other };
+    ratatui::style::Style::reset().fg(color)
+}
+
+pub(super) fn refresh_title(frame: &mut Frame<'_>, area: Rect, title: &str, focused: bool) {
+    if area.width < 3 || area.height == 0 { return; }
+    let width = (Line::from(title).width() as u16).min(area.width - 2);
+    let rect = Rect::new(area.x + 1, area.y, width, 1);
+    frame.render_widget(Paragraph::new(title).style(title_style(focused)), rect);
+    use ratatui::buffer::CellWidth;
+    let mut x = rect.x;
+    while x < rect.right() {
+        let cell = &mut frame.buffer_mut()[(x, rect.y)];
+        cell.set_diff_option(ratatui::buffer::CellDiffOption::AlwaysUpdate);
+        x += cell.cell_width().max(1);
+    }
+}
+
 pub(super) fn render_input(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -112,6 +133,7 @@ pub(super) fn render_input(
             ),
         area,
     );
+    refresh_title(frame, area, title, focused);
     if focused && width > 0 && area.height >= 3 {
         frame.set_cursor_position((
             area.x + 1 + input.visual_cursor().saturating_sub(scroll).min(width - 1) as u16,
@@ -465,7 +487,7 @@ mod tests {
         }).unwrap();
         for x in 1..27 {
             let cell = &terminal.backend().buffer()[(x, 0)];
-            assert_eq!(cell.fg, crate::cli_app::session_tui_layout::muted());
+            assert_eq!(Some(cell.fg), title_style(false).fg);
             assert!(!cell.modifier.contains(Modifier::BOLD));
         }
     }

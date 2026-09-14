@@ -18,7 +18,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 use super::session_tui_terminal::Terminal;
 use tui_input::Input;
@@ -73,16 +73,10 @@ enum ProjectSection {
     Overview,
     Members,
     Operators,
-    Appearance,
 }
 
 impl ProjectSection {
-    const ALL: [Self; 4] = [
-        Self::Members,
-        Self::Overview,
-        Self::Operators,
-        Self::Appearance,
-    ];
+    const ALL: [Self; 2] = [Self::Members, Self::Overview];
 
     fn shifted(self, direction: isize) -> Self {
         let index = Self::ALL
@@ -98,7 +92,6 @@ impl ProjectSection {
             Self::Overview => "Overview",
             Self::Members => "Members",
             Self::Operators => "Operators",
-            Self::Appearance => "Appearance",
         }
     }
 }
@@ -116,6 +109,23 @@ struct OperatorTarget {
 struct ProjectMutationTarget {
     label: String,
     operation: HumanManagementProjectMutationKind,
+}
+
+#[derive(Clone)]
+enum ProjectMenuAction {
+    AgentActions(String), AgentSettings(String), Operators, Appearance,
+    Mutation(ProjectMutationTarget),
+}
+impl ProjectMenuAction {
+    fn label(&self) -> String {
+        match self {
+            Self::AgentActions(name) => format!("Agent actions: {name}"),
+            Self::AgentSettings(name) => format!("Agent settings: {name}"),
+            Self::Operators => "Manage Operators".into(),
+            Self::Appearance => "Edit project name / badge / color".into(),
+            Self::Mutation(target) => target.label.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -389,7 +399,7 @@ impl CutexProjectsModel {
                     .iter()
                     .map(|agent| ProjectMutationTarget {
                         label: format!(
-                            "Review Add / explicit Detach → Add: {} ({})",
+                            "Add / move member: {} ({})",
                             agent.name,
                             agent.cutex_session_id.as_str()
                         ),
@@ -436,8 +446,23 @@ impl CutexProjectsModel {
         }
     }
 
+    fn action_menu(&self) -> Vec<ProjectMenuAction> {
+        let mut actions = Vec::new();
+        if self.section == ProjectSection::Members {
+            if let Some(member) = selected_member(self) {
+                actions.push(ProjectMenuAction::AgentActions(member.name.clone()));
+                actions.push(ProjectMenuAction::AgentSettings(member.name));
+            }
+        }
+        actions.push(ProjectMenuAction::Operators);
+        actions.push(ProjectMenuAction::Appearance);
+        actions.extend(self.project_actions().into_iter().map(ProjectMenuAction::Mutation));
+        actions
+    }
+
     fn begin_project_actions(&mut self) {
         self.action_selected = 0;
+        self.member_inspecting = false;
         self.view = ProjectView::Actions;
         self.failure = None;
     }
@@ -739,7 +764,7 @@ fn save_editor(model: &mut CutexProjectsModel) -> anyhow::Result<()> {
         .update_presentation(&request)?;
     model.editor = None;
     reload(model, true)?;
-    model.section = ProjectSection::Appearance;
+    model.section = ProjectSection::Overview;
     model.notice =
         Some("Project appearance updated through Human/Management audit boundary".into());
     Ok(())
@@ -1313,7 +1338,7 @@ fn project_command(
     }
     if model.view == ProjectView::Details
         && model.section == ProjectSection::Members
-        && matches!(command, Command::Actions | Command::Edit)
+        && command == Command::Edit
     {
         return request_member_action(
             model,
@@ -1777,6 +1802,7 @@ fn handle_project_widget_key(
             _ => {}
         },
         ProjectView::Details => match key.code {
+            KeyCode::Esc if model.section == ProjectSection::Operators => { model.section = ProjectSection::Members; },
             KeyCode::Esc if model.member_inspecting => model.member_inspecting = false,
             KeyCode::Esc => model.view = ProjectView::List,
             KeyCode::Left => {
@@ -1823,7 +1849,7 @@ fn handle_project_widget_key(
                         super::session_tui::SelectorEvent::Activate,
                     );
                 }
-                ProjectSection::Overview | ProjectSection::Appearance => {
+                ProjectSection::Overview => {
                     model.notice = Some("This section has no mutating action.".to_string())
                 }
             },
@@ -1918,18 +1944,25 @@ fn handle_project_widget_key(
         },
         ProjectView::Actions => match key.code {
             KeyCode::Esc => model.view = ProjectView::Details,
+            KeyCode::Home => model.action_selected = 0,
+            KeyCode::End => model.action_selected = model.action_menu().len().saturating_sub(1),
+            KeyCode::PageDown => model.action_selected = (model.action_selected + 8).min(model.action_menu().len().saturating_sub(1)),
+            KeyCode::PageUp => model.action_selected = model.action_selected.saturating_sub(8),
             KeyCode::Up => model.action_selected = model.action_selected.saturating_sub(1),
             KeyCode::Down => {
                 model.action_selected = (model.action_selected + 1)
-                    .min(model.project_actions().len().saturating_sub(1));
+                    .min(model.action_menu().len().saturating_sub(1));
             }
             KeyCode::Enter => {
-                if let Some(target) = model.project_actions().get(model.action_selected).cloned() {
-                    model.pending_project_mutation = Some(target);
-                    model.confirm_selected = false;
-                    model.view = ProjectView::ConfirmProjectMutation;
+                match model.action_menu().get(model.action_selected).cloned() {
+                    Some(ProjectMenuAction::AgentActions(_)) => { model.view = ProjectView::Details; return request_member_action(model, super::session_tui::SelectorEvent::OpenActions); }
+                    Some(ProjectMenuAction::AgentSettings(_)) => { model.view = ProjectView::Details; return request_member_action(model, super::session_tui::SelectorEvent::OpenSettings); }
+                    Some(ProjectMenuAction::Operators) => { model.view = ProjectView::Details; model.section = ProjectSection::Operators; model.operator_selected = 0; }
+                    Some(ProjectMenuAction::Appearance) => model.begin_editor(),
+                    Some(ProjectMenuAction::Mutation(target)) => { model.pending_project_mutation = Some(target); model.confirm_selected = false; model.view = ProjectView::ConfirmProjectMutation; }
+                    None => {}
                 }
-            }
+            },
             _ => {}
         },
         ProjectView::ConfirmProjectMutation => match key.code {
@@ -2100,7 +2133,7 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
                 ("Esc", "cancel"),
             ]),
             ProjectView::Actions => {
-                footer_hints(&[("↑/↓", "choose"), ("Enter", "review"), ("Esc", "details")])
+                footer_hints(&[("↑/↓ PgUp/Dn", "choose"), ("Enter", "open"), ("Esc", "details")])
             }
             ProjectView::ConfirmProjectMutation => footer_hints(&[
                 ("←/→/Tab", "Cancel/Confirm"),
@@ -2402,7 +2435,7 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel)
         }
         tabs.push(Span::styled(
             section.label(),
-            if section == model.section {
+            if section == model.section || (section == ProjectSection::Members && model.section == ProjectSection::Operators) {
                 Style::new().fg(crate::cli_app::session_tui_layout::focus()).add_modifier(Modifier::BOLD)
             } else {
                 Style::new().fg(Color::Gray)
@@ -2441,7 +2474,6 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel)
             }
         }
         ProjectSection::Operators => render_operators(frame, chunks[1], model, project),
-        ProjectSection::Appearance => render_appearance(frame, chunks[1], project),
     }
 }
 
@@ -2453,6 +2485,10 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, project: &CutexProjectWork
     };
     frame.render_widget(
         Paragraph::new(vec![
+            Line::from(format!("Display name: {}", project.presentation.display_name)),
+            Line::from(format!("Badge: {} · Color: {}", project.presentation.badge_label, project.presentation.color.token())),
+            Line::from("Alt+E edit name / badge / color · Alt+A project actions"),
+            Line::from(""),
             Line::from(format!("Canonical project_id: {}", project.project_id)),
             Line::from(format!("Authority epoch: {}", project.authority_epoch)),
             Line::from(format!(
@@ -2478,91 +2514,19 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, project: &CutexProjectWork
     );
 }
 
-fn render_operators(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    model: &CutexProjectsModel,
-    project: &CutexProjectWorkspace,
-) {
+fn render_operators(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel, _project: &CutexProjectWorkspace) {
     let targets = model.operator_targets();
-    let mut lines = vec![Line::from(format!(
-        "Grant set revision {} — every write also fences authority epoch {}",
-        project.operator_grant_revision, project.authority_epoch
-    ))];
-    if targets.is_empty() {
-        lines.push(Line::from("No grant/revoke target is available."));
-    } else {
-        lines.extend(targets.iter().enumerate().map(|(index, target)| {
-            let selected = index == model.operator_selected;
-            let verb = match target.operation {
-                HumanManagementOperatorKind::Grant => "grant",
-                HumanManagementOperatorKind::Revoke => "revoke",
-            };
-            let repair = target
-                .repair_action_id
-                .as_ref()
-                .map(|action| format!("  REVIEW legacy retained rotation {action}"))
-                .unwrap_or_default();
-            Line::from(Span::styled(
-                format!(
-                    "{} {:6} {}  [{}]  {}{}",
-                    if selected { ">" } else { " " },
-                    verb,
-                    target.name,
-                    lifecycle_label(target.lifecycle),
-                    target.cutex_session_id.as_str(),
-                    repair
-                ),
-                if selected {
-                    Style::new()
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::new()
-                },
-            ))
-        }));
-    }
-    if !project.legacy_operator_repair_candidates.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Legacy R11→R12 repair candidates are suggestions only; choose grant and confirm.",
-            Style::new().fg(Color::Yellow),
-        )));
-    }
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .block(Block::bordered().title(" Operators ")),
-        area,
-    );
-}
-
-fn render_appearance(frame: &mut Frame<'_>, area: Rect, project: &CutexProjectWorkspace) {
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(format!(
-                "Display name: {}",
-                project.presentation.display_name
-            )),
-            Line::from(format!("Badge label: {}", project.presentation.badge_label)),
-            Line::from(format!(
-                "Palette color: {}",
-                project.presentation.color.token()
-            )),
-            Line::from(format!(
-                "Presentation revision: {}",
-                project.presentation.revision
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Badge is 1–2 terminal cells. Project identity and authority are immutable here.",
-                Style::new().fg(Color::DarkGray),
-            )),
-        ])
-        .block(Block::bordered().title(" Appearance ")),
-        area,
-    );
+    let rows = targets.iter().map(|target| Row::new([
+        Cell::from(target.name.clone()),
+        Cell::from(match target.operation { HumanManagementOperatorKind::Grant => "Grant", HumanManagementOperatorKind::Revoke => "Revoke" }),
+        Cell::from(lifecycle_label(target.lifecycle)),
+        Cell::from(target.cutex_session_id.as_str().to_owned()),
+    ]));
+    let mut state = TableState::default().with_selected((!targets.is_empty()).then_some(model.operator_selected));
+    frame.render_stateful_widget(Table::new(rows, [Constraint::Percentage(36), Constraint::Length(8), Constraint::Length(8), Constraint::Min(12)])
+        .header(Row::new(["AGENT", "ACTION", "STATUS", "ID"]).style(Style::new().fg(Color::Gray)))
+        .block(Block::bordered().title(" Members / Operators · Enter review · Esc Members "))
+        .row_highlight_style(Style::new().bg(crate::cli_app::session_tui_layout::selection())).highlight_symbol("> "), area, &mut state);
 }
 
 fn render_editor(frame: &mut Frame<'_>, area: Rect, editor: Option<&PresentationEditor>) {
@@ -2883,43 +2847,16 @@ fn render_director_picker(frame: &mut Frame<'_>, area: Rect, model: &CutexProjec
 }
 
 fn render_project_actions(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel) {
-    let popup = centered_rect(76, 16, area);
+    let popup = centered_rect(86, area.height.min(22), area);
     frame.render_widget(Clear, popup);
-    let actions = model.project_actions();
-    let lines = if actions.is_empty() {
-        vec![Line::from("No structural Project action is available.")]
-    } else {
-        actions
-            .iter()
-            .enumerate()
-            .map(|(index, action)| {
-                Line::from(Span::styled(
-                    format!(
-                        "{} {}",
-                        if index == model.action_selected {
-                            ">"
-                        } else {
-                            " "
-                        },
-                        action.label
-                    ),
-                    if index == model.action_selected {
-                        Style::new().fg(crate::cli_app::session_tui_layout::focus()).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::new()
-                    },
-                ))
-            })
-            .collect()
-    };
-    frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: true }).block(
-            Block::bordered()
-                .border_style(Style::new().fg(crate::cli_app::session_tui_layout::focus()))
-                .title(" Project Actions "),
-        ),
-        popup,
-    );
+    let [list_area, description] = Layout::vertical([Constraint::Min(3), Constraint::Length(4)]).areas(popup);
+    let actions = model.action_menu();
+    let items = actions.iter().map(|a| ListItem::new(a.label())).collect::<Vec<_>>();
+    let mut state = ListState::default().with_selected((!actions.is_empty()).then_some(model.action_selected));
+    frame.render_stateful_widget(List::new(items).block(Block::bordered().title(" Project Actions · ↑/↓ PgUp/PgDn · Esc back "))
+        .highlight_style(Style::new().bg(crate::cli_app::session_tui_layout::selection())).highlight_symbol("> "), list_area, &mut state);
+    frame.render_widget(Paragraph::new(actions.get(model.action_selected).map(|a| a.label()).unwrap_or_default())
+        .wrap(Wrap { trim: false }).block(Block::bordered().title(" Selected action · Enter opens ")), description);
 }
 
 fn render_project_mutation_confirmation(
@@ -3085,6 +3022,36 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unified_project_menu_opens_operators_and_returns_to_members() {
+        let mut model = model_with_projects();
+        model.view = ProjectView::Details;
+        model.section = ProjectSection::Members;
+        assert_eq!(ProjectSection::ALL, [ProjectSection::Members, ProjectSection::Overview]);
+        handle_key(&mut model, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT));
+        assert_eq!(model.view, ProjectView::Actions);
+        model.action_selected = model.action_menu().iter()
+            .position(|a| matches!(a, ProjectMenuAction::Operators)).unwrap();
+        handle_key(&mut model, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(model.section, ProjectSection::Operators);
+        handle_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(model.section, ProjectSection::Members);
+        assert_eq!(model.view, ProjectView::Details);
+    }
+
+    #[test]
+    fn unified_project_menu_keeps_last_action_visible_in_short_terminal() {
+        let mut model = model_with_projects();
+        model.begin_project_actions();
+        handle_key(&mut model, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(model.action_selected, model.action_menu().len() - 1);
+        for (width, height) in [(60, 12), (80, 24), (160, 36)] {
+            let screen = rendered(&model, width, height);
+            assert!(screen.contains(&model.action_menu().last().unwrap().label()), "{screen}");
+            assert!(screen.contains("Selected action"), "{screen}");
+        }
+    }
+
     #[test]
     fn ui_contract_e1_project_details_modal_preserves_input_and_small_confirm_choices() {
         let mut model = model_with_projects();
@@ -3442,6 +3409,9 @@ mod tests {
             &mut model,
             KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT),
         );
+        assert_eq!(model.view, ProjectView::Actions);
+        assert!(model.member_action_requested.is_none());
+        handle_key(&mut model, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(model.view, ProjectView::Details);
         assert_eq!(
             model.member_action_requested.take(),

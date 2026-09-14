@@ -6235,6 +6235,12 @@ fn route_selector_key(model: &mut SelectorModel, key: KeyEvent) -> SelectorKeyRo
             }
         }
     }
+    if key.code == KeyCode::Esc && model.help.is_none() && model.leave_review.is_none()
+        && model.settings_overlay.is_none() && model.profile_overlay.is_none()
+        && matches!(model.mode, SelectorMode::Settings { target: SelectorTarget::GlobalSettings, focus: SettingsFocus::Categories, .. }
+            | SelectorMode::Settings { target: SelectorTarget::GlobalSettings, view: SettingsView::Expanded, .. }) {
+        return SelectorKeyRoute::Control(None);
+    }
     if key.code == KeyCode::Esc
         && !text_input
         && !selector_modal(model)
@@ -7400,11 +7406,6 @@ fn render_selector_contents(frame: &mut Frame<'_>, model: &SelectorModel) {
     render_footer(frame, chunks[5], model);
     let confirmed = match &model.mode {
         SelectorMode::ConfirmRuntimeAction { confirmed, .. } => Some(*confirmed),
-        SelectorMode::RecentSessions
-            if model.recent.review().is_some() && !model.recent.adoption_name_focused() =>
-        {
-            Some(model.recent.review_confirmed())
-        }
         _ => None,
     };
     if let Some(confirmed) = confirmed {
@@ -7465,7 +7466,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
     ];
     if count > 0 || matches!(&model.mode, SelectorMode::Agents) {
         spans.push(Span::styled(
-            format!("  {count} shown"),
+            if matches!(model.mode, SelectorMode::Settings { .. }) { format!("  {count} settings") } else { format!("  {count} shown") },
             Style::new().fg(Color::DarkGray),
         ));
     }
@@ -7485,6 +7486,10 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
         }
     }
     if let Some(settings_view) = model.settings_view() {
+        let global = matches!(model.mode, SelectorMode::Settings { target: SelectorTarget::GlobalSettings, .. });
+        if global {
+            spans.push(Span::styled(format!("  Layout: {}", settings_view.label()), Style::new().fg(crate::cli_app::session_tui_layout::muted())));
+        } else {
         spans.push(Span::styled("  view ", Style::new().fg(Color::DarkGray)));
         if area.width < SETTINGS_TWO_PANE_MIN_WIDTH {
             spans.push(Span::styled(
@@ -7508,6 +7513,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
                     spans.push(Span::raw(" "));
                 }
             }
+        }
         }
         let dirty_count = model.settings_dirty_count();
         if dirty_count > 0 {
@@ -7605,18 +7611,13 @@ fn render_retired_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorM
 
 fn render_recent_context(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
     if model.recent.review().is_some() {
-        let status = if model.recent.review_confirmed() {
-            "[Adopt]  Cancel"
-        } else {
-            "Adopt  [Cancel]"
-        };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(
                     "Adopt native thread",
                     Style::new().add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!("  {status}"), Style::new().fg(Color::Yellow)),
+
             ])),
             area,
         );
@@ -7649,8 +7650,8 @@ fn render_recent_context(frame: &mut Frame<'_>, area: Rect, model: &SelectorMode
 
 fn render_recent_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
     if let Some(row) = model.recent.review() {
-        let [name_area, area] =
-            Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).areas(area);
+        let [name_area, info_area, buttons] =
+            Layout::vertical([Constraint::Length(3), Constraint::Min(1), Constraint::Length(3)]).areas(area);
         input_policy::render_input(
             frame,
             name_area,
@@ -7694,24 +7695,17 @@ fn render_recent_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorMo
                 Style::new().fg(crate::cli_app::session_tui_layout::focus()),
             )),
             Line::from(""),
-            Line::from(if model.recent.review_confirmed() {
-                Span::styled(
-                    "Confirm durable adoption + roster import (no assignment)?  [Adopt]  Cancel",
-                    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                )
-            } else {
-                Span::styled(
-                    "Confirm durable adoption + roster import (no assignment)?  Adopt  [Cancel]",
-                    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                )
-            }),
         ];
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: true })
                 .block(Block::bordered().title(" Review native thread ")),
-            area,
+            info_area,
         );
+        let selected = model.recent.review_confirmed();
+        let choice = |label: &str, chosen: bool| Span::styled(format!(" {label} "), if chosen { Style::new().fg(Color::White).bg(crate::cli_app::session_tui_layout::selection()).add_modifier(Modifier::BOLD) } else { Style::new().fg(crate::cli_app::session_tui_layout::muted()) });
+        frame.render_widget(Paragraph::new(Line::from(vec![choice("Cancel", !selected), Span::raw("  "), choice("Adopt", selected), Span::raw("   ←/→ choose · Enter apply")]))
+            .block(settings_panel_block(" Confirmation ".into(), !model.recent.adoption_name_focused())), buttons);
         return;
     }
     let panes = crate::cli_app::session_tui_layout::list_details(area, model.inspector_visible);
@@ -8801,7 +8795,7 @@ fn render_setting_options(
             rows,
             [Constraint::Percentage(48), Constraint::Percentage(52)],
         )
-        .block(settings_panel_block(title, active))
+        .block(settings_panel_block(title.clone(), active))
         .column_spacing(1)
         .row_highlight_style(settings_highlight_style(active))
         .highlight_symbol(if active { "> " } else { "  " });
@@ -8820,11 +8814,12 @@ fn render_setting_options(
             })
             .collect::<Vec<_>>();
         let table = Table::new(rows, [Constraint::Min(12)])
-            .block(settings_panel_block(title, active))
+            .block(settings_panel_block(title.clone(), active))
             .row_highlight_style(settings_highlight_style(active))
             .highlight_symbol(if active { "> " } else { "  " });
         frame.render_stateful_widget(table, area, &mut state);
     }
+    input_policy::refresh_title(frame, area, &title, active);
 }
 
 fn render_setting_value(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
@@ -9110,7 +9105,7 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 }
 
 fn settings_panel_block(title: String, active: bool) -> Block<'static> {
-    Block::bordered().title(title).border_style(if active {
+    Block::bordered().title(Line::styled(title, input_policy::title_style(active))).border_style(if active {
         Style::new().fg(crate::cli_app::session_tui_layout::focus())
     } else {
         Style::new().fg(Color::DarkGray)
@@ -11032,7 +11027,7 @@ mod tests {
         }
         assert!(matches!(
             route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            SelectorKeyRoute::Switch(PrimaryPanel::Projects)
+            SelectorKeyRoute::Control(None)
         ));
         assert_eq!(model.selected_target(), selected);
         route_selector_key(
@@ -11043,9 +11038,10 @@ mod tests {
         assert!(rendered_text_at(100, 30, &model).contains("Global settings"));
         assert!(matches!(
             route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            SelectorKeyRoute::Switch(PrimaryPanel::Tasks)
+            SelectorKeyRoute::Control(None)
         ));
         assert_eq!(model.selected_target(), selected);
+        model.leave_settings(); // explicit panel navigation leaves Settings; Esc does not.
         route_selector_key(
             &mut model,
             KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT),
@@ -15728,7 +15724,7 @@ mod tests {
         global_model.handle(SelectorEvent::Down);
         global_model.handle(SelectorEvent::Down);
         let medium = rendered_text(80, &global_model);
-        assert!(medium.contains("view Expanded [Categories]"));
+        assert!(medium.contains("Layout: Categories"));
         assert!(medium.contains("Global settings"));
         assert!(medium.contains("Network options"));
         assert!(medium.contains("Proxy enabled"));
@@ -15750,7 +15746,7 @@ mod tests {
 
         global_model.handle(SelectorEvent::Insert('v'));
         let global_expanded = rendered_text_at(120, 24, &global_model);
-        assert!(global_expanded.contains("view [Expanded] Categories"));
+        assert!(global_expanded.contains("Layout: Expanded"));
         assert!(global_expanded.contains("SETTING"));
         assert!(global_expanded.contains("VALUE"));
         assert!(global_expanded.contains("Profiles"));
@@ -15961,6 +15957,25 @@ mod tests {
         contract_key(&mut model, KeyCode::Char('x'));
         assert_eq!(model.query.value(), "zx");
         assert_eq!(model.recent.query(), "nNqaev /");
+    }
+
+    #[test]
+    fn adoption_has_one_confirmation_pane_in_both_focus_states() {
+        let mut model = contract_recent_model();
+        route_selector_key(&mut model, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT));
+        for focused in [true, false] {
+            if !focused { model.recent.blur_adoption_name(); }
+            for width in [80, 160] {
+                let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30)).unwrap();
+                terminal.draw(|frame| render_selector_contents(frame, &model)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let text = (0..30).map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n");
+                assert_eq!(text.matches("Confirmation").count(), 1, "{text}");
+                assert_eq!(text.matches("Enter apply").count(), 1, "{text}");
+                assert!(!text.contains("[Adopt]"));
+                assert!(!text.contains("[Cancel]"));
+            }
+        }
     }
 
     #[test]
@@ -16188,7 +16203,8 @@ mod tests {
             route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
             assert!(matches!(model.mode, SelectorMode::Settings { target: SelectorTarget::GlobalSettings, .. }));
             assert_eq!(model.settings_return_panel, Some(origin));
-            assert!(matches!(route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), SelectorKeyRoute::Switch(panel) if panel == origin));
+            assert!(matches!(route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), SelectorKeyRoute::Control(None)));
+            assert!(matches!(model.mode, SelectorMode::Settings { target: SelectorTarget::GlobalSettings, .. }));
         }
     }
 
@@ -16246,7 +16262,8 @@ mod tests {
                 assert!(matches!(model.mode, SelectorMode::Settings { focus, .. } if focus == expected));
                 assert_eq!(model.settings_return_panel, Some(origin));
             }
-            assert!(matches!(route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), SelectorKeyRoute::Switch(panel) if panel == origin));
+            assert!(matches!(route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), SelectorKeyRoute::Control(None)));
+            assert!(matches!(model.mode, SelectorMode::Settings { target: SelectorTarget::GlobalSettings, .. }));
         }
     }
 
