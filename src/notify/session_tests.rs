@@ -44,3 +44,33 @@ fn preferences_persist_without_crossing_sessions_and_reload_labels() {
     assert!(session_at(&root, &id, Change::Set(Level::Normal)).is_err());
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn style_overrides_reload_and_invalid_style_does_not_change_priority() {
+    let root = std::env::temp_dir().join(format!("cutex-style-test-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    fs::write(root.join("config.json"), r##"{"important":"same","normal":"same","styles":{"normal":{"fg":"#123456","bold":true}}}"##).unwrap();
+    let important = session_at(&root, &id, Change::Set(Level::Important)).unwrap();
+    let normal = session_at(&root, &id, Change::Set(Level::Normal)).unwrap();
+    assert_eq!(important.label, normal.label);
+    assert_eq!(
+        normal.style,
+        ItemStyle {
+            fg: "#123456".into(),
+            bold: true
+        }
+    );
+    assert_ne!(important.style, normal.style);
+    fs::write(
+        root.join("config.json"),
+        r#"{"styles":{"normal":{"fg":"red"}}}"#,
+    )
+    .unwrap();
+    assert!(session_at(&root, &id, Change::Cycle).is_err());
+    assert_eq!(
+        read_json::<Level>(&root.join("sessions").join(format!("{id}.json"))).unwrap(),
+        Level::Normal
+    );
+    fs::remove_dir_all(root).unwrap();
+}

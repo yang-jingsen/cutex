@@ -372,7 +372,7 @@ impl Settings {
                     .iter()
                     .flatten()
                     .all(|s| !s.starts_with("custom:")
-                        || matches!(s.as_str(), "custom:profile" | "custom:bon-voyage")),
+                        || matches!(s.as_str(), "custom:profile" | "custom:bon-voyage" | "custom:notification")),
                 "unsupported selected status item"
             );
         }
@@ -698,7 +698,7 @@ impl Projection {
             t.status_line
                 .iter()
                 .flatten()
-                .any(|s| s.starts_with("custom:"))
+                .any(|s| super::selected_status::is_static_id(s))
         });
         ensure!(
             wants_status == self.status.is_some(),

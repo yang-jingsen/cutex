@@ -1232,8 +1232,8 @@ status_line_use_colors = false
             .map(|item| item.id.as_str())
             .collect::<Vec<_>>();
 
-        assert!(ids.contains(&"custom:bon-voyage"));
-        assert!(ids.contains(&"custom:profile"));
+        assert!(ids.contains(&"cutex_welcome"));
+        assert!(ids.contains(&"cutex_profile"));
     }
 
     #[test]

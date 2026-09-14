@@ -68,6 +68,24 @@ impl Default for Render {
     }
 }
 
+/// Canonical display IDs; old spellings remain accepted in saved configuration.
+pub fn canonical_id(id: &str) -> &str {
+    match id {
+        "custom:bon-voyage" | "cutex_bon_voyage" => "cutex_welcome",
+        "custom:profile" => "cutex_profile",
+        "notification" | "custom:notification" => "cutex_notification",
+        _ => id,
+    }
+}
+
+pub fn is_static_id(id: &str) -> bool {
+    matches!(canonical_id(id), "cutex_welcome" | "cutex_profile")
+}
+
+fn requires_catalog(id: &str) -> bool {
+    is_static_id(id) || (id.starts_with("custom:") && canonical_id(id) != "cutex_notification")
+}
+
 fn digest(bytes: &[u8]) -> String {
     use sha2::Digest;
     format!("{:x}", sha2::Sha256::digest(bytes))
@@ -80,22 +98,22 @@ fn resolve(bytes: &[u8], order: &[String], label: &str) -> anyhow::Result<Payloa
     let mut seen = std::collections::BTreeSet::new();
     for entry in &catalog.items {
         ensure!(
-            matches!(entry.id.as_str(), "custom:profile" | "custom:bon-voyage")
-                && seen.insert(&entry.id),
+            is_static_id(&entry.id)
+                && seen.insert(canonical_id(&entry.id)),
             "unknown/duplicate status item"
         );
         let _ = (&entry.title, &entry.description, &entry.render);
     }
     let mut items = Vec::new();
-    for id in order.iter().filter(|id| id.starts_with("custom:")) {
+    for id in order.iter().filter(|id| requires_catalog(id)) {
         ensure!(
-            !items.iter().any(|i: &Item| &i.id == id),
+            !items.iter().any(|i: &Item| canonical_id(&i.id) == canonical_id(id)),
             "duplicate selected status item"
         );
         let entry = catalog
             .items
             .iter()
-            .find(|e| &e.id == id)
+            .find(|e| canonical_id(&e.id) == canonical_id(id))
             .context("selected status item missing from catalog")?;
         let text = match &entry.source {
             Source::Static { value } => value.clone(),
@@ -120,8 +138,8 @@ impl Payload {
         let mut seen = std::collections::BTreeSet::new();
         for i in &self.items {
             ensure!(
-                matches!(i.id.as_str(), "custom:profile" | "custom:bon-voyage")
-                    && seen.insert(&i.id),
+                is_static_id(&i.id)
+                    && seen.insert(canonical_id(&i.id)),
                 "invalid static status ID"
             );
             ensure!(!i.text.trim().is_empty() && i.text.len() <= 256 && !i.text.chars().any(|c| c.is_control() || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')), "invalid static status text");
@@ -147,7 +165,7 @@ impl Status {
         order: &[String],
         label: &str,
     ) -> anyhow::Result<Option<Self>> {
-        if !order.iter().any(|s| s.starts_with("custom:")) {
+        if !order.iter().any(|s| requires_catalog(s)) {
             return Ok(None);
         }
         super::selected_profile::validate_asset(catalog_path)?;
@@ -238,6 +256,15 @@ mod tests {
             {"id":"custom:bon-voyage","title":"Bon voyage","source":{"kind":"static","value":"Bon voyage !"},"style":{"fg":"#F6A3C8","bold":true}},
             {"id":"custom:profile","title":"Profile","source":{"kind":"launch_profile"},"style":{"fg":"#FFFFFF","bold":true}}
         ]})
+    }
+    #[test]
+    fn canonical_order_accepts_legacy_catalog_and_keeps_dynamic_item_separate() {
+        let bytes = serde_json::to_vec(&catalog()).unwrap();
+        let payload = resolve(&bytes, &["cutex_welcome".into(), "cutex_profile".into(), "cutex_notification".into()], "chosen").unwrap();
+        assert_eq!(payload.items.len(), 2);
+        assert_eq!((&payload.items[0].id, &payload.items[0].text), (&"cutex_welcome".to_string(), &"Bon voyage !".to_string()));
+        assert_eq!(payload.items[1].text, "chosen");
+        assert!(resolve(&bytes, &["cutex_profile".into(), "custom:profile".into()], "chosen").is_err());
     }
     #[test]
     fn selected_label_order_and_style_are_not_account_inferred() {

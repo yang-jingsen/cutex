@@ -134,8 +134,11 @@ fn desktop(command: DesktopNotifyCommand) -> anyhow::Result<()> {
 /// Add the notification control to the light frontend without modifying reviewed assets.
 pub(super) fn status_line(items: Option<&Vec<String>>) -> Vec<String> {
     let mut items = items.cloned().unwrap_or_else(|| vec!["model-with-reasoning".into(), "current-dir".into()]);
-    if !items.is_empty() && !items.iter().any(|item| item == "notification") {
-        items.push("notification".into());
+    for item in &mut items {
+        *item = cutex::launch::selected_status::canonical_id(item).to_string();
+    }
+    if !items.is_empty() && !items.iter().any(|item| item == "cutex_notification") {
+        items.push("cutex_notification".into());
     }
     items
 }

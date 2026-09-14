@@ -44,15 +44,16 @@ pub fn materialized_account_files(
         auth_path: dir.join("auth.json"),
         config_path: dir.join("config.toml"),
         model_catalog_path: dir.join("models.json"),
-        custom_status_items_path: dir.join("custom-status-items.json"),
+        // Keep legacy catalogs intact for already-running owners and their receipts.
+        custom_status_items_path: dir.join("cutex-status-items.json"),
     })
 }
 
 fn default_custom_status_items() -> Vec<CustomStatusItemCatalogEntry> {
     vec![
         CustomStatusItemCatalogEntry {
-            id: "custom:bon-voyage".to_string(),
-            title: "Bon voyage".to_string(),
+            id: "cutex_welcome".to_string(),
+            title: "Cutex Welcome".to_string(),
             description: None,
             source: CustomStatusItemSource::Static {
                 value: "Bon voyage !".to_string(),
@@ -68,8 +69,8 @@ fn default_custom_status_items() -> Vec<CustomStatusItemCatalogEntry> {
             },
         },
         CustomStatusItemCatalogEntry {
-            id: "custom:profile".to_string(),
-            title: "Profile".to_string(),
+            id: "cutex_profile".to_string(),
+            title: "Cutex Profile".to_string(),
             description: None,
             source: CustomStatusItemSource::LaunchProfile,
             render: CustomStatusItemRender::Value,
@@ -93,12 +94,16 @@ pub fn normalize_custom_status_items(
     let defaults = default_custom_status_items();
 
     for item in items.iter().chain(defaults.iter()) {
-        let id = item.id.trim();
+        let id = crate::launch::selected_status::canonical_id(item.id.trim());
         if id.is_empty() || !seen.insert(id.to_string()) {
             continue;
         }
 
-        let title = item.title.trim();
+        let title = match (id, item.title.trim()) {
+            ("cutex_welcome", "Bon voyage") => "Cutex Welcome",
+            ("cutex_profile", "Profile") => "Cutex Profile",
+            (_, title) => title,
+        };
         normalized.push(CustomStatusItemCatalogEntry {
             id: id.to_string(),
             title: if title.is_empty() {
@@ -242,7 +247,7 @@ fn validate_materialized_account_files_at(
         let custom_status_items = fs::read_to_string(&files.custom_status_items_path)
             .with_context(|| {
                 format!(
-                    "Failed to read custom-status-items.json for profile '{}' at {}",
+                    "Failed to read cutex-status-items.json for profile '{}' at {}",
                     account.name,
                     files.custom_status_items_path.display()
                 )
@@ -250,7 +255,7 @@ fn validate_materialized_account_files_at(
         serde_json::from_str::<CustomStatusItemsCatalogFile>(&custom_status_items).with_context(
             || {
                 format!(
-                    "Failed to parse custom-status-items.json for profile '{}' at {}",
+                    "Failed to parse cutex-status-items.json for profile '{}' at {}",
                     account.name,
                     files.custom_status_items_path.display()
                 )
@@ -391,7 +396,7 @@ pub fn sync_active_codex_home_files(
     };
     write_optional_text_if_changed(&active_model_catalog_path, model_catalog.as_deref())?;
 
-    let active_custom_status_items_path = codex_home.join("custom-status-items.json");
+    let active_custom_status_items_path = codex_home.join("cutex-status-items.json");
     let custom_status_items = read_optional_text(&files.custom_status_items_path)?;
     write_optional_text_if_changed(
         &active_custom_status_items_path,
@@ -555,7 +560,7 @@ mod tests {
             auth_path: dir.join("auth.json"),
             config_path: dir.join("config.toml"),
             model_catalog_path: dir.join("models.json"),
-            custom_status_items_path: dir.join("custom-status-items.json"),
+            custom_status_items_path: dir.join("cutex-status-items.json"),
         };
         (dir, files)
     }

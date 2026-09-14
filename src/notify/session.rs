@@ -25,12 +25,47 @@ pub enum Change {
     Cycle,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ItemStyle {
+    pub fg: String,
+    #[serde(default)]
+    pub bold: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Styles {
+    pub important: ItemStyle,
+    pub normal: ItemStyle,
+    pub off: ItemStyle,
+}
+impl Default for Styles {
+    fn default() -> Self {
+        Self {
+            important: ItemStyle {
+                fg: "#E08EB2".into(),
+                bold: true,
+            },
+            normal: ItemStyle {
+                fg: "#74BAC3".into(),
+                bold: false,
+            },
+            off: ItemStyle {
+                fg: "#D9B45F".into(),
+                bold: false,
+            },
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Labels {
     pub important: String,
     pub normal: String,
     pub off: String,
+    pub styles: Styles,
 }
 impl Default for Labels {
     fn default() -> Self {
@@ -38,6 +73,7 @@ impl Default for Labels {
             important: "CIAO!".into(),
             normal: "ON".into(),
             off: "OFF".into(),
+            styles: Styles::default(),
         }
     }
 }
@@ -47,6 +83,7 @@ pub struct Preference {
     pub thread_id: String,
     pub level: Level,
     pub label: String,
+    pub style: ItemStyle,
 }
 
 pub fn session(thread_id: &str, change: Change) -> anyhow::Result<Preference> {
@@ -80,6 +117,18 @@ fn session_at(root: &Path, thread_id: &str, change: Change) -> anyhow::Result<Pr
     let labels: Labels = read_json(&root.join("config.json"))?;
     for text in [&labels.important, &labels.normal, &labels.off] {
         ensure!(!text.trim().is_empty() && text.chars().count() <= 32 && !text.chars().any(|c| c.is_control() || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')), "notification labels must contain 1..32 printable characters");
+    }
+    for style in [
+        &labels.styles.important,
+        &labels.styles.normal,
+        &labels.styles.off,
+    ] {
+        ensure!(
+            style.fg.len() == 7
+                && style.fg.starts_with('#')
+                && style.fg.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit),
+            "notification foreground must be #RRGGBB"
+        );
     }
     let path = root.join("sessions").join(format!("{thread_id}.json"));
     let level = if matches!(change, Change::Read) {
@@ -120,6 +169,11 @@ fn session_at(root: &Path, thread_id: &str, change: Change) -> anyhow::Result<Pr
         )?;
         level
     };
+    let style = match level {
+        Level::Important => labels.styles.important,
+        Level::Normal => labels.styles.normal,
+        Level::Off => labels.styles.off,
+    };
     let label = match level {
         Level::Important => labels.important,
         Level::Normal => labels.normal,
@@ -129,6 +183,7 @@ fn session_at(root: &Path, thread_id: &str, change: Change) -> anyhow::Result<Pr
         thread_id,
         level,
         label,
+        style,
     })
 }
 

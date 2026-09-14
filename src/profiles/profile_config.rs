@@ -30,13 +30,14 @@ pub const PROFILE_CONFIG_SCALAR_KEYS: &[&str] = &[
     "service_tier",
 ];
 pub const PROFILE_CONFIG_TABLE_KEYS: &[&str] = &["shell_environment_policy"];
-pub const DEFAULT_CUTEX_STATUS_LINE: [&str; 6] = [
-    "custom:bon-voyage",
-    "custom:profile",
+pub const DEFAULT_CUTEX_STATUS_LINE: [&str; 7] = [
+    "cutex_welcome",
+    "cutex_profile",
     "model-with-reasoning",
     "current-dir",
     "context-used",
     "weekly-limit",
+    "cutex_notification",
 ];
 pub const PROFILE_CONFIG_TUI_KEYS: &[&str] = &[
     "status_line",
