@@ -787,6 +787,7 @@ struct SelectorModel {
     leave_review: Option<LeaveReview>,
     rows: Vec<SelectorRow>,
     retired_rows: Vec<SelectorRow>,
+    archive_return_panel: PrimaryPanel,
     recent: RecentSessionsWorkspace,
     query: Input,
     workspace_selection: WorkspaceSelection<SelectorTarget>,
@@ -839,6 +840,7 @@ impl SelectorModel {
             leave_review: None,
             rows,
             retired_rows: Vec::new(),
+            archive_return_panel: PrimaryPanel::Agents,
             recent: RecentSessionsWorkspace::default(),
             query: Input::default(),
             workspace_selection: WorkspaceSelection::default(),
@@ -1740,7 +1742,7 @@ impl SelectorModel {
     ) -> SelectorControl {
         if self.retired_rows.is_empty() {
             match event {
-                SelectorEvent::Back | SelectorEvent::Escape => self.mode = SelectorMode::Agents,
+                SelectorEvent::Back | SelectorEvent::Escape => self.activate_primary_panel(self.archive_return_panel),
                 SelectorEvent::Exit => return SelectorControl::Exit,
                 _ => {}
             }
@@ -1754,6 +1756,13 @@ impl SelectorModel {
             SelectorEvent::Last => next = self.retired_rows.len() - 1,
             SelectorEvent::Activate | SelectorEvent::OpenActions => {
                 let row = &self.retired_rows[next];
+                if row.actions.is_empty() {
+                    self.notice = Some(
+                        "Permanently retired identity; history is read-only and cannot be restored"
+                            .into(),
+                    );
+                    return SelectorControl::Continue;
+                }
                 let Some(key) = row.target.agent_key() else {
                     return SelectorControl::Continue;
                 };
@@ -1766,7 +1775,7 @@ impl SelectorModel {
                 return SelectorControl::Continue;
             }
             SelectorEvent::Back | SelectorEvent::Escape | SelectorEvent::OpenSettings => {
-                self.mode = SelectorMode::Agents;
+                self.activate_primary_panel(self.archive_return_panel);
                 return SelectorControl::Continue;
             }
             SelectorEvent::Exit => return SelectorControl::Exit,
@@ -1780,6 +1789,9 @@ impl SelectorModel {
     }
 
     fn open_retired_sessions(&mut self, rows: Vec<SelectorRow>) {
+        self.archive_return_panel = if matches!(self.mode, SelectorMode::RecentSessions) {
+            PrimaryPanel::Recent
+        } else { PrimaryPanel::Agents };
         self.retired_rows = rows;
         self.mode = SelectorMode::RetiredSessions { selected: 0 };
         self.notice = None;
@@ -4998,14 +5010,16 @@ fn load_retired_selector_rows() -> anyhow::Result<Vec<SelectorRow>> {
     let snapshot = AgentManagementStore::open_default()?.snapshot()?;
     let contexts = selector_project_contexts(&snapshot);
     let mut rows = retired_selector_rows_from_store(&store, &contexts);
-    rows.retain(|row| {
-        row.target.agent_key().is_some_and(|id| {
-            !snapshot
+    for row in &mut rows {
+        if row.target.agent_key().is_some_and(|id| {
+            snapshot
                 .agents
                 .values()
                 .any(|agent| agent.cutex_session_id.as_str() == id && agent.retired_at.is_some())
-        })
-    });
+        }) {
+            row.actions.clear();
+        }
+    }
     Ok(rows)
 }
 
@@ -5271,7 +5285,7 @@ fn retired_selector_rows_from_store(
     let mut rows = store
         .sessions
         .iter()
-        .filter(|(_, record)| record.is_retired() && cutex_session_is_managed(record))
+        .filter(|(_, record)| record.is_retired())
         .map(|(key, record)| {
             retired_selector_row(key, record, project_contexts.get(&record.cutex_session_id))
         })
@@ -7290,7 +7304,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
     let (view, count) = match &model.mode {
         SelectorMode::Agents => ("Agents", model.visible_indices().len()),
         SelectorMode::RecentSessions => ("recent sessions", model.recent.visible_rows().len()),
-        SelectorMode::RetiredSessions { .. } => ("archived Agents", model.retired_rows.len()),
+        SelectorMode::RetiredSessions { .. } => ("Archive / Retired", model.retired_rows.len()),
         SelectorMode::Actions { .. } => (
             "actions",
             model
@@ -7334,7 +7348,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
     if matches!(&model.mode, SelectorMode::Agents) {
         spans.push(Span::styled(
             format!(
-                "  {} · Alt+O scope",
+                "  {} · Alt+O scope · Alt+Z Archive / Retired",
                 ["All", "Online", "Pinned"][model.managed_scope]
             ),
             Style::new().fg(crate::cli_app::session_tui_layout::FOCUS),
@@ -7447,10 +7461,12 @@ fn render_retired_context(frame: &mut Frame<'_>, area: Rect, model: &SelectorMod
             _ => 0,
         })
         .map(|row| row.agent.as_str())
-        .unwrap_or("No archived Agents");
+        .unwrap_or("No archived or retired Cutex sessions");
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("Archived Agents", Style::new().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Archived / Retired", Style::new().add_modifier(Modifier::BOLD),
+            ),
             Span::styled(format!("  {selected}"), Style::new().fg(Color::DarkGray)),
         ]))
         .block(Block::bordered().title(" Archive ")),
@@ -7496,7 +7512,9 @@ fn render_recent_context(frame: &mut Frame<'_>, area: Rect, model: &SelectorMode
         RecentLoadState::Failed(message) => format!("Catalog unavailable: {message}"),
     };
     let mut heading = crate::cli_app::session_tui_layout::heading("Recent", "Sessions");
-    heading.spans.push(Span::styled(format!(" {}/{} · {text}", model.recent.visible_rows().len(), model.recent.rows().len()), Style::new().fg(Color::DarkGray)));
+    heading.spans.push(Span::styled(format!(
+            " · Alt+Z Archive / Retired · {}/{} · {text}", model.recent.visible_rows().len(), model.recent.rows().len()), Style::new().fg(Color::DarkGray),
+    ));
     frame.render_widget(Paragraph::new(heading), area);
 }
 
@@ -7632,6 +7650,11 @@ fn render_retired_table(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel
     let rows = model.retired_rows.iter().map(|row| {
         Row::new([
             Cell::from(row.agent.as_str()),
+            Cell::from(if row.actions.is_empty() {
+                "Retired"
+            } else {
+                "Archived"
+            }),
             Cell::from(row.configured_profile.as_deref().unwrap_or("-")),
             Cell::from(row.managed_path.as_str()),
             Cell::from(row.retired_at.as_deref().unwrap_or("-")),
@@ -7642,6 +7665,7 @@ fn render_retired_table(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel
         rows,
         [
             Constraint::Min(16),
+            Constraint::Length(8),
             Constraint::Length(16),
             Constraint::Min(20),
             Constraint::Length(22),
@@ -7649,7 +7673,10 @@ fn render_retired_table(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel
         ],
     )
     .header(
-        Row::new(["AGENT", "PROFILE", "MANAGED PATH", "RETIRED AT", "REVISION"])
+        Row::new([
+            "AGENT / SESSION",
+            "STATE", "PROFILE", "MANAGED PATH", "RETIRED AT", "REVISION",
+        ])
             .style(Style::new().fg(Color::Gray).add_modifier(Modifier::BOLD))
             .bottom_margin(1),
     )
@@ -8478,6 +8505,23 @@ fn render_action_overlay(frame: &mut Frame<'_>, area: Rect, model: &SelectorMode
 }
 
 fn render_settings_browser(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
+    let area = if matches!(
+        model.mode,
+        SelectorMode::Settings {
+            target: SelectorTarget::GlobalSettings,
+            ..
+        }
+    ) {
+        let [navigation, body] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
+        frame.render_widget(
+            Paragraph::new(Line::from(footer_hints(&[("Alt+G", "Profiles")]))),
+            navigation,
+        );
+        body
+    } else {
+        area
+    };
     match model.settings_view() {
         Some(SettingsView::Expanded) => render_expanded_settings(frame, area, model),
         Some(SettingsView::Categories) => render_categorized_settings(frame, area, model),
@@ -9515,6 +9559,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
                 ("Enter", "native resume"),
                 ("Alt+A", "actions"),
                 ("Alt+L", "load more"),
+                ("Alt+Z", "archive"),
                 ("Tab", "review"),
                 ("Left/Right", "tabs"),
                 ("F5", "refresh"),
@@ -14575,6 +14620,21 @@ mod tests {
     }
 
     #[test]
+    fn archive_returns_to_recent_and_retired_identity_cannot_restore() {
+        let record = editable_record();
+        let mut model = editable_model(&record);
+        model.activate_primary_panel(PrimaryPanel::Recent);
+        let mut archived = retired_selector_row("retired", &record, None);
+        archived.actions.clear();
+        model.open_retired_sessions(vec![archived]);
+        model.handle(SelectorEvent::Activate);
+        assert!(matches!(model.mode, SelectorMode::RetiredSessions { .. }));
+        assert!(model.notice.as_deref().unwrap().contains("cannot be restored"));
+        model.handle(SelectorEvent::Escape);
+        assert!(matches!(model.mode, SelectorMode::RecentSessions));
+    }
+
+    #[test]
     fn retired_workspace_lists_archive_columns_and_restore_defaults_to_cancel() {
         let mut record = editable_record();
         record.archive_state = cutex::session::model::CutexSessionArchiveState::Retired;
@@ -14590,8 +14650,8 @@ mod tests {
         for column in ["AGENT", "PROFILE", "MANAGED PATH", "RETIRED AT", "REVISION"] {
             assert!(rendered.contains(column));
         }
-        assert!(rendered_text_at(80, 24, &model).contains("Archived Agents"));
-        assert!(rendered_text_at(52, 16, &model).contains("Archived Agents"));
+        assert!(rendered_text_at(80, 24, &model).contains("Archived / Retired"));
+        assert!(rendered_text_at(52, 16, &model).contains("Archived / Retired"));
         model.handle(SelectorEvent::Activate);
         assert!(matches!(
             model.mode,
