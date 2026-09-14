@@ -1068,7 +1068,7 @@ impl GlobalSettingsSnapshot {
         let labels = cutex::notify::session::labels();
         let error = labels.as_ref().err().map(|e| format!("Cannot read notification labels: {e}"));
         let labels = labels.unwrap_or_default();
-        [("Important", labels.important, labels.styles.important),
+        let mut options: Vec<_> = [("Important", labels.important, labels.styles.important),
          ("Normal", labels.normal, labels.styles.normal),
          ("Off", labels.off, labels.styles.off)].into_iter().map(|(name, value, style)| {
             let mut option = SessionTuiSettingOption::new(name, value);
@@ -1080,7 +1080,28 @@ impl GlobalSettingsSnapshot {
                 style: Some(rendered), ..Default::default()
             };
             option
-        }).collect()
+        }).collect();
+        match cutex::notify::outbound::config() {
+            Ok(config) => {
+                for (name,value) in [
+                    ("Enabled", if config.enabled { "On" } else { "Off" }.to_string()),
+                    ("URL", config.url.unwrap_or_else(|| "Not configured".into())),
+                    ("Token", if config.token.is_some() { "Configured" } else { "Not configured" }.to_string()),
+                    ("Events", config.events.join(", ")),
+                ] {
+                    let mut option = SessionTuiSettingOption::new(name, value);
+                    option.presentation.group = Some("Webhook delivery");
+                    option.presentation.detail = Some("Configure: cutex notify configure <file.json> · status/test/deliveries/retry · ~/.cutex/notifications/outbound.json".into());
+                    options.push(option);
+                }
+            }
+            Err(_) => {
+                let mut option = SessionTuiSettingOption::new("Configuration", "Invalid; inspect outbound.json");
+                option.presentation.group = Some("Webhook delivery");
+                options.push(option);
+            }
+        }
+        options
     }
 
     fn appearance_display_options(&self) -> Vec<SessionTuiSettingOption> {

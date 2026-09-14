@@ -1315,6 +1315,18 @@ pub enum ManagementSeatCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum NotifyCommand {
+    /// Run the independent event-to-webhook adapter
+    Run,
+    /// Inspect worker health and bounded outbox
+    Status,
+    /// Apply outbound JSON configuration from a local file (token stays out of argv)
+    Configure { file: std::path::PathBuf },
+    /// Enqueue a clearly marked synthetic webhook test
+    Test,
+    /// List the latest deliveries, optionally filtered by state
+    Deliveries { #[arg(long)] state: Option<String> },
+    /// Retry a failed notification against the currently configured destination
+    Retry { event_id: String },
     /// Read or change a native session's external notification priority
     Session {
         /// Native session UUID (shown by cute-codex /status)

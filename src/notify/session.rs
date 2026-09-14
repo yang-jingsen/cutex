@@ -86,6 +86,12 @@ pub struct Preference {
     pub style: ItemStyle,
 }
 
+/// Read only the policy; presentation errors must not break delivery decisions.
+pub fn read_level(thread_id: &str) -> anyhow::Result<Level> {
+    let id = uuid::Uuid::parse_str(thread_id).context("expected native session UUID")?;
+    read_json(&crate::config::paths::config_dir()?.join(format!("notifications/sessions/{id}.json")))
+}
+
 pub fn labels() -> anyhow::Result<Labels> {
     read_json(&crate::config::paths::config_dir()?.join("notifications/config.json"))
 }

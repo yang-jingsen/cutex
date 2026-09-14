@@ -554,6 +554,7 @@ fn handle_v2_request_with_repository(
                 }
             }
         }
+        ("GET" | "POST", "/v2/notifications/outbound" | "/v2/notifications/deliveries" | "/v2/notifications/test" | "/v2/notifications/retry") => crate::notify::outbound::handle_request(stream, request),
         ("GET" | "POST", "/v2/notifications/session") => crate::notify::session::handle_request(stream, request),
         ("GET", "/v2/events") => {
             let query = match replay_query(request, false) {

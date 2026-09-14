@@ -1,7 +1,16 @@
 use cutex::cli::args::NotifyCommand;
 
 pub(crate) fn run_command(command: NotifyCommand) -> anyhow::Result<()> {
-    match command {
+    let result = match command {
+        NotifyCommand::Run => return cutex::notify::outbound::run(),
+        NotifyCommand::Status => cutex::notify::outbound::status(),
+        NotifyCommand::Configure { file } => {
+            let config = serde_json::from_slice(&std::fs::read(file)?)?;
+            cutex::notify::outbound::set_config(&config)
+        },
+        NotifyCommand::Test => cutex::notify::outbound::test_notification(),
+        NotifyCommand::Deliveries { state } => cutex::notify::outbound::deliveries(state.as_deref()),
+        NotifyCommand::Retry { event_id } => cutex::notify::outbound::retry(&event_id),
         NotifyCommand::Session { thread_id, level, cycle, json } => {
             use cutex::notify::session::{self, Change};
             let change = match (level, cycle) {
@@ -15,9 +24,11 @@ pub(crate) fn run_command(command: NotifyCommand) -> anyhow::Result<()> {
             } else {
                 println!("{} · {}", preference.thread_id, preference.label);
             }
-            Ok(())
+            return Ok(());
         },
-    }
+    };
+    println!("{}", serde_json::to_string_pretty(&result?)?);
+    Ok(())
 }
 
 /// Add the notification control to the light frontend without modifying reviewed assets.
