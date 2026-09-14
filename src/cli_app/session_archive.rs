@@ -595,7 +595,7 @@ mod tests {
 
         let view = archive_session_view(&record);
 
-        assert_eq!(view.lifecycle, "retired");
+        assert_eq!(view.lifecycle, "archived");
         assert_eq!(view.status, "offline");
         assert_eq!(view.runtime_generation, 7);
         let json = serde_json::to_value(view).expect("view json");

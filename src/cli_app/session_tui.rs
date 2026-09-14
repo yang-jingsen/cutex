@@ -8607,7 +8607,7 @@ fn render_settings_browser(frame: &mut Frame<'_>, area: Rect, model: &SelectorMo
 fn setting_option_style(option: &SessionTuiSettingOption) -> Style {
     let actionable = option.field.is_some() || option.global_field.is_some()
         || option.profile_field.is_some() || option.command.is_some() || option.navigation.is_some();
-    Style::new().fg(if actionable { Color::White } else { Color::Gray })
+    Style::new().fg(if actionable { Color::White } else { crate::cli_app::session_tui_layout::muted() })
 }
 
 fn notification_preview() -> cutex::notify::session::Labels {
@@ -9088,7 +9088,7 @@ fn settings_panel_block(title: String, active: bool) -> Block<'static> {
 }
 
 fn settings_highlight_style(active: bool) -> Style {
-    Style::new().bg(if active { crate::cli_app::session_tui_layout::selection() } else { Color::DarkGray })
+    Style::new().bg(if active { crate::cli_app::session_tui_layout::selection() } else { Color::Reset })
 }
 
 fn render_runtime_action_confirmation(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
@@ -9954,10 +9954,9 @@ mod tests {
     }
 
     #[test]
-    fn new_agent_without_install_explains_runtime_selection() {
+    fn new_agent_shortcut_opens_creation_flow() {
         let mut model = SelectorModel::new(Vec::new(), false, false);
-        assert!(matches!(selector_command(&mut model, Command::NewManagedAgent), SelectorKeyRoute::Control(None)));
-        assert!(model.notice.as_deref().is_some_and(|notice| notice.contains("Install a local runtime")));
+        assert!(matches!(selector_command(&mut model, Command::NewManagedAgent), SelectorKeyRoute::Control(Some(SelectorControl::NewAgent))));
     }
 
     #[test]
@@ -11907,6 +11906,10 @@ mod tests {
     #[test]
     fn management_commands_use_service_semantics_without_mutating_runtime_identity() {
         let mut local = editable_record();
+        // This exercises store/UI projection, not machine-local runtime adoption.
+        // A distinct host keeps the fixture independent of installed deployments.
+        local.host_id = format!("{}-remote-test", cutex::platform::host::current_host_name());
+        local.codex_session_id = Some("019e0000-0000-7000-8000-000000000001".into());
         local.current_runtime_agent_id = Some("runtime-occurrence".to_string());
         local.agent_groups.clear();
         let untouched = CutexSessionRecord::new_at(
@@ -12001,7 +12004,11 @@ mod tests {
 
     #[test]
     fn management_success_refreshes_the_row_and_survives_a_stale_snapshot() {
-        let local = editable_record();
+        let mut local = editable_record();
+        // This exercises store/UI projection, not machine-local runtime adoption.
+        // A distinct host keeps the fixture independent of installed deployments.
+        local.host_id = format!("{}-remote-test", cutex::platform::host::current_host_name());
+        local.codex_session_id = Some("019e0000-0000-7000-8000-000000000001".into());
         let mut store = CutexSessionStore::default();
         store
             .sessions
