@@ -1053,6 +1053,9 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
                 .context("status path must be UTF-8")?,
         );
     }
+    let status_items = ready.review.configuration.selected_projection.as_ref()
+        .and_then(|p| p.settings.tui.as_ref()).and_then(|t| t.status_line.as_ref());
+    launch = option(launch, "tui.status_line", super::notify::status_line(status_items))?;
     if bundle.soon_ingress() {
         launch = option(
             launch,

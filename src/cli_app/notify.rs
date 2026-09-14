@@ -130,3 +130,12 @@ fn desktop(command: DesktopNotifyCommand) -> anyhow::Result<()> {
         }
     }
 }
+
+/// Add the notification control to the light frontend without modifying reviewed assets.
+pub(super) fn status_line(items: Option<&Vec<String>>) -> Vec<String> {
+    let mut items = items.cloned().unwrap_or_else(|| vec!["model-with-reasoning".into(), "current-dir".into()]);
+    if !items.is_empty() && !items.iter().any(|item| item == "notification") {
+        items.push("notification".into());
+    }
+    items
+}

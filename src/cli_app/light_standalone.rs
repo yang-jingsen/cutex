@@ -120,6 +120,8 @@ pub(super) fn command(
             .arg("--status-items-file")
             .arg(status.materialize()?.to_string_lossy());
     }
+    launch = super::stock_lifecycle::option(launch, "tui.status_line",
+        super::notify::status_line(projection.settings.tui.as_ref().and_then(|t| t.status_line.as_ref())))?;
     // Explicit invocation options take precedence over the selected profile.
     let mut command = launch.args(args.iter().cloned()).to_command();
     command.env("CUTEX_NOTIFICATION_CONTROL", std::env::current_exe()?);
