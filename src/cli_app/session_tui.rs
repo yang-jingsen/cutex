@@ -7030,6 +7030,7 @@ fn selector_list_panel_from_horizontal_key(
         {
             PrimaryPanel::Recent
         }
+        SelectorMode::Settings { target, .. } if target.uses_global_settings() => PrimaryPanel::Settings,
         _ => return None,
     };
     match key.code {
@@ -9244,7 +9245,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
     {
         frame.render_widget(Paragraph::new(Line::from(footer_hints(&[
             ("↑/↓", "scroll"), ("PgUp/Dn", "page"), ("Home/End", "edge"),
-            ("Esc", "list"), ("F2", "details"), ("F1", "commands"),
+            ("F2", "details"), ("F1", "commands"), ("Esc", "list"),
         ]))).wrap(Wrap { trim: true }), area);
         return;
     }
@@ -9259,12 +9260,24 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
             Line::from("Type · ←/→ Home/End · Backspace/Delete · Ctrl+U clear · Enter/Esc/Tab finish · F1 commands")
         } else {
             Line::from(footer_hints(&[
-                ("↑/↓", "select"), ("Enter", "open"), ("Alt+I", "inspect"), ("←/→", "panels"),
-                ("/", "filter"), ("Alt+A", "actions"), ("Alt+E", "edit"),
+                ("↑/↓", "select"), ("Enter", "open"), ("Alt+I", "inspect"), ("Alt+A", "actions"), ("Alt+E", "edit"),
+                ("←/→", "panels"), ("/", "filter"),
                 ("F5", "refresh"), ("F2", "details"), ("F1", "commands"), ("Esc", "back"),
             ]))
         };
         frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), area);
+        return;
+    }
+    if matches!(&model.mode, SelectorMode::Settings { target, .. } if target.uses_global_settings())
+        && !selector_modal(model)
+    {
+        let mut hints = vec![("↑/↓", "select"), ("Enter", "open")];
+        if area.width >= 66 { hints.extend([("Tab", "focus"), ("V", "view")]); }
+        if area.width >= 66 && model.settings_are_editable() {
+            hints.extend([("S", "save"), ("D", "discard")]);
+        }
+        hints.extend([("←/→", "panels"), ("F2", "details"), ("F1", "commands"), ("Esc", "back"), ("Ctrl+C", "exit")]);
+        frame.render_widget(Paragraph::new(Line::from(footer_hints(&hints))).wrap(Wrap { trim: true }), area);
         return;
     }
     let narrow = area.width < WIDE_LAYOUT_MIN_WIDTH;
@@ -15584,7 +15597,7 @@ mod tests {
         assert!(medium.contains("Defaults options"));
         assert!(medium.contains("Default profile"));
         assert!(medium.contains("Direct default launch"));
-        assert!(medium.contains("Tab/Esc"));
+        assert!(medium.contains("Tab focus"));
         assert!(medium.contains("Ctrl+C exit"));
 
         let wide_boundary = rendered_text(96, &global_model);
@@ -16009,6 +16022,16 @@ mod tests {
         model.runtime_close_started(&intent);
         contract_key(&mut model, KeyCode::Enter);
         assert!(matches!(model.mode, SelectorMode::ClosingRuntime { .. }));
+    }
+
+    #[test]
+    fn global_settings_arrows_navigate_panels_without_opening_options() {
+        let mut model = SelectorModel::new(vec![global_row()], false, false);
+        selector_command(&mut model, Command::Settings);
+        let before = format!("{:?}", model.mode);
+        assert!(matches!(route_selector_key(&mut model, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)), SelectorKeyRoute::Control(None)));
+        assert_eq!(format!("{:?}", model.mode), before);
+        assert!(matches!(route_selector_key(&mut model, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)), SelectorKeyRoute::Switch(PrimaryPanel::Jobs)));
     }
 
     #[test]

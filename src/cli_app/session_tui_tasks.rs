@@ -767,15 +767,15 @@ fn render(frame: &mut Frame<'_>, model: &TaskModel) {
         ])
     } else if model.detail {
         footer_hints(&[
-            ("Esc/Tab", "close"),
             ("↑/↓ PgUp/PgDn", "scroll"),
             ("F5", "refresh"),
+            ("Esc/Tab", "close"),
         ])
     } else {
         footer_hints(&[
             ("↑/↓", "select"),
             ("Enter/Tab", "inspect"),
-            ("←/→", "tabs"),
+            ("←/→", "panels"),
             ("/", "filter"),
             ("Ctrl+A", "history"),
             ("F5", "refresh"),

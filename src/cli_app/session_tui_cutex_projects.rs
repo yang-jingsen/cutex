@@ -2032,7 +2032,12 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
                 ("↑/↓", "select"),
                 ("Enter", "details"),
                 ("Alt+N", "create"),
+                ("←/→", "panels"),
+                ("/", "filter"),
+                ("F5", "refresh"),
+                ("F2", "details"),
                 ("F1", "commands"),
+                ("Esc", "agents"),
             ]),
             ProjectView::Details if model.member_inspecting => footer_hints(&[
                 ("↑/↓", "scroll"),
@@ -2080,7 +2085,9 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
             ]),
         }
     };
-    footer.extend(footer_hints(&[("F2", "details")]));
+    if !matches!(model.view, ProjectView::List) || model.filter_focused {
+        footer.extend(footer_hints(&[("F2", "details")]));
+    }
     frame.render_widget(
         Paragraph::new(Line::from(footer))
             .wrap(Wrap { trim: true })
