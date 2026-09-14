@@ -24,17 +24,28 @@ pub(super) enum PrimaryPanel {
     Projects,
     Tasks,
     Recent,
+    Jobs,
+    Settings,
 }
 
 impl PrimaryPanel {
-    pub(super) const ALL: [Self; 4] = [Self::Agents, Self::Recent, Self::Projects, Self::Tasks];
+    pub(super) const ALL: [Self; 6] = [
+        Self::Agents,
+        Self::Recent,
+        Self::Projects,
+        Self::Tasks,
+        Self::Jobs,
+        Self::Settings,
+    ];
 
     pub(super) fn label(self) -> &'static str {
         match self {
-            Self::Agents => "Managed",
-            Self::Projects => "Cutex Projects",
+            Self::Agents => "Agents",
+            Self::Projects => "Projects",
             Self::Tasks => "Tasks",
-            Self::Recent => "Recent",
+            Self::Recent => "Sessions",
+            Self::Jobs => "Jobs",
+            Self::Settings => "Settings",
         }
     }
 
@@ -70,6 +81,8 @@ pub(super) fn primary_panel_shortcut(key: KeyEvent) -> Option<PrimaryPanel> {
         KeyCode::Char('r' | 'R') => Some(PrimaryPanel::Recent),
         KeyCode::Char('p' | 'P') => Some(PrimaryPanel::Projects),
         KeyCode::Char('t' | 'T') => Some(PrimaryPanel::Tasks),
+        KeyCode::Char('j' | 'J') => Some(PrimaryPanel::Jobs),
+        KeyCode::Char('s' | 'S') => Some(PrimaryPanel::Settings),
         _ => None,
     }
 }
@@ -148,7 +161,7 @@ mod tests {
     }
 
     #[test]
-    fn primary_panels_have_the_frozen_managed_recent_projects_tasks_order() {
+    fn primary_panels_include_jobs_and_settings_in_navigation_order() {
         assert_eq!(
             PrimaryPanel::ALL,
             [
@@ -156,16 +169,23 @@ mod tests {
                 PrimaryPanel::Recent,
                 PrimaryPanel::Projects,
                 PrimaryPanel::Tasks,
+                PrimaryPanel::Jobs,
+                PrimaryPanel::Settings,
             ]
         );
-        assert_eq!(PrimaryPanel::Agents.label(), "Managed");
-        assert_eq!(PrimaryPanel::Projects.label(), "Cutex Projects");
+        assert_eq!(PrimaryPanel::Agents.label(), "Agents");
+        assert_eq!(PrimaryPanel::Projects.label(), "Projects");
         assert_eq!(
             PrimaryPanel::Agents.adjacent(true),
             Some(PrimaryPanel::Recent)
         );
         assert_eq!(PrimaryPanel::Agents.adjacent(false), None);
-        assert_eq!(PrimaryPanel::Tasks.adjacent(true), None);
+        assert_eq!(PrimaryPanel::Tasks.adjacent(true), Some(PrimaryPanel::Jobs));
+        assert_eq!(
+            PrimaryPanel::Jobs.adjacent(true),
+            Some(PrimaryPanel::Settings)
+        );
+        assert_eq!(PrimaryPanel::Settings.adjacent(true), None);
         assert_eq!(
             PrimaryPanel::Tasks.adjacent(false),
             Some(PrimaryPanel::Projects)

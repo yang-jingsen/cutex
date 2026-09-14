@@ -6,6 +6,7 @@
 //! task state, and the Management route preserves the exact current Director
 //! seat plus Primary Director project-authority scope.
 
+use ratatui::widgets::Wrap;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, IsTerminal, Stdout};
 use std::sync::mpsc::{self, TryRecvError};
@@ -75,9 +76,9 @@ impl TaskState {
 
     fn style(self) -> Style {
         match self {
-            Self::Queued | Self::Assigned => Style::new().fg(Color::Cyan),
+            Self::Queued | Self::Assigned => Style::new().fg(crate::cli_app::session_tui_layout::FOCUS),
             Self::Running => Style::new().fg(Color::Green),
-            Self::ReviewReady => Style::new().fg(Color::Magenta),
+            Self::ReviewReady => Style::new().fg(crate::cli_app::session_tui_layout::ACCENT),
             Self::Blocked => Style::new().fg(Color::Yellow),
             Self::Closed => Style::new().fg(Color::DarkGray),
         }
@@ -714,7 +715,7 @@ fn handle_key(
                 .adjacent(false)
                 .map(PrimaryPanelOutcome::Switch)
         }
-        KeyCode::Right => return None,
+        KeyCode::Right => return PrimaryPanel::Tasks.adjacent(true).map(PrimaryPanelOutcome::Switch),
         KeyCode::Tab if model.detail => model.detail = false,
         KeyCode::Tab => {
             model.detail = model.selected_row().is_some();
@@ -741,6 +742,7 @@ fn render(frame: &mut Frame<'_>, model: &TaskModel) {
         Constraint::Length(3),
         Constraint::Min(4),
         Constraint::Length(1),
+        Constraint::Length(2),
     ])
     .split(area);
     let visible_count = model.visible_indices().len();
@@ -750,7 +752,7 @@ fn render(frame: &mut Frame<'_>, model: &TaskModel) {
         "active"
     };
     frame.render_widget(
-        Paragraph::new(super::session_tui_layout::tabs(
+        Paragraph::new(crate::cli_app::session_tui_layout::tabs(
             PrimaryPanel::Tasks,
             area.width,
         )),
@@ -760,20 +762,16 @@ fn render(frame: &mut Frame<'_>, model: &TaskModel) {
         Paragraph::new(Line::from(vec![
             Span::styled(
                 "Cutex Tasks",
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!("  {visible_count} {mode}")),
             Span::styled("  read-only", Style::new().fg(Color::DarkGray)),
-            Span::styled(
-                if model.loading { "  refreshing" } else { "" },
-                Style::new().fg(Color::Yellow),
-            ),
         ])),
         chunks[1],
     );
     render_filter(frame, chunks[2], model);
     let wide_inspector = area.width >= super::session_tui::INSPECTOR_SPLIT_MIN_WIDTH;
-    if let Some((list, inspector)) = super::session_tui_layout::inspector_panes(chunks[3], true) {
+    if let Some((list, inspector)) = crate::cli_app::session_tui_layout::inspector_panes(chunks[3], true) {
         render_table(frame, list, model);
         render_detail(frame, inspector, model, model.detail);
     } else {
@@ -803,45 +801,18 @@ fn render(frame: &mut Frame<'_>, model: &TaskModel) {
         ])
     };
     frame.render_widget(
-        Paragraph::new(Line::from(footer)).style(Style::new().fg(Color::DarkGray)),
-        chunks[4],
+        Paragraph::new(Line::from(footer)).wrap(Wrap { trim: true }).style(Style::new().fg(Color::DarkGray)),
+        chunks[5],
     );
+    frame.render_widget(Paragraph::new(model.warning.as_deref().unwrap_or("Ready")).style(Style::new().fg(if model.warning.is_some() { crate::cli_app::session_tui_layout::WARNING } else { crate::cli_app::session_tui_layout::MUTED })), chunks[4]);
     if model.detail && !wide_inspector {
         render_detail(frame, chunks[3], model, true);
     }
 }
 
 fn render_filter(frame: &mut Frame<'_>, area: Rect, model: &TaskModel) {
-    let title = if model.show_closed {
-        " Filter tasks (all history) "
-    } else {
-        " Filter tasks (active; Ctrl-A for all) "
-    };
-    frame.render_widget(
-        Paragraph::new(model.query.value()).block(Block::bordered().title(title).border_style(
-            Style::new().fg(if model.filter_focused {
-                Color::Cyan
-            } else {
-                Color::DarkGray
-            }),
-        )),
-        area,
-    );
-    if model.filter_focused && model.warning.is_none() {
-        frame.set_cursor_position((area.x + 1 + model.query.visual_cursor() as u16, area.y + 1));
-    }
-    if let Some(warning) = model.warning.as_deref() {
-        let warning_area = Rect {
-            x: area.x.saturating_add(1),
-            y: area.y.saturating_add(1),
-            width: area.width.saturating_sub(2),
-            height: 1,
-        };
-        frame.render_widget(
-            Paragraph::new(warning).style(Style::new().fg(Color::Yellow)),
-            warning_area,
-        );
-    }
+    let title = if model.show_closed { " Filter tasks · all history [/] " } else { " Filter tasks · active [/] " };
+    input_policy::render_input(frame, area, &model.query, title, model.filter_focused);
 }
 
 fn render_table(frame: &mut Frame<'_>, area: Rect, model: &TaskModel) {
@@ -1037,7 +1008,7 @@ fn task_table_row(row: &TaskRow, selected: bool, columns: &[(TaskColumn, u16)]) 
     }))
     .style(if selected {
         Style::new()
-            .bg(super::session_tui_layout::SELECTION)
+            .bg(crate::cli_app::session_tui_layout::SELECTION)
             .fg(Color::White)
             .add_modifier(Modifier::BOLD)
     } else {
@@ -1145,7 +1116,7 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, model: &TaskModel, focused: 
 fn detail_label(label: &str) -> Span<'static> {
     Span::styled(
         format!("{label:<16}"),
-        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD),
     )
 }
 
@@ -1428,7 +1399,7 @@ mod tests {
             assert_eq!(buffer[(3, 8)].fg, Color::Black);
             assert_eq!(
                 buffer[(12, 8)].bg,
-                super::super::session_tui_layout::SELECTION
+                crate::cli_app::session_tui_layout::SELECTION
             );
         }
     }
@@ -1461,16 +1432,16 @@ mod tests {
             terminal.draw(|frame| render(frame, &model)).unwrap();
             let output = buffer_text(terminal.backend().buffer());
             assert!(output.contains("CUTEX"), "width={width}\n{output}");
-            assert!(output.contains("Managed"), "width={width}\n{output}");
-            assert!(output.contains("Recent"), "width={width}\n{output}");
+            assert!(output.contains("Agents"), "width={width}\n{output}");
+            assert!(output.contains("Sessions"), "width={width}\n{output}");
             assert!(output.contains("Projects"), "width={width}\n{output}");
             assert!(output.contains("Tasks"), "width={width}\n{output}");
             assert!(
-                output.contains("Global Settings [Alt+S]"),
+                output.contains("Settings"),
                 "width={width}\n{output}"
             );
             assert!(
-                output.contains("Filter tasks (active"),
+                output.contains("Filter tasks · active"),
                 "width={width}\n{output}"
             );
             assert!(output.contains("Cutex Tasks"), "width={width}\n{output}");
@@ -1507,15 +1478,15 @@ mod tests {
         terminal.draw(|frame| render(frame, &model)).unwrap();
         let filter = buffer_text(terminal.backend().buffer());
         assert!(filter.contains("CUTEX"));
-        assert!(filter.contains("Global Settings [Alt+S]"));
-        assert!(filter.contains("Filter tasks (active"));
+        assert!(filter.contains("Settings"));
+        assert!(filter.contains("Filter tasks · active"));
 
         model.filter_focused = false;
         model.detail = true;
         terminal.draw(|frame| render(frame, &model)).unwrap();
         let detail = buffer_text(terminal.backend().buffer());
         assert!(detail.contains("CUTEX"));
-        assert!(detail.contains("Global Settings [Alt+S]"));
+        assert!(detail.contains("Settings"));
         assert!(detail.contains("Task Inspector"));
 
         handle_key(
@@ -1527,7 +1498,7 @@ mod tests {
         terminal.draw(|frame| render(frame, &model)).unwrap();
         let list = buffer_text(terminal.backend().buffer());
         assert!(list.contains("CUTEX"));
-        assert!(list.contains("Global Settings [Alt+S]"));
+        assert!(list.contains("Settings"));
         assert!(list.contains("Cutex Tasks"));
     }
 
@@ -1581,10 +1552,13 @@ mod tests {
         );
         terminal.draw(|frame| render(frame, &model)).unwrap();
         let middle = buffer_text(terminal.backend().buffer());
-        assert!(
-            middle.contains("/very/long/") && middle.contains("lt.json"),
-            "{middle}"
-        );
+        let mut visited = middle;
+        for _ in 0..40 {
+            handle_key(&mut model, &mut RefreshCadence::new(Instant::now()), KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            terminal.draw(|frame| render(frame, &model)).unwrap();
+            visited.push_str(&buffer_text(terminal.backend().buffer()));
+        }
+        assert!(visited.contains("/very/long/") && visited.contains("lt.json"), "{visited}");
         handle_key(
             &mut model,
             &mut RefreshCadence::new(Instant::now()),
@@ -1592,7 +1566,7 @@ mod tests {
         );
         terminal.draw(|frame| render(frame, &model)).unwrap();
         let last = buffer_text(terminal.backend().buffer());
-        assert!(last.contains("ESSION-END"), "{last}");
+        assert!(visited.contains("ESSION-END"), "{visited}");
         assert!(last.contains("Read-only"), "{last}");
         assert_eq!(
             model.selected_assignment_id.as_deref(),
@@ -1628,7 +1602,7 @@ mod tests {
                 &mut cadence,
                 KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
             ),
-            None
+            Some(PrimaryPanelOutcome::Switch(PrimaryPanel::Jobs))
         );
         assert!(!model.detail);
         assert_eq!(model.selected_assignment_id.as_deref(), Some("one"));

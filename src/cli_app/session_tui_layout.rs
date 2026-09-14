@@ -1,4 +1,4 @@
-//! Bounded shell geometry/theme. Tasks deliberately retains its legacy renderer.
+//! Shared shell geometry and colors for every primary panel.
 use super::session_tui_workspace::PrimaryPanel;
 use ratatui::{
     layout::Rect,
@@ -6,11 +6,12 @@ use ratatui::{
     text::{Line, Span},
 };
 
-pub(super) const BRAND: Color = Color::Magenta;
+pub(super) const BRAND: Color = Color::Rgb(247, 179, 205);
+pub(super) const ACCENT: Color = Color::Rgb(224, 142, 178);
 pub(super) const TEXT: Color = Color::White;
 pub(super) const MUTED: Color = Color::DarkGray;
-pub(super) const FOCUS: Color = Color::Cyan;
-pub(super) const SELECTION: Color = Color::Blue;
+pub(super) const FOCUS: Color = Color::Rgb(116, 186, 195);
+pub(super) const SELECTION: Color = Color::Rgb(38, 52, 79);
 pub(super) const SUCCESS: Color = Color::Green;
 pub(super) const WARNING: Color = Color::Yellow;
 pub(super) const ERROR: Color = Color::Red;
@@ -47,7 +48,7 @@ pub(super) fn tabs(active: PrimaryPanel, width: u16) -> Line<'static> {
         Span::styled("CUTEX", Style::new().fg(BRAND).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
     ];
-    if width < 42 {
+    if width < 60 {
         spans.push(Span::styled(
             active.label().to_owned(),
             Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
@@ -69,12 +70,6 @@ pub(super) fn tabs(active: PrimaryPanel, width: u16) -> Line<'static> {
                 } else {
                     Style::new().fg(MUTED)
                 },
-            ));
-        }
-        if width >= 72 {
-            spans.push(Span::styled(
-                "  Global Settings [Alt+S]",
-                Style::new().fg(FOCUS),
             ));
         }
     }

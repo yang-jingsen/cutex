@@ -886,6 +886,8 @@ impl SelectorModel {
             PrimaryPanel::Agents
             | PrimaryPanel::Projects
             | PrimaryPanel::Tasks
+            | PrimaryPanel::Jobs
+            | PrimaryPanel::Settings
             | PrimaryPanel::Recent => {}
         }
     }
@@ -4493,7 +4495,10 @@ pub(crate) fn run() -> anyhow::Result<()> {
     let mut tasks_model = None;
     loop {
         let outcome = match panel {
-            PrimaryPanel::Agents | PrimaryPanel::Recent => {
+            PrimaryPanel::Agents | PrimaryPanel::Recent | PrimaryPanel::Settings => {
+                if panel == PrimaryPanel::Settings && !matches!(selector_model.mode, SelectorMode::Settings { target: SelectorTarget::GlobalSettings, .. }) {
+                    selector_command(&mut selector_model, Command::Settings);
+                }
                 selector_model.activate_primary_panel(panel);
                 selector_model.enhanced_keyboard = shell.enhanced_keyboard();
                 ensure_recent(panel, &mut recent_catalog, RecentCatalog::spawn)?;
@@ -4510,6 +4515,12 @@ pub(crate) fn run() -> anyhow::Result<()> {
                     PrimaryPanel::Agents
                 };
                 outcome
+            }
+            PrimaryPanel::Jobs => {
+                match super::session_tui_jobs::run(shell.terminal(), &mut events)? {
+                    PrimaryPanelOutcome::Exit => return Ok(()),
+                    PrimaryPanelOutcome::Switch(next) => { panel = next; continue; }
+                }
             }
             PrimaryPanel::Projects => {
                 if std::mem::take(&mut refresh_project_members) {
@@ -5918,6 +5929,9 @@ fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyR
             SelectorKeyRoute::Control(None)
         }
         Command::Page(panel) => {
+            if matches!(model.mode, SelectorMode::Settings { target: SelectorTarget::GlobalSettings, .. }) {
+                model.leave_settings();
+            }
             model.finish_subject_context();
             model.settings_return_panel = None;
             model.filter_focused = false;
@@ -5943,7 +5957,7 @@ fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyR
                 .select(Some(SelectorTarget::GlobalSettings));
             model.open_settings();
             model.workspace_selection.select(selected);
-            model.settings_navigation = Some(Help::default());
+            model.settings_navigation = None;
             SelectorKeyRoute::Control(None)
         }
         Command::Exit => SelectorKeyRoute::Control(Some(SelectorControl::Exit)),
@@ -7125,16 +7139,18 @@ fn render_selector_contents(frame: &mut Frame<'_>, model: &SelectorModel) {
         Constraint::Length(3),
         Constraint::Min(1),
         Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(2),
     ])
     .split(area);
-    let active_panel = if matches!(&model.mode, SelectorMode::RecentSessions) {
+    let active_panel = if matches!(&model.mode, SelectorMode::Settings { target: SelectorTarget::GlobalSettings, .. } | SelectorMode::ProfileManager { .. }) {
+        PrimaryPanel::Settings
+    } else if matches!(&model.mode, SelectorMode::RecentSessions) {
         PrimaryPanel::Recent
     } else {
         PrimaryPanel::Agents
     };
     frame.render_widget(
-        Paragraph::new(super::session_tui_layout::tabs(active_panel, area.width)),
+        Paragraph::new(crate::cli_app::session_tui_layout::tabs(active_panel, area.width)),
         chunks[0],
     );
     render_header(frame, chunks[1], model);
@@ -7203,7 +7219,7 @@ fn render_selector_contents(frame: &mut Frame<'_>, model: &SelectorModel) {
             "Ready"
         });
     frame.render_widget(
-        Paragraph::new(format!("F2 details · {status}")).style(Style::new().fg(
+        Paragraph::new(status).style(Style::new().fg(
             if model.warning.is_some()
                 || (matches!(model.mode, SelectorMode::RecentSessions)
                     && matches!(
@@ -7211,9 +7227,9 @@ fn render_selector_contents(frame: &mut Frame<'_>, model: &SelectorModel) {
                         RecentLoadState::Failed(_) | RecentLoadState::ProviderIncompatible(_)
                     ))
             {
-                super::session_tui_layout::WARNING
+                crate::cli_app::session_tui_layout::WARNING
             } else {
-                super::session_tui_layout::SUCCESS
+                crate::cli_app::session_tui_layout::MUTED
             },
         )),
         chunks[4],
@@ -7231,9 +7247,9 @@ fn render_selector_contents(frame: &mut Frame<'_>, model: &SelectorModel) {
     if let Some(confirmed) = confirmed {
         frame.render_widget(
             Paragraph::new(if confirmed {
-                "Cancel  [Confirm] · Enter selected · F2 details"
+                "Cancel  [Confirm] · Enter selected"
             } else {
-                "[Cancel]  Confirm · Enter selected · F2 details"
+                "[Cancel]  Confirm · Enter selected"
             })
             .style(Style::new().add_modifier(Modifier::BOLD)),
             Rect {
@@ -7247,7 +7263,7 @@ fn render_selector_contents(frame: &mut Frame<'_>, model: &SelectorModel) {
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
     let (view, count) = match &model.mode {
-        SelectorMode::Agents => ("managed", model.visible_indices().len()),
+        SelectorMode::Agents => ("Agents", model.visible_indices().len()),
         SelectorMode::RecentSessions => ("recent sessions", model.recent.visible_rows().len()),
         SelectorMode::RetiredSessions { .. } => ("archived Agents", model.retired_rows.len()),
         SelectorMode::Actions { .. } => (
@@ -7276,8 +7292,8 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
         .then_some(Span::styled("  refreshing", Style::new().fg(Color::Yellow)));
     let mut spans = vec![
         Span::styled(
-            "cutex",
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            "Cutex",
+            Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!(" {view}"),
@@ -7296,7 +7312,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
                 "  {} · Alt+O scope",
                 ["All", "Online", "Pinned"][model.managed_scope]
             ),
-            Style::new().fg(Color::Cyan),
+            Style::new().fg(crate::cli_app::session_tui_layout::FOCUS),
         ));
         if model.show_thread_titles {
             spans.push(Span::styled(
@@ -7310,7 +7326,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
         if area.width < SETTINGS_TWO_PANE_MIN_WIDTH {
             spans.push(Span::styled(
                 format!("[{}]", settings_view.label()),
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD),
             ));
         } else {
             for view in [SettingsView::Expanded, SettingsView::Categories] {
@@ -7320,7 +7336,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
                     view.label().to_string()
                 };
                 let style = if view == settings_view {
-                    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD)
                 } else {
                     Style::new().fg(Color::DarkGray)
                 };
@@ -7456,7 +7472,7 @@ fn render_recent_context(frame: &mut Frame<'_>, area: Rect, model: &SelectorMode
     };
     frame.render_widget(
         Paragraph::new(format!(
-            "Recent {}/{} · {text}",
+            "Recent Sessions {}/{} · {text}",
             model.recent.visible_rows().len(),
             model.recent.rows().len()
         )),
@@ -7518,7 +7534,7 @@ fn render_recent_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorMo
             Line::from(""),
             Line::from(Span::styled(
                 "Cutex defaults: persistent management; native title is metadata, never a formal Agent name; default runtime; no groups; IM hidden; unpinned.",
-                Style::new().fg(Color::Cyan),
+                Style::new().fg(crate::cli_app::session_tui_layout::FOCUS),
             )),
             Line::from(""),
             Line::from(if model.recent.review_confirmed() {
@@ -7550,7 +7566,7 @@ fn render_recent_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorMo
         frame,
         filter_area,
         model.recent.filter_input(),
-        " Filter loaded Recent rows ",
+        " Filter sessions [/] ",
         model.recent.filter_focused(),
     );
     let rows: Vec<_> = model
@@ -7631,7 +7647,7 @@ fn render_profile_context(frame: &mut Frame<'_>, area: Rect, model: &SelectorMod
         if default_profile.as_deref() == Some(profile.name.as_str()) {
             spans.push(Span::styled(
                 "  launch default",
-                Style::new().fg(Color::Cyan),
+                Style::new().fg(crate::cli_app::session_tui_layout::FOCUS),
             ));
         }
         Line::from(spans)
@@ -7678,19 +7694,19 @@ fn render_profile_list(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel)
         return;
     };
     let default_profile = model.current_default_profile_name();
-    let default_style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let default_style = Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD);
     let mut rows = if area.width >= 40 {
         vec![Row::new([
             Cell::from("Default").style(default_style),
             Cell::from("-"),
             Cell::from(default_profile.as_deref().unwrap_or("none"))
-                .style(Style::new().fg(Color::Cyan)),
+                .style(Style::new().fg(crate::cli_app::session_tui_layout::FOCUS)),
         ])]
     } else {
         vec![Row::new([
             Cell::from("Default").style(default_style),
             Cell::from(default_profile.as_deref().unwrap_or("none"))
-                .style(Style::new().fg(Color::Cyan)),
+                .style(Style::new().fg(crate::cli_app::session_tui_layout::FOCUS)),
         ])]
     };
     rows.extend(
@@ -7715,7 +7731,7 @@ fn render_profile_list(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel)
             })
             .collect::<Vec<_>>(),
     );
-    let add_style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let add_style = Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD);
     if area.width >= 40 {
         rows.push(Row::new([
             Cell::from("Add profile").style(add_style),
@@ -7795,7 +7811,7 @@ fn render_profile_details(frame: &mut Frame<'_>, area: Rect, model: &SelectorMod
         .flat_map(|category| {
             std::iter::once(
                 Row::new([Cell::from(category.label), Cell::from("")])
-                    .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    .style(Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD)),
             )
             .chain(category.options.iter().map(|option| {
                 let label = if option.dirty {
@@ -7871,7 +7887,7 @@ fn render_profile_default_editor(frame: &mut Frame<'_>, area: Rect, model: &Sele
         ),
     ];
     let mut rows = vec![Row::new([Cell::from("Launch defaults"), Cell::from("")])
-        .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))];
+        .style(Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD))];
     rows.extend(fields.into_iter().map(|(field, label, value)| {
         let label = if model.global_settings_draft.field_is_dirty(field) {
             format!("  {label} *")
@@ -7927,7 +7943,7 @@ fn profile_state_style(profile: &ProfileCatalogEntry, default_profile: Option<&s
     if profile.active {
         Style::new().fg(Color::Green)
     } else if default_profile == Some(profile.name.as_str()) {
-        Style::new().fg(Color::Cyan)
+        Style::new().fg(crate::cli_app::session_tui_layout::FOCUS)
     } else {
         Style::new().fg(Color::DarkGray)
     }
@@ -8113,7 +8129,7 @@ fn render_managed_workspace_with_inspector(
     let list_focused =
         matches!(&model.mode, SelectorMode::Agents) && !model.inspector_overview_focused;
     if let Some((list, inspector)) =
-        super::session_tui_layout::inspector_panes(area, model.inspector_visible)
+        crate::cli_app::session_tui_layout::inspector_panes(area, model.inspector_visible)
     {
         render_managed_list_pane(frame, list, model, list_focused);
         render_agent_inspector(frame, inspector, model);
@@ -8144,7 +8160,7 @@ fn render_agent_inspector(frame: &mut Frame<'_>, area: Rect, model: &SelectorMod
     let overview = matches!(model.mode, SelectorMode::Agents);
     let block = Block::bordered()
         .title(" Inspector ")
-        .border_style(Style::new().fg(if active { Color::Cyan } else { Color::DarkGray }));
+        .border_style(Style::new().fg(if active { crate::cli_app::session_tui_layout::FOCUS } else { Color::DarkGray }));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -8172,7 +8188,7 @@ fn render_agent_inspector(frame: &mut Frame<'_>, area: Rect, model: &SelectorMod
         tabs.push(Span::styled(
             label,
             if candidate == section {
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD)
             } else {
                 Style::new().fg(Color::Gray)
             },
@@ -8268,7 +8284,7 @@ fn render_inspector_settings(
                     super::session_tui_cutex_projects::project_badge_style(project.color),
                 ),
                 Span::raw(format!(" {}  ", project.display_name)),
-                Span::styled("Alt+P edit", Style::new().fg(Color::Cyan)),
+                Span::styled("Alt+P edit", Style::new().fg(crate::cli_app::session_tui_layout::FOCUS)),
             ]))
             .block(Block::bordered().title(" Project badge settings ")),
             chunks[0],
@@ -8284,7 +8300,7 @@ fn render_filter(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel, focus
         frame,
         area,
         &model.query,
-        " Filter agents / Projects ",
+        " Filter agents / projects [/] ",
         focused && model.filter_focused,
     );
 }
@@ -8358,7 +8374,7 @@ fn render_action_table(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel)
     if row.launch_profile_control_available() {
         rows.push(
             Row::new([
-                Cell::from("Launch profile").style(Style::new().fg(Color::Cyan)),
+                Cell::from("Launch profile").style(Style::new().fg(crate::cli_app::session_tui_layout::FOCUS)),
                 Cell::from(row.launch_profile_detail(
                     model.selected_launch_profile(),
                     global_default_profile.as_deref(),
@@ -8438,7 +8454,7 @@ fn render_expanded_settings(frame: &mut Frame<'_>, area: Rect, model: &SelectorM
         .flat_map(|category| {
             std::iter::once(
                 Row::new([Cell::from(category.label), Cell::from("")])
-                    .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    .style(Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD)),
             )
             .chain(category.options.iter().map(|option| {
                 let label = if option.dirty {
@@ -8855,14 +8871,14 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 fn settings_panel_block(title: String, active: bool) -> Block<'static> {
     Block::bordered().title(title).border_style(if active {
-        Style::new().fg(Color::Cyan)
+        Style::new().fg(crate::cli_app::session_tui_layout::FOCUS)
     } else {
         Style::new().fg(Color::DarkGray)
     })
 }
 
 fn settings_highlight_style(active: bool) -> Style {
-    let style = Style::new().fg(Color::White).bg(Color::DarkGray);
+    let style = Style::new().fg(Color::White).bg(if active { crate::cli_app::session_tui_layout::SELECTION } else { Color::DarkGray });
     if active {
         style.add_modifier(Modifier::BOLD)
     } else {
@@ -9206,7 +9222,7 @@ fn lifecycle_style(state: CutexSessionLifecycleState) -> Style {
 
 pub(super) fn footer_hints(hints: &[(&'static str, &'static str)]) -> Vec<Span<'static>> {
     let mut spans = Vec::with_capacity(hints.len() * 4);
-    let key_style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let key_style = Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD);
     for (key, description) in hints {
         spans.push(Span::styled(*key, key_style));
         if !description.is_empty() {
@@ -9238,9 +9254,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
         {
             Line::from("Type · ←/→ Home/End · Backspace/Delete · Ctrl+U clear · Enter/Esc/Tab finish · F1 commands")
         } else {
-            input_policy::footer(&selector_commands(model))
+            Line::from(footer_hints(&[
+                ("↑/↓", "select"), ("Enter", "open"), ("←/→", "panels"),
+                ("/", "filter"), ("Alt+A", "actions"), ("Alt+E", "edit"),
+                ("F5", "refresh"), ("F2", "details"), ("F1", "commands"), ("Esc", "back"),
+            ]))
         };
-        frame.render_widget(Paragraph::new(line), area);
+        frame.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), area);
         return;
     }
     let narrow = area.width < WIDE_LAYOUT_MIN_WIDTH;
@@ -9688,7 +9708,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
     let mut help = exit_spans;
     help.extend(footer_hints(&[("F1", "commands")]));
     help.append(&mut spans);
-    frame.render_widget(Paragraph::new(Line::from(help)), area);
+    help.extend(footer_hints(&[("F2", "details")]));
+    frame.render_widget(Paragraph::new(Line::from(help)).wrap(Wrap { trim: true }), area);
 }
 
 #[cfg(test)]
@@ -9923,17 +9944,17 @@ mod tests {
         model.activate_primary_panel(PrimaryPanel::Agents);
         for width in 60..=240 {
             let area = Rect::new(0, 0, width, 18);
-            let expected = super::super::session_tui_layout::inspector_panes(area, true);
+            let expected = crate::cli_app::session_tui_layout::inspector_panes(area, true);
             model.query = Input::new("no match".into());
             model.ensure_selection();
             assert!(model.shows_managed_inspector());
             assert_eq!(
-                super::super::session_tui_layout::inspector_panes(area, model.inspector_visible),
+                crate::cli_app::session_tui_layout::inspector_panes(area, model.inspector_visible),
                 expected
             );
             if let Some((list, inspector)) = expected {
                 assert!(list.width - 2 >= 72 && inspector.width - 2 >= 38);
-                assert!(list.width <= super::super::session_tui_layout::LIST_PANE_MAX_WIDTH);
+                assert!(list.width <= crate::cli_app::session_tui_layout::LIST_PANE_MAX_WIDTH);
                 assert_eq!(inspector.right(), area.right());
             }
         }
@@ -10620,13 +10641,7 @@ mod tests {
         );
         model.settings_return_panel = Some(PrimaryPanel::Projects);
         let text = rendered_text_at(100, 30, &model);
-        for label in [
-            "Global Settings",
-            "Profiles",
-            "Appearance",
-            "Workspaces",
-            "Archive",
-        ] {
+        for label in ["Settings", "Global settings"] {
             assert!(text.contains(label), "{label}: {text}");
         }
         assert!(matches!(
@@ -10639,7 +10654,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT),
         );
         model.settings_return_panel = Some(PrimaryPanel::Tasks);
-        assert!(rendered_text_at(100, 30, &model).contains("Global Settings"));
+        assert!(rendered_text_at(100, 30, &model).contains("Global settings"));
         assert!(matches!(
             route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             SelectorKeyRoute::Switch(PrimaryPanel::Tasks)
@@ -15500,7 +15515,7 @@ mod tests {
         model.handle(SelectorEvent::OpenActions);
 
         let actions = rendered_text(96, &model);
-        assert!(actions.contains("cutex actions"));
+        assert!(actions.contains("Cutex actions"));
         assert!(actions.contains("ACTION"));
         assert!(actions.contains("DETAILS"));
         assert!(actions.contains("takeover"));
@@ -15558,10 +15573,6 @@ mod tests {
 
         let mut global_model = SelectorModel::new(vec![global_row()], false, false);
         selector_command(&mut global_model, Command::Settings);
-        route_selector_key(
-            &mut global_model,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        );
         global_model.handle(SelectorEvent::Down);
         let medium = rendered_text(80, &global_model);
         assert!(medium.contains("view Expanded [Categories]"));
@@ -15594,10 +15605,6 @@ mod tests {
 
         let mut narrow_model = SelectorModel::new(vec![global_row()], false, false);
         selector_command(&mut narrow_model, Command::Settings);
-        route_selector_key(
-            &mut narrow_model,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        );
         let narrow_categories = rendered_text(50, &narrow_model);
         assert!(narrow_categories.contains("Categories"));
         assert!(narrow_categories.contains("Notifications  12"));
@@ -15614,10 +15621,6 @@ mod tests {
 
         let mut narrow_choice_model = SelectorModel::new(vec![global_row()], false, false);
         selector_command(&mut narrow_choice_model, Command::Settings);
-        route_selector_key(
-            &mut narrow_choice_model,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        );
         narrow_choice_model.handle(SelectorEvent::Insert('v'));
         narrow_choice_model.handle(SelectorEvent::Activate);
         let narrow_choice = rendered_text_at(50, 24, &narrow_choice_model);
@@ -15626,10 +15629,6 @@ mod tests {
 
         let mut global_tail_model = SelectorModel::new(vec![global_row()], false, false);
         selector_command(&mut global_tail_model, Command::Settings);
-        route_selector_key(
-            &mut global_tail_model,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        );
         global_tail_model.handle(SelectorEvent::Last);
         global_tail_model.handle(SelectorEvent::OpenActions);
         global_tail_model.handle(SelectorEvent::Last);
@@ -15652,7 +15651,7 @@ mod tests {
             .draw(|frame| render_selector(frame, &model))
             .expect("render selector");
         let buffer = terminal.backend().buffer();
-        let footer_y = height - 1;
+        let footer_y = height - 2;
         let footer = (0..width)
             .map(|x| buffer.cell((x, footer_y)).expect("footer cell").symbol())
             .collect::<String>();
@@ -15667,7 +15666,7 @@ mod tests {
                 let cell = buffer
                     .cell((start + offset, footer_y))
                     .expect("shortcut cell");
-                assert_eq!(cell.fg, Color::Cyan);
+                assert_eq!(cell.fg, crate::cli_app::session_tui_layout::FOCUS);
                 assert!(cell.modifier.contains(Modifier::BOLD));
             }
             let description_start = start + key.len() as u16 + 1;
@@ -15675,7 +15674,7 @@ mod tests {
                 .cell((description_start, footer_y))
                 .expect("description cell");
             assert_eq!(description_cell.symbol(), &description[..1]);
-            assert_ne!(description_cell.fg, Color::Cyan);
+            assert_ne!(description_cell.fg, crate::cli_app::session_tui_layout::FOCUS);
             assert!(!description_cell.modifier.contains(Modifier::BOLD));
         }
     }

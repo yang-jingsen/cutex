@@ -1978,7 +1978,7 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
     ])
     .split(frame.area());
     frame.render_widget(
-        Paragraph::new(super::session_tui_layout::tabs(
+        Paragraph::new(crate::cli_app::session_tui_layout::tabs(
             PrimaryPanel::Projects,
             frame.area().width,
         )),
@@ -1988,11 +1988,7 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
         Paragraph::new(Line::from(vec![
             Span::styled(
                 "Cutex Projects",
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "  authenticated Human/Management boundary",
-                Style::new().fg(Color::DarkGray),
+                Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD),
             ),
         ])),
         areas[1],
@@ -2020,7 +2016,7 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
             render_operator_confirmation(frame, areas[2], model);
         }
     }
-    let footer = {
+    let mut footer = {
         match model.view {
             ProjectView::ConfirmImport => footer_hints(&[
                 ("Type", "formal name if required"),
@@ -2085,6 +2081,7 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
             ]),
         }
     };
+    footer.extend(footer_hints(&[("F2", "details")]));
     frame.render_widget(
         Paragraph::new(Line::from(footer))
             .wrap(Wrap { trim: true })
@@ -2097,7 +2094,7 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
     );
     frame.render_widget(
         Paragraph::new(format!(
-            "F2 details · {}",
+            "{}",
             model
                 .failure
                 .as_deref()
@@ -2105,9 +2102,9 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
                 .unwrap_or("Ready"),
         ))
         .style(Style::new().fg(if model.failure.is_some() {
-            super::session_tui_layout::ERROR
+            crate::cli_app::session_tui_layout::ERROR
         } else {
-            super::session_tui_layout::MUTED
+            crate::cli_app::session_tui_layout::MUTED
         })),
         areas[3],
     );
@@ -2176,9 +2173,9 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
     {
         frame.render_widget(
             Paragraph::new(if model.confirm_selected {
-                "Cancel  [Confirm] · Enter selected · F2 details"
+                "Cancel  [Confirm] · Enter selected"
             } else {
-                "[Cancel]  Confirm · Enter selected · F2 details"
+                "[Cancel]  Confirm · Enter selected"
             })
             .style(Style::new().add_modifier(Modifier::BOLD)),
             Rect {
@@ -2196,11 +2193,7 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel) {
         Constraint::Min(1),
     ])
     .split(area);
-    let filter_title = if model.filter_focused {
-        " Filter (typing) "
-    } else {
-        " Filter name / project id / badge  [/] "
-    };
+    let filter_title = " Filter projects / id / badge [/] ";
     input_policy::render_input(
         frame,
         chunks[0],
@@ -2241,7 +2234,7 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel) {
         )
         .style(if row_index == model.selected {
             Style::new()
-                .bg(Color::Blue)
+                .bg(crate::cli_app::session_tui_layout::SELECTION)
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD)
         } else {
@@ -2351,7 +2344,7 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel)
         tabs.push(Span::styled(
             section.label(),
             if section == model.section {
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD)
             } else {
                 Style::new().fg(Color::Gray)
             },
@@ -2523,7 +2516,7 @@ fn render_editor(frame: &mut Frame<'_>, area: Rect, editor: Option<&Presentation
         Line::from(vec![
             Span::styled(
                 if editor.field == index { "> " } else { "  " },
-                Style::new().fg(Color::Cyan),
+                Style::new().fg(crate::cli_app::session_tui_layout::FOCUS),
             ),
             Span::styled(
                 format!("{label}: "),
@@ -2560,9 +2553,9 @@ fn render_import_confirmation(frame: &mut Frame<'_>, area: Rect, model: &CutexPr
         Line::from(vec![
             Span::styled(
                 format!("{label:<14}"),
-                Style::new().fg(super::session_tui_layout::MUTED),
+                Style::new().fg(crate::cli_app::session_tui_layout::MUTED),
             ),
-            Span::styled(value, Style::new().fg(super::session_tui_layout::TEXT)),
+            Span::styled(value, Style::new().fg(crate::cli_app::session_tui_layout::TEXT)),
         ])
     };
     let assignment = request
@@ -2577,9 +2570,9 @@ fn render_import_confirmation(frame: &mut Frame<'_>, area: Rect, model: &CutexPr
         .unwrap_or_else(|| "None".into());
     let selected = Style::new()
         .fg(Color::White)
-        .bg(super::session_tui_layout::SELECTION)
+        .bg(crate::cli_app::session_tui_layout::SELECTION)
         .add_modifier(Modifier::BOLD);
-    let idle = Style::new().fg(super::session_tui_layout::MUTED);
+    let idle = Style::new().fg(crate::cli_app::session_tui_layout::MUTED);
     let buttons = Line::from(vec![
         Span::styled(
             " [ Cancel ] ",
@@ -2600,7 +2593,7 @@ fn render_import_confirmation(frame: &mut Frame<'_>, area: Rect, model: &CutexPr
         ),
     ]);
     let block = Block::bordered()
-        .border_style(Style::new().fg(super::session_tui_layout::FOCUS))
+        .border_style(Style::new().fg(crate::cli_app::session_tui_layout::FOCUS))
         .title(" Confirm durable Agent import / Project assignment ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -2610,7 +2603,7 @@ fn render_import_confirmation(frame: &mut Frame<'_>, area: Rect, model: &CutexPr
             Line::from(Span::styled(
                 "Review the exact Agent and Project plan",
                 Style::new()
-                    .fg(super::session_tui_layout::FOCUS)
+                    .fg(crate::cli_app::session_tui_layout::FOCUS)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
@@ -2672,7 +2665,7 @@ fn render_import_confirmation(frame: &mut Frame<'_>, area: Rect, model: &CutexPr
             Line::from(""),
             Line::from(Span::styled(
                 "Completed steps are retained if a later step fails. The server never retries this action automatically.",
-                Style::new().fg(super::session_tui_layout::WARNING),
+                Style::new().fg(crate::cli_app::session_tui_layout::WARNING),
             )),
             field("Action ID", request.action_id.to_string()),
         ])
@@ -2708,7 +2701,7 @@ fn render_create_editor(frame: &mut Frame<'_>, area: Rect, model: &CutexProjects
         Line::from(vec![
             Span::styled(
                 if editor.field == index { "> " } else { "  " },
-                Style::new().fg(Color::Cyan),
+                Style::new().fg(crate::cli_app::session_tui_layout::FOCUS),
             ),
             Span::styled(
                 format!("{label}: "),
@@ -2732,7 +2725,7 @@ fn render_create_editor(frame: &mut Frame<'_>, area: Rect, model: &CutexProjects
             )),
         ])
         .wrap(Wrap { trim: true })
-        .block(Block::bordered().border_style(Style::new().fg(Color::Cyan)).title(" Create Cutex Project ")),
+        .block(Block::bordered().border_style(Style::new().fg(crate::cli_app::session_tui_layout::FOCUS)).title(" Create Cutex Project ")),
         area,
     );
 }
@@ -2823,7 +2816,7 @@ fn render_director_picker(frame: &mut Frame<'_>, area: Rect, model: &CutexProjec
     let rows = rows.collect::<Vec<_>>();
     frame.render_widget(
         Table::new(rows, widths)
-            .header(header.style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
+            .header(header.style(Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD)))
             .column_spacing(1)
             .block(Block::bordered().title(title)),
         chunks[1],
@@ -2852,7 +2845,7 @@ fn render_project_actions(frame: &mut Frame<'_>, area: Rect, model: &CutexProjec
                         action.label
                     ),
                     if index == model.action_selected {
-                        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                        Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD)
                     } else {
                         Style::new()
                     },
@@ -2863,7 +2856,7 @@ fn render_project_actions(frame: &mut Frame<'_>, area: Rect, model: &CutexProjec
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: true }).block(
             Block::bordered()
-                .border_style(Style::new().fg(Color::Cyan))
+                .border_style(Style::new().fg(crate::cli_app::session_tui_layout::FOCUS))
                 .title(" Project Actions "),
         ),
         popup,
@@ -2891,7 +2884,7 @@ fn render_project_mutation_confirmation(
                     .bg(if confirmed {
                         Color::Yellow
                     } else {
-                        Color::Cyan
+                        crate::cli_app::session_tui_layout::FOCUS
                     })
                     .add_modifier(Modifier::BOLD)
             } else {
@@ -2940,7 +2933,7 @@ fn render_operator_confirmation(frame: &mut Frame<'_>, area: Rect, model: &Cutex
                     .bg(if confirmed {
                         Color::Yellow
                     } else {
-                        Color::Cyan
+                        crate::cli_app::session_tui_layout::FOCUS
                     })
                     .add_modifier(Modifier::BOLD)
             } else {
@@ -3951,7 +3944,7 @@ mod tests {
             let (x, y) = badge_cell(&buffer, "Confirm import + Project step");
             assert_eq!(
                 buffer[(x, y)].bg,
-                super::super::session_tui_layout::SELECTION
+                crate::cli_app::session_tui_layout::SELECTION
             );
             model.details_text = Some(project_status_details(&model));
             let details = model.details_text.as_deref().unwrap();
@@ -4620,7 +4613,7 @@ mod tests {
         let (cx, cy) = badge_cell(&wide, "CX");
         assert_eq!(wide[(cx, cy)].bg, Color::LightMagenta);
         assert_eq!(wide[(cx, cy)].fg, Color::Black);
-        assert_eq!(wide[(cx + 4, cy)].bg, Color::Blue, "selected row base");
+        assert_eq!(wide[(cx + 4, cy)].bg, crate::cli_app::session_tui_layout::SELECTION, "selected row base");
 
         let text = (0..wide.area.height)
             .map(|y| {

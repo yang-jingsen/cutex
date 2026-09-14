@@ -86,7 +86,7 @@ mod tests {
             assert_eq!(buffer[(4, 2)].fg, Color::Black);
             assert_eq!(buffer[(8, 2)].symbol(), "c");
             assert_eq!(buffer[(8, 3)].symbol(), "U", "aligned empty badge slot");
-            assert_eq!(buffer[(8, 2)].bg, Color::Blue);
+            assert_eq!(buffer[(8, 2)].bg, crate::cli_app::session_tui_layout::SELECTION);
             let columns = visible_columns(width - 4, ListKind::Managed);
             assert!(columns[0].1 <= 47);
             let mut x = 3;
@@ -99,7 +99,7 @@ mod tests {
                 if column == Column::Profile {
                     assert_eq!(buffer[(x, 2)].symbol(), "~");
                     assert_eq!(buffer[(x, 2)].fg, Color::Gray);
-                    assert_eq!(buffer[(x, 3)].fg, Color::Magenta);
+                    assert_eq!(buffer[(x, 3)].fg, crate::cli_app::session_tui_layout::ACCENT);
                     assert!(text(buffer).contains("~aemeath"));
                     assert!(text(buffer).contains("~?"));
                 }
@@ -175,7 +175,7 @@ mod tests {
         assert!(pieces.iter().any(|p| p.contains("👩‍💻")));
         let row = visual_row();
         assert!(inspector_lines(&row).iter().any(
-            |l| l.style.fg == Some(Color::Cyan) && l.spans.iter().any(|s| s.content == "Agent")
+            |l| l.style.fg == Some(crate::cli_app::session_tui_layout::FOCUS) && l.spans.iter().any(|s| s.content == "Agent")
         ));
         if std::env::var_os("CUTEX_UI_CAPTURE_DIR").is_some() {
             terminal.backend_mut().resize(60, 30);
@@ -610,7 +610,7 @@ fn runtime_style(runtime: &Observation<String>, selected: bool) -> Style {
 
 fn profile_style(row: &AgentSessionView, selected: bool) -> Style {
     Style::new().fg(if row.configured_profile.is_some() {
-        if selected { Color::LightMagenta } else { Color::Magenta }
+        if selected { Color::LightMagenta } else { crate::cli_app::session_tui_layout::ACCENT }
     } else if matches!(row.effective_profile, Observation::Known(ref value) if !value.trim().is_empty()) {
         if selected { Color::Gray } else { Color::DarkGray }
     } else { Color::Yellow })
@@ -705,7 +705,7 @@ pub(super) fn render_table(
                 let style = match c {
                     Column::Status => runtime_style(&row.runtime, selected),
                     Column::Profile => profile_style(row, selected),
-                    Column::Role => Style::new().fg(Color::Cyan),
+                    Column::Role => Style::new().fg(crate::cli_app::session_tui_layout::FOCUS),
                     Column::Activity | Column::Updated => Style::new().fg(Color::Gray),
                     _ => Style::new(),
                 };
@@ -719,7 +719,7 @@ pub(super) fn render_table(
             }))
             .style(if selected {
                 Style::new()
-                    .bg(super::session_tui_layout::SELECTION)
+                    .bg(crate::cli_app::session_tui_layout::SELECTION)
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD)
             } else {
@@ -908,7 +908,7 @@ pub(super) fn render_styled_details(
         format!("↑↓ Pg · lines {first}–{last}/{total} · Esc")
     };
     frame.render_widget(
-        Paragraph::new(footer).style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Paragraph::new(footer).style(Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD)),
         Rect {
             y: inner.y + inner.height - 1,
             height: 1,
@@ -945,7 +945,7 @@ fn inspector_lines(row: &AgentSessionView) -> Vec<Line<'static>> {
     let heading = |text: &str| {
         Line::styled(
             text.to_owned(),
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::new().fg(crate::cli_app::session_tui_layout::FOCUS).add_modifier(Modifier::BOLD),
         )
     };
     let field = |label: &str, value: String, style: Style| {
@@ -968,7 +968,7 @@ fn inspector_lines(row: &AgentSessionView) -> Vec<Line<'static>> {
         lines.push(field(
             "Role",
             row.role.clone(),
-            Style::new().fg(Color::Cyan),
+            Style::new().fg(crate::cli_app::session_tui_layout::FOCUS),
         ));
     }
     if let Some(activity) = &row.activity_details {

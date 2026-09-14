@@ -54,6 +54,7 @@ mod session_tui_cutex_projects;
 mod session_tui_dispatch;
 mod session_tui_input;
 mod session_tui_layout;
+mod session_tui_jobs;
 mod session_tui_profile_settings;
 mod session_tui_projects;
 mod session_tui_recent;

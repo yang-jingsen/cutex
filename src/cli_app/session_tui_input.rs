@@ -101,9 +101,9 @@ pub(super) fn render_input(
                 Block::bordered()
                     .title(title)
                     .border_style(ratatui::style::Style::new().fg(if focused {
-                        super::session_tui_layout::FOCUS
+                        crate::cli_app::session_tui_layout::FOCUS
                     } else {
-                        super::session_tui_layout::MUTED
+                        crate::cli_app::session_tui_layout::MUTED
                     })),
             ),
         area,
@@ -160,7 +160,7 @@ pub(super) const BINDINGS: &[Binding] = &[
         command: Command::Details,
         key: KeyCode::F(2),
         modifiers: KeyModifiers::NONE,
-        label: "Status / confirmation details",
+        label: "Details",
         hint: "F2",
     },
     Binding {
@@ -191,8 +191,8 @@ pub(super) const BINDINGS: &[Binding] = &[
         "Appearance: toggle Inspector",
         "Alt+B",
     ),
-    alt(Command::Page(PrimaryPanel::Agents), 'm', "Managed", "Alt+M"),
-    alt(Command::Page(PrimaryPanel::Recent), 'r', "Recent", "Alt+R"),
+    alt(Command::Page(PrimaryPanel::Agents), 'm', "Agents", "Alt+M"),
+    alt(Command::Page(PrimaryPanel::Recent), 'r', "Sessions", "Alt+R"),
     alt(
         Command::Page(PrimaryPanel::Projects),
         'p',
@@ -200,7 +200,8 @@ pub(super) const BINDINGS: &[Binding] = &[
         "Alt+P",
     ),
     alt(Command::Page(PrimaryPanel::Tasks), 't', "Tasks", "Alt+T"),
-    alt(Command::Settings, 's', "Global settings", "Alt+S"),
+    alt(Command::Page(PrimaryPanel::Jobs), 'j', "Jobs", "Alt+J"),
+    alt(Command::Settings, 's', "Settings", "Alt+S"),
     alt(Command::Actions, 'a', "Object actions", "Alt+A"),
     alt(Command::Inspect, 'i', "Inspect", "Alt+I"),
     alt(Command::Edit, 'e', "Edit object", "Alt+E"),
@@ -241,7 +242,7 @@ pub(super) fn footer(entries: &[(Command, Option<&'static str>)]) -> Line<'stati
         spans.push(ratatui::text::Span::styled(
             binding.hint,
             ratatui::style::Style::new()
-                .fg(ratatui::style::Color::Cyan)
+                .fg(crate::cli_app::session_tui_layout::FOCUS)
                 .add_modifier(ratatui::style::Modifier::BOLD),
         ));
         spans.push(ratatui::text::Span::raw(format!(" {}", binding.label)));
@@ -412,10 +413,10 @@ mod tests {
     use super::*;
     #[test]
     fn visual_restoration_shortcuts_have_semantic_style_and_same_commands() {
-        use ratatui::style::{Color, Modifier};
+        use ratatui::style::Modifier;
         let line = footer(&[(Command::Help, None), (Command::Settings, None)]);
         assert!(line.spans.iter().any(|s| s.content == "F1"
-            && s.style.fg == Some(Color::Cyan)
+            && s.style.fg == Some(crate::cli_app::session_tui_layout::FOCUS)
             && s.style.add_modifier.contains(Modifier::BOLD)));
         assert!(line.to_string().contains("Alt+S"));
         let mut terminal =
@@ -427,7 +428,7 @@ mod tests {
             .unwrap();
         let cell = &terminal.backend().buffer()[(0, 0)];
         assert_eq!(cell.symbol(), "F");
-        assert_eq!(cell.fg, Color::Cyan);
+        assert_eq!(cell.fg, crate::cli_app::session_tui_layout::FOCUS);
         assert!(cell.modifier.contains(Modifier::BOLD));
         assert_eq!(
             resolve(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)),
