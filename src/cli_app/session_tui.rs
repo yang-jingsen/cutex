@@ -5583,8 +5583,10 @@ fn sort_rows(rows: &mut [SelectorRow]) {
             (Some(left), Some(right)) => left.cmp(&right),
             (Some(_), None) => std::cmp::Ordering::Greater,
             (None, Some(_)) => std::cmp::Ordering::Less,
-            (None, None) => lifecycle_rank(left.lifecycle.expect("agent lifecycle"))
-                .cmp(&lifecycle_rank(right.lifecycle.expect("agent lifecycle")))
+            // Initial and failed runtime snapshots intentionally leave lifecycle
+            // unknown. Keep those rows after observed states, never panic.
+            (None, None) => left.lifecycle.map(lifecycle_rank).unwrap_or(u8::MAX)
+                .cmp(&right.lifecycle.map(lifecycle_rank).unwrap_or(u8::MAX))
                 .then_with(|| right.pinned.cmp(&left.pinned))
                 .then_with(|| left.agent.to_lowercase().cmp(&right.agent.to_lowercase()))
                 .then_with(|| left.target.agent_key().cmp(&right.target.agent_key())),
@@ -16022,6 +16024,21 @@ mod tests {
         model.runtime_close_started(&intent);
         contract_key(&mut model, KeyCode::Enter);
         assert!(matches!(model.mode, SelectorMode::ClosingRuntime { .. }));
+    }
+
+    #[test]
+    fn sorting_pending_runtime_rows_is_total_and_keeps_unknown_last() {
+        let mut unknown = row("cutex.unknown", "Unknown", CutexSessionLifecycleState::Online, false, true);
+        unknown.lifecycle = None;
+        let online = row("cutex.online", "Online", CutexSessionLifecycleState::Online, false, true);
+        let offline = row("cutex.offline", "Offline", CutexSessionLifecycleState::Offline, false, true);
+        let mut rows = vec![unknown, global_row(), offline, online];
+        sort_rows(&mut rows);
+        assert_eq!(rows[0].target.agent_key(), Some("cutex.online"));
+        assert_eq!(rows[1].target.agent_key(), Some("cutex.offline"));
+        assert_eq!(rows[2].target.agent_key(), Some("cutex.unknown"));
+        assert_eq!(rows[2].lifecycle, None);
+        assert!(rows[3].target.uses_global_settings());
     }
 
     #[test]

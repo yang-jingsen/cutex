@@ -21,3 +21,9 @@ Settings 不足 66 列时省略部分辅助提示，保留选择、打开、切�
 - 文本编辑、确认弹窗、Inspector 和项目工作区内部保留各自的光标/选择/内容导航。此时底部显示本地动作，不能误标为 panels。
 - Agent 自身的设置页保留内部导航，不等同于全局 Settings Panel。
 - 详情滚动提示先显示滚动/翻页，再显示刷新与关闭。
+
+## 同次验证发现的退出问题
+
+实际 PTY 从多个 Panel 切到 Settings 时复现退出 101：`session_tui.rs` 的 `sort_rows` 对 `lifecycle` 调用 `expect("agent lifecycle")`。初始快照未完成、Agent Bus 查询失败时，投影会合法地将 lifecycle 设置为 None，因此这一假设不成立。
+
+修复：已观测状态仍按原顺序排，未知状态排在其后、系统入口之前；保留未知含义，不伪造 Offline。新增混合已知/未知/系统行排序回归。此项与键位修复共同进入 r31，不能仅归因于用户操作或 PyCharm。
