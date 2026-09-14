@@ -13,7 +13,7 @@ use crate::app_server::protocol::RpcError;
 use crate::config::paths::host_codex_home_dir;
 use crate::launch::program::codex_program;
 
-const EXPECTED_PROVIDER_VERSION_PREFIX: &str = "0.153.";
+const SUPPORTED_PROVIDER_VERSION_PREFIXES: &[&str] = &["0.153.", "0.154."];
 const MAX_ERROR_TEXT_CHARS: usize = 2_048;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -119,11 +119,13 @@ impl CatalogClient {
             .next()
             .and_then(|product| product.rsplit_once('/'))
             .map(|(_, version)| version);
-        if !provider_version
-            .is_some_and(|version| version.starts_with(EXPECTED_PROVIDER_VERSION_PREFIX))
-        {
+        if !provider_version.is_some_and(|version| {
+            SUPPORTED_PROVIDER_VERSION_PREFIXES
+                .iter()
+                .any(|prefix| version.starts_with(prefix))
+        }) {
             return Err(CatalogError::ProviderIncompatible(format!(
-                "paired app-server version is incompatible: expected {EXPECTED_PROVIDER_VERSION_PREFIX}x, received {}",
+                "paired app-server version is incompatible: expected 0.153.x or 0.154.x, received {}",
                 bounded_text(user_agent)
             )));
         }
@@ -533,6 +535,22 @@ mod tests {
         );
         assert_eq!(sent[1], ("initialized".to_string(), Value::Null));
         assert_eq!(sent[2], ("project/list".to_string(), json!({ "limit": 1 })));
+    }
+
+    #[test]
+    fn supports_154_catalog_and_rejects_unvalidated_next_version() {
+        for (version, supported) in [("0.154.0", true), ("0.155.0", false)] {
+            let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let result = CatalogClient::from_endpoint(FakeEndpoint {
+                responses: vec![
+                    Ok(json!({"userAgent": format!("cutex_catalog/{version} (test)"), "codexHome": "/tmp"})),
+                    Ok(json!({"data": [], "nextCursor": null})),
+                ]
+                .into(),
+                sent,
+            });
+            assert_eq!(result.is_ok(), supported, "version {version}");
+        }
     }
 
     #[test]
