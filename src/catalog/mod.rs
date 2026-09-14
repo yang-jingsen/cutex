@@ -13,3 +13,5 @@ pub use client::CatalogError;
 pub use protocol::*;
 pub use stdio::OwnedStdioEndpoint;
 pub use stdio::StdioAppServerOptions;
+
+pub mod native_archive;

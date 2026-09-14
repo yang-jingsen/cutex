@@ -378,6 +378,7 @@ enum SelectorControl {
     Selected(SessionTuiIntent),
     OpenRetiredSessions,
     OpenRecentSessions,
+    ArchiveNative(String),
     Recent(RecentCommand),
     AdoptRecent(RecentAdoptionRequest),
     OpenProfileManager,
@@ -795,6 +796,8 @@ struct SelectorModel {
     suspended_managed_mode: Option<SelectorMode>,
     inspector_overview_focused: bool,
     recent_inspecting: bool,
+    native_actions: Option<(String, usize, bool)>,
+    native_archive_pending: bool,
     settings_navigation: Option<Help>,
     settings_return_panel: Option<PrimaryPanel>,
     profiles_from_settings: bool,
@@ -849,6 +852,8 @@ impl SelectorModel {
             suspended_managed_mode: None,
             inspector_overview_focused: false,
             recent_inspecting: false,
+            native_actions: None,
+            native_archive_pending: false,
             settings_navigation: None,
             settings_return_panel: None,
             profiles_from_settings: false,
@@ -1671,7 +1676,7 @@ impl SelectorModel {
                         );
                     }
                     self.recent_inspecting = false;
-                    self.recent.begin_review();
+                    self.native_actions = Some((row.thread_id, 0, false));
                 }
             }
             SelectorEvent::Back | SelectorEvent::Escape | SelectorEvent::OpenSettings => {
@@ -1688,6 +1693,17 @@ impl SelectorModel {
     }
 
     fn recent_catalog_reply(&mut self, reply: super::session_tui_recent::CatalogReply) {
+        if let super::session_tui_recent::CatalogReply::Archived { id, result } = &reply {
+            self.native_archive_pending = false;
+            match result {
+                Ok(()) => {
+                    self.recent.remove_archived(id);
+                    self.notice = Some(format!("Closed and archived. Restore history: cutex session restore-native {id}"));
+                }
+                Err(error) => self.warning = Some(error.clone()),
+            }
+            return;
+        }
         match load_cutex_session_store() {
             Ok(store) => {
                 let managed_names = managed_names_by_native_session_id();
@@ -5889,7 +5905,7 @@ fn selector_dirty(model: &SelectorModel) -> bool {
         )
 }
 fn selector_modal(model: &SelectorModel) -> bool {
-    matches!(model.mode, SelectorMode::ConfirmRuntimeAction { .. })
+    model.native_actions.is_some() || model.native_archive_pending || matches!(model.mode, SelectorMode::ConfirmRuntimeAction { .. })
         || (matches!(model.mode, SelectorMode::RecentSessions) && model.recent.review().is_some())
         || model.action_overlay.is_some()
         || model.settings_overlay.as_ref().is_some_and(|o| {
@@ -6182,6 +6198,29 @@ fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyR
     }
 }
 fn route_selector_key(model: &mut SelectorModel, key: KeyEvent) -> SelectorKeyRoute {
+    if model.native_archive_pending { return SelectorKeyRoute::Control(None); }
+    if let Some((id, mut selected, mut confirming)) = model.native_actions.take() {
+        if key.kind != KeyEventKind::Press {
+            model.native_actions = Some((id, selected, confirming));
+            return SelectorKeyRoute::Control(None);
+        }
+        match key.code {
+            KeyCode::Esc => {
+                if confirming { model.native_actions = Some((id, selected, false)); }
+                return SelectorKeyRoute::Control(None);
+            }
+            KeyCode::Up | KeyCode::Down if !confirming => selected = 1 - selected,
+            KeyCode::Enter if confirming => return SelectorKeyRoute::Control(Some(SelectorControl::ArchiveNative(id))),
+            KeyCode::Enter if selected == 0 => {
+                model.recent.begin_review();
+                return SelectorKeyRoute::Control(None);
+            }
+            KeyCode::Enter => confirming = true,
+            _ => {}
+        }
+        model.native_actions = Some((id, selected, confirming));
+        return SelectorKeyRoute::Control(None);
+    }
     if model.details.is_some() {
         if key.kind != KeyEventKind::Release && key.code == KeyCode::Esc {
             model.details = None;
@@ -6689,6 +6728,12 @@ fn run_event_loop(
                         SelectorControl::OpenRecentSessions => {
                             model.mode = SelectorMode::RecentSessions;
                             model.notice = None;
+                        }
+                        SelectorControl::ArchiveNative(id) => {
+                            if recent_catalog.as_ref().is_some_and(|catalog| catalog.archive(id)) {
+                                model.native_archive_pending = true;
+                                model.notice = Some("Closing and archiving session…".into());
+                            } else { model.warning = Some("Session worker unavailable; no close requested".into()); }
                         }
                         SelectorControl::Recent(command) => {
                             let cursor = model.recent.cursor_for(command);
@@ -7289,6 +7334,14 @@ fn render_selector(frame: &mut Frame<'_>, model: &SelectorModel) {
         return;
     }
     render_workspace(frame, model, &SelectorWorkspaceRenderer);
+    if let Some((id, selected, confirming)) = &model.native_actions {
+        let text = if *confirming {
+            format!("Session: {id}\n\nClose the runtime and archive this session and spawned descendants.\nHistory is retained. Restore with:\ncutex session restore-native {id}\n\nEnter: Close and archive    Esc: Cancel")
+        } else {
+            format!("Session: {id}\n\n{} Adopt as managed Agent\n{} Close and archive\n\n↑/↓ Select · Enter Open · Esc Back", if *selected == 0 { ">" } else { " " }, if *selected == 1 { ">" } else { " " })
+        };
+        views::render_details(frame, frame.area(), if *confirming { " Close and archive · Confirm " } else { " Session Actions " }, &text, &model.status_scroll);
+    }
     if let Some(navigation) = &model.settings_navigation {
         navigation.render_titled(
             frame,
@@ -10154,6 +10207,7 @@ mod tests {
         selector_command(&mut model, Command::Inspect);
         assert!(model.recent_inspecting);
         selector_command(&mut model, Command::Actions);
+        contract_key(&mut model, KeyCode::Enter);
         assert!(!model.recent_inspecting);
         assert!(model.recent.review().is_some());
         for c in "review-worker".chars() { contract_key(&mut model, KeyCode::Char(c)); }
@@ -16080,9 +16134,30 @@ mod tests {
     }
 
     #[test]
+    fn native_archive_menu_requires_confirmation_and_preserves_target() {
+        let mut model = contract_recent_model();
+        selector_command(&mut model, Command::Actions);
+        let id = model.native_actions.as_ref().unwrap().0.clone();
+        contract_key(&mut model, KeyCode::Down);
+        contract_key(&mut model, KeyCode::Enter);
+        assert!(model.native_actions.as_ref().unwrap().2);
+        contract_key(&mut model, KeyCode::Esc);
+        assert!(!model.native_actions.as_ref().unwrap().2);
+        contract_key(&mut model, KeyCode::Enter);
+        assert!(matches!(route_selector_key(&mut model, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), SelectorKeyRoute::Control(Some(SelectorControl::ArchiveNative(target))) if target == id));
+        assert!(model.native_actions.is_none());
+        model.native_archive_pending = true;
+        assert!(matches!(route_selector_key(&mut model, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), SelectorKeyRoute::Control(None)));
+        model.recent_catalog_reply(super::super::session_tui_recent::CatalogReply::Archived { id: id.clone(), result: Ok(()) });
+        assert!(!model.native_archive_pending);
+        assert!(!model.recent.rows().iter().any(|row| row.thread_id == id));
+    }
+
+    #[test]
     fn adoption_has_one_confirmation_pane_in_both_focus_states() {
         let mut model = contract_recent_model();
         route_selector_key(&mut model, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT));
+        contract_key(&mut model, KeyCode::Enter);
         for focused in [true, false] {
             if !focused { model.recent.blur_adoption_name(); }
             for width in [80, 160] {
@@ -16105,6 +16180,7 @@ mod tests {
             &mut model,
             KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT),
         );
+        contract_key(&mut model, KeyCode::Enter);
         assert!(model.recent.review().is_some());
         assert!(!model.recent.review_confirmed());
         assert_eq!(model.recent.adoption_name().unwrap().value(), "");
@@ -16127,6 +16203,7 @@ mod tests {
             &mut model,
             KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT),
         );
+        contract_key(&mut model, KeyCode::Enter);
         for ch in "Explicit name".chars() {
             contract_key(&mut model, KeyCode::Char(ch));
         }
@@ -16153,7 +16230,8 @@ mod tests {
         route_selector_key(
             &mut model,
             KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT),
-        ); // explicit fresh review
+        );
+        contract_key(&mut model, KeyCode::Enter); // explicit fresh review
         contract_key(&mut model, KeyCode::Esc);
         assert!(model.recent.review().is_some()); // First Esc leaves the name editor.
         contract_key(&mut model, KeyCode::Esc);

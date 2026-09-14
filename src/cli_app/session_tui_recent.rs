@@ -106,6 +106,7 @@ struct AdoptionReview {
 
 #[derive(Debug)]
 enum CatalogCommand {
+    Archive { request: u64, id: String },
     Load {
         request: u64,
         cursor: Option<String>,
@@ -115,6 +116,7 @@ enum CatalogCommand {
 
 #[derive(Debug)]
 pub(super) enum CatalogReply {
+    Archived { id: String, result: Result<(), String> },
     Page {
         cursor: Option<String>,
         result: Result<ThreadPage, CatalogError>,
@@ -166,6 +168,12 @@ impl RecentCatalog {
             .is_ok()
     }
 
+    pub(super) fn archive(&self, id: String) -> bool {
+        let request = self.request.get().wrapping_add(1);
+        self.request.set(request);
+        self.commands.send(CatalogCommand::Archive { request, id }).is_ok()
+    }
+
     pub(super) fn poll(&self) -> Option<CatalogReply> {
         loop {
             match self.replies.try_recv() {
@@ -191,12 +199,26 @@ impl RecentCatalog {
 
 fn catalog_worker(commands: Receiver<CatalogCommand>, replies: Sender<(u64, CatalogReply)>) {
     let mut client = CatalogClient::spawn_local();
-    while let Ok(CatalogCommand::Load {
-        request,
-        cursor,
-        retry,
-    }) = commands.recv()
-    {
+    while let Ok(command) = commands.recv() {
+        let (request, cursor, retry) = match command {
+            CatalogCommand::Archive { request, id } => {
+                let result = cutex::catalog::native_archive::change(&id, false, None)
+                    .map(|_| ()).map_err(|error| format!("{error:#}"));
+                let succeeded = result.is_ok();
+                if replies.send((request, CatalogReply::Archived { id, result })).is_err() { break; }
+                // Native archive includes descendants; refresh the full first page,
+                // rather than only removing the selected parent from the UI.
+                if succeeded {
+                    let result = match &mut client {
+                        Ok(client) => client.thread_list(thread_list_params(None)),
+                        Err(error) => Err(error.clone()),
+                    };
+                    if replies.send((request, CatalogReply::Page { cursor: None, result })).is_err() { break; }
+                }
+                continue;
+            }
+            CatalogCommand::Load { request, cursor, retry } => (request, cursor, retry),
+        };
         if retry && client.is_err() {
             client = CatalogClient::spawn_local();
         }
@@ -365,13 +387,19 @@ impl RecentSessionsWorkspace {
         self.receive_with_managed_names(reply, store, &HashMap::new());
     }
 
+    pub(super) fn remove_archived(&mut self, id: &str) {
+        self.rows.retain(|row| row.thread_id != id);
+        self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+        self.loading = false;
+    }
+
     pub(super) fn receive_with_managed_names(
         &mut self,
         reply: CatalogReply,
         store: &CutexSessionStore,
         managed_names: &HashMap<String, String>,
     ) {
-        let CatalogReply::Page { cursor, result } = reply;
+        let CatalogReply::Page { cursor, result } = reply else { return; };
         self.loading = false;
         match result {
             Ok(page) => {
@@ -447,7 +475,7 @@ impl RecentSessionsWorkspace {
     /// reconciliation. A store read failure must leave the UI retryable rather
     /// than indefinitely showing its previous loading state.
     pub(super) fn reconciliation_failed(&mut self, reply: CatalogReply, message: String) {
-        let CatalogReply::Page { cursor, .. } = reply;
+        let CatalogReply::Page { cursor, .. } = reply else { return; };
         self.loading = false;
         self.failed_cursor = cursor;
         self.load_state = RecentLoadState::Failed(bound(&message));

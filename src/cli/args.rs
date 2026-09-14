@@ -484,6 +484,19 @@ pub enum SessionCommand {
     },
     /// Attach stock native CLI to the exact already-ready owner (no new writer)
     StockAttach { id: String },
+    /// Close and archive a native session and its spawned descendants; retain history
+    CloseNative {
+        id: String,
+        /// Existing daemon Unix socket (defaults to the native home's control socket)
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
+    },
+    /// Restore a native archived session without starting its runtime
+    RestoreNative {
+        id: String,
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
+    },
     /// Open the interactive session management wizard
     #[command(visible_alias = "edit")]
     Wizard {

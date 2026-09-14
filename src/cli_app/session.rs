@@ -13,6 +13,16 @@ pub(crate) fn run_command(command: SessionCommand) -> anyhow::Result<()> {
             request,
             management_url,
         } => super::stock_lifecycle::request(&request, &management_url),
+        SessionCommand::CloseNative { id, socket } => {
+            let result = cutex::catalog::native_archive::change(&id, false, socket.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
+        SessionCommand::RestoreNative { id, socket } => {
+            let result = cutex::catalog::native_archive::change(&id, true, socket.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
         SessionCommand::StockAttach { id } => super::stock_lifecycle::attach(&id),
         SessionCommand::Wizard { list } => cmd_session_wizard(&list),
         SessionCommand::List { list } => cmd_session_list(&list),
