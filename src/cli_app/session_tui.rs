@@ -8590,6 +8590,45 @@ fn render_settings_browser(frame: &mut Frame<'_>, area: Rect, model: &SelectorMo
     }
 }
 
+fn setting_option_style(option: &SessionTuiSettingOption) -> Style {
+    let actionable = option.field.is_some() || option.global_field.is_some()
+        || option.profile_field.is_some() || option.command.is_some() || option.navigation.is_some();
+    Style::new().fg(if actionable { Color::White } else { Color::Gray })
+}
+
+fn notification_preview() -> cutex::notify::session::Labels {
+    cutex::notify::session::labels().unwrap_or_default()
+}
+
+fn notification_span(label: String, style: &cutex::notify::session::ItemStyle) -> Span<'static> {
+    let color = style.fg.parse::<Color>().unwrap_or(Color::White);
+    let mut rendered = Style::new().fg(color);
+    if style.bold { rendered = rendered.add_modifier(Modifier::BOLD); }
+    Span::styled(label, rendered)
+}
+
+fn setting_value_line(option: &SessionTuiSettingOption) -> Line<'static> {
+    if option.label == "Session priority" {
+        let labels = notification_preview();
+        return Line::from(vec![
+            notification_span(labels.important, &labels.styles.important), Span::raw(" / "),
+            notification_span(labels.normal, &labels.styles.normal), Span::raw(" / "),
+            notification_span(labels.off, &labels.styles.off), Span::raw("; Alt+N in cute-codex"),
+        ]).style(setting_option_style(option));
+    }
+    if option.global_field == Some(GlobalSettingsField::DefaultNotification) {
+        let labels = notification_preview();
+        let (label, style) = match option.value.as_str() {
+            "important" | "CIAO!" => (labels.important, labels.styles.important),
+            "normal" | "ON" => (labels.normal, labels.styles.normal),
+            "off" | "OFF" => (labels.off, labels.styles.off),
+            _ => return Line::styled(option.value.clone(), setting_option_style(option)),
+        };
+        return Line::from(notification_span(label, &style));
+    }
+    Line::styled(option.value.clone(), setting_option_style(option))
+}
+
 fn render_expanded_settings(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
     let Some(row) = model.active_row() else {
         return;
@@ -8609,8 +8648,8 @@ fn render_expanded_settings(frame: &mut Frame<'_>, area: Rect, model: &SelectorM
                     format!("  {}", option.label)
                 };
                 Row::new([
-                    Cell::from(label),
-                    Cell::from(option.value.as_str()).style(Style::new().fg(Color::Gray)),
+                    Cell::from(label).style(setting_option_style(option)),
+                    Cell::from(setting_value_line(option)),
                 ])
             }))
         })
@@ -8709,8 +8748,8 @@ fn render_setting_options(
                     option.label.to_string()
                 };
                 Row::new([
-                    Cell::from(label),
-                    Cell::from(option.value.as_str()).style(Style::new().fg(Color::Gray)),
+                    Cell::from(label).style(setting_option_style(option)),
+                    Cell::from(setting_value_line(option)),
                 ])
             })
             .collect::<Vec<_>>();
@@ -8733,7 +8772,7 @@ fn render_setting_options(
                 } else {
                     option.label.to_string()
                 };
-                Row::new([Cell::from(label)])
+                Row::new([Cell::from(label).style(setting_option_style(option))])
             })
             .collect::<Vec<_>>();
         let table = Table::new(rows, [Constraint::Min(12)])
@@ -8756,10 +8795,10 @@ fn render_setting_value(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel
             } else {
                 option.label.to_string()
             },
-            Style::new().fg(Color::Gray).add_modifier(Modifier::BOLD),
+            setting_option_style(option).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(option.value.as_str()),
+        setting_value_line(option),
     ];
     frame.render_widget(
         Paragraph::new(body)
@@ -8822,7 +8861,18 @@ fn render_settings_overlay(frame: &mut Frame<'_>, area: Rect, model: &SelectorMo
             items.extend(
                 choices
                     .iter()
-                    .map(|choice| ListItem::new(choice.label.as_str())),
+                    .map(|choice| {
+                        if model.active_setting_option().is_some_and(|o| o.global_field == Some(GlobalSettingsField::DefaultNotification)) {
+                            let labels = notification_preview();
+                            let span = match choice.value.as_deref() {
+                                Some("important") => notification_span(labels.important, &labels.styles.important),
+                                Some("normal") => notification_span(labels.normal, &labels.styles.normal),
+                                Some("off") => notification_span(labels.off, &labels.styles.off),
+                                _ => Span::raw(choice.label.clone()),
+                            };
+                            ListItem::new(Line::from(span))
+                        } else { ListItem::new(choice.label.as_str()) }
+                    }),
             );
             let title = model
                 .active_setting_label()
@@ -9024,12 +9074,7 @@ fn settings_panel_block(title: String, active: bool) -> Block<'static> {
 }
 
 fn settings_highlight_style(active: bool) -> Style {
-    let style = Style::new().fg(Color::White).bg(if active { crate::cli_app::session_tui_layout::selection() } else { Color::DarkGray });
-    if active {
-        style.add_modifier(Modifier::BOLD)
-    } else {
-        style
-    }
+    Style::new().bg(if active { crate::cli_app::session_tui_layout::selection() } else { Color::DarkGray })
 }
 
 fn render_runtime_action_confirmation(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {

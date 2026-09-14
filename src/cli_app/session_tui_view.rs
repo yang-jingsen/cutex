@@ -523,7 +523,10 @@ impl Column {
     fn value(self, row: &AgentSessionView) -> String {
         match self {
             Self::Name => row.name.clone(),
-            Self::Status => row.runtime.label(),
+            Self::Status => match &row.runtime {
+                Observation::Unavailable(_) => "N/A".into(),
+                _ => row.runtime.label(),
+            },
             Self::Role => row.role.clone(),
             Self::Activity => row.activity.clone(),
             Self::Project => match &row.project {
@@ -537,7 +540,7 @@ impl Column {
     }
 }
 pub(super) fn visible_columns(width: u16, kind: ListKind) -> Vec<(Column, u16)> {
-    let mut columns = vec![(Column::Status, 11)];
+    let mut columns = vec![(Column::Status, 7)];
     if kind == ListKind::Members && width >= 36 {
         columns.push((Column::Role, 16));
     }

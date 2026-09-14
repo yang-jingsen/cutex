@@ -24,3 +24,18 @@ Managed creation initializes notification state when the UUID is known. For ordi
 Esc closes an active editor first. Categorized Settings then unwinds Value -> Options -> Categories before returning to the originating panel. Dirty drafts still use the existing leave review.
 
 Validation: scoped model/effort drafts and discard, profile/shared inheritance, preference persistence and creation cutoff, adoption retries with fixed creation settings, Settings cancellation routes, and terminal UI checks. The full TUI suite retains three previously documented environment/fixture failures (installed-runtime expectation, invalid synthetic native ID, and fixture owner collision).
+
+### Settings presentation (r42)
+
+Editable and actionable setting labels are white; read-only labels and values are
+light gray. Selection changes the background without replacing semantic foreground
+colors. Notification priority previews and the default notification choice list use
+labels, foreground colors and bold settings from `~/.cutex/notifications/config.json`.
+No emoji or edit icons are added.
+
+List STATUS uses `N/A` for an unavailable observation and reserves seven columns;
+Details retain the underlying reason. Filter titles explicitly reset their text
+style, preventing underlying content from contributing colors or bold attributes.
+
+Validation: 285 TUI tests passed, two ignored; the same three existing runtime/fixture
+failures remain. The new filter-title regression covers underlying colored/bold text.

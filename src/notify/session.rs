@@ -86,6 +86,10 @@ pub struct Preference {
     pub style: ItemStyle,
 }
 
+pub fn labels() -> anyhow::Result<Labels> {
+    read_json(&crate::config::paths::config_dir()?.join("notifications/config.json"))
+}
+
 pub fn session(thread_id: &str, change: Change) -> anyhow::Result<Preference> {
     session_at(
         &crate::config::paths::config_dir()?.join("notifications"),

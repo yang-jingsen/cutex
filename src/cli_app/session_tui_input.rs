@@ -99,7 +99,11 @@ pub(super) fn render_input(
             .scroll((0, scroll.min(u16::MAX as usize) as u16))
             .block(
                 Block::bordered()
-                    .title(title)
+                    .title(ratatui::text::Line::styled(title, ratatui::style::Style::reset().fg(if focused {
+                        crate::cli_app::session_tui_layout::focus()
+                    } else {
+                        crate::cli_app::session_tui_layout::muted()
+                    })))
                     .border_style(ratatui::style::Style::new().fg(if focused {
                         crate::cli_app::session_tui_layout::focus()
                     } else {
@@ -450,6 +454,22 @@ fn overlay(frame: &mut Frame<'_>, title: &str, lines: Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn filter_title_resets_underlying_color_and_modifiers() {
+        use ratatui::{backend::TestBackend, style::{Color, Modifier, Style}, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(50, 3)).unwrap();
+        terminal.draw(|frame| {
+            frame.render_widget(Paragraph::new("underlying panel title, including a pale suffix")
+                .style(Style::new().fg(Color::Gray).add_modifier(Modifier::BOLD)), frame.area());
+            render_input(frame, frame.area(), &Input::default(), " Filter tasks · active [/] ", false);
+        }).unwrap();
+        for x in 1..27 {
+            let cell = &terminal.backend().buffer()[(x, 0)];
+            assert_eq!(cell.fg, crate::cli_app::session_tui_layout::muted());
+            assert!(!cell.modifier.contains(Modifier::BOLD));
+        }
+    }
+
     use super::*;
     #[test]
     fn visual_restoration_shortcuts_have_semantic_style_and_same_commands() {
