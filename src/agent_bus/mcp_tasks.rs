@@ -1,6 +1,9 @@
 //! Outbound-only native Task tool surface. All transitions remain provider-owned.
 use serde_json::{json, Value};
 
+#[path = "mcp_task_arguments.rs"]
+mod arguments;
+
 #[path = "mcp_task_director.rs"]
 mod director;
 #[path = "mcp_task_terminal.rs"]
@@ -66,11 +69,13 @@ pub(super) fn tools() -> Vec<Value> {
         json!("Required for assign, create_and_assign and all result/cancel decisions.");
     director["opaque_contract"]["description"] = json!("Exact UTF-8 contract, at most 131072 bytes. Trusted adapter computes SHA-256; do not submit a digest.");
     director["completion_authority_cutex_session_id"]["description"] = json!("Optional intended completion target; provider validates its current seat. Never caller authority.");
+    let director_help = arguments::describe(DIRECTOR, &mut director);
+    let worker_help = arguments::describe(WORKER, &mut worker);
     vec![
         json!({"name":READ,"description":"Read the full immutable contract of your own assignment, including its revision and SHA-256. Available before start; does not start an attempt or modify task state.","inputSchema":{"type":"object","properties":{"assignment_id":{"type":"string"}},"required":["assignment_id"],"additionalProperties":false}}),
         json!({"name":TERMINAL,"description":"Explicit completion-seat decision (including Release). accept_result/request_changes/fail_result only; request_changes requires decision_reference. Current runtime, seat and mechanical revisions are resolved by Cutex, never tool arguments. Reuse exact action_id/payload after uncertainty.","inputSchema":{"type":"object","properties":{"operation":{"type":"string","enum":["accept_result","request_changes","fail_result"]},"action_id":{"type":"string"},"assignment_id":{"type":"string"},"decision_reference":{"type":"string","maxLength":4096}},"required":["operation","action_id","assignment_id"],"additionalProperties":false}}),
-        json!({"name":WORKER,"description":"Semantic Worker action. Requires operation, action_id and assignment_id. Runtime and assignment authority are provider-authenticated, never supplied in arguments. report_status/block require summary; submit requires result_sha256 and result_reference.","inputSchema":{"type":"object","properties":worker,"required":["operation","action_id","assignment_id"],"additionalProperties":false}}),
-        json!({"name":DIRECTOR,"description":"Semantic Director action. Create requires project_id, workflow_id, task_id, task_revision, opaque_contract, completion_policy. Assign requires project_id, task_id, task_revision, assignment_id, assignee_cutex_session_id, summary. create_and_assign requires both sets and is a recoverable two-step operation, NOT atomic. Query requires selector. Decisions require assignment_id. Reuse action_id exactly after uncertain response.","inputSchema":{"type":"object","properties":director,"required":["operation","action_id"],"additionalProperties":false}}),
+        json!({"name":WORKER,"description":format!("Semantic Worker action. Runtime and assignment authority are provider-authenticated. {worker_help}"),"inputSchema":{"type":"object","properties":worker,"required":["operation","action_id","assignment_id"],"additionalProperties":false}}),
+        json!({"name":DIRECTOR,"description":format!("Semantic Director action. {director_help} create_and_assign is recoverable, NOT atomic. Reuse the exact action_id AND payload after an uncertain response. Example acceptance: {{\"operation\":\"accept_result\",\"action_id\":\"accept-1\",\"assignment_id\":\"assignment-1\",\"decision_reference\":\"/path/to/acceptance.md\"}}. For decisions, summary/project_id/task_id/task_revision are forbidden; decision_reference is optional for accept_result/fail_result/cancel, required for request_changes."),"inputSchema":{"type":"object","properties":director,"required":["operation","action_id"],"additionalProperties":false}}),
     ]
 }
 
@@ -144,6 +149,9 @@ pub(super) fn invoke(name: &str, args: Value, transport: &mut impl Transport) ->
             "schema":"cutex/task-service-query/v2",
             "query":{"operation":"read_contract","body":{"assignment_id":args.assignment_id}}
         })).unwrap_or_else(|_| json!({"status":"no_write","code":"query_transport_failed"}));
+    }
+    if let Some(error) = arguments::validate(name, &args) {
+        return error;
     }
     if let Some(field) = missing_field(name, &args) {
         return json!({"schema":if name==WORKER {"cutex/task-service-tool-receipt/v1"} else {"cutex/task-service-director-tool-receipt/v1"},"status":"no_write","code":format!("missing_{field}")});
