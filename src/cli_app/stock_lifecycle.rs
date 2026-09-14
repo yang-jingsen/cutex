@@ -739,7 +739,7 @@ impl StockRuntimeExecutor for StockExecutor {
         receipt: &StockRuntimeReceipt,
     ) -> anyhow::Result<()> {
         let binding = receipt.binding.as_ref().context("stock binding missing")?;
-        let bundle = StockBundle::load(&receipt.review.contract)?;
+        let bundle = StockBundle::load_running(&receipt.review.contract)?;
         if bundle.common_ingress() {
             ExternalInputBinding::from_review(receipt)
                 .verify(std::path::Path::new(&binding.runtime_dir))?;
@@ -1029,7 +1029,13 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
     // when its server, host and wire schema are byte-identical to that owner.
     let desired = record.explicit_launch.as_ref()
         .filter(|desired| desired.bundle_sha256 != contract.bundle_sha256)
-        .map(StockBundle::load).transpose()?;
+        .and_then(|desired| match StockBundle::load(desired) {
+            Ok(bundle) => Some(bundle),
+            Err(error) => {
+                eprintln!("Optional frontend update unavailable; using running bundle: {error}");
+                None
+            }
+        });
     let frontend = desired.as_ref().filter(|desired| {
         desired.version == 4 && bundle.version == 4
             && desired.executable.sha256 == bundle.executable.sha256
@@ -1066,7 +1072,7 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
     {
         launch = launch.arg("--status-items-file").arg(
             status
-                .materialize()?
+                .materialize_frozen()?
                 .to_str()
                 .context("status path must be UTF-8")?,
         );

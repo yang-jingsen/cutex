@@ -257,6 +257,8 @@ pub fn map_event(e: &EventEnvelope, level: Level, name: &str) -> Option<Value> {
         "item/tool/requestUserInput"
         | "item/commandExecution/requestApproval"
         | "item/fileChange/requestApproval"
+        | "mcpServer/elicitation/request"
+        | "item/permissions/requestApproval"
             if request =>
         {
             "agent.attention_required"

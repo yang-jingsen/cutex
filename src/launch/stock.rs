@@ -213,6 +213,9 @@ pub struct StockBundle {
     pub schema: VerifiedFile,
     /// The authoritative shared config is reviewed, never rewritten on launch.
     pub shared_config: VerifiedFile,
+    /// Launch semantics exclude mutable native presentation preferences.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_config_sha256: Option<Sha256>,
 }
 #[derive(Clone, Copy)]
 enum ConfigCheck { Launch, Running }
@@ -316,7 +319,12 @@ impl StockBundle {
         );
         let mut bundle: Self = serde_json::from_slice(&std::fs::read(manifest)?)
             .context("invalid stock bundle manifest")?;
+        let raw = std::fs::read_to_string(&bundle.shared_config.path)?;
+        validate_shared_config(&raw)?;
         if matches!(config, ConfigCheck::Running) {
+            bundle.shared_config.sha256 = file_sha256(&bundle.shared_config.path)?;
+        } else if let Some(expected) = &bundle.launch_config_sha256 {
+            ensure!(&launch_config_digest(&raw)? == expected, "shared launch configuration changed");
             bundle.shared_config.sha256 = file_sha256(&bundle.shared_config.path)?;
         }
         bundle.validate_components()?;
@@ -400,6 +408,16 @@ struct Notice {
     #[serde(default)]
     model_migrations: BTreeMap<String, String>,
 }
+/// Hash launch-affecting values, preserving all non-presentation configuration.
+pub fn launch_config_digest(raw: &str) -> anyhow::Result<Sha256> {
+    use sha2::Digest;
+    validate_shared_config(raw)?;
+    let mut value: toml::Value = toml::from_str(raw)?;
+    value.as_table_mut().context("config must be a table")?.remove("tui");
+    Sha256::new(format!("{:x}", sha2::Sha256::digest(serde_json::to_vec(&value)?)))
+        .map_err(anyhow::Error::msg)
+}
+
 pub fn validate_shared_config(raw: &str) -> anyhow::Result<()> {
     let config: SharedConfig = toml::from_str(raw).map_err(|_| anyhow::anyhow!("unsupported shared stock config; only reviewed trust/notices and disabled analytics are supported"))?;
     ensure!(
@@ -1143,6 +1161,7 @@ mod tests {
             code_mode_host: file(&"c".repeat(64)),
             facade: file(&"d".repeat(64)),
             schema: file(S6E_SCHEMA_SHA256),
+            launch_config_sha256: None,
             shared_config: file(&"e".repeat(64)),
         };
         bundle.validate_identity().unwrap();
@@ -1171,6 +1190,7 @@ mod tests {
             code_mode_host: file(STOCK_HOST_SHA256),
             facade: file(STOCK_HOST_SHA256),
             schema: file(S6_SCHEMA_SHA256),
+            launch_config_sha256: None,
             shared_config: file(STOCK_HOST_SHA256),
         };
         b.validate_identity().unwrap();
@@ -1330,6 +1350,17 @@ mod tests {
         ))
         .is_err());
     }
+    #[test]
+    fn presentation_changes_do_not_change_launch_semantics() {
+        let base = "cutex_projection_version=2\nmodel='gpt-5'\n";
+        let expected = launch_config_digest(base).unwrap();
+        for tui in ["[tui]\nstatus_line=['model-name']\n", "[tui]\nanimations=false\n"] {
+            assert_eq!(launch_config_digest(&format!("{base}{tui}")).unwrap(), expected);
+        }
+        assert_ne!(launch_config_digest(&base.replace("gpt-5", "other-model")).unwrap(), expected);
+        assert!(launch_config_digest(&format!("{base}unknown=true\n")).is_err());
+    }
+
     #[test]
     fn stock_shared_config_rejects_execution_auth_and_unknown_options() {
         assert!(validate_shared_config(

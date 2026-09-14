@@ -196,6 +196,11 @@ impl Status {
             digest(&bytes) == self.catalog.sha256.as_str(),
             "status catalog changed since review"
         );
+        self.validate_frozen()
+    }
+    /// Ready occurrences use their frozen display payload, not the mutable catalog.
+    pub fn validate_frozen(&self) -> anyhow::Result<()> {
+        self.payload.validate()?;
         let expected = self
             .catalog
             .path
@@ -221,6 +226,10 @@ impl Status {
     /// content is verified, never overwritten or repaired during attachment.
     pub fn materialize(&self) -> anyhow::Result<&Path> {
         self.validate()?;
+        self.materialize_frozen()
+    }
+    pub fn materialize_frozen(&self) -> anyhow::Result<&Path> {
+        self.validate_frozen()?;
         let bytes = serde_json::to_vec(&self.payload)?;
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -243,7 +252,7 @@ impl Status {
             super::selected_profile::bounded_asset(&self.path)? == bytes,
             "reviewed status file changed; no overwrite"
         );
-        self.validate()?;
+        self.validate_frozen()?;
         Ok(&self.path)
     }
 }
@@ -257,6 +266,24 @@ mod tests {
             {"id":"custom:profile","title":"Profile","source":{"kind":"launch_profile"},"style":{"fg":"#FFFFFF","bold":true}}
         ]})
     }
+    #[test]
+    fn frozen_payload_survives_catalog_removal_but_rejects_changed_materialization() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("frozen-status-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("catalog.json");
+        std::fs::write(&path, serde_json::to_vec(&catalog()).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let status = Status::review(&path, &["cutex_profile".into()], "profile").unwrap().unwrap();
+        status.materialize().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(status.validate().is_err());
+        status.materialize_frozen().unwrap();
+        std::fs::write(&status.path, b"changed").unwrap();
+        assert!(status.materialize_frozen().is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn canonical_order_accepts_legacy_catalog_and_keeps_dynamic_item_separate() {
         let bytes = serde_json::to_vec(&catalog()).unwrap();

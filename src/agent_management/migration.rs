@@ -952,6 +952,7 @@ impl AgentManagementProvider {
             ensure!(request.bundle.soon_ingress(),"maintenance requires exact accepted coherent bundle");
             let shared_projection=projected_shared(&shared.read_bounded(MAX_CONFIG)?)?;
             let mut bundle=request.bundle.clone();
+            bundle.launch_config_sha256=Some(crate::launch::stock::launch_config_digest(&shared_projection)?);
             bundle.shared_config=VerifiedFile{path:destination.join("config.toml"),sha256:bytes_digest(shared_projection.as_bytes())};
             let contract=ExplicitLaunchContract{version:3,migration_action_id:Some(request.action_id.clone()),native_id:expected.native_id.clone(),native_home:destination.clone(),bundle_manifest:destination.join("bundle.json"),bundle_sha256:bytes_digest(&serde_json::to_vec(&bundle)?)};
             let configuration=crate::launch::stock::migration_configuration(record)?;

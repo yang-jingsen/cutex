@@ -23,6 +23,8 @@ struct Session {
     activity: i64,
     sequence: u64,
     reminder: Option<String>,
+    #[serde(default)]
+    reminder_at: Option<String>,
     acknowledged: bool,
     requests: BTreeSet<String>,
     turn_id: Option<String>,
@@ -94,6 +96,8 @@ fn reduce(s: &mut Session, e: &EventEnvelope) -> bool {
         "item/tool/requestUserInput"
         | "item/commandExecution/requestApproval"
         | "item/fileChange/requestApproval"
+        | "mcpServer/elicitation/request"
+        | "item/permissions/requestApproval"
             if request =>
         {
             Some("attention")
@@ -149,6 +153,7 @@ fn reduce(s: &mut Session, e: &EventEnvelope) -> bool {
         if removed && s.state == "attention" && s.requests.is_empty() {
             s.state = "working".into();
             s.reminder = None;
+            s.reminder_at = None;
         }
     } else if next != "activity" {
         s.state = next.into();
@@ -160,6 +165,7 @@ fn reduce(s: &mut Session, e: &EventEnvelope) -> bool {
         } else {
             None
         };
+        s.reminder_at = s.reminder.as_ref().map(|_| e.received_at.clone());
         s.acknowledged = false;
     } else if s.state.is_empty() {
         s.state = "working".into();
@@ -305,7 +311,7 @@ pub fn snapshot() -> anyhow::Result<Value> {
 }
 
 /// Current unread reminder for the session control, without loading the agent catalog.
-pub fn current_reminder(thread: &str) -> anyhow::Result<Option<String>> {
+pub fn current_reminder(thread: &str) -> anyhow::Result<Option<(String, Option<String>)>> {
     uuid::Uuid::parse_str(thread)?;
     let db = open()?;
     let now = Utc::now().timestamp();
@@ -322,7 +328,7 @@ pub fn current_reminder(thread: &str) -> anyhow::Result<Option<String>> {
     let s: Session = serde_json::from_str(&value)?;
     Ok(
         if !s.acknowledged && inactive_reason(&s, now, healthy).is_none() {
-            s.reminder
+            s.reminder.map(|id| (id, s.reminder_at))
         } else {
             None
         },
@@ -519,6 +525,26 @@ mod tests {
         );
         assert_eq!(s.state, "working");
     }
+    #[test]
+    fn elicitation_and_permissions_are_attention_until_both_resolve() {
+        let mut s = Session::default();
+        for (seq, method) in [(1, "mcpServer/elicitation/request"), (2, "item/permissions/requestApproval")] {
+            let mut e = event(seq, method, json!({}));
+            assert!(!reduce(&mut s, &e), "notifications with request names are not requests");
+            let native = e.native.as_mut().unwrap();
+            native.kind = NativeMessageKind::ServerRequest;
+            native.message["id"] = json!(seq);
+            assert!(reduce(&mut s, &e));
+            assert_eq!(s.state, "attention");
+            assert_eq!(s.reminder_at.as_deref(), Some(e.received_at.as_str()));
+        }
+        reduce(&mut s, &event(3, "serverRequest/resolved", json!({"requestId":1})));
+        assert_eq!(s.state, "attention");
+        reduce(&mut s, &event(4, "serverRequest/resolved", json!({"requestId":2})));
+        assert_eq!(s.state, "working");
+        assert!(s.reminder.is_none());
+    }
+
     #[test]
     fn multiple_questions_clear_only_when_all_resolved() {
         let mut s = Session::default();

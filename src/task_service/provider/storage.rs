@@ -409,10 +409,8 @@ impl Store {
                 continue;
             }
             let active = match prepared.attempt_binding {
-                None => matches!(
-                    assignment.state,
-                    AssignmentState::AwaitingAck | AssignmentState::RetryPending
-                ),
+                None => prepared.context.expected_assignment_revision == assignment.local_revision
+                    && matches!(assignment.state, AssignmentState::AwaitingAck | AssignmentState::RetryPending),
                 Some(binding) if assignment.active_attempt == Some(binding.attempt_number) => {
                     let Some(root) = current_root(
                         &conn,

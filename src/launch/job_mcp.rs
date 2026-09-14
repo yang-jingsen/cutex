@@ -534,6 +534,7 @@ mod tests {
             code_mode_host: file(STOCK_HOST_SHA256),
             facade: file(STOCK_HOST_SHA256),
             schema: file(S6E_SCHEMA_SHA256),
+            launch_config_sha256: None,
             shared_config: file(STOCK_HOST_SHA256),
         };
         let descriptor = JobMcpDescriptor {

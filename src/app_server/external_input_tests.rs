@@ -31,6 +31,7 @@ fn pinned_artifact_fence_detects_same_length_write_and_symlink_replacement() {
         code_mode_host: file.clone(),
         facade: file.clone(),
         schema: file.clone(),
+        launch_config_sha256: None,
         shared_config: file,
     };
     let stamps = PinnedArtifacts::stamps(&contract, &bundle).unwrap();

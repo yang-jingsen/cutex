@@ -53,6 +53,7 @@ enum TaskState {
     Assigned,
     Running,
     ReviewReady,
+    RetryPending,
     Blocked,
     Closed,
 }
@@ -64,6 +65,7 @@ impl TaskState {
             Self::Assigned => "assigned",
             Self::Running => "running",
             Self::ReviewReady => "review",
+            Self::RetryPending => "retry pending",
             Self::Blocked => "blocked",
             Self::Closed => "closed",
         }
@@ -71,7 +73,7 @@ impl TaskState {
 
     fn style(self) -> Style {
         match self {
-            Self::Queued | Self::Assigned => Style::new().fg(crate::cli_app::session_tui_layout::focus()),
+            Self::Queued | Self::Assigned | Self::RetryPending => Style::new().fg(crate::cli_app::session_tui_layout::focus()),
             Self::Running => Style::new().fg(crate::cli_app::session_tui_layout::success()),
             Self::ReviewReady => Style::new().fg(crate::cli_app::session_tui_layout::accent()),
             Self::Blocked => Style::new().fg(crate::cli_app::session_tui_layout::warning()),
@@ -215,11 +217,12 @@ fn map_state(
     if assignment.state == "closed" || assignment.closure_reason.is_some() {
         return TaskState::Closed;
     }
+    if assignment.state == "retry_pending" { return TaskState::RetryPending; }
     match active.map(|attempt| attempt.phase.as_str()) {
         Some("blocked") => TaskState::Blocked,
         Some("review_ready") => TaskState::ReviewReady,
         Some("running") => TaskState::Running,
-        Some("completed" | "failed" | "cancelled" | "aborted") => TaskState::Closed,
+        Some("completed" | "failed" | "cancelled" | "aborted") => TaskState::Assigned,
         _ if assignment.state == "awaiting_ack" => TaskState::Queued,
         _ => TaskState::Assigned,
     }
@@ -606,15 +609,21 @@ fn run_loop(
             Err(TryRecvError::Empty) => {}
         }
         terminal.draw(|frame| render(frame, model))?;
-        let Some(Event::Key(key)) = events.next()? else {
-            continue;
-        };
-        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-            continue;
+        if let Some(event) = events.next()? {
+            if let Some(outcome) = handle_event(model, &mut cadence, event) { return Ok(outcome); }
         }
-        if let Some(outcome) = handle_key(model, &mut cadence, key) {
-            return Ok(outcome);
+    }
+}
+
+fn handle_event(model: &mut TaskModel, cadence: &mut RefreshCadence, event: Event) -> Option<PrimaryPanelOutcome> {
+    match event {
+        Event::Paste(text) if model.filter_focused => {
+            input_policy::paste(&mut model.query, &text);
+            model.retain_selection();
+            None
         }
+        Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => handle_key(model, cadence, key),
+        _ => None,
     }
 }
 
@@ -1069,6 +1078,17 @@ fn detail_field(label: &str, value: String) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn task_filter_handles_paste_only_while_focused() {
+        let mut model = TaskModel::default();
+        let mut cadence = RefreshCadence::new(Instant::now());
+        handle_event(&mut model, &mut cadence, Event::Paste("ignored".into()));
+        assert_eq!(model.query.value(), "");
+        model.filter_focused = true;
+        handle_event(&mut model, &mut cadence, Event::Paste("中文 task".into()));
+        assert_eq!(model.query.value(), "中文 task");
+    }
+
+    #[test]
     fn pro_review_task_filter_leaves_details() {
         let mut model = TaskModel { rows: vec![row("one", TaskState::Running, "2026-01-01T00:00:00Z")], selected_assignment_id: Some("one".into()), detail: true, ..Default::default() };
         let mut cadence = RefreshCadence::new(Instant::now());
@@ -1238,6 +1258,11 @@ mod tests {
         ] {
             let attempt = serde_json::from_value::<DirectorAttemptView>(serde_json::json!({"attempt_number":1,"phase":phase,"started_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"})).unwrap();
             assert_eq!(map_state(&assignment, Some(&attempt)), expected);
+        }
+        assignment.state = "retry_pending".to_string();
+        for phase in ["failed", "aborted"] {
+            let attempt = serde_json::from_value::<DirectorAttemptView>(serde_json::json!({"attempt_number":1,"phase":phase,"started_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"})).unwrap();
+            assert_eq!(map_state(&assignment, Some(&attempt)), TaskState::RetryPending);
         }
         assignment.state = "closed".to_string();
         assert_eq!(map_state(&assignment, None), TaskState::Closed);

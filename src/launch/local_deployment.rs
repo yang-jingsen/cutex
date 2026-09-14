@@ -185,6 +185,7 @@ impl LocalDeployment {
                 }
             }
         }
+        bundle.launch_config_sha256 = Some(super::stock::launch_config_digest(&config)?);
         std::fs::write(materialization.join("config.toml"), config)?;
         bundle.version = 4;
         bundle.shared_config = super::stock::VerifiedFile {

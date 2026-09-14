@@ -25,7 +25,11 @@ pub(crate) fn run_command(command: NotifyCommand) -> anyhow::Result<()> {
                 let mut value = serde_json::to_value(&preference)?;
                 if preference.level != session::Level::Off {
                     match cutex::notify::state::current_reminder(&thread_id) {
-                        Ok(reminder) => value["reminder_id"] = serde_json::to_value(reminder)?,
+                        Ok(Some((id, at))) => {
+                            value["reminder_id"] = serde_json::json!(id);
+                            value["reminder_at"] = serde_json::json!(at);
+                        }
+                        Ok(None) => value["reminder_id"] = serde_json::Value::Null,
                         Err(_) => value["reminder_id"] = serde_json::Value::Null,
                     }
                 }

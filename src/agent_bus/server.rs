@@ -1367,7 +1367,7 @@ impl TaskWorkerActionHost {
                 "provider unavailable",
             );
         };
-        let snapshot = match provider.query_live() {
+        let snapshot = match provider.query_assignment(&body.assignment_id) {
             Ok(s) => s,
             Err(_) => {
                 return task_service_v2_no_write(
@@ -1710,7 +1710,7 @@ impl TaskWorkerActionHost {
             Operation::Cancel(decision) => (decision, "cancel"),
             _ => unreachable!(),
         };
-        let snapshot = match provider.query_live() {
+        let snapshot = match provider.query_assignment(&decision.assignment_id) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 return director_provider_error(request.action_id.clone(), operation, error)

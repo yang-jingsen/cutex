@@ -2105,6 +2105,11 @@ impl TaskServiceProvider {
                 if digest != prepared.request_sha256 {
                     return Err(ProviderError::Conflict("action_id_payload_conflict"));
                 }
+                if prepared.attempt_binding.is_none()
+                    && prepared.context.expected_assignment_revision != assignment(&state, request.action.assignment_id())?.local_revision
+                {
+                    return Err(ProviderError::Conflict("prepared_action_expired"));
+                }
                 let (context, binding) = prepare_worker_context(
                     &state,
                     &session,
@@ -2410,17 +2415,16 @@ impl TaskServiceProvider {
             TerminalAuthorityRequest::FailResult(value) => ("fail_result", value),
             TerminalAuthorityRequest::Cancel(value) => ("cancel", value),
         };
-        let attempt_binding =
-            request
-                .context
-                .attempt
-                .as_ref()
-                .map(|attempt| DurableAttemptBinding {
-                    attempt_number: attempt.attempt_number,
-                    attempt_token: attempt.attempt_token.clone(),
-                });
+        let attempt_binding = match self.receipt(&body.action_id)? {
+            Some(receipt) => receipt.attempt_binding,
+            None => request.context.attempt.as_ref().map(|attempt| DurableAttemptBinding {
+                attempt_number: attempt.attempt_number,
+                attempt_token: attempt.attempt_token.clone(),
+            }),
+        };
         let digest = request_digest(operation, principal, &(&request.command, &attempt_binding))?;
-        self.mutate(
+        self.mutate_scoped(
+            Some(std::slice::from_ref(&body.assignment_id)),
             operation,
             &body.action_id,
             digest,
@@ -3905,10 +3909,8 @@ fn active_prepared_count(state: &TaskServiceSnapshot) -> usize {
                 return false;
             }
             match &prepared.attempt_binding {
-                None => matches!(
-                    assignment.state,
-                    AssignmentState::AwaitingAck | AssignmentState::RetryPending
-                ),
+                None => prepared.context.expected_assignment_revision == assignment.local_revision
+                    && matches!(assignment.state, AssignmentState::AwaitingAck | AssignmentState::RetryPending),
                 Some(binding) => {
                     state
                         .active_attempt(&prepared.assignment_id)
@@ -4766,6 +4768,59 @@ mod tests {
                 .state,
             AssignmentState::Closed
         );
+    }
+
+    #[test]
+    fn unused_start_preparations_stay_expired_after_abort_and_retry() {
+        let fixture = Fixture::new("start-capacity-after-abort");
+        fixture.provision();
+        let command = WorkerActionRequest::Start(AssignmentActionRequest {
+            schema: ProviderActionSchema::V2, action_id: action("first-start"), assignment_id: assignment_id(),
+        });
+        let envelope = fixture.worker_envelope(command);
+        let store = storage::Store::open(fixture.provider.root.as_ref()).unwrap();
+        let before = store.load_live().unwrap();
+        let mut full = before.clone();
+        let original = full.prepared_worker_actions.values().next().unwrap().clone();
+        for i in 1..MAX_PREPARED_WORKER_ACTIONS {
+            let mut prepared = original.clone();
+            prepared.action_id = action(&format!("unused-start-{i}"));
+            full.prepared_worker_actions.insert(prepared.action_id.clone(), prepared);
+        }
+        store.commit(&before, &mut full, "capacity_fixture", now()).unwrap();
+        assert_eq!(active_prepared_count(&full), MAX_PREPARED_WORKER_ACTIONS);
+        fixture.provider.execute_worker_action(&fixture.worker, &envelope).unwrap();
+        fixture.worker_action(WorkerActionRequest::AbortAttempt(AssignmentActionRequest {
+            schema: ProviderActionSchema::V2, action_id: action("abort-first"), assignment_id: assignment_id(),
+        }));
+        assert_eq!(active_prepared_count(&fixture.provider.query_live().unwrap()), 0);
+        let context = fixture.worker_context();
+        fixture.provider.authorize_attempt_retry(&fixture.coordinator, &AssignmentActionRequest {
+            schema: ProviderActionSchema::V2, action_id: action("allow-second"), assignment_id: assignment_id(),
+        }, context.expected_assignment_revision).unwrap();
+        fixture.start("second-start");
+        assert_eq!(fixture.provider.query_live().unwrap().attempts[&assignment_id()].len(), 2);
+    }
+
+    #[test]
+    fn terminal_replay_after_retry_returns_attempt_one_receipt() {
+        let fixture = Fixture::new("terminal-replay-after-retry");
+        fixture.provision();
+        fixture.start("first");
+        fixture.submit("submit-first", "result-one");
+        let command = TerminalAuthorityRequest::FailResult(TerminalActionRequest {
+            schema: ProviderActionSchema::V2, action_id: action("fail-first"),
+            assignment_id: assignment_id(), decision_reference: Some("failure".into()),
+        });
+        let receipt = fixture.terminal_action(command.clone());
+        let context = fixture.worker_context();
+        fixture.provider.authorize_attempt_retry(&fixture.coordinator, &AssignmentActionRequest {
+            schema: ProviderActionSchema::V2, action_id: action("retry"), assignment_id: assignment_id(),
+        }, context.expected_assignment_revision).unwrap();
+        fixture.start("second");
+        let before = fixture.provider.query_live().unwrap();
+        assert_eq!(fixture.terminal_action(command), receipt);
+        assert_eq!(fixture.provider.query_live().unwrap(), before);
     }
 
     #[test]

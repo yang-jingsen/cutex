@@ -39,7 +39,7 @@ pub(crate) fn reconcile_cutex_session_registration(
         cutex::session::reviewed_registration::preserve_reviewed_groups(&store, agent, &host_id)?;
     let bundle = reviewed
         .as_ref()
-        .map(|(_, running_contract)| cutex::launch::stock::StockBundle::load(running_contract))
+        .map(|(_, running_contract)| cutex::launch::stock::StockBundle::load_running(running_contract))
         .transpose()?;
     if let Some((record, _)) = &reviewed {
         super::stock_lifecycle::verify_stock_process_with_bundle(

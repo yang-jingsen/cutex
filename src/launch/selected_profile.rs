@@ -629,7 +629,7 @@ impl Projection {
     /// The same nonsecret argv projection is used by owner launch and the
     /// independent process test. Remote attach deliberately omits auth-file.
     pub fn native_args(&self, owner: bool) -> anyhow::Result<Vec<String>> {
-        self.validate()?;
+        self.validate_for_launch(owner)?;
         let mut args = Vec::new();
         if owner {
             args.extend([
@@ -693,6 +693,9 @@ impl Projection {
         Ok(args)
     }
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.validate_for_launch(true)
+    }
+    fn validate_for_launch(&self, owner: bool) -> anyhow::Result<()> {
         self.settings.validate()?;
         let wants_status = self.settings.tui.as_ref().is_some_and(|t| {
             t.status_line
@@ -705,7 +708,7 @@ impl Projection {
             "selected status projection missing or inappropriate"
         );
         if let Some(status) = &self.status {
-            status.validate()?;
+            if owner { status.validate()?; } else { status.validate_frozen()?; }
         }
         ensure!(
             review_auth(&self.auth.path, &self.route)? == self.auth,
