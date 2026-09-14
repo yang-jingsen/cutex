@@ -1,14 +1,14 @@
 # 第二轮跨仓库审核入口（2026-09-14）
 
-本轮材料补齐实际部署的 cute-codex light 源码、独立 Job Service 和 PRH/hostctl。请以指定 commit 为审核对象，不能仅查看两仓库的 main/release。最新追加了消息显示、Task 合同交接和 Job cwd / launcher 兼容修复，详见 [修复记录](MESSAGE-TASK-JOB-FIX.md)。分隔线时间恢复详见 [时间显示记录](TIMESTAMP-FIX.md)。legacy 分页遗漏的补修详见 [修复记录](LEGACY-TIMELINE-FIX.md)。Task MCP 参数可用性修复详见 [记录](TASK-MCP-ARGUMENTS-FIX.md)。MCP resubmit 传输修复见 [记录](TASK-MCP-RESUBMIT-TRANSPORT-FIX.md)，独立通知乱序问题见 [调查](TASK-NOTIFICATION-DELAY-FINDINGS.md)。旧发布记录保留在 Git 历史。
+本轮材料补齐实际部署的 cute-codex light 源码、独立 Job Service 和 PRH/hostctl。请以指定 commit 为审核对象，不能仅查看两仓库的 main/release。最新追加了消息显示、Task 合同交接和 Job cwd / launcher 兼容修复，详见 [修复记录](MESSAGE-TASK-JOB-FIX.md)。分隔线时间恢复详见 [时间显示记录](TIMESTAMP-FIX.md)。legacy 分页遗漏的补修详见 [修复记录](LEGACY-TIMELINE-FIX.md)。Task MCP 参数可用性修复详见 [记录](TASK-MCP-ARGUMENTS-FIX.md)。MCP resubmit 传输修复见 [记录](TASK-MCP-RESUBMIT-TRANSPORT-FIX.md)，通知恢复排序修复见 [调查](TASK-NOTIFICATION-DELAY-FINDINGS.md)，本轮全部自定义显示见 [清单](CUSTOM-EVENT-DISPLAY.md)。旧发布记录保留在 Git 历史。
 
 ## 源码与部署对应
 
 | 组件 | 固定源码 / 审核位置 | 说明 |
 | --- | --- | --- |
-| Cutex CLI、Agent Bus、Management API、Task Service | [`8fbd40e`](https://github.com/yang-jingsen/cutex/tree/8fbd40e57062ed352d8c28317f42dec5cf75817b)；分支 `review/runtime-repair-20260914` | release-runtime-r23 使用优化的 release 构建，包含分栏修复与 attach 去重校验；后续提交补充审核材料。 |
-| cute-codex CLI、app-server、Code Mode host | [`4e3e2b1fc9b1c8931e7a472ab01b665a089f42d3`](https://github.com/yang-jingsen/cute-codex/tree/4e3e2b1fc9b1c8931e7a472ab01b665a089f42d3)；分支 `review/runtime-repair-20260914` | release-native-r4 CLI / app-server 已重建，补齐 legacy 时间线缓存；Code Mode host 未改动。用户授权重启在线 owner 使修复生效。 |
-| Cutex MCP facade | Cutex `2dbdf1f`，`src/agent_bus/mcp_tasks.rs` / `mcp_http_response.rs` | release-runtime-r25 优化构建，包含逐操作参数说明、完整 HTTP 回执读取和不确定响应阶段诊断；native-r6 引用该 facade。 |
+| Cutex CLI、Agent Bus、Management API、Task Service | [`9c4af47`](https://github.com/yang-jingsen/cutex/tree/9c4af47)；分支 `review/runtime-repair-20260914` | release-runtime-r26 优化构建，新增通知恢复排序、发生时间和 Task 展示事实。 |
+| cute-codex CLI、app-server、Code Mode host | [`382431657`](https://github.com/yang-jingsen/cute-codex/tree/382431657)；分支 `review/runtime-repair-20260914` | release-native-r7 CLI 新增统一事件样式；app-server 与 Code Mode host 复用 r4 的相同二进制（同包复制）。legacy 缓存保留。 |
+| Cutex MCP facade | Cutex `2dbdf1f`，`src/agent_bus/mcp_tasks.rs` / `mcp_http_response.rs` | release-runtime-r25 优化构建，包含逐操作参数说明、完整 HTTP 回执读取和不确定响应阶段诊断；native-r7 继续引用该 facade。 |
 | Job Service / Job MCP adapter | [`bbaebdd7a4ec6c05290d633d7ad2a174f53468f5`](https://github.com/yang-jingsen/cutex/tree/bbaebdd7a4ec6c05290d633d7ad2a174f53468f5)；分支 `review/job-service-20260914` | 独立 Git 历史发布在 Cutex 的专用分支。主审核分支中的 `review-sources/job-service/` 是完全相同的 tracked source。 |
 | PRH、hostctl、Linux sentinel / Windows host | [`2fcb9c4b09d44e1010cfed2983e094aa53261ebe`](https://github.com/yang-jingsen/cutex/tree/2fcb9c4b09d44e1010cfed2983e094aa53261ebe/persistent-runtime-host)；分支 `review/persistent-runtime-host-20260914` | 对应 `persistent-runtime-host/` 子项目。主审核分支 `review-sources/persistent-runtime-host/` 为相同源码树；当前 PRH host 文件 hash 与该部署清单一致。 |
 
@@ -18,13 +18,13 @@ Job 主 daemon 和新安装的 adapter 为 bbaebdd；旧 native 的 adapter 进�
 
 ## 比较范围
 
-- Cutex 首轮审核快照为 `74734f3`。本轮代码修复截至 `2dbdf1f`，可以直接比较两者；最新分支另包含说明和配套源码快照。
+- Cutex 首轮审核快照为 `74734f3`。本轮代码修复截至 `9c4af47`，可以直接比较两者；最新分支另包含说明和配套源码快照。
 - cute-codex 实际 light 改造基线为 `3d2ee51ca2d5db578f328aa75e20aa22c0197c9a`，到 4e3e2b1fc 有 66 个提交。最近的恢复优化仅是 `8cde7956..a8677ec` 两个提交，不能把此前 light 改造遗漏掉。
 - GitHub 原 cute-codex release `d52dc3d14bb36fa783a5e3c1942d7d13bd86d8c4` 与当前部署历史没有共同祖先（两个仓库历史均非 shallow）。请使用两个快照的直接 diff，或以上 light 基线；不要使用依赖 merge-base 的三点比较。
 
 ```bash
 # 在 Cutex 仓库
- git diff 74734f3 2dbdf1f -- src
+ git diff 74734f3 9c4af47 -- src
 # 在 cute-codex 仓库，light 改造及随后恢复修复
  git diff 3d2ee51ca2d5db578f328aa75e20aa22c0197c9a 4e3e2b1fc9b1c8931e7a472ab01b665a089f42d3
 # 若要核对上一轮看到的 release：比较两个完整树（不是三点 diff）
