@@ -144,3 +144,11 @@ Agent 的“最近全局活动”不一定属于这项 Task，必须保留“Age
 环境已确认：PyCharm Terminal，切换顶部 Panel（不是从 cute-codex 返回）。Agents 第三条 scpolya-2 的 Online 比其他行靠前约 3 个字符；Projects 第三条 IFM 从 Director 第二列起左移约 5 个字符，边框随之后移位置错误。应检查第二列之前的输出定位及切页差分，不能仅修右边框。两个名称均为 ASCII，当前没有支持“名称含宽字符”归因的证据。
 
 JetBrains 解析验证：从 Cutex 捕获首次进入 Agents/Projects 和往返切页的原始 ANSI 输出，用本机 IntelliJ 安装自带的 `intellij.libraries.jediterm.core.jar` 在无 GUI 模式回放。四次结果均对齐：180 列时 Agents 各行 Online 为零基列 49、左列表右边框 109；Projects IFM 的 Director 为 115、右边框 179。此验证覆盖该版本 JediTerm 的逻辑缓冲区，不覆盖用户 PyCharm 的版本、终端引擎及实际字体绘制；问题仍未修复。回放程序与原始捕获仅保留本地，不上传运行内容。
+
+用户截图（2026-09-14 12:49:56 / 12:50:12）确认：Agents scpolya-2 名称左端对齐，从 Online 起后续列和边框一起左移约 3 格；Projects IFM 名称左端对齐，从 Director 起后续列和边框一起左移约 5 格。截图保留本地 Downloads。环境为 PyCharm 2026.2.2 / Reworked 2025；旧 JediTerm 回放不能替代该引擎的现场验证。已提供 `record-cutex-tui.py`，输出及 timing/尺寸/必要元数据，本地 32 MiB 限额、无 stdin 记录；启动、两页切换、退出 smoke test 通过。等待现场 ANSI 记录与截图对照，不把旧模拟器未复现当作问题不存在。
+
+根因已由用户现场记录复现（`tui-diagnostics/20260914-125152-666920`）：96×30，约 5.007 秒显示 Sessions，第三行标题含中文；5.487 秒切回 Agents，JediTerm 缓冲区在 scpolya-2 右边留下 3 个 U+E000 宽字符尾格标记；11.299 秒第一次下移仍保留；12.368 秒第二次下移选中该行后消失。原先只检查边框逻辑坐标漏掉了这些显示宽度为零的残留标记。
+
+修复方案：当前 Ratatui 0.30/ratatui-core 0.1.2 对默认背景宽字符变窄时可省略尾格；Cutex 共享 Terminal 在渲染后仅为上一帧的宽字符尾格、且当前不是新宽字符延续的位置标记 AlwaysUpdate。所有 Panel 共用，不依赖 PyCharm 环境变量，不改名称列宽，不清屏、不每帧全量输出。新增中文→ASCII 空格尾格回归，以及中文不变/移动不破坏新宽字符回归。
+
+验证完成：旧 r29 与修复版在 96 列实际 PTY 中执行 Sessions→Agents，旧版第三行留下 3 个占位标记，修复版 0 个。中文标题→IFM 的合成差分回归确认旧版漏 5 个尾格、修复版全部输出；实际 Projects 对照这一次未复现旧版偏移，不扩大这一项的现场证据。完整 TUI 272 通过 / 原有 3 个基线失败 / 2 忽略；最终两项新回归通过。当前准备 r30 优化构建，待用户原终端确认视觉恢复。

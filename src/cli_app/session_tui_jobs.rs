@@ -10,9 +10,9 @@ use ratatui::{
     layout::{Constraint, Layout},
     style::Style,
     widgets::{Block, Paragraph, Wrap},
-    Terminal,
 };
 use std::io::Stdout;
+use super::session_tui_terminal::Terminal;
 
 pub(super) fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,

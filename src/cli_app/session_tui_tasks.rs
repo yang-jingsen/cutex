@@ -32,7 +32,8 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState};
-use ratatui::{Frame, Terminal};
+use ratatui::Frame;
+use super::session_tui_terminal::Terminal;
 use tui_input::{Input, InputRequest};
 use uuid::Uuid;
 

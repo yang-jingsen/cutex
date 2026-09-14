@@ -55,7 +55,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
 };
-use ratatui::{Frame, Terminal};
+use ratatui::Frame;
+use super::session_tui_terminal::Terminal;
 use tui_input::{Input, InputRequest};
 
 use super::account_store::{

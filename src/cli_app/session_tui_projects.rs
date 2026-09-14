@@ -21,7 +21,8 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
-use ratatui::{Frame, Terminal};
+use ratatui::Frame;
+use super::session_tui_terminal::Terminal;
 use uuid::Uuid;
 
 use cutex::catalog::{

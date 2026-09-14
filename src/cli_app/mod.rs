@@ -60,6 +60,7 @@ mod session_tui_projects;
 mod session_tui_recent;
 mod session_tui_settings;
 mod session_tui_tasks;
+mod session_tui_terminal;
 mod session_tui_view;
 mod session_tui_workspace;
 mod session_tui_workspace_events;
