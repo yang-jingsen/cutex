@@ -273,7 +273,11 @@ impl JobService {
                 self.inner.store.save(&mut state)?;
                 return Ok(SubmitReceipt {
                     status: "committed".into(),
-                    job: snapshot,
+                    job: state
+                        .jobs
+                        .get(&job_id)
+                        .expect("committed job exists")
+                        .clone(),
                     deduplicated: false,
                 });
             }
@@ -447,6 +451,9 @@ impl JobService {
             JobError::Conflict("running record has no locally owned process".into())
         })?;
         process::cancel(process, self.inner.config.cancel_grace)?;
+        // submit and terminal watchers acquire state before live. Never acquire
+        // state while this guard is held, including in the return expression.
+        drop(live);
         self.query_inner(job_id)
     }
 

@@ -722,3 +722,65 @@ fn child_worktree_cwd_preserves_arguments_and_original_read_only_policy() {
     assert!(!child.join("forbidden").exists());
     assert!(!child.join("injected").exists());
 }
+
+#[test]
+fn failed_launch_submit_query_and_replay_share_completion_projection() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let missing_runner = root.path().join("removed-runner");
+    std::fs::copy(runner(), &missing_runner).unwrap();
+    let mut cfg = config(root.path());
+    cfg.runner_executable = missing_runner.clone();
+    cfg.completion_enabled = true;
+    let service = JobService::open(cfg).unwrap();
+    std::fs::remove_file(missing_runner).unwrap();
+    let request = job_request(cwd.path(), "failed-launch-projection", "true");
+    let first = service
+        .submit(API, request.clone(), issue(&request))
+        .unwrap();
+    assert_eq!(first.job.state, JobState::Failed);
+    let queried = service.query(API, &first.job.job_id).unwrap();
+    let replay = service
+        .submit(API, request.clone(), issue(&request))
+        .unwrap();
+    assert!(replay.deduplicated);
+    assert_eq!(
+        serde_json::to_value(&first.job).unwrap(),
+        serde_json::to_value(queried).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&first.job).unwrap(),
+        serde_json::to_value(replay.job).unwrap()
+    );
+}
+
+#[test]
+fn concurrent_submit_and_cancel_finish_without_lock_inversion() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let mut cfg = config(root.path());
+    cfg.cancel_grace = Duration::from_millis(500);
+    let service = JobService::open(cfg).unwrap();
+    let request = job_request(cwd.path(), "lock-cancel", "trap '' TERM; sleep 30");
+    let first = service
+        .submit(API, request.clone(), issue(&request))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let cancelling = service.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cancel = std::thread::spawn(move || {
+        let result = cancelling.cancel(API, &first.job.job_id, first.job.revision);
+        tx.send(result).unwrap();
+    });
+    std::thread::sleep(Duration::from_millis(40));
+    let submitting = service.clone();
+    let request = job_request(cwd.path(), "lock-submit", "true");
+    let submit =
+        std::thread::spawn(move || submitting.submit(API, request.clone(), issue(&request)));
+    rx.recv_timeout(Duration::from_secs(5))
+        .expect("cancel deadlocked with submit")
+        .unwrap();
+    cancel.join().unwrap();
+    let second = submit.join().unwrap().unwrap();
+    await_terminal(&service, &second.job.job_id);
+}
