@@ -9,6 +9,7 @@ use crate::profiles::model::{CodezConfig, ProxyConfig};
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GlobalConfigPatch {
     pub docker_use_sudo: Option<bool>,
+    pub terminal_truecolor: Option<bool>,
     pub session_enabled: Option<bool>,
     pub default_profile: ConfigValueUpdate<String>,
     pub default_profile_direct_launch: Option<bool>,
@@ -55,6 +56,7 @@ pub fn apply_global_config_patch(
         validate_agent_bus_port(*port)?;
     }
     let mut changed = false;
+    changed |= apply_value_update(&mut config.terminal_truecolor, patch.terminal_truecolor);
     changed |= apply_value_update(&mut config.docker_use_sudo, patch.docker_use_sudo);
     changed |= apply_value_update(&mut config.session.enabled, patch.session_enabled);
     changed |= apply_optional_update(&mut config.default_profile, &patch.default_profile);

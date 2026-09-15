@@ -5451,11 +5451,11 @@ fn retired_selector_row(
 }
 
 fn managed_session_fallback_name(record: &CutexSessionRecord) -> String {
-    record
-        .formal_agent_name
-        .as_deref()
+    [record.formal_agent_name.as_deref(), record.display_name_hint.as_deref()]
+        .into_iter()
+        .flatten()
         .map(str::trim)
-        .filter(|name| !name.is_empty())
+        .find(|name| !name.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| record.cutex_session_id.clone())
 }
@@ -7299,6 +7299,12 @@ fn selector_list_panel_from_horizontal_key(
         {
             PrimaryPanel::Recent
         }
+        SelectorMode::Settings {
+            target: SelectorTarget::GlobalSettings,
+            focus: SettingsFocus::Categories,
+            view: SettingsView::Categories,
+            ..
+        } => PrimaryPanel::Settings,
         _ => return None,
     };
     match key.code {
@@ -9722,7 +9728,12 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
     if matches!(&model.mode, SelectorMode::Settings { target: SelectorTarget::GlobalSettings, .. })
         && model.settings_overlay.is_none() && !selector_modal(model)
     {
-        let mut hints = vec![("↑/↓", "select"), ("←/→", "value"), ("Enter", "edit"), ("Tab", "focus")];
+        let categories = matches!(model.mode, SelectorMode::Settings {
+            focus: SettingsFocus::Categories, view: SettingsView::Categories, ..
+        });
+        let mut hints = vec![("↑/↓", "select"),
+            ("←/→", if categories { "panels" } else { "value" }),
+            ("Enter", if categories { "open" } else { "edit" }), ("Tab", "focus")];
         if model.settings_are_editable() { hints.extend([("S", "save"), ("D", "discard")]); }
         if area.width >= 66 { hints.push(("Alt+1–6", "panels")); }
         hints.extend([("Esc", "back"), ("Ctrl+C", "exit")]);
@@ -11431,6 +11442,22 @@ mod tests {
     }
 
     #[test]
+    fn managed_display_name_uses_saved_name_but_not_generated_title() {
+        let mut record = editable_record();
+        record.formal_agent_name = None;
+        record.display_name_hint = Some("sailing-era-mod".into());
+        record.thread_name = Some("A generated conversation title".into());
+        assert_eq!(managed_session_fallback_name(&record), "sailing-era-mod");
+        assert_eq!(retired_selector_row("key", &record, None).agent, "sailing-era-mod");
+        record.formal_agent_name = Some("canonical-name".into());
+        assert_eq!(managed_session_fallback_name(&record), "canonical-name");
+        record.formal_agent_name = Some("  ".into());
+        assert_eq!(managed_session_fallback_name(&record), "sailing-era-mod");
+        record.display_name_hint = Some("  ".into());
+        assert_eq!(managed_session_fallback_name(&record), record.cutex_session_id);
+    }
+
+    #[test]
     fn homepage_project_ownership_is_an_exact_canonical_session_join() {
         let snapshot = project_snapshot(
             "cutex.exact-worker",
@@ -11492,7 +11519,7 @@ mod tests {
             exact.thread_title.as_deref(),
             Some("Generated conversation title")
         );
-        assert_eq!(decoy.agent, "cutex.decoy-worker");
+        assert_eq!(decoy.agent, "decoy-worker");
         assert_ne!(decoy.agent, "Decoy conversation title");
         assert!(decoy.project.is_none());
         assert!(rows
@@ -16525,6 +16552,7 @@ mod tests {
         for _ in 0..4 { model.handle(SelectorEvent::Down); }
         for focused in [false, true] {
             if focused { model.handle(SelectorEvent::OpenActions); }
+            if let SelectorMode::Settings { option, .. } = &mut model.mode { *option = 1; }
             for width in [80, 120, 160] {
                 let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 24)).unwrap();
                 terminal.draw(|frame| render_categorized_settings(frame, frame.area(), &model)).unwrap();
@@ -16536,7 +16564,7 @@ mod tests {
                 assert_eq!(buffer[(26,23)].symbol(), "└");
                 assert_eq!(buffer[(width-1,23)].symbol(), "┘");
                 let swatch = model.active_setting_option().unwrap().presentation.swatch.unwrap();
-                assert_eq!((0..width).filter(|x| buffer[(*x,5)].bg == swatch).count(), 2, "Brand swatch lost when focused={focused}");
+                assert_eq!(buffer.content.iter().filter(|cell| cell.bg == swatch).count(), 2, "Brand swatch lost when focused={focused}");
             }
         }
     }
@@ -16642,14 +16670,28 @@ mod tests {
     }
 
     #[test]
-    fn global_settings_category_arrows_stay_local_without_opening_options() {
+    fn global_settings_category_arrows_switch_panels_without_opening_options() {
         let mut model = SelectorModel::new(vec![global_row()], false, false);
         selector_command(&mut model, Command::Settings);
         let before = format!("{:?}", model.mode);
         assert!(matches!(route_selector_key(&mut model, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)), SelectorKeyRoute::Control(_)));
         assert_eq!(format!("{:?}", model.mode), before);
-        assert!(matches!(route_selector_key(&mut model, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)), SelectorKeyRoute::Control(_)));
-        assert_eq!(format!("{:?}", model.mode), before);
+        assert!(matches!(route_selector_key(&mut model, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)), SelectorKeyRoute::Switch(PrimaryPanel::Jobs)));
+    }
+
+    #[test]
+    fn global_settings_escape_then_left_leaves_options() {
+        let mut model = SelectorModel::new(vec![global_row()], false, false);
+        selector_command(&mut model, Command::Settings);
+        if let SelectorMode::Settings { focus, .. } = &mut model.mode {
+            *focus = SettingsFocus::Options;
+        }
+        assert_eq!(selector_list_panel_from_horizontal_key(&model,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)), None);
+        route_selector_key(&mut model, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(route_selector_key(&mut model,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            SelectorKeyRoute::Switch(PrimaryPanel::Jobs)));
     }
 
     #[test]

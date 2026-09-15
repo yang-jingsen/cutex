@@ -230,6 +230,9 @@ pub struct CodezConfig {
     pub new_session_defaults: std::collections::BTreeMap<String, NewSessionDefaults>,
     #[serde(default)]
     pub new_session_notification: crate::notify::session::Level,
+    /// Frontend-only opt-in for terminals whose TrueColor marker is lost over SSH.
+    #[serde(default)]
+    pub terminal_truecolor: bool,
     #[serde(default)]
     #[serde(skip)]
     pub notify_service_url: Option<String>,
@@ -304,6 +307,7 @@ impl Default for CodezConfig {
             default_profile_direct_launch: false,
             new_session_defaults: Default::default(),
             new_session_notification: Default::default(),
+            terminal_truecolor: false,
             notify_service_url: None,
             notify_service_token: None,
             notify_service_idle_timeout_secs: None,

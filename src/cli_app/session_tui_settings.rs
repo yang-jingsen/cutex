@@ -855,6 +855,7 @@ pub(super) enum GlobalSettingsField {
     DefaultModel,
     DefaultReasoning,
     DefaultNotification,
+    TerminalColors,
     ProxyEnabled,
     ProxyUrl,
     ProxyNoProxy,
@@ -883,7 +884,7 @@ pub(super) enum GlobalSettingsField {
 impl GlobalSettingsField {
     pub(super) fn editor_kind(self) -> SessionSettingsEditorKind {
         match self {
-            Self::DefaultReasoning | Self::DefaultNotification | Self::ManagedSessions
+            Self::TerminalColors | Self::DefaultReasoning | Self::DefaultNotification | Self::ManagedSessions
             | Self::DockerSudo
             | Self::DefaultProfile
             | Self::DefaultProfileDirectLaunch
@@ -983,6 +984,7 @@ impl GlobalSettingsSnapshot {
     pub(super) fn choices(&self, field: GlobalSettingsField) -> Vec<SessionSettingsChoice> {
         match field {
             GlobalSettingsField::DefaultReasoning => &[("Follow profile", None), ("none", Some("none")), ("minimal", Some("minimal")), ("low", Some("low")), ("medium", Some("medium")), ("high", Some("high")), ("xhigh", Some("xhigh"))][..],
+            GlobalSettingsField::TerminalColors => &[("Auto", Some("auto")), ("TrueColor", Some("truecolor"))][..],
             GlobalSettingsField::DefaultNotification => &[("CIAO!", Some("important")), ("ON", Some("normal")), ("OFF", Some("off"))][..],
             GlobalSettingsField::ManagedSessions
             | GlobalSettingsField::DockerSudo
@@ -1051,7 +1053,13 @@ impl GlobalSettingsSnapshot {
                 self.editable_option("Bypass proxy", GlobalSettingsField::ProxyNoProxy, draft),
             ]),
             SessionTuiSettingCategory::new("Notifications", self.notification_display_options()),
-            SessionTuiSettingCategory::new("Appearance", self.appearance_display_options()),
+            SessionTuiSettingCategory::new("Appearance", {
+                let mut terminal = self.editable_option("Terminal colors", GlobalSettingsField::TerminalColors, draft);
+                terminal.presentation.detail = Some("Auto preserves terminal detection. TrueColor supplies COLORTERM=truecolor to Cutex foreground TUI launches, including SSH; background runtimes are unchanged.".into());
+                let mut options = vec![terminal];
+                options.extend(self.appearance_display_options());
+                options
+            }),
             SessionTuiSettingCategory::new("Messages", vec![
                 SessionTuiSettingOption::new("Sender identity", "Structured Agent Bus provenance"),
                 SessionTuiSettingOption::new("Message display", "Sender and delivery timing are shown with each message"),
@@ -1173,6 +1181,7 @@ impl GlobalSettingsSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(super) struct GlobalSettingsDraft {
+    terminal_truecolor: Option<bool>,
     managed_sessions: Option<bool>,
     docker_sudo: Option<bool>,
     default_profile: ConfigValueUpdate<String>,
@@ -1231,6 +1240,14 @@ impl GlobalSettingsDraft {
                 self.default_model_dirty = defaults.keys().chain(snapshot.config.new_session_defaults.keys()).any(|name| defaults.get(name).and_then(|d| d.model.as_ref()) != snapshot.config.new_session_defaults.get(name).and_then(|d| d.model.as_ref()));
                 self.default_reasoning_dirty = defaults.keys().chain(snapshot.config.new_session_defaults.keys()).any(|name| defaults.get(name).and_then(|d| d.reasoning.as_ref()) != snapshot.config.new_session_defaults.get(name).and_then(|d| d.reasoning.as_ref()));
                 self.new_session_defaults = (defaults != snapshot.config.new_session_defaults).then_some(defaults);
+            }
+            GlobalSettingsField::TerminalColors => {
+                let enabled = match value.as_deref() {
+                    Some("auto") => false,
+                    Some("truecolor") => true,
+                    _ => anyhow::bail!("Expected auto or truecolor"),
+                };
+                self.terminal_truecolor = (enabled != snapshot.config.terminal_truecolor).then_some(enabled);
             }
             GlobalSettingsField::DefaultNotification => {
                 let level = match value.as_deref() {
@@ -1513,6 +1530,7 @@ impl GlobalSettingsDraft {
                 let entry = name.as_ref().and_then(|n| defaults.get(n));
                 entry.and_then(|e| if field == GlobalSettingsField::DefaultModel { e.model.clone() } else { e.reasoning.clone() }).unwrap_or_default()
             }
+            GlobalSettingsField::TerminalColors => if self.terminal_truecolor.unwrap_or(snapshot.config.terminal_truecolor) { "truecolor" } else { "auto" }.into(),
             GlobalSettingsField::DefaultNotification => match self.new_session_notification.unwrap_or(snapshot.config.new_session_notification) {
                 cutex::notify::session::Level::Important => "important",
                 cutex::notify::session::Level::Normal => "normal",
@@ -1686,6 +1704,7 @@ impl GlobalSettingsDraft {
         match field {
             GlobalSettingsField::DefaultModel => self.default_model_dirty,
             GlobalSettingsField::DefaultReasoning => self.default_reasoning_dirty,
+            GlobalSettingsField::TerminalColors => self.terminal_truecolor.is_some(),
             GlobalSettingsField::DefaultNotification => self.new_session_notification.is_some(),
             GlobalSettingsField::ManagedSessions => self.managed_sessions.is_some(),
             GlobalSettingsField::DockerSudo => self.docker_sudo.is_some(),
@@ -1769,6 +1788,7 @@ impl GlobalSettingsDraft {
             GlobalSettingsField::DefaultModel,
             GlobalSettingsField::DefaultReasoning,
             GlobalSettingsField::DefaultNotification,
+            GlobalSettingsField::TerminalColors,
             GlobalSettingsField::ProxyEnabled,
             GlobalSettingsField::ProxyUrl,
             GlobalSettingsField::ProxyNoProxy,
@@ -1847,6 +1867,7 @@ impl GlobalSettingsDraft {
         };
         Ok(GlobalConfigPatch {
             docker_use_sudo: self.docker_sudo,
+            terminal_truecolor: self.terminal_truecolor,
             session_enabled: self.managed_sessions,
             default_profile: self.default_profile.clone(),
             default_profile_direct_launch: self.default_profile_direct_launch,
@@ -2065,6 +2086,22 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn terminal_colors_default_stage_save_and_reset() {
+        let config = CodezConfig::default();
+        assert!(!config.terminal_truecolor);
+        let snapshot = GlobalSettingsSnapshot::from_config_with_profiles(&config, &[]);
+        let mut draft = GlobalSettingsDraft::default();
+        draft.stage(&snapshot, GlobalSettingsField::TerminalColors, Some("truecolor".into())).unwrap();
+        assert_eq!(draft.dirty_count(), 1);
+        assert!(draft.stage(&snapshot, GlobalSettingsField::TerminalColors, Some("invalid".into())).is_err());
+        let mut saved = config;
+        cutex::config::global_settings::apply_global_config_patch(&mut saved, &draft.patch(&snapshot.config).unwrap()).unwrap();
+        assert!(saved.terminal_truecolor);
+        draft.stage(&snapshot, GlobalSettingsField::TerminalColors, Some("auto".into())).unwrap();
+        assert_eq!(draft.dirty_count(), 0);
     }
 
     #[test]
@@ -2650,7 +2687,7 @@ mod tests {
                 .flat_map(|category| category.options.iter())
                 .filter(|option| option.global_field.is_some())
                 .count(),
-            10
+            11
         );
     }
 

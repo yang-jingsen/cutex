@@ -292,12 +292,16 @@ pub(super) fn clean_launch(
 }
 /// Foreground rendering uses the user's terminal capabilities. The background
 /// runtime's deliberately minimal environment is not a terminal description.
-fn foreground_terminal(mut launch: LaunchCommand, environment: impl IntoIterator<Item=(String, String)>) -> LaunchCommand {
+fn foreground_terminal(mut launch: LaunchCommand, environment: impl IntoIterator<Item=(String, String)>, truecolor: bool) -> LaunchCommand {
     for (key, value) in environment {
         if matches!(key.as_str(), "TERM" | "COLORTERM" | "TERM_PROGRAM" | "TERM_PROGRAM_VERSION"
             | "WT_SESSION" | "NO_COLOR" | "FORCE_COLOR" | "CLICOLOR" | "CLICOLOR_FORCE") {
             launch = launch.env_unset(&key).env(key, value);
         }
+    }
+    if truecolor {
+        launch.envs.retain(|(key, _)| key != "COLORTERM");
+        launch.envs.push(("COLORTERM".into(), "truecolor".into()));
     }
     launch
 }
@@ -1117,7 +1121,8 @@ pub(super) fn attach_status(id: &str) -> anyhow::Result<std::process::ExitStatus
     }).unwrap_or(&bundle);
     let cli = frontend.cli.as_ref().unwrap_or(&frontend.executable);
     let actual_cwd = cutex::session::reviewed_registration::occurrence_launch_cwd(ready)?;
-    let launch = foreground_terminal(clean_launch(&cli.path, &contract.native_home)?, std::env::vars())
+    let launch = foreground_terminal(clean_launch(&cli.path, &contract.native_home)?, std::env::vars(),
+        cutex::config::store::load_codez_config_checked()?.terminal_truecolor)
         .env("CUTEX_NOTIFICATION_CONTROL", std::env::current_exe()?.to_string_lossy())
         .args([
         "resume",
@@ -1335,11 +1340,20 @@ mod windows_environment_tests {
 mod foreground_terminal_tests {
     use super::*;
     #[test]
+    fn frontend_truecolor_opt_in_supplies_ssh_marker_only_to_child() {
+        let launch = foreground_terminal(LaunchCommand::new("native"),
+            [("COLORTERM".into(), "old".into())], true);
+        assert_eq!(launch.envs.iter().filter(|(key, _)| key == "COLORTERM").count(), 1);
+        assert!(launch.envs.contains(&("COLORTERM".into(), "truecolor".into())));
+        let auto = foreground_terminal(LaunchCommand::new("native"), [], false);
+        assert!(!auto.envs.iter().any(|(key, _)| key == "COLORTERM"));
+    }
+    #[test]
     fn frontend_preserves_terminal_color_capabilities_and_user_overrides() {
         let launch = foreground_terminal(LaunchCommand::new("native").env("TERM", "xterm-256color"),
             [("TERM", "xterm-direct"), ("COLORTERM", "truecolor"), ("NO_COLOR", "1"),
              ("WT_SESSION", "terminal-id"), ("OPENAI_API_KEY", "must-not-forward")]
-                .map(|(k,v)|(k.to_string(), v.to_string())));
+                .map(|(k,v)|(k.to_string(), v.to_string())), false);
         assert!(launch.envs.contains(&("COLORTERM".into(),"truecolor".into())));
         assert!(launch.envs.contains(&("NO_COLOR".into(),"1".into())));
         assert!(launch.envs.contains(&("WT_SESSION".into(),"terminal-id".into())));
