@@ -384,6 +384,7 @@ enum SelectorControl {
     Recent(RecentCommand),
     AdoptRecent(RecentAdoptionRequest),
     OpenProfileManager,
+    OpenHosts,
     OpenCutexProjects,
     OpenProjects,
     OpenTasks,
@@ -6036,6 +6037,7 @@ fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyR
             | Command::Edit
             | Command::Inspect
             | Command::Profiles
+            | Command::Hosts
             | Command::Workspaces
             | Command::Archive
             | Command::Appearance
@@ -6063,6 +6065,7 @@ fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyR
         }
     }
     match command {
+        Command::Hosts => SelectorKeyRoute::Control(Some(SelectorControl::OpenHosts)),
         Command::Profiles => {
             model.profiles_from_settings = matches!(model.mode, SelectorMode::Settings { target: SelectorTarget::GlobalSettings, .. });
             SelectorKeyRoute::Control(Some(SelectorControl::OpenProfileManager))
@@ -6796,6 +6799,13 @@ fn run_event_loop(
                             match adopt_recent_thread(&request) {
                                 Ok(result) => model.recent_adoption_succeeded(&request, result),
                                 Err(error) => model.recent_adoption_failed(format!("{error:#}")),
+                            }
+                        }
+                        SelectorControl::OpenHosts => {
+                            match super::session_tui_hosts::run(terminal, events) {
+                                Ok(true) => return Ok(SessionTuiCycleOutcome::Exit),
+                                Ok(false) => {},
+                                Err(error) => model.notice = Some(format!("Hosts: {error:#}")),
                             }
                         }
                         SelectorControl::OpenProfileManager => {
@@ -8624,6 +8634,7 @@ fn render_filter(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel, focus
 
 fn selector_view(row: &SelectorRow, _default_profile: Option<&str>) -> AgentSessionView {
     AgentSessionView {
+        host: row.host.clone(),
         badge: row.project.as_ref().map(|p| views::ProjectBadge { label: p.badge_label.clone(), color: p.color }),
         project_id: row.project.as_ref().map(|p| p.project_id.clone()),
         subject: SubjectRef::Managed(
@@ -16076,8 +16087,8 @@ mod tests {
         global_tail_model.handle(SelectorEvent::OpenActions);
         global_tail_model.handle(SelectorEvent::Last);
         let global_tail = rendered_text(120, &global_tail_model);
-        assert!(global_tail.contains("Agent Bus"));
-        assert!(rendered_text_at(120, 30, &global_tail_model).contains("restarts"));
+        assert!(global_tail.contains("Hosts / Connections"));
+        assert!(rendered_text_at(120, 30, &global_tail_model).contains("Manage hosts"));
         assert!(global_tail.contains("Ctrl+C exit"));
     }
 

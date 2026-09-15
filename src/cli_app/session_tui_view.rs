@@ -16,6 +16,7 @@ mod tests {
     use super::*;
     fn visual_row() -> AgentSessionView {
         AgentSessionView {
+            host: String::new(),
             badge: Some(ProjectBadge {
                 label: "CX".into(),
                 color: ProjectPaletteColor::Rgb(240, 220, 90),
@@ -355,6 +356,7 @@ impl Observation<String> {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AgentSessionView {
+    pub host: String,
     pub badge: Option<ProjectBadge>,
     pub project_id: Option<String>,
     pub subject: SubjectRef,
@@ -396,6 +398,7 @@ pub(super) fn member_view(
         _ => Observation::Unavailable("runtime observation missing or identity mismatch".into()),
     };
     AgentSessionView {
+        host: String::new(),
         badge: None,
         project_id: None,
         subject: SubjectRef::Managed(member.agent.cutex_session_id.as_str().to_owned()),
@@ -463,6 +466,7 @@ pub(super) fn project_members(project: &CutexProjectWorkspace) -> Vec<AgentSessi
                 view.role = format!("Director/{}", view.role);
             })
             .or_insert(AgentSessionView {
+                host: String::new(),
                 badge: (!project.presentation.badge_label.is_empty()).then(|| ProjectBadge {
                     label: project.presentation.badge_label.clone(),
                     color: project.presentation.color,
@@ -507,10 +511,12 @@ pub(super) enum Column {
     Project,
     Profile,
     Updated,
+    Host,
 }
 impl Column {
     fn label(self) -> &'static str {
         match self {
+            Self::Host => "HOST",
             Self::Name => "NAME",
             Self::Status => "STATUS",
             Self::Role => "ROLE",
@@ -522,6 +528,7 @@ impl Column {
     }
     fn value(self, row: &AgentSessionView) -> String {
         match self {
+            Self::Host => cutex::management::connections::display(&row.host),
             Self::Name => row.name.clone(),
             Self::Status => match &row.runtime {
                 Observation::Unavailable(_) => "N/A".into(),
@@ -547,6 +554,7 @@ pub(super) fn visible_columns(width: u16, kind: ListKind) -> Vec<(Column, u16)> 
     if kind == ListKind::Recent && width >= 44 {
         columns.push((Column::Updated, 16));
     }
+    if kind != ListKind::Members && width >= 120 { columns.push((Column::Host, 22)); }
     if width >= 66 {
         columns.push((Column::Project, 18));
     }
@@ -975,6 +983,8 @@ fn inspector_lines(row: &AgentSessionView) -> Vec<Line<'static>> {
             row.runtime.label(),
             runtime_style(&row.runtime),
         ),
+        field("Host", cutex::management::connections::display(&row.host), Style::new()),
+        field("Host identity", if row.host.is_empty(){"N/A".into()}else{row.host.clone()}, Style::new().fg(Color::Gray)),
         field("Cutex Project", row.project.label(), Style::new()),
     ];
     if !row.role.trim().is_empty() {

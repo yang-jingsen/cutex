@@ -752,6 +752,7 @@ fn recent_row(
     let owner = store.sessions.values().find(|record| record.is_owned_session()
         && record.codex_session_id.as_deref() == Some(&thread.id));
     let mut view = AgentSessionView {
+        host: cutex::platform::host::current_host_name(),
         badge: None,
         project_id: None,
         subject: if records.len() == 1 && state != RecentThreadState::Ambiguous {

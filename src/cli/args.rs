@@ -1527,6 +1527,10 @@ pub enum ProfileCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum HumanCommand {
+    /// Host connections and read-only connection testing
+    Hosts {
+        #[command(subcommand)] command: HostsCommand,
+    },
     /// Inspect local runtime, failed actions and storage without starting services
     Doctor { id: Option<String> },
     /// Create a persistent native agent without sending a model prompt
@@ -1638,4 +1642,14 @@ pub enum HumanConfigCommand {
         #[arg(long)]
         action_id: Option<String>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HostsCommand {
+    /// Show configured identities and connection details (no credential values)
+    List,
+    /// Replace hosts configuration from a JSON file
+    Configure { file: std::path::PathBuf },
+    /// Test an existing tunnel and verify its remote host identity
+    Test { id: String },
 }

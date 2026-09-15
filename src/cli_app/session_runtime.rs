@@ -8,11 +8,10 @@ use cutex::app_server::runtime::AppServerRuntimeLayout;
 use cutex::config::store::load_codez_config;
 use cutex::launch::args::codex_args_for_runtime;
 use cutex::management::remote::{
-    ensure_management_remote_tunnel, management_api_healthy, management_http_json_with_timeout,
+    management_api_healthy, management_http_json_with_timeout,
 };
 use cutex::management::service::{
     management_api_token, management_base_url, management_root_credential, DEFAULT_MANAGEMENT_PORT,
-    DEFAULT_MANAGEMENT_REMOTE_TUNNEL_PORT, MANAGEMENT_BRIDGE_ID,
 };
 use cutex::platform::host::current_host_name;
 use cutex::platform::process::process_is_running;
@@ -329,7 +328,7 @@ fn cmd_session_lifecycle_action_with_payload_and_output(
         .sessions
         .get(&key)
         .ok_or_else(|| anyhow!("cutex session disappeared while preparing lifecycle request"))?;
-    if action_type == "session.online" && record.explicit_launch.is_some() {
+    if action_type == "session.online" && record.explicit_launch.is_some() && cutex_session_host_is_local(&record.host_id, &current_host_name()) {
         let profile = launch_profile_from_payload(&payload)?;
         validate_managed_launch_overrides(record, None, profile.as_deref())?;
         let receipt = super::stock_lifecycle::online(&key, false)?;
@@ -384,7 +383,9 @@ fn cmd_session_lifecycle_action_with_payload_and_output(
         "params": params,
     }))?;
     let (base_url, token) = management_endpoint_for_record(&config, record)?;
-    let token = lifecycle_request_credential(&config, method, token)?;
+    let token = if cutex_session_host_is_local(&record.host_id, &current_host_name()) {
+        lifecycle_request_credential(&config, method, token)?
+    } else { token };
     let encoded_session_id =
         url::form_urlencoded::byte_serialize(record.cutex_session_id.as_bytes())
             .collect::<String>();
@@ -481,17 +482,9 @@ fn management_endpoint_for_record(
             token.map(str::to_string),
         ));
     }
-    ensure_management_remote_tunnel(
-        &record.host_id,
-        MANAGEMENT_BRIDGE_ID,
-        DEFAULT_MANAGEMENT_REMOTE_TUNNEL_PORT,
-        DEFAULT_MANAGEMENT_PORT,
-        token,
-    )?;
-    Ok((
-        management_base_url(DEFAULT_MANAGEMENT_REMOTE_TUNNEL_PORT),
-        token.map(str::to_string),
-    ))
+    let hosts = cutex::management::connections::Hosts::load()?;
+    let (url, token) = hosts.for_host(&record.host_id)?.verified_endpoint()?;
+    Ok((url, Some(token)))
 }
 
 fn print_management_v2_lifecycle_response(response: &serde_json::Value) {

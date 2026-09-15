@@ -1069,6 +1069,12 @@ impl GlobalSettingsSnapshot {
                 self.editable_option("Agent Bus port", GlobalSettingsField::AgentBusPort, draft),
                 self.editable_option("Agent Bus token", GlobalSettingsField::AgentBusToken, draft),
             ]),
+            SessionTuiSettingCategory::new("Hosts / Connections", vec![SessionTuiSettingOption {
+                navigation: Some(super::session_tui_input::Command::Hosts),
+                presentation: SettingPresentation { detail: Some("Manage display names, identities, SSH targets, ports and credential files. Test verifies an existing tunnel without starting runtimes.".into()), ..Default::default() },
+                ..SessionTuiSettingOption::new("Manage hosts", "Enter to open")
+            }]),
+
         ]
     }
 
@@ -2669,7 +2675,7 @@ mod tests {
                 .map(|category| category.label)
                 .collect::<Vec<_>>(),
             vec![
-                "Profiles", "Defaults", "Network", "Notifications", "Appearance", "Messages", "Services",
+                "Profiles", "Defaults", "Network", "Notifications", "Appearance", "Messages", "Services", "Hosts / Connections",
             ]
         );
         let settings = flattened(&categories);

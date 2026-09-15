@@ -9,3 +9,5 @@ pub mod service;
 pub mod v2;
 
 pub mod task_reports;
+
+pub mod connections;

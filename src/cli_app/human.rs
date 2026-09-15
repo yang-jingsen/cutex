@@ -41,6 +41,22 @@ pub(super) fn recover(
 
 pub(super) fn run_command(command: HumanCommand) -> anyhow::Result<()> {
     match command {
+        HumanCommand::Hosts { command } => {
+            use cutex::cli::args::HostsCommand;
+            use cutex::management::connections::Hosts;
+            match command {
+                HostsCommand::List => println!("{}", serde_json::to_string_pretty(&Hosts::load()?)?),
+                HostsCommand::Configure { file } => {
+                    let hosts: Hosts = serde_json::from_slice(&std::fs::read(file)?)?;
+                    hosts.save()?; println!("Saved host connections");
+                },
+                HostsCommand::Test { id } => {
+                    let hosts=Hosts::load()?;
+                    let c=hosts.connections.iter().find(|c|c.id==id).context("Connection ID not found")?;
+                    c.verified_endpoint()?;println!("{}: connected; host identity {} verified",c.name,c.host_id);
+                }
+            }
+        },
         HumanCommand::Doctor { id } => super::human_diagnostics::run(id.as_deref())?,
         HumanCommand::New { name, cwd } => {
             let cwd = cwd.unwrap_or(std::env::current_dir()?);

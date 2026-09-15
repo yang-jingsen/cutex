@@ -161,6 +161,7 @@ pub(super) enum Command {
     Help,
     Archived,
     Profiles,
+    Hosts,
     Workspaces,
     Archive,
     Appearance,

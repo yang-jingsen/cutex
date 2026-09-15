@@ -212,6 +212,7 @@ fn agent_management_admin_path(path: &str) -> bool {
             | "/v2/agent-management/project-mutations"
             | "/v2/task-service/management-query"
             | "/v2/job-service/management-query"
+            | "/v2/host"
             | "/v2/task-service/human-recovery"
     ) || management_project_id_from_path(path).is_some()
 }
@@ -468,6 +469,7 @@ fn handle_v2_request_with_repository(
         ("POST", "/v2/agent-management/human-config") => {
             super::human_config::handle(stream, request)
         }
+        ("GET", "/v2/host") => write_json_response(stream,200,"OK",&serde_json::json!({"hostId":crate::platform::host::current_host_name(),"schema":"cutex/host/v1"})),
         ("POST", "/v2/job-service/management-query") => super::human_jobs::handle(stream, request),
         ("POST", "/v2/task-service/human-recovery") => super::human_tasks::handle(stream, request),
         ("POST", "/v2/task-service/management-query") => {
@@ -4351,6 +4353,7 @@ mod tests {
             "/v2/agent-management/project-mutations",
             "/v2/task-service/management-query",
             "/v2/job-service/management-query",
+            "/v2/host",
             "/v2/task-service/human-recovery",
         ] {
             assert!(agent_management_admin_path(path), "root scope: {path}");
