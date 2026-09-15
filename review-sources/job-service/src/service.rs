@@ -404,6 +404,44 @@ impl JobService {
         )
     }
 
+    /// Human read projection: bounded metadata only, with no commands or output bodies.
+    pub fn human_list(&self, api_token: &[u8], params: serde_json::Value) -> Result<serde_json::Value, JobError> {
+        self.authenticate(api_token)?;
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Query { #[serde(default)] query: String, cursor: Option<String>, limit: Option<usize> }
+        let q: Query = serde_json::from_value(params)?;
+        if q.query.len() > 256 || q.cursor.as_ref().is_some_and(|c| c.len() > 160) {
+            return Err(JobError::Invalid("Job query is too long".into()));
+        }
+        let before = q.cursor.as_deref().map(|c| {
+            let (time, id) = c.split_once(':').ok_or_else(|| JobError::Invalid("Invalid job cursor".into()))?;
+            Ok::<_, JobError>((time.parse::<u64>().map_err(|_| JobError::Invalid("Invalid job cursor".into()))?, id))
+        }).transpose()?;
+        let query = q.query.to_lowercase();
+        let limit = q.limit.unwrap_or(50).clamp(1, 50);
+        let state = self.inner.state.lock().expect("state mutex poisoned");
+        let mut jobs: Vec<_> = state.jobs.values().filter(|j| {
+            before.is_none_or(|key| (j.created_at_epoch_secs, j.job_id.as_str()) < key)
+                && [j.job_id.as_str(), j.request.action_id.as_str(), j.request.subscriber_cutex_session_id.as_str()]
+                    .iter().any(|s| s.to_lowercase().contains(&query))
+        }).collect();
+        jobs.sort_by(|a,b| (b.created_at_epoch_secs, &b.job_id).cmp(&(a.created_at_epoch_secs, &a.job_id)));
+        let more = jobs.len() > limit;
+        jobs.truncate(limit);
+        let cursor = if more { jobs.last().map(|j| format!("{}:{}", j.created_at_epoch_secs, j.job_id)) } else { None };
+        let data: Vec<_> = jobs.into_iter().map(|j| serde_json::json!({
+            "jobId":j.job_id, "actionId":j.request.action_id.chars().take(512).collect::<String>(),
+            "sessionId":j.request.subscriber_cutex_session_id, "state":j.state,
+            "createdAt":j.created_at_epoch_secs, "updatedAt":j.updated_at_epoch_secs,
+            "exitCode":j.exit_code, "cwd":j.request.cwd.chars().take(1024).collect::<String>(),
+            "stdout":j.stdout, "stderr":j.stderr, "execution":j.execution,
+            "delivery":j.completion_delivery.state, "outputReference":j.output_reference,
+            "revision":j.revision
+        })).collect();
+        Ok(serde_json::json!({"schema":"cutex/job-list/v1", "data":data, "nextCursor":cursor}))
+    }
+
     pub fn query(&self, api_token: &[u8], job_id: &str) -> Result<JobRecord, JobError> {
         self.authenticate(api_token)?;
         self.query_inner(job_id)

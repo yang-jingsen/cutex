@@ -6,6 +6,7 @@ pub mod archive;
 pub mod contract_validation;
 mod human_config;
 mod human_tasks;
+mod human_jobs;
 pub mod integration_events;
 pub mod model;
 pub mod native_events;

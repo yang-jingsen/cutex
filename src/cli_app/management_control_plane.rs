@@ -284,6 +284,11 @@ impl ManagementControlClient {
         )
     }
 
+    pub(super) fn jobs(&self, query: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        self.request_with_timeout("POST", "/v2/job-service/management-query",
+            Some(&serde_json::to_vec(query)?), std::time::Duration::from_secs(6))
+    }
+
     pub(super) fn tasks(
         &self,
         request: &HumanManagementTaskQueryRequest,

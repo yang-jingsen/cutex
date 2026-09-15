@@ -784,3 +784,36 @@ fn concurrent_submit_and_cancel_finish_without_lock_inversion() {
     let second = submit.join().unwrap().unwrap();
     await_terminal(&service, &second.job.job_id);
 }
+
+#[test]
+fn human_job_pages_are_stable_bounded_authenticated_and_metadata_only() {
+    let root=tempfile::tempdir().unwrap();
+    let mut jobs=serde_json::Map::new();
+    for i in 0..55 {
+        let id=format!("job_{i:03}");
+        jobs.insert(id.clone(),json!({"schema":CONTRACT,"jobId":id,"revision":1,"requestSha256":"0".repeat(64),
+            "request":{"actionId":format!("action-{i:03}"),"argumentCount":1,"cwd":"/tmp",
+            "environmentNames":["SECRET_SENTINEL"],"subscriberCutexSessionId":"cutex.owner"},
+            "state":"exited","createdAtEpochSecs":100,"updatedAtEpochSecs":101,"exitCode":0,
+            "terminalReason":"SECRET_SENTINEL","stdout":{"observedBytes":999,"retainedBytes":10,"truncated":true},
+            "stderr":{"observedBytes":0,"retainedBytes":0,"truncated":false},"outputReference":format!("job-output:{id}")}));
+    }
+    std::fs::write(root.path().join("state.json"),serde_json::to_vec(&json!({"version":1,"jobs":jobs,"actionIndex":{},"outbox":{}})).unwrap()).unwrap();
+    let mut cfg=config(root.path());cfg.max_jobs=100;
+    let service=JobService::open(cfg).unwrap();
+    assert!(service.human_list(b"wrong",json!({})).is_err());
+    assert!(service.human_list(API,json!({"cursor":"broken"})).is_err());
+    assert!(service.human_list(API,json!({"query":"x".repeat(257)})).is_err());
+    let page=service.human_list(API,json!({"limit":10000})).unwrap();
+    assert_eq!(page["data"].as_array().unwrap().len(),50);
+    assert_eq!(page["data"][0]["jobId"],"job_054");
+    assert!(!page.to_string().contains("SECRET_SENTINEL"));
+    assert!(!page.to_string().contains("environmentNames"));
+    let second=service.human_list(API,json!({"cursor":page["nextCursor"]})).unwrap();
+    assert_eq!(second["data"].as_array().unwrap().len(),5);
+    assert_eq!(second["data"][0]["jobId"],"job_004");
+    assert!(second["nextCursor"].is_null());
+    let filtered=service.human_list(API,json!({"query":"ACTION-003"})).unwrap();
+    assert_eq!(filtered["data"].as_array().unwrap().len(),1);
+    assert_eq!(filtered["data"][0]["stdout"]["truncated"],true);
+}
