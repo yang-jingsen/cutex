@@ -35,6 +35,9 @@ pub(super) fn list(c: &Connection, query: &str, cursor: Option<&str>) -> anyhow:
     Ok(value)
 }
 pub(super) fn lifecycle(c: &Connection, id: &str, close: bool) -> anyhow::Result<Value> {
+    let current=connection(&c.id)?;
+    ensure!(current.enabled && current.host_id.eq_ignore_ascii_case(&c.host_id),"Connection disabled or host changed; refresh before retrying");
+    let c=&current;
     let value = list(c, id, None)?;
     let row: HostSession = serde_json::from_value(
         value["data"]
@@ -114,6 +117,9 @@ fn command(platform: &str, exe: &str, id: &str) -> anyhow::Result<String> {
     }
 }
 pub(super) fn foreground(c: &Connection, id: &str) -> anyhow::Result<std::process::ExitStatus> {
+    let current=connection(&c.id)?;
+    ensure!(current.enabled && current.host_id.eq_ignore_ascii_case(&c.host_id),"Connection disabled or host changed; refresh before retrying");
+    let c=&current;
     let (url, token) = c.verified_endpoint()?;
     let host = request(
         &url,

@@ -22,6 +22,10 @@ pub struct HostSession {
     pub kind: String,
     pub host_id: String,
     pub profile: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub project_name: Option<String>,
     pub cwd: String,
     pub state: String,
     pub generation: u64,
@@ -59,7 +63,17 @@ pub(super) fn handle(
     }
     let store = crate::session::store::load_cutex_session_store()?;
     let host = crate::platform::host::current_host_name();
-    let value=project(&store,&host,&query,context.load_runtime_status);
+    let mut value=project(&store,&host,&query,context.load_runtime_status);
+    if let Ok(snapshot)=crate::agent_management::AgentManagementStore::open_default().and_then(|s|s.snapshot().map_err(anyhow::Error::new)) {
+        if let Some(rows)=value["data"].as_array_mut(){for row in rows {
+            if let Some((_,agent))=snapshot.agents.iter().find(|(id,_)|Some(id.as_str())==row["id"].as_str()) {
+                if let Some(id)=crate::agent_management::current_project_id(&snapshot,agent) {
+                    let presentation=crate::agent_management::effective_presentation(&id,snapshot.project_presentations.get(&id));
+                    row["projectId"]=json!(id.as_str());row["projectName"]=json!(presentation.display_name);
+                }
+            }
+        }}
+    }
     write_json_response(stream,200,"OK",&value)
 }
 fn project(store:&crate::session::model::CutexSessionStore,host:&str,query:&Query,load:crate::management::server::ManagementRuntimeStatusLoader)->serde_json::Value {
@@ -130,6 +144,7 @@ fn project(store:&crate::session::model::CutexSessionStore,host:&str,query:&Quer
                 .into(),
                 host_id: host.to_owned(),
                 profile: r.profile.clone(),
+                project_id:None,project_name:None,
                 cwd: crate::session::service::cutex_session_launch_cwd(r)
                     .chars()
                     .take(1024)

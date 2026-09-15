@@ -100,6 +100,7 @@ type CutexTerminal = Terminal<CrosstermBackend<Stdout>>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SelectorTarget {
     Agent(String),
+    RemoteAgent(String,String),
     RetiredAgent(String),
     RecentSessions,
     RetiredSessions,
@@ -113,7 +114,7 @@ enum SelectorTarget {
 impl SelectorTarget {
     fn workspace(&self) -> SessionTuiWorkspace {
         match self {
-            Self::Agent(_) => SessionTuiWorkspace::Agents,
+            Self::Agent(_) | Self::RemoteAgent(..) => SessionTuiWorkspace::Agents,
             Self::RecentSessions => SessionTuiWorkspace::RecentSessions,
             Self::RetiredAgent(_) | Self::RetiredSessions => SessionTuiWorkspace::RetiredSessions,
             Self::CutexProjects => SessionTuiWorkspace::CutexProjects,
@@ -127,7 +128,7 @@ impl SelectorTarget {
     fn agent_key(&self) -> Option<&str> {
         match self {
             Self::Agent(key) | Self::RetiredAgent(key) => Some(key),
-            Self::RecentSessions
+            Self::RemoteAgent(..) | Self::RecentSessions
             | Self::RetiredSessions
             | Self::CutexProjects
             | Self::Projects
@@ -385,6 +386,8 @@ enum SelectorControl {
     AdoptRecent(RecentAdoptionRequest),
     OpenProfileManager,
     OpenHosts,
+    RemoteForeground(cutex::management::connections::Connection,String),
+    RemoteBrowse(cutex::management::connections::Connection,String),
     OpenCutexProjects,
     OpenProjects,
     OpenTasks,
@@ -759,7 +762,7 @@ impl AppContext {
     fn extract(rows: &mut Vec<SelectorRow>) -> Self {
         let mut settings = Vec::new();
         rows.retain(|row| {
-            if matches!(row.target, SelectorTarget::Agent(_)) {
+            if matches!(row.target, SelectorTarget::Agent(_) | SelectorTarget::RemoteAgent(..)) {
                 true
             } else {
                 settings.push(row.clone());
@@ -788,9 +791,13 @@ struct SelectorModel {
     context: AppContext,
     inspector_visible: bool,
     filter_focused: bool,
+    facets: super::session_tui_filters::Facets,
     help: Option<Help>,
     leave_review: Option<LeaveReview>,
     rows: Vec<SelectorRow>,
+    remote_entries: Vec<remote_projection::Entry>,
+    remote_worker: Option<std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<remote_projection::Reply>>>>,
+    remote_due: Instant,
     retired_rows: Vec<SelectorRow>,
     archive_return_panel: PrimaryPanel,
     recent: RecentSessionsWorkspace,
@@ -844,9 +851,12 @@ impl SelectorModel {
             context,
             inspector_visible: true,
             filter_focused: false,
+            facets: Default::default(),
             help: None,
             leave_review: None,
             rows,
+            remote_entries: Vec::new(),
+            remote_worker:None,remote_due:Instant::now(),
             retired_rows: Vec::new(),
             archive_return_panel: PrimaryPanel::Agents,
             recent: RecentSessionsWorkspace::default(),
@@ -1071,11 +1081,12 @@ impl SelectorModel {
             .iter()
             .enumerate()
             .filter_map(|(index, row)| {
-                (matches!(row.target, SelectorTarget::Agent(_))
+                (matches!(row.target, SelectorTarget::Agent(_) | SelectorTarget::RemoteAgent(..))
                     && (self.managed_scope == 0
                         || (self.managed_scope == 1
                             && row.lifecycle == Some(CutexSessionLifecycleState::Online))
                         || (self.managed_scope == 2 && row.pinned))
+                    && self.facets.matches(&row.host, row.project.as_ref().map(|p| p.project_id.as_str()))
                     && (query.is_empty() || selector_row_matches_query(row, &query)))
                 .then_some(index)
             })
@@ -1784,6 +1795,7 @@ impl SelectorModel {
         match result.snapshot {
             Ok(snapshot) => {
                 self.rows = snapshot.rows;
+        remote_projection::apply(self);
                 self.context = AppContext::extract(&mut self.rows);
                 self.workspace_selection.select(selected);
                 self.ensure_selection();
@@ -3967,6 +3979,7 @@ impl SelectorModel {
             _ => None,
         };
         self.rows = snapshot.rows;
+        remote_projection::apply(self);
         self.context = AppContext::extract(&mut self.rows);
         sort_rows(&mut self.rows);
         let mut settings_warning = None;
@@ -4715,7 +4728,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
             SessionTuiCycleOutcome::RemoteForeground(connection,id) => {
                 let result=shell.handoff(||super::remote_sessions::foreground(&connection,&id))?;
                 match result {Ok(status)=>selector_model.notice=Some(format!("Remote frontend returned ({status})")),Err(error)=>selector_model.warning=Some(format!("Remote frontend: {error:#}"))};
-                panel=PrimaryPanel::Settings;
+                // Preserve the page and selection from which foreground was opened.
             }
             SessionTuiCycleOutcome::NewSession => {
                 match shell.handoff(|| -> anyhow::Result<std::process::ExitStatus> {
@@ -5253,11 +5266,8 @@ fn combine_warnings(left: Option<String>, right: Option<String>) -> Option<Strin
 
 fn selector_row_matches_query(row: &SelectorRow, query: &str) -> bool {
     row.agent.to_lowercase().contains(query)
-        || row.project.as_ref().is_some_and(|project| {
-            project.display_name.to_lowercase().contains(query)
-                || project.project_id.to_lowercase().contains(query)
-                || project.badge_label.to_lowercase().contains(query)
-        })
+        || row.thread_title.as_ref().is_some_and(|s| s.to_lowercase().contains(query))
+        || row.target.agent_key().is_some_and(|id| id.to_lowercase().contains(query))
 }
 
 fn selector_activity_from_state(state: &SessionActivityState) -> Option<SelectorActivity> {
@@ -5745,7 +5755,7 @@ fn sort_rows(rows: &mut [SelectorRow]) {
 
 fn system_row_rank(target: &SelectorTarget) -> Option<u8> {
     match target {
-        SelectorTarget::Agent(_) | SelectorTarget::RetiredAgent(_) => None,
+        SelectorTarget::Agent(_) | SelectorTarget::RemoteAgent(..) | SelectorTarget::RetiredAgent(_) => None,
         SelectorTarget::RecentSessions => Some(0),
         SelectorTarget::RetiredSessions => Some(1),
         SelectorTarget::CutexProjects => Some(2),
@@ -5894,10 +5904,10 @@ fn selector_input(model: &mut SelectorModel) -> Option<&mut Input> {
     if matches!(model.mode, SelectorMode::RecentSessions) && model.recent.review().is_some() {
         return model.recent.adoption_name_input();
     }
-    if matches!(model.mode, SelectorMode::RecentSessions) && model.recent.filter_focused() {
+    if matches!(model.mode, SelectorMode::RecentSessions) && model.recent.filter_focused() && model.recent.facets.field == 0 {
         return Some(model.recent.filter_input_mut());
     }
-    if matches!(model.mode, SelectorMode::Agents) && model.filter_focused {
+    if matches!(model.mode, SelectorMode::Agents) && model.filter_focused && model.facets.field == 0 {
         return Some(&mut model.query);
     }
     if !matches!(
@@ -5986,7 +5996,7 @@ fn selector_commands(model: &SelectorModel) -> Vec<(Command, Option<&'static str
                 }
                 Command::Actions | Command::Inspect | Command::Edit | Command::Titles
                     if !matches!(model.mode, SelectorMode::RecentSessions)
-                        && model.selected_managed_agent().is_none() =>
+                        && model.selected_managed_agent().is_none() && remote_projection::selected(model).is_none() =>
                 {
                     Some("Select an Agent")
                 }
@@ -6002,6 +6012,11 @@ fn selector_commands(model: &SelectorModel) -> Vec<(Command, Option<&'static str
         .collect()
 }
 fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyRoute {
+    if let Some(e)=remote_projection::selected(model) {match command {
+        Command::Actions=>return SelectorKeyRoute::Control(Some(SelectorControl::RemoteBrowse(e.connection,e.session.id))),
+        Command::Edit=>{model.notice=Some("Edit on the owning host; Alt+A opens remote runtime actions".into());return SelectorKeyRoute::Control(None);},
+        _=>{}
+    }}
     let command = if command == Command::Back && model.profiles_from_settings
         && matches!(model.mode, SelectorMode::ProfileManager { .. }) {
         Command::Settings
@@ -6230,6 +6245,10 @@ fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyR
     }
 }
 fn route_selector_key(model: &mut SelectorModel, key: KeyEvent) -> SelectorKeyRoute {
+    if key.kind==KeyEventKind::Release{return SelectorKeyRoute::Control(None);}
+    let f=if matches!(model.mode,SelectorMode::RecentSessions){&mut model.recent.facets}else{&mut model.facets};
+    if f.picker.is_some(){let old=f.project.clone();f.picker_key(key);if old.is_some() && f.project.is_none() && f.host.is_some(){model.notice=Some("Project filter cleared for the selected host".into());}model.ensure_selection();model.recent.filter_edited();return SelectorKeyRoute::Control(None);}
+
     if model.native_archive_pending { return SelectorKeyRoute::Control(None); }
     if let Some((id, mut selected, mut confirming)) = model.native_actions.take() {
         if key.kind != KeyEventKind::Press {
@@ -6378,6 +6397,29 @@ fn route_selector_key(model: &mut SelectorModel, key: KeyEvent) -> SelectorKeyRo
         model.help = Some(Help::default());
         return SelectorKeyRoute::Control(None);
     }
+    if matches!(model.mode, SelectorMode::Agents | SelectorMode::RecentSessions) && !selector_modal(model) {
+        let recent=matches!(model.mode,SelectorMode::RecentSessions);
+        let active=if recent {model.recent.filter_focused()}else{model.filter_focused};
+        let facets=if recent {&mut model.recent.facets}else{&mut model.facets};
+        let prior_project=facets.project.clone();
+        if facets.picker_key(key) {
+            if prior_project.is_some() && facets.project.is_none() && facets.host.is_some() {model.notice=Some("Project filter cleared for the selected host".into());}
+            model.ensure_selection();model.recent.filter_edited();
+            return SelectorKeyRoute::Control(None);
+        }
+        if active {
+            match key.code {
+                KeyCode::Tab | KeyCode::BackTab => {facets.field=(facets.field+if key.code==KeyCode::Tab {1}else{2})%3;return SelectorKeyRoute::Control(None);},
+                KeyCode::Enter if facets.field>0 => {open_facet_picker(model);return SelectorKeyRoute::Control(None);},
+                KeyCode::Esc | KeyCode::Enter => {},
+                _ if facets.field>0 => {return SelectorKeyRoute::Control(None);},
+                _=>{},
+            }
+        }
+    }
+    if key.code==KeyCode::Enter && !(matches!(model.mode,SelectorMode::Agents) && model.filter_focused) && !(matches!(model.mode,SelectorMode::RecentSessions) && model.recent.filter_focused()) && !selector_modal(model) {
+        if let Some(e)=remote_projection::selected(model) {return SelectorKeyRoute::Control(Some(SelectorControl::RemoteForeground(e.connection,e.session.id)));}
+    }
     // Editors consume plain text and cursor keys, not page/exit commands.
     if let Some(input) = selector_input(model) {
         if input_policy::edit(input, key) {
@@ -6471,11 +6513,13 @@ fn route_selector_key(model: &mut SelectorModel, key: KeyEvent) -> SelectorKeyRo
                 && !c.is_control()
             {
                 if recent {
+                    model.recent.facets.field=0;
                     model.recent.focus_filter();
                     if c != '/' {
                         model.recent.push_filter(c);
                     }
                 } else {
+                    model.facets.field=0;
                     model.filter_focused = true;
                     if c != '/' {
                         input_policy::edit(&mut model.query, key);
@@ -6547,6 +6591,8 @@ fn route_selector_key(model: &mut SelectorModel, key: KeyEvent) -> SelectorKeyRo
 }
 
 fn handle_selector_paste(model: &mut SelectorModel, text: &str) {
+    if matches!(model.mode,SelectorMode::Agents) && model.facets.paste(text) {return;}
+    if matches!(model.mode,SelectorMode::RecentSessions) && model.recent.facets.paste(text) {return;}
     if model.details.is_some() {
         return;
     }
@@ -6581,8 +6627,11 @@ fn run_event_loop(
             next_activity_refresh = now + ACTIVITY_REFRESH_INTERVAL;
         }
         receive_refresh(model, refresh);
+        if let Some(worker)=model.remote_worker.clone() {if let Ok(rx)=worker.lock(){loop {match rx.try_recv(){Ok((c,r))=>remote_projection::receive(model,c,r),Err(std::sync::mpsc::TryRecvError::Empty)=>break,Err(std::sync::mpsc::TryRecvError::Disconnected)=>{model.remote_worker=None;break;}}}}}
+        if model.remote_worker.is_none() && Instant::now()>=model.remote_due {model.remote_worker=Some(std::sync::Arc::new(std::sync::Mutex::new(remote_projection::start())));model.remote_due=Instant::now()+Duration::from_secs(15);}
         if let Some(reply) = recent_catalog.as_ref().and_then(RecentCatalog::poll) {
             model.recent_catalog_reply(reply);
+            remote_projection::apply(model);
         }
         if receive_runtime_close(model, &mut runtime_close) {
             terminal.clear()?;
@@ -6807,6 +6856,8 @@ fn run_event_loop(
                                 Err(error) => model.recent_adoption_failed(format!("{error:#}")),
                             }
                         }
+                        SelectorControl::RemoteForeground(c,id)=>return Ok(SessionTuiCycleOutcome::RemoteForeground(c,id)),
+                        SelectorControl::RemoteBrowse(c,id)=>{match super::session_tui_remote::run_selected(terminal,events,c,Some(id))? {super::session_tui_remote::Outcome::Foreground(c,id)=>return Ok(SessionTuiCycleOutcome::RemoteForeground(c,id)),super::session_tui_remote::Outcome::Exit=>return Ok(SessionTuiCycleOutcome::Exit),_=>{}}},
                         SelectorControl::OpenHosts => {
                             match super::session_tui_hosts::run(terminal, events) {
                                 Ok(super::session_tui_remote::Outcome::Exit) => return Ok(SessionTuiCycleOutcome::Exit),
@@ -7401,6 +7452,8 @@ fn render_selector(frame: &mut Frame<'_>, model: &SelectorModel) {
         return;
     }
     render_workspace(frame, model, &SelectorWorkspaceRenderer);
+    if matches!(model.mode,SelectorMode::Agents) {model.facets.render_picker(frame);}
+    if matches!(model.mode,SelectorMode::RecentSessions) {model.recent.facets.render_picker(frame);}
     if let Some((id, selected, confirming)) = &model.native_actions {
         let owned = model.native_owned_id(id).is_some();
         let text = if *confirming && owned {
@@ -7570,7 +7623,7 @@ fn render_selector_contents(frame: &mut Frame<'_>, model: &SelectorModel) {
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
     if matches!(model.mode, SelectorMode::Settings { target: SelectorTarget::GlobalSettings, .. }) {
-        let mut spans = vec![Span::styled("Settings", Style::new().fg(crate::cli_app::session_tui_layout::text()).add_modifier(Modifier::BOLD))];
+        let mut spans = crate::cli_app::session_tui_layout::heading("Cutex","Settings").spans;
         let dirty = model.settings_dirty_count();
         if dirty > 0 { spans.push(Span::styled(format!("  Unsaved: {dirty}"), Style::new().fg(crate::cli_app::session_tui_layout::warning()))); }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -7611,7 +7664,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
         ),
         Span::styled(
             format!(" {view}"),
-            Style::new().add_modifier(Modifier::BOLD),
+            Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
         ),
     ];
     if count > 0 || matches!(&model.mode, SelectorMode::Agents) {
@@ -7721,7 +7774,7 @@ fn render_item_context(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel)
         SelectorTarget::Tasks => " Tasks ",
         SelectorTarget::Profiles => " Profiles ",
         SelectorTarget::GlobalSettings => " Global settings ",
-        SelectorTarget::Agent(_) | SelectorTarget::RetiredAgent(_) => " Agent ",
+        SelectorTarget::Agent(_) | SelectorTarget::RemoteAgent(..) | SelectorTarget::RetiredAgent(_) => " Agent ",
     };
     frame.render_widget(
         Paragraph::new(Line::from(spans)).block(
@@ -7791,7 +7844,7 @@ fn render_recent_context(frame: &mut Frame<'_>, area: Rect, model: &SelectorMode
         }
         RecentLoadState::Failed(message) => format!("Catalog unavailable: {message}"),
     };
-    let mut heading = crate::cli_app::session_tui_layout::heading("Recent", "Sessions");
+    let mut heading = crate::cli_app::session_tui_layout::heading("Cutex", "Sessions");
     heading.spans.push(Span::styled(format!(
             " · Alt+Z Archive / Retired · {}/{} · {text}", model.recent.visible_rows().len(), model.recent.rows().len()), Style::new().fg(Color::DarkGray),
     ));
@@ -7866,13 +7919,7 @@ fn render_recent_workspace(frame: &mut Frame<'_>, area: Rect, model: &SelectorMo
     if let Some(details) = panes.details { render_recent_details(frame, details, model); }
     let filter_area = panes.filter;
     let table_area = panes.list;
-    input_policy::render_input(
-        frame,
-        filter_area,
-        model.recent.filter_input(),
-        " Filter sessions [/] ",
-        model.recent.filter_focused(),
-    );
+    model.recent.facets.render(frame,filter_area,model.recent.filter_input(),model.recent.filter_focused());
     let rows: Vec<_> = model
         .recent
         .visible_rows()
@@ -8630,13 +8677,22 @@ fn render_inspector_settings(
 }
 
 fn render_filter(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel, focused: bool) {
-    input_policy::render_input(
-        frame,
-        area,
-        &model.query,
-        " Filter agents / projects [/] ",
-        focused && model.filter_focused,
-    );
+    model.facets.render(frame, area, &model.query, focused && model.filter_focused);
+}
+
+fn open_facet_picker(model: &mut SelectorModel) {
+    use super::session_tui_filters::{Choice,project_key};
+    let recent=matches!(model.mode,SelectorMode::RecentSessions);
+    let views:Vec<_>=if recent {model.recent.all_views()}else{model.rows.iter().map(|r|r.view.clone().unwrap_or_else(||selector_view(r,None))).collect()};
+    let f=if recent {&mut model.recent.facets}else{&mut model.facets};
+    let mut choices=Vec::new();
+    let mut seen=std::collections::HashSet::new();
+    for v in views {
+        let c=if f.field==2 {Some(Choice{key:v.host.to_lowercase(),label:cutex::management::connections::short_display(&v.host)})}
+        else if f.host.as_ref().is_none_or(|h|h.key.eq_ignore_ascii_case(&v.host)) {v.project_id.as_ref().map(|id|Choice{key:project_key(&v.host,id),label:format!("{} · {}",v.project.label(),cutex::management::connections::short_display(&v.host))})}else{None};
+        if let Some(c)=c {if !c.key.is_empty() && seen.insert(c.key.clone()){choices.push(c);}}
+    }
+    f.open(choices);
 }
 
 fn selector_view(row: &SelectorRow, _default_profile: Option<&str>) -> AgentSessionView {
@@ -11547,7 +11603,7 @@ mod tests {
     }
 
     #[test]
-    fn homepage_filter_matches_project_name_id_and_badge_only_for_associated_agents() {
+    fn homepage_name_filter_is_separate_from_project_facet() {
         let mut associated = row(
             "associated",
             "worker-zeta",
@@ -11564,16 +11620,14 @@ mod tests {
         });
 
         for query in ["nova operations", "project-8f31", "nx"] {
-            let mut model = SelectorModel::new(vec![associated.clone()], false, false);
-            for character in query.chars() {
-                model.handle(SelectorEvent::Insert(character));
-            }
-            assert_eq!(model.visible_rows().len(), 1, "query {query:?}");
-            assert_eq!(
-                model.visible_rows()[0].target,
-                SelectorTarget::Agent("associated".to_string())
-            );
+            let mut model=SelectorModel::new(vec![associated.clone()],false,false);
+            model.query=Input::new(query.into());assert!(model.visible_rows().is_empty());
         }
+        let mut model=SelectorModel::new(vec![associated.clone()],false,false);
+        model.facets.project=Some(super::super::session_tui_filters::Choice{key:super::super::session_tui_filters::project_key(&associated.host,"project-8f31"),label:"Nova Operations".into()});
+        assert_eq!(model.visible_rows().len(),1);
+        model.facets.host=Some(super::super::session_tui_filters::Choice{key:"another-host".into(),label:"Other".into()});
+        assert!(model.visible_rows().is_empty());
 
         let mut unowned = associated;
         unowned.target = SelectorTarget::Agent("unowned".to_string());
@@ -11995,7 +12049,7 @@ mod tests {
             .visible_rows()
             .iter()
             .map(|row| match &row.target {
-                SelectorTarget::Agent(key) | SelectorTarget::RetiredAgent(key) => key.as_str(),
+                SelectorTarget::Agent(key) | SelectorTarget::RemoteAgent(_,key) | SelectorTarget::RetiredAgent(key) => key.as_str(),
                 SelectorTarget::RecentSessions => "recent",
                 SelectorTarget::RetiredSessions => "retired",
                 SelectorTarget::CutexProjects => "cutex-projects",
@@ -12015,7 +12069,7 @@ mod tests {
             .visible_rows()
             .iter()
             .map(|row| match &row.target {
-                SelectorTarget::Agent(key) | SelectorTarget::RetiredAgent(key) => key.as_str(),
+                SelectorTarget::Agent(key) | SelectorTarget::RemoteAgent(_,key) | SelectorTarget::RetiredAgent(key) => key.as_str(),
                 SelectorTarget::RecentSessions => "recent",
                 SelectorTarget::RetiredSessions => "retired",
                 SelectorTarget::CutexProjects => "cutex-projects",
@@ -12035,7 +12089,7 @@ mod tests {
                 .visible_rows()
                 .iter()
                 .map(|row| match &row.target {
-                    SelectorTarget::Agent(key) | SelectorTarget::RetiredAgent(key) => key.as_str(),
+                    SelectorTarget::Agent(key) | SelectorTarget::RemoteAgent(_,key) | SelectorTarget::RetiredAgent(key) => key.as_str(),
                     SelectorTarget::RecentSessions => "recent",
                     SelectorTarget::RetiredSessions => "retired",
                     SelectorTarget::CutexProjects => "cutex-projects",
@@ -16247,7 +16301,8 @@ mod tests {
         for exit in [KeyCode::Tab, KeyCode::BackTab, KeyCode::Esc] {
             contract_key(&mut model, KeyCode::Char('/'));
             contract_key(&mut model, exit);
-            assert!(!model.recent.filter_focused());
+            assert_eq!(model.recent.filter_focused(),exit!=KeyCode::Esc);
+            if exit!=KeyCode::Esc {contract_key(&mut model,KeyCode::Esc);}
             assert!(model.recent.review().is_none());
             assert!(matches!(model.mode, SelectorMode::RecentSessions));
         }
@@ -17105,3 +17160,6 @@ mod tests {
         }));
     }
 }
+
+#[path="session_tui_remote_projection.rs"]
+mod remote_projection;

@@ -843,11 +843,7 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, model: &TaskModel) {
         columns.iter().map(|(_, width)| Constraint::Length(*width)),
     )
     .header(header)
-    .block(Block::bordered().title(if model.show_closed {
-        " Cutex Tasks + history "
-    } else {
-        " Cutex Tasks "
-    }))
+    .block(Block::bordered())
     .column_spacing(1)
     .highlight_symbol("> ")
     // Row styles carry selection so semantic status and badge colors survive.
@@ -1488,7 +1484,7 @@ mod tests {
         let list = buffer_text(terminal.backend().buffer());
         assert!(list.contains("CUTEX"));
         assert!(list.contains("Settings"));
-        assert!(list.contains("Cutex Tasks"));
+        assert_eq!(list.matches("Cutex Tasks").count(),1);
     }
 
     #[test]

@@ -14,7 +14,7 @@ use unicode_width::UnicodeWidthStr;
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn visual_row() -> AgentSessionView {
+    pub(super) fn visual_row() -> AgentSessionView {
         AgentSessionView {
             host: String::new(),
             badge: Some(ProjectBadge {
@@ -88,7 +88,8 @@ mod tests {
             assert_eq!(buffer[(8, 2)].symbol(), "c");
             assert_eq!(buffer[(8, 3)].symbol(), "U", "aligned empty badge slot");
             assert_eq!(buffer[(8, 2)].bg, crate::cli_app::session_tui_layout::selection());
-            let columns = visible_columns(width - 4, ListKind::Managed);
+            let mut columns = visible_columns(width - 4, ListKind::Managed);
+            columns.retain(|(c,_)|*c!=Column::Host);
             assert!(columns[0].1 <= 47);
             let mut x = 3;
             for (column, w) in columns {
@@ -528,10 +529,11 @@ impl Column {
     }
     fn value(self, row: &AgentSessionView) -> String {
         match self {
-            Self::Host => cutex::management::connections::display(&row.host),
+            Self::Host => cutex::management::connections::short_display(&row.host),
             Self::Name => row.name.clone(),
             Self::Status => match &row.runtime {
                 Observation::Unavailable(_) => "N/A".into(),
+                Observation::Stale(..) => "Stale".into(),
                 _ => row.runtime.label(),
             },
             Self::Role => row.role.clone(),
@@ -554,7 +556,7 @@ pub(super) fn visible_columns(width: u16, kind: ListKind) -> Vec<(Column, u16)> 
     if kind == ListKind::Recent && width >= 44 {
         columns.push((Column::Updated, 16));
     }
-    if kind != ListKind::Members && width >= 120 { columns.push((Column::Host, 22)); }
+    if kind != ListKind::Members && width >= 120 { columns.push((Column::Host, 14)); }
     if width >= 66 {
         columns.push((Column::Project, 18));
     }
@@ -694,7 +696,8 @@ pub(super) fn render_table(
 ) {
     let block = Block::bordered();
     let inner = block.inner(area);
-    let columns = visible_columns(inner.width.saturating_sub(2), kind);
+    let mut columns = visible_columns(inner.width.saturating_sub(2), kind);
+    if rows.iter().map(|r|r.host.to_lowercase()).collect::<std::collections::HashSet<_>>().len()<=1 {columns.retain(|(c,_)|*c!=Column::Host);}
     let table = Table::new(
         rows.iter().enumerate().map(|(index, row)| {
             let selected = state.selected() == Some(index);
@@ -707,6 +710,7 @@ pub(super) fn render_table(
                     Column::Profile => profile_style(row),
                     Column::Project if matches!(row.project, Observation::Unavailable(_)) => Style::new().fg(crate::cli_app::session_tui_layout::status_unknown()),
                     Column::Role => Style::new().fg(crate::cli_app::session_tui_layout::focus()),
+                    Column::Host => Style::new().fg(if cutex::runtime::lifecycle::cutex_session_host_is_local(&row.host,&cutex::platform::host::current_host_name()) {Color::Gray}else{super::session_tui_layout::focus()}),
                     Column::Activity | Column::Updated => Style::new().fg(Color::Gray),
                     _ => Style::new(),
                 };
@@ -1082,4 +1086,9 @@ fn inspector_lines(row: &AgentSessionView) -> Vec<Line<'static>> {
         lines.push(field("Native ID", id.clone(), Style::new().fg(Color::Gray)));
     }
     lines
+}
+
+#[cfg(test)] mod stale_status_test {
+use super::*;
+#[test] fn stale_state_is_not_hidden_after_column_clipping(){let mut row=tests::visual_row();row.runtime=Observation::Stale("Online".into(),"host unreachable".into());assert_eq!(Column::Status.value(&row),"Stale");}
 }

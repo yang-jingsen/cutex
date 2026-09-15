@@ -290,6 +290,7 @@ pub(super) struct RecentSessionsWorkspace {
     review: Option<AdoptionReview>,
     query: tui_input::Input,
     filter_focused: bool,
+    pub(super) facets: super::session_tui_filters::Facets,
 }
 
 impl Default for RecentSessionsWorkspace {
@@ -304,11 +305,16 @@ impl Default for RecentSessionsWorkspace {
             review: None,
             query: tui_input::Input::default(),
             filter_focused: false,
+            facets: Default::default(),
         }
     }
 }
 
 impl RecentSessionsWorkspace {
+    pub(super) fn replace_remote(&mut self,rows:Vec<RecentThreadRow>) {let selected=self.selected_row().map(|r|r.thread_id.clone());self.rows.retain(|r|!r.thread_id.starts_with("remote/"));self.rows.extend(rows);if let Some(id)=selected {if let Some(i)=self.rows.iter().position(|r|r.thread_id==id){self.selected=i;}}self.normalize_visible_selection();}
+
+    pub(super) fn all_views(&self)->Vec<AgentSessionView> {self.rows.iter().map(|r|r.view.clone()).collect()}
+
     pub(super) fn enrich_views(&mut self, managed: &[AgentSessionView]) {
         for row in &mut self.rows {
             if let Some(view) = managed.iter().find(|view| {
@@ -324,6 +330,7 @@ impl RecentSessionsWorkspace {
             }
         }
     }
+    pub(super) fn selected_row(&self)->Option<&RecentThreadRow>{self.visible_indices().contains(&self.selected).then(||self.rows.get(self.selected)).flatten()}
     pub(super) fn rows(&self) -> &[RecentThreadRow] {
         &self.rows
     }
@@ -675,26 +682,13 @@ impl RecentSessionsWorkspace {
             .iter()
             .enumerate()
             .filter_map(|(index, row)| {
-                if row.state == RecentThreadState::Retired {
+                if row.state == RecentThreadState::Retired || !self.facets.matches(&row.view.host,row.view.project_id.as_deref()) {
                     return None;
                 }
                 let matches = query.is_empty()
                     || row.title.to_lowercase().contains(&query)
-                    || row
-                        .managed_name
-                        .as_deref()
-                        .is_some_and(|name| name.to_lowercase().contains(&query))
-                    || row
-                        .cwd
-                        .as_deref()
-                        .is_some_and(|cwd| cwd.to_lowercase().contains(&query))
-                    || row.provider.to_lowercase().contains(&query)
-                    || row.source.to_lowercase().contains(&query)
-                    || row
-                        .project_id
-                        .as_deref()
-                        .is_some_and(|project| project.to_lowercase().contains(&query))
-                    || row.state.label().to_lowercase().contains(&query);
+                    || row.thread_id.to_lowercase().contains(&query)
+                    || row.managed_name.as_deref().is_some_and(|name|name.to_lowercase().contains(&query));
                 matches.then_some(index)
             })
             .collect()
@@ -1184,7 +1178,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_matches_project_provider_source_and_preserves_load_more_cursor() {
+    fn name_filter_preserves_load_more_cursor_and_does_not_match_provider() {
         let mut workspace = RecentSessionsWorkspace::default();
         let mut other = thread("other", "tree-b", 2);
         other.project_id = Some("project-b".to_string());
@@ -1203,14 +1197,14 @@ mod tests {
         );
 
         workspace.focus_filter();
-        for character in "project-a".chars() {
+        for character in "openai".chars() {
             workspace.push_filter(character);
         }
         assert_eq!(workspace.visible_rows().len(), 1);
         assert_eq!(workspace.visible_rows()[0].thread_id, "openai");
         assert_eq!(workspace.next_cursor().as_deref(), Some("next"));
         workspace.clear_filter();
-        for character in "ide".chars() {
+        for character in "other".chars() {
             workspace.push_filter(character);
         }
         assert_eq!(workspace.visible_rows()[0].thread_id, "other");

@@ -137,6 +137,7 @@ fn details(value: &Value) -> Vec<Line<'static>> {
 fn render(frame: &mut ratatui::Frame, model: &mut Model) {
     let areas = Layout::vertical([
         Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Min(3),
         Constraint::Length(1),
         Constraint::Length(2),
@@ -146,8 +147,9 @@ fn render(frame: &mut ratatui::Frame, model: &mut Model) {
         Paragraph::new(theme::tabs(PrimaryPanel::Jobs, frame.area().width)),
         areas[0],
     );
-    let panes = theme::inspector_panes(areas[1], !model.hide_details);
-    let (left, right) = panes.map(|(l, r)| (l, Some(r))).unwrap_or((areas[1], None));
+    frame.render_widget(Paragraph::new(theme::heading("Cutex","Jobs")),areas[1]);
+    let panes = theme::inspector_panes(areas[2], !model.hide_details);
+    let (left, right) = panes.map(|(l, r)| (l, Some(r))).unwrap_or((areas[2], None));
     if !model.detail || right.is_some() {
         let list = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(left);
         frame.render_widget(
@@ -188,7 +190,6 @@ fn render(frame: &mut ratatui::Frame, model: &mut Model) {
         .header(Row::new(["ACTION", "STATE", "AGENT"]).style(Style::default().fg(theme::muted())))
         .block(
             Block::bordered()
-                .title(theme::heading("Cutex", "Jobs"))
                 .border_style(Style::default().fg(theme::muted())),
         )
         .row_highlight_style(Style::default().bg(theme::selection()))
@@ -197,7 +198,7 @@ fn render(frame: &mut ratatui::Frame, model: &mut Model) {
             TableState::default().with_selected((!model.rows.is_empty()).then_some(model.selected));
         frame.render_stateful_widget(table, list[1], &mut selection);
     }
-    if let Some(area) = right.or_else(|| model.detail.then_some(areas[1])) {
+    if let Some(area) = right.or_else(|| model.detail.then_some(areas[2])) {
         let lines = model
             .rows
             .get(model.selected)
@@ -243,7 +244,7 @@ fn render(frame: &mut ratatui::Frame, model: &mut Model) {
     };
     frame.render_widget(
         Paragraph::new(status).style(Style::default().fg(theme::muted())),
-        areas[2],
+        areas[3],
     );
     let hints = if model.filtering {
         vec![("Enter/Esc", "finish filter"), ("Ctrl+U", "clear")]
@@ -263,7 +264,7 @@ fn render(frame: &mut ratatui::Frame, model: &mut Model) {
     frame.render_widget(
         Paragraph::new(Line::from(super::session_tui::footer_hints(&hints)))
             .wrap(Wrap { trim: true }),
-        areas[3],
+        areas[4],
     );
 }
 

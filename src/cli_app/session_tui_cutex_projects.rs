@@ -2321,11 +2321,7 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, model: &CutexProjectsModel) {
     .header(Row::new(
         columns.iter().map(|(label, _)| *label).collect::<Vec<_>>(),
     ))
-    .block(Block::bordered().title(if model.show_archived {
-        " Cutex Projects + archived "
-    } else {
-        " Cutex Projects "
-    }))
+    .block(Block::bordered())
     // Each row owns its selection base so the configured badge span remains
     // visible on the selected row instead of being erased by a late highlight.
     .row_highlight_style(Style::new())

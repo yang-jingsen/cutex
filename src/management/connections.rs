@@ -274,3 +274,9 @@ mod endpoint_tests {
         worker.join().unwrap();std::fs::remove_file(file).unwrap();
     }
 }
+
+/// Compact table label; full routing detail remains available through display().
+pub fn short_display(host:&str)->String {
+    let full=display(host);
+    full.strip_prefix("Local · ").or_else(||full.strip_prefix("Remote · ")).unwrap_or(&full).trim_end_matches(" (disabled)").trim_end_matches(" (unconfigured)").to_owned()
+}

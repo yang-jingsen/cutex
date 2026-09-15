@@ -25,11 +25,14 @@ pub(super) fn run(
     events: &mut ShellEvents,
     c: Connection,
 ) -> anyhow::Result<Outcome> {
+    run_selected(terminal,events,c,None)
+}
+pub(super) fn run_selected(terminal:&mut Terminal<CrosstermBackend<Stdout>>,events:&mut ShellEvents,c:Connection,id:Option<String>)->anyhow::Result<Outcome>{
     let (tx, rx) = mpsc::channel::<(bool, Result<Value, String>)>();
     let mut rows: Vec<HostSession> = vec![];
     let mut selected = 0usize;
-    let mut query = Input::default();
-    let mut applied_query=String::new();
+    let mut query = Input::new(id.clone().unwrap_or_default());
+    let mut applied_query=id.unwrap_or_default();
     let mut filtering = false;
     let mut cursors = vec![None::<String>];
     let mut next = None;

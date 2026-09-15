@@ -92,3 +92,5 @@ mod session_tui_hosts;
 mod remote_sessions;
 
 mod session_tui_remote;
+
+mod session_tui_filters;
