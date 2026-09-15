@@ -279,7 +279,8 @@ impl StockBundle {
     }
 
     /// Verify an existing owner without treating mutable TUI preferences as
-    /// changed executable evidence. New launches still require exact config.
+    /// changed executable evidence. New launches still check launch semantics
+    /// (or the exact config hash for bundles without a semantic digest).
     pub fn load_running(contract: &ExplicitLaunchContract) -> anyhow::Result<Self> {
         Self::load_contract(contract, ConfigCheck::Running)
     }
