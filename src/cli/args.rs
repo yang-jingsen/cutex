@@ -1646,6 +1646,14 @@ pub enum HumanConfigCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum HostsCommand {
+    /// List a page of sessions on a configured host
+    Sessions { id:String, #[arg(long,default_value="")] query:String, #[arg(long)] cursor:Option<String> },
+    /// Start or reconnect an existing session on its host
+    Online { id:String, session:String },
+    /// Close the remote runtime without archiving its session
+    Close { id:String, session:String },
+    /// Enter the remote host's own Cutex frontend over SSH
+    Foreground { id:String, session:String },
     /// Show configured identities and connection details (no credential values)
     List,
     /// Replace hosts configuration from a JSON file

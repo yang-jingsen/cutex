@@ -45,6 +45,10 @@ pub(super) fn run_command(command: HumanCommand) -> anyhow::Result<()> {
             use cutex::cli::args::HostsCommand;
             use cutex::management::connections::Hosts;
             match command {
+                HostsCommand::Sessions{id,query,cursor} => println!("{}",serde_json::to_string_pretty(&super::remote_sessions::list(&super::remote_sessions::connection(&id)?,&query,cursor.as_deref())?)?),
+                HostsCommand::Online{id,session} => println!("{}",serde_json::to_string_pretty(&super::remote_sessions::lifecycle(&super::remote_sessions::connection(&id)?,&session,false)?)?),
+                HostsCommand::Close{id,session} => println!("{}",serde_json::to_string_pretty(&super::remote_sessions::lifecycle(&super::remote_sessions::connection(&id)?,&session,true)?)?),
+                HostsCommand::Foreground{id,session} => {super::remote_sessions::foreground(&super::remote_sessions::connection(&id)?,&session)?;},
                 HostsCommand::List => println!("{}", serde_json::to_string_pretty(&Hosts::load()?)?),
                 HostsCommand::Configure { file } => {
                     let hosts: Hosts = serde_json::from_slice(&std::fs::read(file)?)?;

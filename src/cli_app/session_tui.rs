@@ -481,6 +481,7 @@ struct ProfileManagerStartup {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SessionTuiCycleOutcome {
+    RemoteForeground(cutex::management::connections::Connection,String),
     NewSession,
     NewAgent,
     NativeResume {
@@ -4711,6 +4712,11 @@ pub(crate) fn run() -> anyhow::Result<()> {
             }
         };
         match outcome {
+            SessionTuiCycleOutcome::RemoteForeground(connection,id) => {
+                let result=shell.handoff(||super::remote_sessions::foreground(&connection,&id))?;
+                match result {Ok(status)=>selector_model.notice=Some(format!("Remote frontend returned ({status})")),Err(error)=>selector_model.warning=Some(format!("Remote frontend: {error:#}"))};
+                panel=PrimaryPanel::Settings;
+            }
             SessionTuiCycleOutcome::NewSession => {
                 match shell.handoff(|| -> anyhow::Result<std::process::ExitStatus> {
                     Ok(std::process::Command::new(std::env::current_exe()?)
@@ -6803,8 +6809,9 @@ fn run_event_loop(
                         }
                         SelectorControl::OpenHosts => {
                             match super::session_tui_hosts::run(terminal, events) {
-                                Ok(true) => return Ok(SessionTuiCycleOutcome::Exit),
-                                Ok(false) => {},
+                                Ok(super::session_tui_remote::Outcome::Exit) => return Ok(SessionTuiCycleOutcome::Exit),
+                                Ok(super::session_tui_remote::Outcome::Back) => {},
+                                Ok(super::session_tui_remote::Outcome::Foreground(c,id)) => return Ok(SessionTuiCycleOutcome::RemoteForeground(c,id)),
                                 Err(error) => model.notice = Some(format!("Hosts: {error:#}")),
                             }
                         }

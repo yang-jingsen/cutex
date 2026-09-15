@@ -88,3 +88,7 @@ pub(crate) fn json_process_error(error: &anyhow::Error) -> Option<serde_json::Va
 mod light_new;
 
 mod session_tui_hosts;
+
+mod remote_sessions;
+
+mod session_tui_remote;

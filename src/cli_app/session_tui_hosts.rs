@@ -77,7 +77,7 @@ impl Editor {
 pub(super) fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     events: &mut ShellEvents,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<super::session_tui_remote::Outcome> {
     let mut hosts = Hosts::load()?;
     let mut selected = 0usize;
     let mut editor: Option<Editor> = None;
@@ -106,7 +106,7 @@ pub(super) fn run(
    else {let c=&hosts.connections[selected-1];vec![Line::from(format!("Connection: {}",c.id)),Line::from(format!("Host identity: {}",c.host_id)),Line::from(format!("SSH target: {}",c.ssh_target)),Line::from(format!("Management: {}",c.base_url())),Line::from(format!("Credential file: {}",c.token_file.display())),Line::from(""),Line::from("Start this tunnel in another terminal:"),Line::from(c.tunnel_command()),Line::from(""),Line::from("Enable/disable changes Cutex routing only. It does not stop the tunnel or any runtime.")]};
    f.render_widget(Paragraph::new(detail).wrap(Wrap{trim:false}).block(Block::bordered().title(" Details ")),panes[1]);
    f.render_widget(Paragraph::new(if deleting{"Remove selected connection? Y confirms · Esc cancels"}else if testing{"Testing host identity…"}else{&notice}).wrap(Wrap{trim:false}),area[2]);
-   let hints=if editor.is_some()||rename.is_some(){"↑/↓ Tab fields · Ctrl+S save · Esc discard"}else{"↑/↓ select · Enter edit · N add · T test · Space enable/disable · Delete remove · Esc back"};
+   let hints=if editor.is_some()||rename.is_some(){"↑/↓ Tab fields · Ctrl+S save · Esc discard"}else{"↑/↓ select · Enter edit · B browse · N add · T test · Space enable/disable · Delete remove · Esc back"};
    f.render_widget(Paragraph::new(hints).style(Style::default().fg(theme::focus())).wrap(Wrap{trim:true}),area[3]);
   })?;
         let Some(event) = events.next()? else {
@@ -135,7 +135,7 @@ pub(super) fn run(
             continue;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            return Ok(true);
+            return Ok(super::session_tui_remote::Outcome::Exit);
         }
         if deleting {
             match key.code {
@@ -159,7 +159,7 @@ pub(super) fn run(
         }
         if key.code == KeyCode::Esc {
             if editor.take().is_none() && rename.take().is_none() {
-                return Ok(false);
+                return Ok(super::session_tui_remote::Outcome::Back);
             }
             continue;
         }
@@ -225,6 +225,11 @@ pub(super) fn run(
                         Some(&hosts.connections[selected - 1]),
                         Some(selected - 1),
                     ))
+                }
+            }
+            KeyCode::Char('b' | 'B') if selected>0 => {
+                match super::session_tui_remote::run(terminal,events,hosts.connections[selected-1].clone())? {
+                    super::session_tui_remote::Outcome::Back=>{}, outcome=>return Ok(outcome),
                 }
             }
             KeyCode::Char('n' | 'N') => editor = Some(Editor::new(None, None)),

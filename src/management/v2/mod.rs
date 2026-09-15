@@ -17,3 +17,5 @@ pub mod server_requests;
 pub mod session;
 pub mod usage;
 pub mod user_input;
+
+pub mod host_sessions;
