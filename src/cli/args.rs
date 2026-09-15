@@ -1527,6 +1527,12 @@ pub enum ProfileCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum HumanCommand {
+    /// Compile a welcome animation; optionally save its editable source in Cutex settings.
+    StatusAnimation {
+        file: std::path::PathBuf,
+        #[arg(long)]
+        install: bool,
+    },
     /// Host connections and read-only connection testing
     Hosts {
         #[command(subcommand)] command: HostsCommand,

@@ -52,6 +52,7 @@ pub fn materialized_account_files(
 fn default_custom_status_items() -> Vec<CustomStatusItemCatalogEntry> {
     vec![
         CustomStatusItemCatalogEntry {
+            animation: None,
             id: "cutex_welcome".to_string(),
             title: "Cutex Welcome".to_string(),
             description: None,
@@ -69,6 +70,7 @@ fn default_custom_status_items() -> Vec<CustomStatusItemCatalogEntry> {
             },
         },
         CustomStatusItemCatalogEntry {
+            animation: None,
             id: "cutex_profile".to_string(),
             title: "Cutex Profile".to_string(),
             description: None,
@@ -105,6 +107,7 @@ pub fn normalize_custom_status_items(
             (_, title) => title,
         };
         normalized.push(CustomStatusItemCatalogEntry {
+            animation: item.animation.clone(),
             id: id.to_string(),
             title: if title.is_empty() {
                 id.to_string()

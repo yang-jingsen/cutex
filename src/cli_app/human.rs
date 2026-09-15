@@ -41,6 +41,21 @@ pub(super) fn recover(
 
 pub(super) fn run_command(command: HumanCommand) -> anyhow::Result<()> {
     match command {
+        HumanCommand::StatusAnimation {file,install} => {
+            let bytes=std::fs::read(file)?;
+            ensure!(bytes.len()<=1_048_576,"animation configuration exceeds 1 MiB");
+            let spec:serde_json::Value=serde_json::from_slice(&bytes)?;
+            let animation=cutex::launch::status_animation::compile(&spec)?;
+            if install {
+                let mut config=cutex::config::store::load_codez_config_checked()?;
+                config.custom_status_items=cutex::profiles::materialize::normalize_custom_status_items(&config.custom_status_items);
+                let item=config.custom_status_items.iter_mut().find(|i|i.id=="cutex_welcome").context("Welcome item missing")?;
+                item.animation=Some(spec);
+                cutex::config::store::save_codez_config(&config)?;
+                eprintln!("Saved Cutex Welcome animation; reopen the foreground TUI to apply.");
+            }
+            println!("{}",serde_json::to_string_pretty(&serde_json::json!({"version":1,"items":[{"id":"cutex_welcome","text":"旅途愉快","style":{},"animation":animation}]}))?);
+        }
         HumanCommand::Hosts { command } => {
             use cutex::cli::args::HostsCommand;
             use cutex::management::connections::Hosts;

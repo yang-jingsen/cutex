@@ -1113,7 +1113,12 @@ pub(super) fn attach_status(id: &str) -> anyhow::Result<std::process::ExitStatus
                 None
             }
         });
-    let frontend = desired.as_ref().filter(|desired| {
+    let installed = (|| -> anyhow::Result<Option<StockBundle>> {
+        let Some(deployment)=cutex::launch::local_deployment::LocalDeployment::selected()? else{return Ok(None)};
+        let manifest:StockBundle=serde_json::from_slice(&std::fs::read(&deployment.bundle_manifest)?)?;
+        StockBundle::load_references(manifest.shared_config.path.parent().context("bundle parent missing")?,&deployment.bundle_manifest,&cutex::agent_management::file_sha256(&deployment.bundle_manifest)?).map(Some)
+    })().unwrap_or_else(|error|{eprintln!("Optional installed frontend unavailable: {error}");None});
+    let frontend = installed.as_ref().into_iter().chain(desired.as_ref()).find(|desired| {
         desired.version == 4 && bundle.version == 4
             && desired.executable.sha256 == bundle.executable.sha256
             && desired.code_mode_host.sha256 == bundle.code_mode_host.sha256
@@ -1150,7 +1155,7 @@ pub(super) fn attach_status(id: &str) -> anyhow::Result<std::process::ExitStatus
     {
         launch = launch.arg("--status-items-file").arg(
             status
-                .materialize_frozen()?
+                .materialize_current_display()?
                 .to_str()
                 .context("status path must be UTF-8")?,
         );

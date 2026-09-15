@@ -20,6 +20,8 @@ pub struct Payload {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Item {
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    pub animation: Option<serde_json::Value>,
     pub id: String,
     pub text: String,
     pub style: Style,
@@ -42,6 +44,8 @@ struct Catalog {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Entry {
+    #[serde(default)]
+    animation: Option<serde_json::Value>,
     id: String,
     title: String,
     description: Option<String>,
@@ -91,7 +95,7 @@ fn digest(bytes: &[u8]) -> String {
     format!("{:x}", sha2::Sha256::digest(bytes))
 }
 fn resolve(bytes: &[u8], order: &[String], label: &str) -> anyhow::Result<Payload> {
-    ensure!(bytes.len() <= 8192, "status catalog exceeds reviewed bound");
+    ensure!(bytes.len() <= 1_048_576, "status catalog exceeds reviewed bound");
     let catalog: Catalog = serde_json::from_slice(bytes)
         .map_err(|_| anyhow::anyhow!("unsupported status catalog/source/render"))?;
     ensure!(catalog.items.len() <= 2, "unsupported status catalog items");
@@ -119,7 +123,11 @@ fn resolve(bytes: &[u8], order: &[String], label: &str) -> anyhow::Result<Payloa
             Source::Static { value } => value.clone(),
             Source::LaunchProfile {} => label.into(),
         };
+        let animation=entry.animation.as_ref().and_then(|spec|match super::status_animation::compile(spec) {
+            Ok(frames)=>Some(frames),Err(error)=>{eprintln!("Cutex: invalid status animation; using static fallback: {error}");None}
+        });
         items.push(Item {
+            animation,
             id: id.clone(),
             text,
             style: entry.style.clone(),
@@ -137,6 +145,7 @@ impl Payload {
         );
         let mut seen = std::collections::BTreeSet::new();
         for i in &self.items {
+            if let Some(animation)=&i.animation {super::status_animation::validate(animation)?;}
             ensure!(
                 is_static_id(&i.id)
                     && seen.insert(canonical_id(&i.id)),
@@ -153,13 +162,22 @@ impl Payload {
             }
         }
         ensure!(
-            serde_json::to_vec(self)?.len() <= 8192,
+            serde_json::to_vec(self)?.len() <= 1_048_576,
             "static status file too large"
         );
         Ok(())
     }
 }
 impl Status {
+    /// Foreground-only presentation follows current settings, without restarting the owner.
+    pub fn materialize_current_display(&self) -> anyhow::Result<PathBuf> {
+        let config=crate::config::store::load_codez_config_checked()?;
+        let catalog=crate::profiles::materialize::custom_status_items_catalog_json(&config)?.context("status catalog missing")?;
+        let order=self.payload.items.iter().map(|i|i.id.clone()).collect::<Vec<_>>();
+        let label=self.payload.items.iter().find(|i|canonical_id(&i.id)=="cutex_profile").map(|i|i.text.as_str()).unwrap_or("N/A");
+        materialize_session_display(catalog.as_bytes(),&order,label)
+    }
+
     pub fn review(
         catalog_path: &Path,
         order: &[String],

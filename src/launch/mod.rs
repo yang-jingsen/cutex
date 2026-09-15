@@ -21,3 +21,5 @@ pub mod stock;
 pub mod session_display;
 
 pub mod native_history;
+
+pub mod status_animation;

@@ -364,6 +364,8 @@ pub struct CustomStatusItemsCatalogFile {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CustomStatusItemCatalogEntry {
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    pub animation: Option<serde_json::Value>,
     pub id: String,
     pub title: String,
     #[serde(default)]
