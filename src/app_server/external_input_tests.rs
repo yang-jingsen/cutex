@@ -32,7 +32,7 @@ fn pinned_artifact_fence_detects_same_length_write_and_symlink_replacement() {
         facade: file.clone(),
         schema: file.clone(),
         launch_config_sha256: None,
-        shared_config: file,
+        shared_config: VerifiedFile { path: root.join("config.toml"), sha256: file.sha256.clone() },
     };
     let stamps = PinnedArtifacts::stamps(&contract, &bundle).unwrap();
     let pinned = PinnedArtifacts {
@@ -40,6 +40,15 @@ fn pinned_artifact_fence_detects_same_length_write_and_symlink_replacement() {
         bundle,
         stamps,
     };
+    pinned.check().unwrap();
+    // Mutable launch configuration is neither an ingress artifact nor part of
+    // the running process identity. Editing or removing it cannot stop input.
+    let config = root.join("config.toml");
+    std::fs::write(&config, b"model='changed'").unwrap();
+    pinned.check().unwrap();
+    std::fs::write(&config, b"unfinished = [").unwrap();
+    pinned.check().unwrap();
+    std::fs::remove_file(&config).unwrap();
     pinned.check().unwrap();
     std::fs::write(&path, b"other").unwrap();
     assert!(pinned.check().is_err());

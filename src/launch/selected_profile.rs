@@ -17,6 +17,7 @@ pub const GLM_ENDPOINT: &str = "https://www.colabapi.com/v1";
 pub enum Route {
     ChatgptFile,
     GlmApiKey,
+    ApiKey,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +31,10 @@ pub struct AuthCustody {
     // Opaque API keys have no independently verifiable account ID. A file
     // replacement/write needs review; no key bytes or key digest are retained.
     pub api_file: Option<super::job_mcp::PrivateObject>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_parent_file_id: Option<[u8; 16]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_api_file_id: Option<[u8; 16]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,6 +43,8 @@ pub struct Projection {
     pub version: Version,
     pub route: Route,
     pub auth: AuthCustody,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<ApiConnection>,
     pub settings: Settings,
     pub catalog: Option<VerifiedFile>,
     pub requires_job: bool,
@@ -67,6 +74,22 @@ impl From<Version> for u8 {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows: Option<BTreeMap<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forced_login_method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_context_window: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_reasoning_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_supports_reasoning_summaries: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_verbosity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_mode_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_model: Option<String>,
     pub approvals_reviewer: Option<String>,
     pub service_tier: Option<String>,
     pub shell_environment_policy: Option<ShellPolicy>,
@@ -147,10 +170,19 @@ pub struct Plugin {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    pub windows: Option<BTreeMap<String, serde_json::Value>>,
+    pub forced_login_method: Option<String>,
+    pub model_context_window: Option<i64>,
+    pub model_reasoning_summary: Option<String>,
+    pub model_supports_reasoning_summaries: Option<bool>,
+    pub model_verbosity: Option<String>,
+    pub plan_mode_reasoning_effort: Option<String>,
+    pub review_model: Option<String>,
     pub cutex_provider_mode: String,
     pub model: Option<String>,
     pub model_provider: Option<String>,
     pub model_reasoning_effort: Option<String>,
+    #[serde(default = "file_storage")]
     pub cli_auth_credentials_store: String,
     pub approvals_reviewer: Option<String>,
     pub service_tier: Option<String>,
@@ -166,18 +198,40 @@ pub struct Config {
     #[serde(default)]
     pub plugins: BTreeMap<String, Plugin>,
     #[serde(default)]
-    pub model_providers: BTreeMap<String, GlmProvider>,
+    pub model_providers: BTreeMap<String, ApiProvider>,
     #[serde(default)]
     pub mcp_servers: BTreeMap<String, LegacyJob>,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct GlmProvider {
+pub struct ApiProvider {
     pub name: String,
     pub base_url: String,
+    #[serde(default = "responses_protocol")]
     pub wire_api: String,
     pub requires_openai_auth: bool,
     pub env_key: String,
+}
+fn file_storage() -> String { "file".into() }
+fn responses_protocol() -> String { "responses".into() }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiConnection {
+    pub provider_id: String,
+    pub provider: ApiProvider,
+}
+impl ApiConnection {
+    fn validate(&self) -> anyhow::Result<()> {
+        ensure!(!self.provider_id.is_empty() && !self.provider_id.chars().any(char::is_control), "invalid provider id");
+        let url = url::Url::parse(&self.provider.base_url)?;
+        ensure!(matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+            && url.username().is_empty() && url.password().is_none(), "invalid API base URL");
+        ensure!(self.provider.wire_api == "responses", "this runtime requires the Responses API protocol");
+        ensure!(!self.provider.requires_openai_auth && self.provider.env_key == "OPENAI_API_KEY",
+            "API-key profile must use its selected API credential file");
+        Ok(())
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -210,39 +264,30 @@ impl Config {
             "selected profile requires File storage"
         );
         ensure!(uuid::Uuid::parse_str(id).is_ok(), "invalid profile ID");
-        // Account identity does not determine credential semantics. Select the
-        // supported route from the actual configured provider instead.
-        let route = match self.model_provider.as_deref() {
-            None | Some("openai") => Route::ChatgptFile,
-            Some("GLM") => Route::GlmApiKey,
-            _ => anyhow::bail!("unsupported selected profile provider"),
+        let auth_value: serde_json::Value = serde_json::from_slice(&bounded_asset(&auth_path)?)
+            .map_err(|_| anyhow::anyhow!("invalid selected credential file"))?;
+        let api_key = auth_value.get("OPENAI_API_KEY").and_then(serde_json::Value::as_str)
+            .is_some_and(|key| !key.is_empty());
+        let route = if api_key { Route::ApiKey } else { Route::ChatgptFile };
+        let api = if api_key {
+            let provider_id = self.model_provider.clone().unwrap_or_else(|| "openai".into());
+            let provider = match self.model_providers.get(&provider_id) {
+                Some(provider) => provider.clone(),
+                None if provider_id == "openai" => ApiProvider {
+                    name: "OpenAI".into(), base_url: "https://api.openai.com/v1".into(),
+                    wire_api: "responses".into(), requires_openai_auth: false, env_key: "OPENAI_API_KEY".into(),
+                },
+                None => anyhow::bail!("selected API provider definition missing"),
+            };
+            let connection = ApiConnection { provider_id, provider };
+            connection.validate()?;
+            Some(connection)
+        } else {
+            ensure!(self.model_provider.as_deref().is_none_or(|v| v == "openai")
+                && self.model_providers.is_empty(),
+                "subscription credentials require the native OpenAI subscription route");
+            None
         };
-        match route {
-            Route::ChatgptFile => ensure!(
-                self.model_provider.as_deref().is_none_or(|v| v == "openai")
-                    && self.model_providers.is_empty(),
-                "ChatGPT projection forbids provider bearer/endpoint overrides"
-            ),
-            Route::GlmApiKey => {
-                ensure!(
-                    self.model_provider.as_deref() == Some("GLM")
-                        && self.model_providers.len() == 1,
-                    "exact GLM provider required"
-                );
-                let p = self
-                    .model_providers
-                    .get("GLM")
-                    .context("GLM provider missing")?;
-                ensure!(
-                    p.base_url == GLM_ENDPOINT
-                        && p.wire_api == "responses"
-                        && !p.requires_openai_auth
-                        && p.env_key == "OPENAI_API_KEY"
-                        && p.name == "GLM",
-                    "unsupported GLM endpoint/TLS/credential mapping"
-                );
-            }
-        }
         let model = selected_model
             .cloned()
             .or(self.model)
@@ -251,6 +296,9 @@ impl Config {
         let catalog = self
             .model_catalog_json
             .map(|path| -> anyhow::Result<VerifiedFile> {
+                let path = if path.is_absolute() { path } else {
+                    auth_path.parent().context("profile directory missing")?.join(path)
+                }.canonicalize()?;
                 validate_asset(&path)?;
                 Ok(VerifiedFile {
                     sha256: crate::agent_management::file_sha256(&path)?,
@@ -273,6 +321,15 @@ impl Config {
         // of its command/args/env is executed; an independent reviewed Job
         // descriptor is mandatory at the root review boundary.
         let settings = Settings {
+            windows: self.windows,
+            forced_login_method: self.forced_login_method,
+            model_context_window: self.model_context_window,
+            model_reasoning_summary: self.model_reasoning_summary,
+            model_supports_reasoning_summaries: self.model_supports_reasoning_summaries,
+            model_verbosity: self.model_verbosity,
+            plan_mode_reasoning_effort: self.plan_mode_reasoning_effort,
+            review_model: self.review_model,
+
             approvals_reviewer: self.approvals_reviewer,
             service_tier: self.service_tier,
             shell_environment_policy: self.shell_environment_policy,
@@ -291,6 +348,7 @@ impl Config {
                 version: Version,
                 route,
                 auth,
+                api,
                 settings,
                 catalog,
                 requires_job: !self.mcp_servers.is_empty(),
@@ -307,11 +365,11 @@ impl Settings {
         ensure!(
             self.approvals_reviewer
                 .as_deref()
-                .is_none_or(|v| v == "user"),
+                .is_none_or(|v| matches!(v, "user" | "auto_review" | "guardian_subagent")),
             "unsupported approval reviewer"
         );
         ensure!(
-            self.service_tier.as_deref().is_none_or(|v| v == "default"),
+            self.service_tier.as_deref().is_none_or(|v| matches!(v, "default" | "fast" | "priority" | "flex")),
             "unsupported service tier"
         );
         ensure!(
@@ -410,8 +468,12 @@ pub fn validate_model(
                 "unsupported reasoning effort"
             );
         }
-        Route::GlmApiKey => {
-            let catalog = catalog.context("GLM reviewed catalog required")?;
+        Route::GlmApiKey | Route::ApiKey => {
+            let Some(catalog) = catalog else {
+                ensure!(*route == Route::ApiKey, "legacy GLM catalog required");
+                ensure!(effort.is_none_or(supported_effort), "unsupported reasoning effort");
+                return Ok(());
+            };
             catalog.validate()?;
             let bytes = bounded_asset(&catalog.path)?;
             use sha2::Digest;
@@ -430,10 +492,11 @@ pub fn validate_model(
                 matched.len() == 1
                     && matched[0]["supported_reasoning_levels"]
                         .as_array()
-                        .is_some_and(|a| a
+                        .is_some_and(|a| (*route == Route::ApiKey && (effort.is_none()
+                            || (a.is_empty() && effort.is_none_or(supported_effort)))) || a
                             .iter()
-                            .any(|v| v["effort"].as_str() == effort && effort.is_some())),
-                "GLM catalog model/effort missing or ambiguous"
+                            .any(|v| v["effort"].as_str() == effort || (effort.is_none() && *route == Route::ApiKey))),
+                "catalog model/effort missing or ambiguous"
             );
         }
     }
@@ -528,7 +591,7 @@ pub fn review_auth(path: &Path, route: &Route) -> anyhow::Result<AuthCustody> {
             Some(super::aemeath_auth::review(path.to_path_buf())?.account_sha256),
             None,
         ),
-        Route::GlmApiKey => {
+        Route::GlmApiKey | Route::ApiKey => {
             let _secret = read_api_key(path)?;
             (
                 None,
@@ -554,14 +617,24 @@ pub fn review_auth(path: &Path, route: &Route) -> anyhow::Result<AuthCustody> {
         parent_device: parent.dev(),
         parent_inode: parent.ino(),
         owner: uid,
+        windows_parent_file_id: None,
+        windows_api_file_id: None,
         account,
         api_file,
     })
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 pub fn review_auth(_: &Path, _: &Route) -> anyhow::Result<AuthCustody> {
     anyhow::bail!("selected auth requires Linux")
 }
+
+#[cfg(windows)]
+#[path = "selected_profile_windows.rs"]
+mod windows;
+#[cfg(windows)]
+pub use windows::review_auth;
+#[cfg(windows)]
+use windows::read_api_key;
 
 // Deliberately neither Debug nor Serialize. Used only immediately before child
 // spawn, never inserted into LaunchCommand's printable plan.
@@ -626,6 +699,10 @@ fn read_api_key(path: &Path) -> anyhow::Result<ApiKey> {
     Ok(ApiKey(key.into()))
 }
 impl Projection {
+    pub fn provider_id(&self) -> &str {
+        self.api.as_ref().map(|api| api.provider_id.as_str())
+            .unwrap_or(if self.route == Route::GlmApiKey { "GLM" } else { "openai" })
+    }
     /// The same nonsecret argv projection is used by owner launch and the
     /// independent process test. Remote attach deliberately omits auth-file.
     pub fn native_args(&self, owner: bool) -> anyhow::Result<Vec<String>> {
@@ -653,8 +730,18 @@ impl Projection {
                 serde_json::json!({"name":"GLM","base_url":GLM_ENDPOINT,"wire_api":"responses","requires_openai_auth":false,"env_key":"OPENAI_API_KEY"}),
             )?;
         }
+        if let Some(api) = &self.api {
+            api.validate()?;
+            option("model_providers", serde_json::to_value(BTreeMap::from([
+                (&api.provider_id, &api.provider)
+            ]))?)?;
+        }
         let settings = serde_json::to_value(&self.settings)?;
         for (key, value) in settings.as_object().context("typed settings missing")? {
+            // The existing remote owner also owns its approval reviewer.
+            if !owner && key == "approvals_reviewer" {
+                continue;
+            }
             if !value.is_null() && !value.as_object().is_some_and(|v| v.is_empty()) {
                 option(key, value.clone())?;
             }
@@ -697,6 +784,8 @@ impl Projection {
     }
     fn validate_for_launch(&self, owner: bool) -> anyhow::Result<()> {
         self.settings.validate()?;
+        ensure!(self.api.is_some() == (self.route == Route::ApiKey), "API connection and credential route mismatch");
+        if let Some(api) = &self.api { api.validate()?; }
         let wants_status = self.settings.tui.as_ref().is_some_and(|t| {
             t.status_line
                 .iter()
@@ -722,8 +811,8 @@ impl Projection {
     }
     pub fn secret(&self) -> anyhow::Result<Option<ApiKey>> {
         self.validate()?;
-        #[cfg(target_os = "linux")]
-        if self.route == Route::GlmApiKey {
+        #[cfg(any(target_os = "linux", windows))]
+        if matches!(self.route, Route::GlmApiKey | Route::ApiKey) {
             let key = read_api_key(&self.auth.path)?;
             ensure!(
                 review_auth(&self.auth.path, &self.route)? == self.auth,
@@ -738,6 +827,14 @@ impl Projection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_windows_options_are_accepted_and_preserved() {
+        let config = Config::parse("cutex_provider_mode='selected_profile_v2'\n[windows]\nsandbox='unelevated'\n").unwrap();
+        let settings = Settings { windows: config.windows, ..Default::default() };
+        settings.validate().unwrap();
+        assert_eq!(serde_json::to_value(&settings).unwrap()["windows"], serde_json::json!({"sandbox":"unelevated"}));
+    }
+
     #[test]
     fn native_presentation_is_preserved_without_inventing_status_defaults() {
         let original = serde_json::json!({
@@ -907,7 +1004,7 @@ mod tests {
         s.skills = Some(Skills {
             config: vec![Skill {
                 enabled: false,
-                path: "/private/missing/SKILL.md".into(),
+                path: std::env::temp_dir().join("missing/SKILL.md"),
             }],
         });
         s.plugins
@@ -967,6 +1064,17 @@ mod tests {
         assert!(serde_json::from_value::<Tui>(malformed).is_err());
     }
     #[test]
+    fn native_service_tiers_and_reviewers_are_supported() {
+        for tier in ["default", "fast", "priority", "flex"] {
+            Settings { service_tier: Some(tier.into()), ..Default::default() }.validate().unwrap();
+        }
+        for reviewer in ["user", "auto_review", "guardian_subagent"] {
+            Settings { approvals_reviewer: Some(reviewer.into()), ..Default::default() }.validate().unwrap();
+        }
+        assert!(Settings { service_tier: Some("invalid".into()), ..Default::default() }.validate().is_err());
+    }
+
+    #[test]
     fn actual_catalog_reference_is_pinned_not_remote_claim() {
         // Fixture source identity is independently checked by the protocol test.
         assert_eq!(
@@ -981,26 +1089,16 @@ mod tests {
         .is_err());
     }
     #[test]
-    fn selected_routes_reject_foreign_identity_and_endpoint_before_auth_read() {
-        let raw = "cutex_provider_mode='selected_profile_v2'\ncli_auth_credentials_store='file'\n";
-        assert!(Config::parse(raw)
-            .unwrap()
-            .review("foreign", "/no-auth-read".into(), None, None)
-            .unwrap_err()
-            .to_string()
-            .contains("profile ID"));
-        let provider="model_provider='GLM'\n[model_providers.GLM]\nname='GLM'\nbase_url='http://www.colabapi.com/v1'\nwire_api='responses'\nrequires_openai_auth=false\nenv_key='OPENAI_API_KEY'\n";
-        let error = Config::parse(&format!("{raw}{provider}"))
-            .unwrap()
-            .review(GLM_ID, "/no-auth-read".into(), None, None)
-            .unwrap_err();
-        assert!(error.to_string().contains("endpoint/TLS"));
-        let arbitrary="model_provider='openai'\n[model_providers.openai]\nname='GLM'\nbase_url='https://www.colabapi.com/v1'\nwire_api='responses'\nrequires_openai_auth=false\nenv_key='OPENAI_API_KEY'\n";
-        assert!(Config::parse(&format!("{raw}{arbitrary}"))
-            .unwrap()
-            .review(OCTOBRE_ID, "/no-auth-read".into(), None, None)
-            .unwrap_err()
-            .to_string()
-            .contains("forbids provider"));
+    fn api_connections_accept_provider_names_and_endpoints_without_brand_fences() {
+        for (id, endpoint) in [("GLM", "https://api.z.ai/api/coding/paas/v4"),
+            ("colab", "https://www.colabapi.com/v1"), ("deepseek", "https://api.deepseek.com/v1"),
+            ("local", "http://127.0.0.1:8080/v1"), ("openai", "https://api.openai.com/v1")] {
+            let connection = ApiConnection { provider_id: id.into(), provider: ApiProvider {
+                name:id.into(), base_url:endpoint.into(), wire_api:"responses".into(),
+                requires_openai_auth:false, env_key:"OPENAI_API_KEY".into() } };
+            connection.validate().unwrap();
+        }
+        assert!(validate_model(&Route::ApiKey, "manual-model", None, None).is_ok());
+        assert!(validate_model(&Route::ApiKey, "manual-model", Some("high"), None).is_ok());
     }
 }

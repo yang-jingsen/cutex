@@ -153,6 +153,18 @@ pub fn set_materialized_file_permissions(_files: &MaterializedAccountFiles) -> a
             fs::set_permissions(&_files.custom_status_items_path, perms)?;
         }
     }
+    #[cfg(windows)]
+    {
+        let parent = _files.auth_path.parent().context("profile auth parent missing")?;
+        let (_, identity) = crate::platform::private_fs::secure_directory(parent)?;
+        for path in [&_files.auth_path, &_files.config_path, &_files.model_catalog_path, &_files.custom_status_items_path] {
+            if path.exists() {
+                let name = path.file_name().and_then(|s| s.to_str()).context("invalid profile file name")?;
+                drop(crate::platform::private_fs::open_child(parent, identity, name, libc::O_RDONLY, true)?);
+            }
+        }
+    }
+
     Ok(())
 }
 

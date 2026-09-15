@@ -20,8 +20,8 @@ impl LocalDeployment {
     /// Select an installed artifact template; existing agent bindings are not rewritten.
     pub fn install(&self) -> anyhow::Result<()> {
         ensure!(
-            cfg!(target_os = "linux"),
-            "local runtime deployment requires Linux"
+            cfg!(any(target_os = "linux", windows)),
+            "local runtime deployment is unsupported on this platform"
         );
         ensure!(self.native_home.is_dir(), "saved native home missing");
         let bundle: super::stock::StockBundle =
@@ -177,15 +177,14 @@ impl LocalDeployment {
                 &provenance,
                 "adoption source",
             )?;
-            #[cfg(unix)]
             for asset in ["skills", "memories", "plugins"] {
                 let source = source_home.join(asset);
                 if source.exists() {
-                    std::os::unix::fs::symlink(source, materialization.join(asset))?;
+                    crate::platform::shared_assets::link_directory(&source, &materialization.join(asset))?;
                 }
             }
         }
-        bundle.launch_config_sha256 = Some(super::stock::launch_config_digest(&config)?);
+        bundle.launch_config_sha256 = None; // User configuration is not an immutable artifact.
         std::fs::write(materialization.join("config.toml"), config)?;
         bundle.version = 4;
         bundle.shared_config = super::stock::VerifiedFile {
@@ -220,7 +219,7 @@ impl LocalDeployment {
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn open_history_writer_blocks_adoption_until_closed() {
         let path =
@@ -245,34 +244,12 @@ mod tests {
 }
 
 fn find_history(home: &Path, native_id: &str) -> anyhow::Result<PathBuf> {
-    use std::io::BufRead;
-    let mut pending = vec![home.join("sessions")];
-    let mut found = Vec::new();
-    while let Some(directory) = pending.pop() {
-        for entry in std::fs::read_dir(directory)? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                pending.push(entry.path());
-            } else if entry
-                .file_name()
-                .to_string_lossy()
-                .ends_with(&format!("-{native_id}.jsonl"))
-            {
-                let first = std::io::BufReader::new(std::fs::File::open(entry.path())?)
-                    .lines()
-                    .next()
-                    .context("empty saved history")??;
-                let meta: serde_json::Value = serde_json::from_str(&first)?;
-                ensure!(
-                    meta["type"] == "session_meta" && meta["payload"]["id"] == native_id,
-                    "saved identity metadata mismatch"
-                );
-                found.push(entry.path());
-            }
-        }
-    }
-    ensure!(found.len() == 1, "saved history missing or ambiguous");
-    Ok(found.remove(0))
+    let path = super::native_history::current(home, native_id)?;
+    // Adoption currently copies one rollout into a private home. A reference-
+    // backed history needs its ancestors and native catalog transferred too.
+    ensure!(super::native_history::metadata(&path)?["history_base"].is_null(),
+        "this history references other rollouts; migrate its native home before adoption");
+    Ok(path)
 }
 
 #[cfg(target_os = "linux")]
@@ -312,7 +289,17 @@ fn has_history_writer(history: &Path) -> anyhow::Result<bool> {
     }
     Ok(false)
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+fn has_history_writer(history: &Path) -> anyhow::Result<bool> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // Denying write sharing conflicts with an already open rollout writer.
+    match std::fs::OpenOptions::new().read(true).share_mode(1).open(history) {
+        Ok(_) => Ok(false),
+        Err(error) if error.raw_os_error() == Some(32) => Ok(true),
+        Err(error) => Err(error.into()),
+    }
+}
+#[cfg(not(any(target_os = "linux", windows)))]
 fn has_history_writer(_: &Path) -> anyhow::Result<bool> {
     anyhow::bail!("local adoption requires Linux")
 }

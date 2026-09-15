@@ -282,7 +282,7 @@ pub fn adopt_cutex_session(
         options.expose_to_im,
         options.pin,
     );
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     if newly_managed
         && record.explicit_launch.is_none()
         && crate::runtime::lifecycle::cutex_session_host_is_local(

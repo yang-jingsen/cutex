@@ -196,6 +196,9 @@ pub struct HumanManagementTaskQueryRequest {
     pub schema: HumanManagementTaskQuerySchema,
     pub action_id: ActionId,
     pub selector: DirectorQuerySelector,
+    /// Empty string requests the first report page; omitted keeps list refresh light.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reports_before: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -210,6 +213,8 @@ pub struct HumanManagementTaskQueryResponse {
     pub project_ids: Vec<ProjectId>,
     pub project_presentations: BTreeMap<ProjectId, EffectiveProjectPresentation>,
     pub receipt: DirectorActionReceipt,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_page: Option<crate::management::task_reports::ReportPage>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

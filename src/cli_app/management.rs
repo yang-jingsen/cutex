@@ -22,6 +22,7 @@ use cutex::management::service::{
 };
 use cutex::platform::command::command_exists_in_path;
 use cutex::platform::host::current_host_name;
+use cutex::profiles::model::CodezConfig;
 
 use super::agent_bus_config;
 use super::agent_bus_runtime;
@@ -341,7 +342,43 @@ pub(crate) fn cmd_management_serve(
     let configured = load_codez_config();
     let config = agent_bus_config::ensure_agent_bus_config(true, configured.agent_bus_port)?;
     agent_bus_runtime::ensure_agent_bus_running(&config, true)?;
-    let adoption = app_server_runtime::adopt_persisted_runtimes(&config, &current_host_name())?;
+    // Classify any process-loss window before the Management API begins
+    // serving query or retry traffic. Subsequent provider opens in this
+    // process do not reclassify an actively executing rotation.
+    let _ = cutex::rotation::ReleaseRotationProvider::open_default()?;
+    let port = port.unwrap_or(DEFAULT_MANAGEMENT_PORT);
+    validate_management_port(port)?;
+    let bind_addr = bind
+        .parse::<IpAddr>()
+        .with_context(|| format!("Invalid management bind address: {bind}"))?;
+    let seat_admin_token = task_service_seat_credential(&config, token.as_deref()).ok();
+    let agent_management_admin_token = management_root_credential(&config, token.as_deref())
+        .ok()
+        .map(str::to_string);
+    let token = management_api_token(&config, token.as_deref()).map(str::to_string);
+    let owner_task_read_credentials = config.owner_task_read_credentials.clone();
+    // Recover existing runtime connections in the background. A slow native
+    // peer must not keep HTTP health unavailable and trigger repeated auto-start.
+    let recovery_config = config.clone();
+    std::thread::Builder::new()
+        .name("cutex-runtime-recovery".into())
+        .spawn(move || {
+            if let Err(error) = recover_runtime_connections(&recovery_config) {
+                eprintln!("app-server runtime adoption warning: {error:#}");
+            }
+        })?;
+    run_management_server(
+        bind_addr,
+        port,
+        token,
+        seat_admin_token,
+        agent_management_admin_token,
+        owner_task_read_credentials,
+    )
+}
+
+fn recover_runtime_connections(config: &CodezConfig) -> anyhow::Result<()> {
+    let adoption = app_server_runtime::adopt_persisted_runtimes(config, &current_host_name())?;
     if adoption.adopted > 0
         || adoption.cleared_stale > 0
         || adoption.skipped > 0
@@ -358,29 +395,7 @@ pub(crate) fn cmd_management_serve(
             eprintln!("app-server adoption warning: {failure}");
         }
     }
-    // Classify any process-loss window before the Management API begins
-    // serving query or retry traffic. Subsequent provider opens in this
-    // process do not reclassify an actively executing rotation.
-    let _ = cutex::rotation::ReleaseRotationProvider::open_default()?;
-    let port = port.unwrap_or(DEFAULT_MANAGEMENT_PORT);
-    validate_management_port(port)?;
-    let bind_addr = bind
-        .parse::<IpAddr>()
-        .with_context(|| format!("Invalid management bind address: {bind}"))?;
-    let seat_admin_token = task_service_seat_credential(&config, token.as_deref()).ok();
-    let agent_management_admin_token = management_root_credential(&config, token.as_deref())
-        .ok()
-        .map(str::to_string);
-    let token = management_api_token(&config, token.as_deref()).map(str::to_string);
-    let owner_task_read_credentials = config.owner_task_read_credentials.clone();
-    run_management_server(
-        bind_addr,
-        port,
-        token,
-        seat_admin_token,
-        agent_management_admin_token,
-        owner_task_read_credentials,
-    )
+    Ok(())
 }
 
 fn run_management_server(

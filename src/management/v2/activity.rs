@@ -497,6 +497,47 @@ pub fn load_session_activity_states() -> anyhow::Result<HashMap<String, SessionA
     load_session_activity_states_at(&root)
 }
 
+/// UI refreshes keep their previous snapshot while another process writes.
+pub fn try_load_session_activity_states() -> anyhow::Result<Option<HashMap<String, SessionActivityState>>> {
+    try_load_session_activity_states_at(&runtime_dir()?.join("management-v2"))
+}
+
+fn try_load_session_activity_states_at(root: &Path) -> anyhow::Result<Option<HashMap<String, SessionActivityState>>> {
+    let _guard = match ACTIVITY_STORE_LOCK.get_or_init(|| Mutex::new(())).try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+        Err(error) => anyhow::bail!("management v2 session activity lock: {error}"),
+    };
+    fs::create_dir_all(root)?;
+    secure_directory(root)?;
+    let lock = open_private_lock(&root.join(ACTIVITY_LOCK_FILE))?;
+    match lock.try_lock() {
+        Ok(()) => {},
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+    }
+    let result = load_activity_store(&root.join(ACTIVITY_STATE_FILE)).map(|store| Some(store.sessions));
+    let unlock = lock.unlock();
+    if result.is_ok() { unlock?; }
+    result
+}
+
+#[cfg(test)]
+#[test]
+fn ui_activity_refresh_skips_a_locked_store_and_recovers() {
+    let root = std::env::temp_dir().join(format!("cutex-ui-activity-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let lock = open_private_lock(&root.join(ACTIVITY_LOCK_FILE)).unwrap();
+    lock.lock().unwrap();
+    let start = std::time::Instant::now();
+    assert!(try_load_session_activity_states_at(&root).unwrap().is_none());
+    assert!(start.elapsed() < Duration::from_secs(1));
+    lock.unlock().unwrap();
+    assert!(try_load_session_activity_states_at(&root).unwrap().is_some());
+    drop(lock);
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// Binds a successfully inserted first-stage watchdog turn to its protected
 /// assignment so subsequent output/tool projections retain exact Task scope.
 /// This is observability metadata only and grants no Task authority.

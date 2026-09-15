@@ -168,10 +168,11 @@ impl ManagementControlClient {
         &self,
         request: &cutex::agent_management::HumanAdoptRequest,
     ) -> anyhow::Result<cutex::agent_management::HumanAdoptResult> {
-        self.request(
+        self.request_with_timeout(
             "POST",
             "/v2/agent-management/adopt-saved-native",
             Some(&serde_json::to_vec(request)?),
+            Duration::from_secs(120),
         )
     }
     pub(super) fn review_agent_archive(
@@ -231,7 +232,7 @@ impl ManagementControlClient {
             anyhow::ensure!(url.scheme()=="http" && url.host_str().is_some() && url.username().is_empty() && url.password().is_none(), "CUTEX_MANAGEMENT_URL must be an http endpoint without embedded credentials");
             return Ok(Self {base_url,root_bearer});
         }
-        cutex::management::launch::ensure_management_api_running(config, DEFAULT_MANAGEMENT_PORT)?;
+        cutex::management::launch::require_management_api_running(config, DEFAULT_MANAGEMENT_PORT)?;
         Ok(Self {
             base_url: management_base_url(DEFAULT_MANAGEMENT_PORT),
             root_bearer,

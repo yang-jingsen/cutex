@@ -166,7 +166,8 @@ fn adopt_saved_native(
                     && native
                         .pointer("/thread/cwd")
                         .and_then(serde_json::Value::as_str)
-                        == Some(request.cwd.as_str()),
+                        .and_then(|cwd| std::path::Path::new(cwd).canonicalize().ok())
+                        == Some(std::path::Path::new(&request.cwd).canonicalize()?),
                 "native source/cwd changed; review again"
             );
         }

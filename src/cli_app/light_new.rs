@@ -25,6 +25,7 @@ fn create_configured(formal_name: &str, cwd: &str, configuration: cutex::launch:
     cutex::notify::session::session(&native, cutex::notify::session::Change::Set(notification))?;
     super::management_control_plane::ManagementControlClient::connect()?
         .adopt_saved_native(&cutex::agent_management::HumanAdoptRequest {
+            session_only: false,
             creation_defaults: Some(cutex::agent_management::HumanCreationDefaults {
                 profile: configuration.profile_name.clone(),
                 model: configuration.model.clone(),
@@ -40,6 +41,7 @@ fn create_configured(formal_name: &str, cwd: &str, configuration: cutex::launch:
 
 /// Persist an empty native thread without a model turn or management recursion.
 /// Report its identity immediately so typed callers can journal late failures.
+#[cfg(any(unix, windows))]
 pub(super) fn create_native(
     cwd: &std::path::Path,
     configuration: &cutex::launch::stock::StockConfiguration,
@@ -66,8 +68,16 @@ pub(super) fn create_native(
         use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
     }
-    #[cfg(not(unix))]
-    anyhow::bail!("new local runtime requires Linux");
+    #[cfg(windows)]
+    let layout = cutex::app_server::runtime::AppServerRuntimeLayout::prepare_stock(
+        &format!("bootstrap-{}", uuid::Uuid::new_v4()),
+    )?;
+    #[cfg(windows)]
+    {
+        std::fs::create_dir(&directory)?;
+        cutex::platform::private_fs::secure_directory(&directory)?;
+    }
+    #[cfg(unix)]
     let socket = directory.join("native.sock");
     use super::stock_lifecycle::{clean_launch, configured, option, receiver_profile};
     let launch = configured(
@@ -80,9 +90,12 @@ pub(super) fn create_native(
         launch,
         "default_permissions",
         receiver_profile(&configuration.sandbox)?,
-    )?
-    .arg("--listen")
-    .arg(format!("unix://{}", socket.display()));
+    )?;
+    #[cfg(unix)]
+    let launch = launch.arg("--listen").arg(format!("unix://{}", socket.display()));
+    #[cfg(windows)]
+    let launch = layout.app_server_args().into_iter().skip(1)
+        .fold(launch, |launch, arg| launch.arg(arg));
     let mut command = launch.to_command();
     if let Some(projection) = &configuration.selected_projection {
         if let Some(secret) = projection.secret()? {
@@ -117,11 +130,23 @@ pub(super) fn create_native(
             let _ = self.0.wait();
         }
     }
+    #[cfg(unix)]
     let owned = Owned(command.spawn()?);
-    let client =
-        AppServerClient::connect(AppServerClientOptions::new(AppServerEndpoint::UnixSocket {
-            socket_path: socket,
-        }))?;
+    #[cfg(windows)]
+    let owned = {
+        let lease = std::fs::File::create(directory.join("bootstrap.lock"))?;
+        let secret = configuration.selected_projection.as_ref()
+            .map(|projection| projection.secret()).transpose()?.flatten();
+        let mut child = super::stock_publication::spawn_with_secret(&launch, cwd.to_str().context("cwd must be UTF-8")?,
+            &directory.join("native.stderr.log"), &lease, secret.as_ref())?;
+        child.start_ephemeral()?;
+        child
+    };
+    #[cfg(unix)]
+    let endpoint = AppServerEndpoint::UnixSocket { socket_path: socket };
+    #[cfg(windows)]
+    let endpoint = layout.endpoint();
+    let client = AppServerClient::connect(AppServerClientOptions::new(endpoint))?;
     let handle = client.handle();
     let response = handle.request("thread/start", serde_json::json!({"cwd":cwd,"approvalPolicy":configuration.approval,"ephemeral":false,"historyMode":"paginated"})).context("Native creation response unconfirmed; inspect Recent before creating another agent")?;
     let native = response["thread"]["id"]
@@ -157,6 +182,15 @@ pub(super) fn create_native(
     drop(client);
     drop(owned);
     Ok(native)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(super) fn create_native(
+    _cwd: &std::path::Path,
+    _configuration: &cutex::launch::stock::StockConfiguration,
+    _captured: impl FnMut(&str),
+) -> anyhow::Result<String> {
+    anyhow::bail!("Managed native creation requires the Linux runtime adapter; no session was created")
 }
 
 /// Foreground form shared by the main selector's New action.
@@ -217,6 +251,7 @@ pub(super) fn adopt_saved(
         .context("saved thread cwd missing")?;
     let result = super::management_control_plane::ManagementControlClient::connect()?
         .adopt_saved_native(&cutex::agent_management::HumanAdoptRequest {
+            session_only: false,
             creation_defaults: None,
             action_id: cutex::agent_management::AgentActionId::new(format!(
                 "human-adopt-{native}"
@@ -229,4 +264,20 @@ pub(super) fn adopt_saved(
         anyhow::bail!("Agent adopted, but roster import incomplete: {error}. Retry the same Adopt");
     }
     Ok(result)
+}
+
+/// New ordinary Cutex session: native history + dedicated owner, no Agent import.
+pub(super) fn create_owned_session(profile: &str, cwd: &std::path::Path) -> anyhow::Result<String> {
+    let mut configuration=cutex::launch::stock::local_configuration_with_profile(Some(&profile.to_owned()))?;
+    if let Some(projection) = configuration.selected_projection.as_mut() { projection.requires_job = false; }
+    let cwd=cwd.canonicalize()?;
+    let native=create_native(&cwd,&configuration,|id|eprintln!("Session: {id}"))?;
+    let result=super::management_control_plane::ManagementControlClient::connect()?.adopt_saved_native(
+        &cutex::agent_management::HumanAdoptRequest {
+            session_only:true,
+            action_id:cutex::agent_management::AgentActionId::new(format!("session-owner-{native}"))?,
+            native_id:native.clone(),cwd:cwd.to_string_lossy().into_owned(),formal_name:format!("Session {}",&native[..8]),
+            creation_defaults:Some(cutex::agent_management::HumanCreationDefaults{profile:profile.into(),model:configuration.model,reasoning:configuration.reasoning}),
+        }).with_context(||format!("Session {native} exists; runtime registration incomplete, retain this ID"))?;
+    Ok(result.adopted.record.cutex_session_id)
 }

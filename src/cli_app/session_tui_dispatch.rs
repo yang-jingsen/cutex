@@ -257,6 +257,7 @@ fn dispatch_plan_for_intent(
         .unwrap_or(record.cutex_session_id.as_str())
         .to_string();
     let plan = match intent.action {
+        SessionTuiAction::RevertHistory => anyhow::bail!("open history editor from the Cutex TUI"),
         SessionTuiAction::RecoverRuntime => SessionTuiDispatchPlan::RecoverRuntime {
             id: record.cutex_session_id.clone(),
         },

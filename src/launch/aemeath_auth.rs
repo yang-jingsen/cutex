@@ -46,7 +46,6 @@ pub struct ReviewedAemeathAuth {
 
 #[cfg(target_os = "linux")]
 pub fn review(path: PathBuf) -> anyhow::Result<ReviewedAemeathAuth> {
-    use sha2::Digest;
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     ensure!(
@@ -92,6 +91,21 @@ pub fn review(path: PathBuf) -> anyhow::Result<ReviewedAemeathAuth> {
             && before.mtime_nsec() == after.mtime_nsec(),
         "native auth changed during read"
     );
+    let account_sha256 = account_identity(&bytes)?;
+    Ok(ReviewedAemeathAuth {
+        version: 1,
+        path,
+        device: before.dev(),
+        inode: before.ino(),
+        owner: uid,
+        directory_device: dir.dev(),
+        directory_inode: dir.ino(),
+        account_sha256,
+    })
+}
+
+pub(super) fn account_identity(bytes: &[u8]) -> anyhow::Result<crate::role_revision::Sha256> {
+    use sha2::Digest;
     let value: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid native auth JSON"))?;
     ensure!(
@@ -177,16 +191,7 @@ pub fn review(path: PathBuf) -> anyhow::Result<ReviewedAemeathAuth> {
         ))?)
     ))
     .map_err(|_| anyhow::anyhow!("invalid account identity digest"))?;
-    Ok(ReviewedAemeathAuth {
-        version: 1,
-        path,
-        device: before.dev(),
-        inode: before.ino(),
-        owner: uid,
-        directory_device: dir.dev(),
-        directory_inode: dir.ino(),
-        account_sha256,
-    })
+    Ok(account_sha256)
 }
 
 #[cfg(not(target_os = "linux"))]

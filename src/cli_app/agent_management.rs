@@ -140,6 +140,10 @@ pub(crate) fn bind_project_authority(request: ProjectAuthorityRequest) -> serde_
     let outcome = match AgentManagementProvider::open_default() {
         Ok(provider) => match provider.bind_project_authority(&request) {
             Ok(receipt) => ProjectAuthorityOutcome::Complete { receipt },
+            Err(error) if provider.project_authority_correction_has_writes(&request).unwrap_or(true) => ProjectAuthorityOutcome::OwnerActionRequired {
+                code: error.code().to_string(),
+                detail: format!("{error}; authority correction may have committed partially; replay the same request"),
+            },
             Err(error) => ProjectAuthorityOutcome::NoWrite {
                 code: error.code().to_string(),
                 detail: error.to_string(),
@@ -918,6 +922,27 @@ impl AgentLifecycle for CutexAgentLifecycle {
         }
     }
 
+    fn reconcile_interrupted_native_bootstrap(
+        &self, spec: &ManagedAgentSpec, started_at: &Rfc3339, failed_at: &Rfc3339,
+    ) -> Result<NativeBootstrapIdentityReconciliation, LifecycleFailure> {
+        // light_new owns the empty-thread creator with PDEATHSIG. The provider
+        // mutation lock excludes a concurrent creator; its child cannot outlive
+        // an interrupted owning process. Other backends do not make that claim.
+        if !cfg!(target_os = "linux") || cutex::launch::local_deployment::LocalDeployment::selected()
+            .map_err(unknown("native_bootstrap_reconciliation_unavailable"))?.is_none() {
+            return Err(LifecycleFailure::outcome_unknown("native_bootstrap_reconciliation_unavailable", "interrupted recovery requires the local owned bootstrap backend"));
+        }
+        for entry in std::fs::read_dir("/proc").map_err(unknown("native_bootstrap_reconciliation_unavailable"))? {
+            let entry = entry.map_err(unknown("native_bootstrap_reconciliation_unavailable"))?;
+            if !entry.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit()) { continue; }
+            if std::fs::read_link(entry.path().join("cwd")).ok().as_deref() == Some(Path::new(&spec.cwd))
+                && std::fs::read_link(entry.path().join("exe")).ok().and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned())).is_some_and(|n| n == "codex-app-server") {
+                return Ok(NativeBootstrapIdentityReconciliation::Unavailable { reason: "native creator is still exiting; retry after it has stopped".into() });
+            }
+        }
+        self.reconcile_ambiguous_native_bootstrap(spec, started_at, failed_at)
+    }
+
     fn reconcile_ambiguous_native_bootstrap(
         &self,
         spec: &ManagedAgentSpec,
@@ -1128,6 +1153,7 @@ impl AgentLifecycle for CutexAgentLifecycle {
     ) -> Result<CutexSessionId, LifecycleFailure> {
         let mut store =
             load_cutex_session_store().map_err(definite("session_store_unavailable"))?;
+        let before = store.clone();
         let outcome = adopt_cutex_session(
             &mut store,
             native_session_id,
@@ -1145,7 +1171,8 @@ impl AgentLifecycle for CutexAgentLifecycle {
             },
         )
         .map_err(definite("session_adopt_failed"))?;
-        persist_cutex_session_store_and_im_record(&store, &outcome.key)
+        cutex::session::store::save_cutex_session_record(&before, &store, &outcome.key)
+            .and_then(|_| cutex::session::im_bridge::persist_cutex_session_im_record(&store, &outcome.key))
             .map_err(unknown("session_adopt_persistence_unknown"))?;
         CutexSessionId::new(outcome.key)
             .map_err(|_| LifecycleFailure::definite("invalid_durable_session", "adopted ID"))
@@ -1159,6 +1186,7 @@ impl AgentLifecycle for CutexAgentLifecycle {
     ) -> Result<(), LifecycleFailure> {
         let mut store =
             load_cutex_session_store().map_err(definite("session_store_unavailable"))?;
+        let before = store.clone();
         let key =
             cutex_session_key_for_user_id_including_retired(&store, cutex_session_id.as_str())
                 .ok_or_else(|| {
@@ -1204,7 +1232,8 @@ impl AgentLifecycle for CutexAgentLifecycle {
             .bump_durable_revision()
             .map_err(definite("session_revision_failed"))?;
         record.updated_at = chrono::Utc::now().to_rfc3339();
-        persist_cutex_session_store_and_im_record(&store, &key)
+        cutex::session::store::save_cutex_session_record(&before, &store, &key)
+            .and_then(|_| cutex::session::im_bridge::persist_cutex_session_im_record(&store, &key))
             .map_err(unknown("session_configuration_persistence_unknown"))
     }
 

@@ -1,6 +1,5 @@
 //! Manifest-selected Linux runtime artifacts with checked file integrity and protocol compatibility.
 use std::collections::BTreeMap;
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context};
@@ -108,11 +107,11 @@ pub struct ExternalInputBinding {
     pub canonical_byte_limit: CanonicalBytePolicy,
 }
 impl ExternalInputBinding {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     pub fn stage(&self, _directory: &Path) -> anyhow::Result<PathBuf> {
         anyhow::bail!("ExternalInput requires private Unix transport")
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     pub fn verify(&self, _directory: &Path) -> anyhow::Result<()> {
         anyhow::bail!("ExternalInput requires private Unix transport")
     }
@@ -177,6 +176,34 @@ impl ExternalInputBinding {
         );
         Ok(())
     }
+    #[cfg(windows)]
+    pub fn stage(&self, directory: &Path) -> anyhow::Result<PathBuf> {
+        use std::io::Write;
+        use crate::platform::private_fs;
+        let (_guard, identity) = private_fs::open_validated_directory(directory)?;
+        let mut file = private_fs::open_child(directory, identity, "external-input.json",
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, false)?;
+        file.write_all(&serde_json::to_vec(self)?)?;
+        file.flush()?;
+        Ok(directory.join("external-input.json"))
+    }
+    #[cfg(windows)]
+    pub fn verify(&self, directory: &Path) -> anyhow::Result<()> {
+        use std::io::Read;
+        use std::os::windows::fs::OpenOptionsExt;
+        use crate::platform::private_fs;
+        let (_guard, identity) = private_fs::open_validated_directory(directory)?;
+        let file = std::fs::OpenOptions::new().read(true).share_mode(1)
+            .custom_flags(0x00200000).open(directory.join("external-input.json"))?;
+        private_fs::validate_private_file(&file)?;
+        let mut bytes = Vec::new();
+        file.take(4097).read_to_end(&mut bytes)?;
+        ensure!(bytes.len() <= 4096 && serde_json::from_slice::<Self>(&bytes)? == *self,
+            "ingress binding changed");
+        private_fs::validate_binding(directory, identity)?;
+        Ok(())
+    }
+
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,14 +238,12 @@ pub struct StockBundle {
     pub facade: VerifiedFile,
     /// Pinned stock experimental schema, or accepted S6 generated schema.
     pub schema: VerifiedFile,
-    /// The authoritative shared config is reviewed, never rewritten on launch.
+    /// Mutable shared config; its current content is validated on each load.
     pub shared_config: VerifiedFile,
-    /// Launch semantics exclude mutable native presentation preferences.
+    /// Historical migration digest, retained for receipts, not a launch restriction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_config_sha256: Option<Sha256>,
 }
-#[derive(Clone, Copy)]
-enum ConfigCheck { Launch, Running }
 
 impl StockBundle {
     pub fn common_ingress(&self) -> bool {
@@ -275,23 +300,32 @@ impl StockBundle {
         Ok(())
     }
     pub fn load(contract: &ExplicitLaunchContract) -> anyhow::Result<Self> {
-        Self::load_contract(contract, ConfigCheck::Launch)
+        Self::load_contract(contract)
     }
 
-    /// Verify an existing owner without treating mutable TUI preferences as
-    /// changed executable evidence. New launches still check launch semantics
-    /// (or the exact config hash for bundles without a semantic digest).
+    /// An existing process keeps its startup configuration. Reading messages,
+    /// history, or stopping it must not depend on later edits to config.toml.
     pub fn load_running(contract: &ExplicitLaunchContract) -> anyhow::Result<Self> {
-        Self::load_contract(contract, ConfigCheck::Running)
+        contract.validate()?;
+        canonical(&contract.native_home)?;
+        canonical(&contract.bundle_manifest)?;
+        ensure!(contract.native_home.is_dir(), "native home missing");
+        ensure!(file_sha256(&contract.bundle_manifest)? == contract.bundle_sha256,
+            "bundle evidence missing or changed");
+        let bundle: Self = serde_json::from_slice(&std::fs::read(&contract.bundle_manifest)?)
+            .context("invalid stock bundle manifest")?;
+        bundle.validate_components_with_config(false)?;
+        ensure!(contract.version == if contract.version == 4 && bundle.version == 4 {4} else if bundle.soon_ingress() { if contract.migration_action_id.is_some() {3} else {2} } else { 1 },
+            "runtime contract version does not match its bundle");
+        Ok(bundle)
     }
 
-    fn load_contract(contract: &ExplicitLaunchContract, config: ConfigCheck) -> anyhow::Result<Self> {
+    fn load_contract(contract: &ExplicitLaunchContract) -> anyhow::Result<Self> {
         contract.validate()?;
-        let bundle = Self::load_references_with_config(
+        let bundle = Self::load_verified_references(
             &contract.native_home,
             &contract.bundle_manifest,
             &contract.bundle_sha256,
-            config,
         )?;
         ensure!(contract.version == if contract.version == 4 && bundle.version == 4 {4} else if bundle.soon_ingress() { if contract.migration_action_id.is_some() {3} else {2} } else { 1 },
             "new coherent Soon bundle requires explicit version-2 activation; old markers cannot opt in");
@@ -305,11 +339,11 @@ impl StockBundle {
         manifest: &Path,
         digest: &Sha256,
     ) -> anyhow::Result<Self> {
-        Self::load_references_with_config(native_home, manifest, digest, ConfigCheck::Launch)
+        Self::load_verified_references(native_home, manifest, digest)
     }
 
-    fn load_references_with_config(
-        native_home: &Path, manifest: &Path, digest: &Sha256, config: ConfigCheck,
+    fn load_verified_references(
+        native_home: &Path, manifest: &Path, digest: &Sha256,
     ) -> anyhow::Result<Self> {
         canonical(native_home)?;
         canonical(manifest)?;
@@ -321,26 +355,33 @@ impl StockBundle {
         let mut bundle: Self = serde_json::from_slice(&std::fs::read(manifest)?)
             .context("invalid stock bundle manifest")?;
         let raw = std::fs::read_to_string(&bundle.shared_config.path)?;
-        validate_shared_config(&raw)?;
-        if matches!(config, ConfigCheck::Running) {
-            bundle.shared_config.sha256 = file_sha256(&bundle.shared_config.path)?;
-        } else if let Some(expected) = &bundle.launch_config_sha256 {
-            ensure!(&launch_config_digest(&raw)? == expected, "shared launch configuration changed");
-            bundle.shared_config.sha256 = file_sha256(&bundle.shared_config.path)?;
-        }
+        bundle.validate_shared_configuration(&raw)?;
+        // Config is user-editable state, not an immutable build artifact.
+        // Old manifest hashes remain historical evidence, never launch gates.
+        bundle.shared_config.sha256 = file_sha256(&bundle.shared_config.path)?;
         bundle.validate_components()?;
         ensure!(
-            bundle.shared_config.path == native_home.join("config.toml"),
+            bundle.shared_config.path.canonicalize()? == native_home.join("config.toml").canonicalize()?,
             "wrong shared config/home"
         );
-        validate_shared_config(&std::fs::read_to_string(&bundle.shared_config.path)?)?;
+        bundle.validate_shared_configuration(&std::fs::read_to_string(&bundle.shared_config.path)?)?;
         Ok(bundle)
+    }
+
+    fn validate_shared_configuration(&self, raw: &str) -> anyhow::Result<()> {
+        validate_shared_config(raw)
     }
 
     /// Identical artifact fences, before a migration's shared config exists.
     pub(crate) fn validate_components(&self) -> anyhow::Result<()> {
+        self.validate_components_with_config(true)
+    }
+
+    fn validate_components_with_config(&self, validate_config: bool) -> anyhow::Result<()> {
         let bundle = self;
-        ensure!(cfg!(target_os = "linux"), "stock subset requires Linux");
+        ensure!(cfg!(any(target_os = "linux", windows)), "stock runtime unsupported on this platform");
+        #[cfg(windows)]
+        ensure!(bundle.local_deployment(), "Windows requires a local v4 runtime deployment");
         bundle.validate_identity()?;
         if let Some(cli) = &bundle.cli {
             cli.validate()?;
@@ -354,10 +395,10 @@ impl StockBundle {
             &bundle.code_mode_host,
             &bundle.facade,
             &bundle.schema,
-            &bundle.shared_config,
         ] {
             file.validate()?;
         }
+        if validate_config { bundle.shared_config.validate()?; }
         ensure!(
             bundle.code_mode_host.path
                 == bundle
@@ -365,7 +406,7 @@ impl StockBundle {
                     .path
                     .parent()
                     .context("stock binary parent missing")?
-                    .join("codex-code-mode-host"),
+                    .join(if cfg!(windows) { "codex-code-mode-host.exe" } else { "codex-code-mode-host" }),
             "stock companion must be beside executable"
         );
         let schema: serde_json::Value =
@@ -375,40 +416,6 @@ impl StockBundle {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SharedConfig {
-    cutex_projection_version: Option<super::selected_profile::Version>,
-    #[serde(default)]
-    projects: BTreeMap<String, Trust>,
-    analytics: Option<Analytics>,
-    notice: Option<Notice>,
-    model: Option<String>,
-    model_reasoning_effort: Option<String>,
-    plan_mode_reasoning_effort: Option<String>,
-    sandbox_mode: Option<String>,
-    approvals_reviewer: Option<String>,
-    service_tier: Option<String>,
-    shell_environment_policy: Option<super::selected_profile::ShellPolicy>,
-    skills: Option<super::selected_profile::Skills>,
-    tui: Option<super::selected_profile::Tui>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Trust {
-    trust_level: String,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Analytics {
-    enabled: bool,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Notice {
-    #[serde(default)]
-    model_migrations: BTreeMap<String, String>,
-}
 /// Hash launch-affecting values, preserving all non-presentation configuration.
 pub fn launch_config_digest(raw: &str) -> anyhow::Result<Sha256> {
     use sha2::Digest;
@@ -419,82 +426,31 @@ pub fn launch_config_digest(raw: &str) -> anyhow::Result<Sha256> {
         .map_err(anyhow::Error::msg)
 }
 
+/// Locally installed native runtimes own their config schema. Do not keep a
+/// second, progressively stale allowlist that rejects ordinary native settings.
 pub fn validate_shared_config(raw: &str) -> anyhow::Result<()> {
-    let config: SharedConfig = toml::from_str(raw).map_err(|_| anyhow::anyhow!("unsupported shared stock config; only reviewed trust/notices and disabled analytics are supported"))?;
-    ensure!(
-        config
-            .projects
-            .values()
-            .all(|p| matches!(p.trust_level.as_str(), "trusted" | "untrusted")),
-        "unsupported stock trust level"
-    );
-    ensure!(
-        config.analytics.is_none_or(|a| !a.enabled),
-        "stock private analytics must be disabled"
-    );
-    // These exact nonsecret defaults are bound by the reviewed shared-config
-    // hash. Owner launch always supplies effective model/sandbox/approval.
-    ensure!(
-        config.cutex_projection_version.is_some()
-            || (config.model.is_none()
-                && config.model_reasoning_effort.is_none()
-                && config.plan_mode_reasoning_effort.is_none()
-                && config.sandbox_mode.is_none()
-                && config.approvals_reviewer.is_none()
-                && config.service_tier.is_none()
-                && config.shell_environment_policy.is_none()
-                && config.skills.is_none()
-                && config.tui.is_none()),
-        "shared selected defaults require explicit projection version2"
-    );
-    if let Some(model) = config.model.as_deref() {
-        super::selected_profile::validate_model_identifier(model)?;
-    }
-    for effort in [
-        config.model_reasoning_effort.as_deref(),
-        config.plan_mode_reasoning_effort.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        ensure!(
-            super::selected_profile::supported_effort(effort),
-            "unsupported shared reasoning default"
-        );
-    }
-    ensure!(
-        config
-            .sandbox_mode
-            .as_deref()
-            .is_none_or(|s| matches!(s, "read-only" | "workspace-write" | "danger-full-access")),
-        "unsupported shared sandbox"
-    );
-    super::selected_profile::Settings {
-        approvals_reviewer: config.approvals_reviewer,
-        service_tier: config.service_tier,
-        shell_environment_policy: config.shell_environment_policy,
-        skills: config.skills,
-        tui: config.tui,
-        ..Default::default()
-    }
-    .validate()?;
-    if let Some(notice) = config.notice {
-        ensure!(
-            notice
-                .model_migrations
-                .iter()
-                .all(|(a, b)| !a.is_empty() && !b.is_empty()),
-            "invalid stock migration notice"
-        );
-    }
+    let value: toml::Value = toml::from_str(raw)
+        .map_err(|error: toml::de::Error| anyhow::anyhow!("invalid native configuration: {}", error.message()))?;
+    ensure!(value.is_table(), "native config must be a table");
     Ok(())
 }
 
+
 pub fn canonical(path: &Path) -> anyhow::Result<()> {
-    ensure!(
-        path.is_absolute() && path.canonicalize()? == path,
-        "canonical existing stock path required"
-    );
+    ensure!(path.is_absolute(), "absolute stock path required");
+    let resolved = path.canonicalize()?;
+    #[cfg(not(windows))]
+    ensure!(resolved == path, "canonical existing stock path required");
+    #[cfg(windows)]
+    {
+        fn spelling(path: &Path) -> String {
+            let text = path.to_string_lossy().replace('/', "\\");
+            if let Some(unc) = text.strip_prefix(r"\\?\UNC\") { format!(r"\\{unc}") }
+            else { text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned() }
+        }
+        ensure!(spelling(&resolved).eq_ignore_ascii_case(&spelling(path)),
+            "canonical existing stock path required");
+    }
     Ok(())
 }
 
@@ -626,7 +582,7 @@ fn configuration_for_record(
         "stock does not accept arbitrary durable CLI overrides"
     );
     let (sandbox, approval) = crate::runtime::args::effective_runtime_permission_defaults(record);
-    configuration_for_selection(
+    let mut configuration = configuration_for_selection(
         record.profile.as_ref(),
         record.permission_defaults.as_deref(),
         sandbox,
@@ -634,7 +590,11 @@ fn configuration_for_record(
         record.model_defaults.as_ref(),
         record.reasoning_defaults.as_ref(),
         migration,
-    )
+    )?;
+    if !record.agent_enabled && record.registration_class == crate::agent_bus::model::AgentRegistrationClass::LocalOnly {
+        if let Some(projection)=configuration.selected_projection.as_mut() { projection.requires_job=false; }
+    }
+    Ok(configuration)
 }
 
 /// Configuration is independent of identity. Bootstrap has no durable/native
@@ -763,7 +723,6 @@ fn configuration_for_selection(
     ensure!(
         matches!(account.runtime, RuntimeConfig::Host)
             && account.cli_kind == CliKind::Codex
-            && account.proxy.is_none()
             && account.session.is_none()
             && account.default_cli_args.is_empty(),
         "unsupported stock account/runtime/options"
@@ -819,6 +778,15 @@ fn configuration_for_selection(
             format!("{:x}", sha2::Sha256::digest(raw.as_bytes())) == profile_sha256.as_str(),
             "selected profile changed during review"
         );
+        let provider_id = projection.provider_id().to_owned();
+        let provider = if let Some(api) = &projection.api {
+            DummyProvider { name: api.provider.name.clone(), base_url: api.provider.base_url.clone(),
+                wire_api: api.provider.wire_api.clone(), requires_openai_auth: false, supports_websockets: false }
+        } else {
+            DummyProvider { name: if chatgpt { "OpenAI" } else { "GLM" }.into(),
+                base_url: if chatgpt { super::aemeath_auth::ENDPOINT } else { super::selected_profile::GLM_ENDPOINT }.into(),
+                wire_api: "responses".into(), requires_openai_auth: chatgpt, supports_websockets: chatgpt }
+        };
         return Ok(StockConfiguration {
             selected_projection: Some(projection),
             aemeath_auth: None,
@@ -833,19 +801,8 @@ fn configuration_for_selection(
             .map_err(|_| anyhow::anyhow!("invalid selected account digest"))?,
             model,
             reasoning,
-            model_provider: if chatgpt { "openai" } else { "GLM" }.into(),
-            provider: DummyProvider {
-                name: if chatgpt { "OpenAI" } else { "GLM" }.into(),
-                base_url: if chatgpt {
-                    super::aemeath_auth::ENDPOINT
-                } else {
-                    super::selected_profile::GLM_ENDPOINT
-                }
-                .into(),
-                wire_api: "responses".into(),
-                requires_openai_auth: chatgpt,
-                supports_websockets: chatgpt,
-            },
+            model_provider: provider_id,
+            provider,
             sandbox,
             approval,
         });
@@ -1045,37 +1002,7 @@ pub fn validate_native(
         );
     }
     current_configuration(record)?.validate_auth_home(&contract.native_home)?;
-    let mut found = Vec::new();
-    let mut pending = vec![contract.native_home.join("sessions")];
-    while let Some(dir) = pending.pop() {
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let ty = entry.file_type()?;
-            ensure!(!ty.is_symlink(), "symlinked stock history is unsupported");
-            if ty.is_dir() {
-                pending.push(entry.path());
-            } else if entry
-                .file_name()
-                .to_string_lossy()
-                .ends_with(&format!("{}.jsonl", contract.native_id))
-            {
-                let path = entry.path();
-                canonical(&path)?;
-                let first = std::io::BufReader::new(std::fs::File::open(&path)?)
-                    .lines()
-                    .next()
-                    .context("empty native rollout")??;
-                let meta: serde_json::Value = serde_json::from_str(&first)?;
-                ensure!(
-                    meta["type"] == "session_meta" && meta["payload"]["id"] == contract.native_id,
-                    "native rollout metadata mismatch"
-                );
-                found.push(path);
-            }
-        }
-    }
-    ensure!(found.len() == 1, "native rollout missing or ambiguous");
-    Ok(found.remove(0))
+    super::native_history::current(&contract.native_home, &contract.native_id)
 }
 
 #[cfg(test)]
@@ -1097,31 +1024,6 @@ mod tests {
             validate_selected_permissions(Some("unknown"), "danger-full-access", "never").is_err()
         );
         assert!(validate_selected_permissions(Some(":read-only"), "read-only", "always").is_err());
-    }
-    #[test]
-    fn shared_defaults_accept_new_model_identifiers_and_native_efforts() {
-        assert!(validate_shared_config("cutex_projection_version=2\nmodel='future-model/revision-2'\nmodel_reasoning_effort='none'\n").is_ok());
-        assert!(validate_shared_config("cutex_projection_version=2\nmodel=''\n").is_err());
-        assert!(validate_shared_config(
-            "cutex_projection_version=2\nmodel='model'\nmodel_reasoning_effort='guessed'\n"
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn selected_shared_version_is_explicit_and_unknowns_stay_closed() {
-        let raw="cutex_projection_version=2\nmodel='gpt-5.6-sol'\nmodel_reasoning_effort='max'\nsandbox_mode='danger-full-access'\napprovals_reviewer='user'\n[shell_environment_policy]\nexclude=['CODEX_AUTH_FILE']\n";
-        assert!(validate_shared_config(raw).is_ok());
-        assert!(validate_shared_config(&format!(
-            "{raw}\n[tui]\nstatus_line=['model-with-reasoning']\nstatus_line_use_colors=true\n[tui.model_availability_nux]\n'gpt-5.5'=2\n'gpt-5.6-sol'=1\n"
-        ))
-        .is_ok());
-        assert!(validate_shared_config(&raw.replace("cutex_projection_version=2\n", "")).is_err());
-        assert!(validate_shared_config(&raw.replace("version=2", "version=3")).is_err());
-        assert!(
-            validate_shared_config(&format!("{raw}\n[mcp_servers.other]\ncommand='bad'\n"))
-                .is_err()
-        );
     }
     #[test]
     #[ignore = "requires the task-owned accepted native manifest"]
@@ -1359,26 +1261,21 @@ mod tests {
             assert_eq!(launch_config_digest(&format!("{base}{tui}")).unwrap(), expected);
         }
         assert_ne!(launch_config_digest(&base.replace("gpt-5", "other-model")).unwrap(), expected);
-        assert!(launch_config_digest(&format!("{base}unknown=true\n")).is_err());
+        assert!(launch_config_digest(&format!("{base}unknown=true\n")).is_ok());
     }
 
     #[test]
-    fn stock_shared_config_rejects_execution_auth_and_unknown_options() {
-        assert!(validate_shared_config(
-            "[analytics]\nenabled=false\n[projects.\"/private\"]\ntrust_level=\"trusted\""
-        )
-        .is_ok());
+    fn ordinary_settings_do_not_require_migration_marker() {
         for raw in [
-            "notify=['sh','-c','exit 0']",
-            "sandbox_mode='danger-full-access'",
-            "forced_login_method='chatgpt'",
-            "[mcp_servers.foreign]\ncommand='other'",
-            "[analytics]\nenabled=true",
-            "[projects.x]\ntrust_level='guessed'",
-        ] {
-            assert!(validate_shared_config(raw).is_err(), "{raw}");
-        }
+            "model='gpt-6-astra'\nmodel_reasoning_effort='xhigh'",
+            "sandbox_mode='danger-full-access'\napprovals_reviewer='user'",
+            "service_tier='priority'\nplan_mode_reasoning_effort='high'",
+            "[tui]\nstatus_line=['model-name']",
+            "[[skills.config]]\npath='/skills/example/SKILL.md'\nenabled=false",
+            "[plugins.example]\nenabled=false",
+        ] { validate_shared_config(raw).unwrap(); }
     }
+
     #[test]
     fn stock_unknown_bundle_fields_and_versions_reject_without_spawn() {
         let json = serde_json::json!({"version":1,"native_id":"not-a-native-id","native_home":"/","bundle_manifest":"/","bundle_sha256":"a".repeat(64)});
@@ -1447,5 +1344,46 @@ mod tests {
         assert_eq!(record.explicit_launch, contract);
         assert_eq!(record.profile.as_deref(), Some("changed-profile"));
         assert!(crate::agent_management::require_default_launch(record).is_err());
+    }
+}
+
+#[cfg(test)]
+mod native_plugin_config_tests {
+    use super::*;
+    const CONFIG: &str = r#"
+cutex_projection_version=2
+[plugins."visualize@openai-bundled"]
+enabled=true
+[marketplaces.openai-bundled]
+source_type="local"
+source="/native/.tmp/bundled-marketplaces/openai-bundled"
+"#;
+    #[test]
+    fn native_plugins_and_marketplaces_survive_adoption_config_and_remain_bound() {
+        validate_shared_config(CONFIG).unwrap();
+        let hash = launch_config_digest(CONFIG).unwrap();
+        assert_ne!(hash, launch_config_digest(&CONFIG.replace("enabled=true", "enabled=false")).unwrap());
+        assert_ne!(hash, launch_config_digest(&CONFIG.replace("/native/", "/other/")).unwrap());
+        let rich = format!("{CONFIG}last_updated='today'\nlast_revision='revision'\nref='main'\nsparse_paths=['plugins']\n[plugins.\"visualize@openai-bundled\".mcp_servers.visualize]\ndefault_tools_approval_mode='prompt'\nenabled_tools=['view']\ndisabled_tools=['delete']\n[plugins.\"visualize@openai-bundled\".mcp_servers.visualize.tools.view]\napproval_mode='auto'\noutput_token_limit=1000\n");
+        validate_shared_config(&rich).unwrap();
+        // Native owns semantic validation of plugin options.
+        assert!(validate_shared_config(&CONFIG.replace("source_type=\"local\"", "source_type=\"git\"")).is_ok());
+    }
+    #[test]
+    #[ignore = "explicit read-only live shared config probe"]
+    fn actual_shared_config_is_accepted_after_projection_marker() {
+        let path = std::env::var("CUTEX_SHARED_CONFIG_TEST_FILE").unwrap();
+        let mut value: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        value.as_table_mut().unwrap().insert("cutex_projection_version".into(), 2.into());
+        let raw = toml::to_string(&value).unwrap();
+        validate_shared_config(&raw).unwrap();
+        launch_config_digest(&raw).unwrap();
+    }
+    #[test]
+    fn rejected_config_reports_field_without_echoing_source_document() {
+        let error = validate_shared_config("private_unknown_key='SENSITIVE_SENTINEL").unwrap_err().to_string();
+        assert!(error.contains("invalid native configuration"));
+        assert!(!error.contains("SENSITIVE_SENTINEL"));
+        assert!(validate_shared_config(&format!("{CONFIG}unknown_option=true\n")).is_ok());
     }
 }

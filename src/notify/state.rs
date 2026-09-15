@@ -306,7 +306,7 @@ pub fn snapshot() -> anyhow::Result<Value> {
         sessions.push(json!({"agentId":s.agent_id,"agentName":name,"threadId":s.thread_id,"priority":level.as_ref().ok(),"preferenceError":level.is_err(),"state":if reason.is_some(){"inactive"}else{&s.state},"reason":reason,"lastActivityAt":s.activity,"inactiveAt":s.activity+IDLE_SECONDS,"reminderId":s.reminder,"unread":enabled && reason.is_none() && s.reminder.is_some() && !s.acknowledged}));
     }
     Ok(
-        json!({"schema":"cutex/notification-state/v1","generatedAt":now,"expiresAt":now+HEALTH_SECONDS,"healthy":healthy,"sourceHeartbeat":heartbeat,"checkpoint":meta(&db,"checkpoint")?.and_then(|s|serde_json::from_str::<Value>(&s).ok()),"retentionGapObserved":meta(&db,"gap")?.is_some(),"sessions":sessions,"coverage":"managed_runtime_events","automaticInteractionAck":true,"interactionAckScope":"updated_cute_codex_frontends","interactionAckInputs":["key","paste"]}),
+        json!({"schema":"cutex/notification-state/v1","generatedAt":now,"expiresAt":now+HEALTH_SECONDS,"healthy":healthy,"sourceHeartbeat":heartbeat,"checkpoint":meta(&db,"checkpoint")?.and_then(|s|serde_json::from_str::<Value>(&s).ok()),"retentionGapObserved":meta(&db,"gap")?.is_some(),"sessions":sessions,"coverage":"registered_runtime_events","runtimeKinds":["cutex_agent","cutex_session"],"automaticInteractionAck":true,"interactionAckScope":"updated_cute_codex_frontends","interactionAckInputs":["key","paste"]}),
     )
 }
 

@@ -50,6 +50,27 @@ pub(crate) fn run_codex_process(
             program
         ));
     }
+    if !agent_mode && effective_codex_args.first().is_some_and(|arg| arg == "resume") {
+        if let Some(native) = effective_codex_args.get(1).filter(|arg| !arg.starts_with('-')) {
+            let store = cutex::session::store::load_cutex_session_store()?;
+            if let Some(record) = store.sessions.values().find(|r| r.is_owned_session()
+                && r.codex_session_id.as_deref() == Some(native)) {
+                anyhow::ensure!(effective_codex_args.len() == 2,
+                    "This Cutex session has a dedicated runtime; resume without extra native overrides or use Recent Sessions");
+                super::stock_lifecycle::online(&record.cutex_session_id, false)?;
+                return super::stock_lifecycle::attach(&record.cutex_session_id);
+            }
+        }
+    }
+    if !agent_mode && effective_codex_args.is_empty()
+        && account.cli_kind == CliKind::Codex
+        && matches!(account.runtime, cutex::profiles::model::RuntimeConfig::Host)
+        && super::light_standalone::selected_entry_available()?
+    {
+        let id=super::light_new::create_owned_session(&account.name,&std::env::current_dir()?)?;
+        super::stock_lifecycle::online(&id,false)?;
+        return super::stock_lifecycle::attach(&id);
+    }
     if !agent_mode {
         if let Some(mut command) = super::light_standalone::command(account, &effective_codex_args)? {
             let status = command.status().context("Failed to start ordinary light session")?;
@@ -88,7 +109,7 @@ pub(crate) fn ensure_management_api_for_launch(account: &StoredAccount) -> anyho
     }
     let config = agent_bus_config::ensure_agent_bus_config(true, None)?;
     if let Err(err) =
-        cutex::management::launch::ensure_management_api_running(&config, DEFAULT_MANAGEMENT_PORT)
+        cutex::management::launch::require_management_api_running(&config, DEFAULT_MANAGEMENT_PORT)
     {
         cutex::management::launch::warn_management_api_unavailable(&err);
     }

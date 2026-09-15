@@ -189,6 +189,7 @@ impl AgentManagementProvider {
                 .formal_agent_name
                 .clone()
                 .or_else(|| state.agents.get(id).map(|a| a.spec.name.clone()))
+                .or_else(|| record.is_owned_session().then(|| crate::session::metadata::cutex_session_display_name(record)))
                 .ok_or_else(|| anyhow::anyhow!("formal Agent name unavailable"))?;
             Ok(StockRuntimeReview {
                 digest_version: RuntimeReviewDigestVersion::SemanticV2,
@@ -612,10 +613,9 @@ fn active(record: &CutexSessionRecord, id: &CutexSessionId) -> anyhow::Result<()
     anyhow::ensure!(
         record.cutex_session_id == id.as_str()
             && !record.is_retired()
-            && record.agent_enabled
-            && record.registration_class
-                == crate::agent_bus::model::AgentRegistrationClass::Persistent,
-        "exact active persistent stock Agent required"
+            && (record.is_owned_session() || (record.agent_enabled
+            && record.registration_class == crate::agent_bus::model::AgentRegistrationClass::Persistent)),
+        "active Cutex agent or owned session runtime required"
     );
     Ok(())
 }
@@ -714,6 +714,21 @@ mod review_digest_tests {
             assignment.state = crate::task_service::AssignmentState::Closed;
         }
         runtime_task_guard(&tasks, &id, true).unwrap();
+    }
+
+    #[test]
+    fn ordinary_owner_admission_does_not_require_managed_identity() {
+        let mut record = record();
+        let id = CutexSessionId::new(record.cutex_session_id.clone()).unwrap();
+        assert!(active(&record, &id).is_err());
+        record.explicit_launch = Some(review(&record).contract);
+        record.agent_enabled = false;
+        record.formal_agent_name = None;
+        record.registration_class = crate::agent_bus::model::AgentRegistrationClass::LocalOnly;
+        active(&record, &id).unwrap();
+        assert!(!crate::session::metadata::cutex_session_is_managed(&record));
+        record.formal_agent_name = Some("unexpected identity".into());
+        assert!(active(&record, &id).is_err());
     }
 
     #[test]

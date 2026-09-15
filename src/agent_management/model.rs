@@ -968,6 +968,7 @@ pub struct ProjectAuthorityReceipt {
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProjectAuthorityOutcome {
     Complete { receipt: ProjectAuthorityReceipt },
+    OwnerActionRequired { code: String, detail: String },
     NoWrite { code: String, detail: String },
 }
 

@@ -11,3 +11,5 @@ pub mod model;
 pub mod profile_config;
 pub mod references;
 pub mod store;
+
+pub mod model_discovery;

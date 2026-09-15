@@ -4,6 +4,7 @@
 //! instead of scattering platform checks through domain logic.
 
 pub mod command;
+pub mod shared_assets;
 pub mod host;
 #[cfg(windows)]
 pub mod private_fs;

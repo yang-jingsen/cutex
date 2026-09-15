@@ -17,3 +17,7 @@ pub mod runtime;
 pub mod selected_profile;
 pub mod selected_status;
 pub mod stock;
+
+pub mod session_display;
+
+pub mod native_history;

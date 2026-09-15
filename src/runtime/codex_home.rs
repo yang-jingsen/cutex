@@ -634,16 +634,11 @@ fn rollout_entries_between(
         {
             continue;
         }
-        let (created_at, event_timestamp, candidate) = rollout_session_metadata(&path)?;
-        let creation_in_window = created_at >= start && created_at <= end;
-        let event_in_window = event_timestamp >= start && event_timestamp <= end;
-        match (creation_in_window, event_in_window) {
-            (true, true) => candidates.push(candidate),
-            (false, false) => {}
-            _ => anyhow::bail!(
-                "native rollout session_meta timestamps straddle the reconciliation window: {}",
-                path.display()
-            ),
+        let (created_at, _event_timestamp, candidate) = rollout_session_metadata(&path)?;
+        // SessionMeta records creation time. Its envelope records a later
+        // write: native rollouts may remain buffered until explicit persist.
+        if created_at >= start && created_at <= end {
+            candidates.push(candidate);
         }
     }
     Ok(candidates)
@@ -708,13 +703,6 @@ fn rollout_session_metadata(
                 )
             })?
             .with_timezone(&Utc);
-        let event_delay = event_timestamp.signed_duration_since(created_at);
-        if event_delay < Duration::zero() || event_delay > Duration::seconds(5) {
-            anyhow::bail!(
-                "native rollout session_meta timestamps conflict: {}",
-                path.display()
-            );
-        }
         let session_id = payload
             .get("id")
             .and_then(serde_json::Value::as_str)
@@ -1082,7 +1070,7 @@ mod tests {
     }
 
     #[test]
-    fn native_reconciliation_rejects_missing_malformed_and_conflicting_embedded_timestamps() {
+    fn native_reconciliation_rejects_missing_and_malformed_embedded_timestamps() {
         let (started_at, failed_at) = window();
         let cases = [
             (
@@ -1093,10 +1081,7 @@ mod tests {
                 "malformed-creation-time",
                 "{\"timestamp\":\"2026-08-30T01:02:04Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"native\",\"timestamp\":\"not-rfc3339\",\"cwd\":\"/managed/worker\"}}\n",
             ),
-            (
-                "conflicting-times",
-                "{\"timestamp\":\"2026-08-30T01:02:20Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"native\",\"timestamp\":\"2026-08-30T01:02:04Z\",\"cwd\":\"/managed/worker\"}}\n",
-            ),
+
         ];
         for (label, metadata) in cases {
             let codex_home = root(label);
@@ -1116,6 +1101,48 @@ mod tests {
             .is_err());
             fs::remove_dir_all(codex_home).unwrap();
         }
+    }
+
+    #[test]
+    fn native_reconciliation_uses_creation_time_for_delayed_persistence() {
+        let home = root("delayed-persistence");
+        let day = home.join("sessions/2026/08/30");
+        fs::create_dir_all(&day).unwrap();
+        let (start, end) = window();
+        for (name, created, written, cwd) in [
+            (
+                "target",
+                "2026-08-30T01:02:04Z",
+                "2026-08-30T01:07:04Z",
+                "/managed/worker",
+            ),
+            (
+                "unrelated",
+                "2026-08-30T00:02:04Z",
+                "2026-08-30T01:02:04Z",
+                "/other",
+            ),
+        ] {
+            fs::write(day.join(format!("rollout-2026-08-30T11-02-04-{name}.jsonl")), serde_json::to_string(&serde_json::json!({"timestamp":written,"type":"session_meta","payload":{"id":name,"timestamp":created,"cwd":cwd}})).unwrap()).unwrap();
+        }
+        assert_eq!(
+            correlate_codex_session_between_in_home(
+                &home,
+                &start,
+                &end,
+                Path::new("/managed/worker")
+            )
+            .unwrap(),
+            NativeSessionCorrelation::Present {
+                session_id: "target".into()
+            }
+        );
+        assert_eq!(
+            correlate_codex_session_between_in_home(&home, &start, &end, Path::new("/other"))
+                .unwrap(),
+            NativeSessionCorrelation::ProvenAbsent
+        );
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

@@ -397,7 +397,6 @@ impl PinnedArtifacts {
                 &bundle.code_mode_host.path,
                 &bundle.facade.path,
                 &bundle.schema.path,
-                &bundle.shared_config.path,
             ]
             .into_iter()
             .chain(bundle.cli.as_ref().map(|c| &c.path))
@@ -426,14 +425,31 @@ impl PinnedArtifacts {
             })
             .collect()
         }
-        #[cfg(not(unix))]
-        anyhow::bail!("native artifact fence requires Unix")
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+            [&contract.bundle_manifest, &bundle.executable.path, &bundle.code_mode_host.path,
+                &bundle.facade.path, &bundle.schema.path]
+                .into_iter().chain(bundle.cli.as_ref().map(|c| &c.path)).map(|path| {
+                    crate::launch::stock::canonical(path)?;
+                    let file = std::fs::OpenOptions::new().read(true).custom_flags(0x00200000).open(path)?;
+                    let m = file.metadata()?;
+                    ensure!(m.is_file() && m.file_attributes() & 0x400 == 0, "ingress artifact is not regular");
+                    let identity = crate::platform::private_fs::identity(&file)?;
+                    Ok((path.clone(), vec![identity.volume as i128,
+                        i128::from_le_bytes(identity.file_id), m.len() as i128,
+                        m.last_write_time() as i128, m.creation_time() as i128,
+                        m.file_attributes() as i128]))
+                }).collect()
+        }
+        #[cfg(not(any(unix, windows)))]
+        anyhow::bail!("native artifact identity unsupported on this platform")
     }
     fn load(contract: crate::agent_management::ExplicitLaunchContract) -> anyhow::Result<Self> {
         let proposed: StockBundle =
             serde_json::from_slice(&std::fs::read(&contract.bundle_manifest)?)?;
         let before = Self::stamps(&contract, &proposed)?;
-        let bundle = StockBundle::load(&contract)?;
+        let bundle = StockBundle::load_running(&contract)?;
         ensure!(
             bundle == proposed && before == Self::stamps(&contract, &bundle)?,
             "ingress artifacts changed during verification"
@@ -518,6 +534,10 @@ fn occurrence(
             "ingress native process occurrence changed"
         );
     }
+    #[cfg(windows)]
+    ensure!(crate::platform::process::process_started_at(runtime.pid)?
+        == chrono::DateTime::parse_from_rfc3339(&runtime.started_at)?,
+        "ingress native process occurrence changed");
     let mut receipts = store
         .explicit_launch_receipts
         .values()
@@ -559,7 +579,11 @@ impl ExternalInputClient {
         match &endpoint {
             #[cfg(unix)]
             AppServerEndpoint::UnixSocket { .. } => {}
-            _ => anyhow::bail!("ingress requires private Unix endpoint"),
+            #[cfg(windows)]
+            AppServerEndpoint::LoopbackWebSocket { url, bearer_token: Some(token) }
+                if !token.is_empty() && url::Url::parse(url)?.host_str()
+                    .is_some_and(|host| matches!(host, "127.0.0.1" | "::1")) => {},
+            _ => anyhow::bail!("ingress requires an authenticated private endpoint"),
         }
         let client = AppServerClient::connect(AppServerClientOptions::new(endpoint))?;
         crate::launch::stock::validate_ingress_capability(

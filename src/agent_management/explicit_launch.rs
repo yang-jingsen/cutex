@@ -521,6 +521,7 @@ pub(super) fn inherited_runtime_job(
     contract: &ExplicitLaunchContract,
 ) -> anyhow::Result<Option<crate::launch::job_mcp::ReviewedJobMcp>> {
     let sessions = crate::session::store::load_cutex_session_store_from_path(path)?;
+    if sessions.sessions.get(id.as_str()).is_some_and(|r| r.is_owned_session()) { return Ok(None); }
     let saved = saved_runtime_job(&sessions, id, contract).map(|job| job.descriptor.clone());
     let selected =
         crate::launch::local_deployment::LocalDeployment::selected()?.and_then(|d| d.job_mcp);

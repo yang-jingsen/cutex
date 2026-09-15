@@ -1450,6 +1450,7 @@ fn apply_annotation(
 
 pub(crate) fn run_command(command: ProfileCommand) -> anyhow::Result<()> {
     match command {
+        ProfileCommand::Models { target, refresh, apply } => cmd_profile_models(&target, refresh, apply),
         ProfileCommand::List => cmd_profile_list(),
         ProfileCommand::Show { target } => cmd_profile_show(target.as_deref()),
         ProfileCommand::Edit { target } => cmd_profile_edit(target.as_deref()),
@@ -1515,4 +1516,55 @@ pub(crate) fn run_command(command: ProfileCommand) -> anyhow::Result<()> {
             session_inherit,
         ),
     }
+}
+
+fn cmd_profile_models(target: &str, refresh: bool, apply: bool) -> anyhow::Result<()> {
+    use cutex::profiles::model_discovery::{self, ModelCatalog};
+    let store = load_store()?;
+    let account = find_account(&store, target)?.context("Profile not found")?;
+    let files = ensure_materialized_account_files(account)?;
+    let directory = files.config_path.parent().context("profile directory missing")?;
+    let mut config: toml::Value = toml::from_str(&fs::read_to_string(&files.config_path)?)?;
+    let provider = config.get("model_provider").and_then(toml::Value::as_str).unwrap_or("openai");
+    let base = config.get("model_providers").and_then(|v| v.get(provider))
+        .and_then(|v| v.get("base_url")).and_then(toml::Value::as_str)
+        .unwrap_or("https://api.openai.com/v1");
+    let source = model_discovery::models_url(base)?.to_string();
+    let cached_path = directory.join("discovered-models.json");
+    let cached = fs::read(&cached_path).ok().and_then(|bytes| serde_json::from_slice::<ModelCatalog>(&bytes).ok())
+        .filter(|catalog| catalog.source_url == source);
+    let catalog = if refresh || cached.is_none() {
+        let auth: serde_json::Value = serde_json::from_slice(&fs::read(&files.auth_path)?)
+            .map_err(|_| anyhow!("Invalid profile credential file"))?;
+        let key = auth.get("OPENAI_API_KEY").and_then(serde_json::Value::as_str)
+            .filter(|key| !key.is_empty()).context("API model discovery requires an API-key profile; subscriptions use native model discovery")?;
+        let global = load_codez_config();
+        let proxy = effective_proxy_config(account, &global)
+            .map(|proxy| if proxy.enabled { proxy.url.as_deref() } else { None });
+        let no_proxy = effective_proxy_config(account, &global).and_then(|proxy| proxy.no_proxy.as_deref());
+        let catalog = model_discovery::fetch(base, key, proxy, no_proxy)?;
+        write_private_pretty_json_atomic(&cached_path, &catalog, "discovered models")?;
+        catalog
+    } else { cached.unwrap() };
+    let existing_path = config.get("model_catalog_json").and_then(toml::Value::as_str)
+        .map(|path| { let path=std::path::PathBuf::from(path); if path.is_absolute() { path } else { directory.join(path) } });
+    let existing = existing_path.and_then(|path| fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let preset = model_discovery::preset(&catalog, existing.as_ref(), config.get("model").and_then(toml::Value::as_str));
+    let preset_path = directory.join("discovered-preset.json");
+    write_private_pretty_json_atomic(&preset_path, &preset, "discovered model preset")?;
+    if apply {
+        // Runtime receipts retain their existing immutable catalog. Updating a
+        // profile must not overwrite the file a running occurrence has selected.
+        let immutable = directory.join(format!("models-{}.json", uuid::Uuid::new_v4()));
+        write_private_pretty_json_atomic(&immutable, &preset, "selected model catalog")?;
+        config.as_table_mut().context("profile config table missing")?.insert("model_catalog_json".into(),
+            toml::Value::String(immutable.canonicalize()?.to_string_lossy().into_owned()));
+        write_private_bytes_atomic(&files.config_path, toml::to_string(&config)?.as_bytes())?;
+    }
+    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+        "profile":account.name,"source":catalog.source_url,"fetched_at":catalog.fetched_at,
+        "models":catalog.models,"preset":preset_path,"applied":apply
+    }))?);
+    Ok(())
 }

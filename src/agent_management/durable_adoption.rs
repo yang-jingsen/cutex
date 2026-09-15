@@ -15,6 +15,8 @@ pub struct HumanCreationDefaults {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HumanAdoptRequest {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creation_defaults: Option<HumanCreationDefaults>,
     pub action_id: AgentActionId,
@@ -81,40 +83,54 @@ impl AgentManagementProvider {
                     return Ok(receipt.clone());
                 }
                 anyhow::ensure!(!sessions.sessions.values().any(|r| r.codex_session_id.as_deref() == Some(request.native_id.as_str()) && (r.registration_class == crate::agent_bus::model::AgentRegistrationClass::Persistent || r.is_retired())), "native identity already has a managed record; use existing Agent/import/Restore");
-                let candidate = crate::session::service::adopt_cutex_session(
-                    sessions,
-                    &request.native_id,
-                    crate::session::service::CutexSessionEnsureSeed {
-                        host_id: host.into(),
-                        cwd: request.cwd.clone(),
-                        profile: None,
-                    },
-                    crate::session::service::CutexSessionAdoptOptions {
-                        display_name: Some(request.formal_name.as_str()),
-                        managed_cwd: None,
-                        groups: Vec::new(),
-                        expose_to_im: false,
-                        pin: false,
-                    },
-                )?;
+                let seed = crate::session::service::CutexSessionEnsureSeed {
+                    host_id: host.into(), cwd: request.cwd.clone(), profile: None,
+                };
+                let key = if request.session_only {
+                    crate::session::service::ensure_cutex_session_record_for_user_id(
+                        sessions, &request.native_id, seed,
+                    )?
+                } else {
+                    crate::session::service::adopt_cutex_session(
+                        sessions, &request.native_id, seed,
+                        crate::session::service::CutexSessionAdoptOptions {
+                            display_name: Some(request.formal_name.as_str()),
+                            managed_cwd: None, groups: Vec::new(), expose_to_im: false, pin: false,
+                        },
+                    )?.key
+                };
                 anyhow::ensure!(
-                    !roster.agents.keys().any(|id| id.as_str() == candidate.key),
+                    !roster.agents.keys().any(|id| id.as_str() == key),
                     "existing roster identity cannot be readopted"
                 );
                 let record = sessions
                     .sessions
-                    .get_mut(&candidate.key)
+                    .get_mut(&key)
                     .expect("adoption created exact record");
-                record.formal_agent_name = Some(request.formal_name.clone());
+                record.formal_agent_name = (!request.session_only).then(|| request.formal_name.clone());
+                if request.session_only {
+                    anyhow::ensure!(record.explicit_launch.is_none(), "session runtime already registered; resume existing session");
+                    record.display_name_hint = Some(request.formal_name.clone());
+                    record.agent_enabled = false;
+                    record.registration_class = crate::agent_bus::model::AgentRegistrationClass::LocalOnly;
+                }
                 if let Some(defaults) = &request.creation_defaults {
                     anyhow::ensure!(!defaults.profile.trim().is_empty() && !defaults.model.trim().is_empty(), "Creation profile and model required");
                     record.profile = Some(defaults.profile.clone());
                     record.model_defaults = Some(defaults.model.clone());
                     record.reasoning_defaults = defaults.reasoning.clone();
                 }
+                let mut candidate=record.clone();
+                if request.session_only {
+                    crate::launch::local_deployment::LocalDeployment::selected()?
+                        .ok_or_else(|| anyhow::anyhow!("Local runtime deployment required"))?
+                        .adopt(&mut candidate, sessions)?;
+                    candidate.bump_durable_revision()?;
+                    sessions.sessions.insert(candidate.cutex_session_id.clone(), candidate.clone());
+                }
                 let receipt = HumanAdoptReceipt {
                     request: request.clone(),
-                    record: record.clone(),
+                    record: candidate,
                     import_request: None,
                 };
                 sessions
@@ -124,6 +140,9 @@ impl AgentManagementProvider {
                 Ok(receipt)
             })?
         };
+        if request.session_only {
+            return Ok(HumanAdoptResult{adopted, imported:None, error:None});
+        }
         let outcome = (|| -> anyhow::Result<DurableImportReceipt> {
             if adopted.import_request.is_none() {
                 let candidate = self
@@ -191,6 +210,7 @@ mod tests {
             .with_current_names_path(path.clone());
         let principal = HumanManagementPrincipal::authenticated();
         let request = HumanAdoptRequest {
+            session_only: false,
             creation_defaults: Some(HumanCreationDefaults { profile: "selected-profile".into(), model: "selected-model".into(), reasoning: Some("high".into()) }),
             action_id: AgentActionId::new("partial-adopt").unwrap(),
             native_id: "native-partial".into(),
@@ -261,6 +281,17 @@ mod tests {
     }
     #[test]
     fn ui_contract_d08_d09_d10_adoption_exact_replay_name_and_single_identity() {
+        const CHILD: &str = "CUTEX_ADOPTION_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = std::env::temp_dir().join(format!("cutex-adopt-home-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&home).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "agent_management::durable_adoption::tests::ui_contract_d08_d09_d10_adoption_exact_replay_name_and_single_identity", "--nocapture"])
+                .env("HOME", &home).env(CHILD, "1").status().unwrap();
+            std::fs::remove_dir_all(home).unwrap();
+            assert!(status.success(), "isolated adoption test failed");
+            return;
+        }
         let root = std::env::temp_dir().join(format!("cutex-d2-adopt-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         let path = root.join("sessions.json");
@@ -269,9 +300,10 @@ mod tests {
             .with_current_names_path(path.clone());
         let principal = HumanManagementPrincipal::authenticated();
         let request = HumanAdoptRequest {
+            session_only: false,
             creation_defaults: None,
             action_id: AgentActionId::new("adopt-test").unwrap(),
-            native_id: "native-saved".into(),
+            native_id: "019e0995-cc8d-7f81-83cc-a4f09e8b4901".into(),
             cwd: root.to_string_lossy().into_owned(),
             formal_name: "Explicit Formal Name".into(),
         };

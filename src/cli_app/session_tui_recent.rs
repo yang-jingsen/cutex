@@ -51,6 +51,7 @@ pub(super) struct RecentThreadRow {
     /// The native `thread/list` id. This is the only identity used for
     /// adoption; `session_id` is intentionally not retained as an identity.
     pub(super) thread_id: String,
+    pub(super) owned_runtime_id: Option<String>,
     pub(super) title: String,
     /// Stable managed identity, populated only by an exact native-session
     /// join to Agent Management (or a durable session-id fallback). Native
@@ -106,6 +107,7 @@ struct AdoptionReview {
 
 #[derive(Debug)]
 enum CatalogCommand {
+    CloseOwned { request: u64, id: String, owner: String },
     Archive { request: u64, id: String },
     Load {
         request: u64,
@@ -116,6 +118,7 @@ enum CatalogCommand {
 
 #[derive(Debug)]
 pub(super) enum CatalogReply {
+    ClosedOwned { id: String, result: Result<(), String> },
     Archived { id: String, result: Result<(), String> },
     Page {
         cursor: Option<String>,
@@ -174,6 +177,12 @@ impl RecentCatalog {
         self.commands.send(CatalogCommand::Archive { request, id }).is_ok()
     }
 
+    pub(super) fn close_owned(&self, id: String, owner: String) -> bool {
+        let request = self.request.get().wrapping_add(1);
+        self.request.set(request);
+        self.commands.send(CatalogCommand::CloseOwned { request, id, owner }).is_ok()
+    }
+
     pub(super) fn poll(&self) -> Option<CatalogReply> {
         loop {
             match self.replies.try_recv() {
@@ -201,6 +210,17 @@ fn catalog_worker(commands: Receiver<CatalogCommand>, replies: Sender<(u64, Cata
     let mut client = CatalogClient::spawn_local();
     while let Ok(command) = commands.recv() {
         let (request, cursor, retry) = match command {
+            CatalogCommand::CloseOwned { request, id, owner } => {
+                let result = (|| -> anyhow::Result<()> {
+                    let store = cutex::session::store::load_cutex_session_store()?;
+                    anyhow::ensure!(store.sessions.get(&owner).is_some_and(|r|
+                        r.is_owned_session() && r.codex_session_id.as_deref() == Some(&id)),
+                        "session runtime mapping changed; refresh before closing");
+                    super::session_runtime::cmd_session_close_and_wait_quiet(&owner).map(|_| ())
+                })().map_err(|error| format!("{error:#}"));
+                if replies.send((request, CatalogReply::ClosedOwned { id, result })).is_err() { break; }
+                continue;
+            }
             CatalogCommand::Archive { request, id } => {
                 let result = cutex::catalog::native_archive::change(&id, false, None)
                     .map(|_| ()).map_err(|error| format!("{error:#}"));
@@ -414,6 +434,19 @@ impl RecentSessionsWorkspace {
                     .into_iter()
                     .map(|thread| recent_row(thread, store, managed_names))
                     .collect::<Vec<_>>();
+                if !append {
+                    for record in store.sessions.values().filter(|r| r.is_owned_session() && !r.is_retired()) {
+                        let Some(native) = record.codex_session_id.as_ref() else { continue; };
+                        incoming.retain(|row| &row.thread_id != native);
+                        let thread: CatalogThread = serde_json::from_value(serde_json::json!({
+                            "id":native, "sessionId":native, "projectId":null,
+                            "cwd":record.cwd, "name":cutex::session::metadata::cutex_session_display_name(record),
+                            "updatedAt":chrono::DateTime::parse_from_rfc3339(&record.updated_at).ok().map(|t|t.timestamp()),
+                            "source":"cutex-session"
+                        })).expect("owned session catalog fields have fixed types");
+                        incoming.push(recent_row(thread, store, managed_names));
+                    }
+                }
                 incoming.sort_by(|left, right| {
                     right
                         .recency_at
@@ -518,7 +551,15 @@ impl RecentSessionsWorkspace {
                     Observation::Unavailable("durable mapping absent or ambiguous".into());
                 row.view.effective_profile =
                     Observation::Unavailable("effective profile not observed".into());
-                row.view.configured_profile = None;
+                let owner = store.sessions.values().find(|r| r.is_owned_session()
+                    && r.codex_session_id.as_deref() == Some(&row.thread_id));
+                row.owned_runtime_id = owner.map(|r|r.cutex_session_id.clone());
+                row.view.configured_profile = owner.and_then(|r| r.profile.clone());
+                if let Some(record) = owner {
+                    row.view.runtime = if record.app_server_runtime.is_none() && record.runtime_pid.is_none() {
+                        Observation::Known("Offline".into())
+                    } else { Observation::Stale("Online".into(), "saved runtime binding".into()) };
+                }
             }
         }
         self.normalize_visible_selection();
@@ -708,7 +749,9 @@ fn recent_row(
                 && cutex_session_is_managed(record)
         })
         .collect();
-    let view = AgentSessionView {
+    let owner = store.sessions.values().find(|record| record.is_owned_session()
+        && record.codex_session_id.as_deref() == Some(&thread.id));
+    let mut view = AgentSessionView {
         badge: None,
         project_id: None,
         subject: if records.len() == 1 && state != RecentThreadState::Ambiguous {
@@ -746,7 +789,14 @@ fn recent_row(
         retirement_note: (state == RecentThreadState::Ambiguous)
             .then(|| "Ambiguous durable/native mapping; not joined".into()),
     };
+    if let Some(record) = owner {
+        view.configured_profile = record.profile.clone();
+        view.runtime = if record.app_server_runtime.is_none() && record.runtime_pid.is_none() {
+            Observation::Known("Offline".into())
+        } else { Observation::Stale("Online".into(), "saved runtime binding; refresh for current status".into()) };
+    }
     RecentThreadRow {
+        owned_runtime_id: owner.map(|r|r.cutex_session_id.clone()),
         view,
         thread_id: thread.id,
         title: bound(&title),
@@ -978,6 +1028,33 @@ mod tests {
         ));
         assert!(catalog.poll().is_none());
     }
+    #[test]
+    fn owned_session_remains_native_and_is_listed_without_shared_catalog_history() {
+        let native = "019e0995-cc8d-7f81-83cc-a4f09e8b4901";
+        let mut record = CutexSessionRecord::new(format!("cutex.{native}"), Some(native.into()),
+            "local".into(), "/workspace".into(), Some("test-profile".into())).unwrap();
+        record.registration_class = AgentRegistrationClass::LocalOnly;
+        record.agent_enabled = false;
+        record.explicit_launch = Some(cutex::agent_management::ExplicitLaunchContract {
+            version:4, migration_action_id:None, native_id:native.into(),
+            native_home:"/private/native".into(), bundle_manifest:"/private/bundle.json".into(), bundle_sha256:cutex::role_revision::Sha256::new("a".repeat(64)).unwrap(),
+        });
+        let mut store = CutexSessionStore::default();
+        store.sessions.insert(record.cutex_session_id.clone(), record.clone());
+        let mut workspace = RecentSessionsWorkspace::default();
+        workspace.receive(CatalogReply::Page { cursor:None, result:Ok(ThreadPage {
+            data:Vec::new(), next_cursor:None, backwards_cursor:None,
+        })}, &store);
+        assert_eq!(workspace.rows.len(), 1);
+        let row = &workspace.rows[0];
+        assert_eq!(row.owned_runtime_id.as_deref(), Some(record.cutex_session_id.as_str()));
+        assert!(matches!(row.view.subject, SubjectRef::Native { .. }));
+        assert_eq!(row.view.configured_profile.as_deref(), Some("test-profile"));
+        workspace.reproject(&store);
+        assert_eq!(workspace.rows[0].view.configured_profile.as_deref(), Some("test-profile"));
+        assert_eq!(workspace.rows[0].view.runtime.known().map(String::as_str), Some("Offline"));
+    }
+
     use super::*;
     use cutex::agent_bus::model::AgentRegistrationClass;
     use cutex::session::model::CutexSessionRecord;

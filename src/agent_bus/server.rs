@@ -2767,6 +2767,13 @@ fn human_management_task_query_with_stores(
         &request.selector,
         Some(&exact_scope),
     );
+    let report_page = if let Some(before) = &request.reports_before {
+        let crate::task_service::DirectorQuerySelector::Assignment { assignment_id } = &request.selector else {
+            anyhow::bail!("Report browsing requires an exact assignment");
+        };
+        anyhow::ensure!(receipt.assignments.iter().any(|a| &a.assignment_id == assignment_id), "Assignment is not in this authorized task view");
+        Some(crate::management::task_reports::read(provider, assignment_id, before)?)
+    } else { None };
     Ok(
         crate::management::control_plane::HumanManagementTaskQueryResponse {
             schema: request.schema,
@@ -2776,6 +2783,7 @@ fn human_management_task_query_with_stores(
             project_ids,
             project_presentations,
             receipt,
+            report_page,
         },
     )
 }
@@ -5262,6 +5270,7 @@ mod tests {
         let response = human_management_task_query_with_stores(
             &crate::management::control_plane::HumanManagementPrincipal::authenticated(),
             &crate::management::control_plane::HumanManagementTaskQueryRequest {
+                reports_before: None,
                 schema: crate::management::control_plane::HumanManagementTaskQuerySchema::V1,
                 action_id: ActionId::new("human-management-query").unwrap(),
                 selector: DirectorQuerySelector::All {},
@@ -5271,6 +5280,16 @@ mod tests {
             &management,
         )
         .unwrap();
+        assert!(response.report_page.is_none());
+        let hidden_reports=human_management_task_query_with_stores(
+            &crate::management::control_plane::HumanManagementPrincipal::authenticated(),
+            &crate::management::control_plane::HumanManagementTaskQueryRequest {
+                schema:crate::management::control_plane::HumanManagementTaskQuerySchema::V1,
+                action_id:ActionId::new("human-hidden-reports").unwrap(),
+                selector:DirectorQuerySelector::Assignment{assignment_id:crate::task_service::AssignmentId::new("unknown-assignment").unwrap()},
+                reports_before:Some(String::new()),
+            }, &provider, &seats, &management);
+        assert!(hidden_reports.is_err());
         assert_eq!(response.director_seat_occupant, director);
         assert_eq!(response.project_ids, vec![owned_project.clone()]);
         assert_eq!(response.receipt.status, DirectorActionStatus::CurrentState);
@@ -5300,6 +5319,7 @@ mod tests {
         let denied = human_management_task_query_with_stores(
             &crate::management::control_plane::HumanManagementPrincipal::authenticated(),
             &crate::management::control_plane::HumanManagementTaskQueryRequest {
+                reports_before: None,
                 schema: crate::management::control_plane::HumanManagementTaskQuerySchema::V1,
                 action_id: ActionId::new("human-management-query-denied").unwrap(),
                 selector: DirectorQuerySelector::All {},

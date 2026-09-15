@@ -110,9 +110,9 @@ pub fn preserve_reviewed_groups(
         .ok_or_else(|| anyhow::anyhow!("reviewed registration binding missing"))?;
     anyhow::ensure!(
         !record.is_retired()
-            && record.agent_enabled
-            && record.registration_class == AgentRegistrationClass::Persistent
-            && agent.registration_class == AgentRegistrationClass::Persistent
+            && (record.is_owned_session() || (record.agent_enabled
+                && record.registration_class == AgentRegistrationClass::Persistent))
+            && agent.registration_class == record.registration_class
             && crate::runtime::lifecycle::cutex_session_host_is_local(&record.host_id, host)
             && agent.host_id.as_deref().is_some_and(|value| {
                 crate::runtime::lifecycle::cutex_session_host_is_local(value, host)
@@ -229,6 +229,28 @@ mod tests {
             ExplicitLaunchActionReceipt::Runtime(receipt),
         );
         (store, agent)
+    }
+
+    #[test]
+    fn ordinary_owner_registers_without_promotion_or_revision_change() {
+        let (mut store, mut agent) = fixture();
+        let record = store.sessions.get_mut("cutex.test").unwrap();
+        record.agent_enabled = false;
+        record.formal_agent_name = None;
+        record.registration_class = AgentRegistrationClass::LocalOnly;
+        agent.registration_class = AgentRegistrationClass::LocalOnly;
+        agent.base_name = Some("runtime-sanitized-name".into());
+        let revision = record.revision;
+        preserve_reviewed_groups(&store, &mut agent, "private").unwrap().unwrap();
+        crate::session::runtime_reconciliation::reconcile_cutex_session_store_for_registration(
+            &mut store, &agent, "private", "2026-01-02T00:00:00Z").unwrap();
+        let record = &store.sessions["cutex.test"];
+        assert!(record.is_owned_session());
+        assert_eq!(record.revision, revision);
+        assert_eq!(record.runtime_generation, 1);
+        assert_eq!(record.current_runtime_agent_id.as_deref(), Some(agent.id.as_str()));
+        agent.registration_class = AgentRegistrationClass::Persistent;
+        assert!(preserve_reviewed_groups(&store, &mut agent, "private").is_err());
     }
 
     #[test]

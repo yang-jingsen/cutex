@@ -230,14 +230,27 @@ pub(super) fn clean_launch(
                 anyhow::anyhow!("non-UTF8 environment key cannot be safely scrubbed")
             })?);
     }
+    #[cfg(not(windows))]
     for key in ["HOME"] {
         launch = launch.env(
             key,
             std::env::var(key).with_context(|| format!("private {key} required"))?,
         );
     }
+    #[cfg(windows)]
+    for key in ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "SystemRoot", "SystemDrive", "WINDIR", "COMSPEC", "PATHEXT", "PATH", "ProgramData", "ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(value) = std::env::var(key) {
+            launch = launch.env(key, value);
+        }
+    }
     let tmp = launch_tmpdir(std::env::var("TMPDIR").ok().as_deref())?;
     launch = launch.env("TMPDIR", tmp.to_str().context("TMPDIR must be UTF-8")?);
+    #[cfg(windows)]
+    {
+        let value = tmp.to_str().context("temporary path must be UTF-8")?;
+        launch = launch.env("TEMP", value).env("TMP", value);
+    }
+
     #[cfg(feature = "stock-launch-test-hook")]
     if std::env::var("CUTEX_STOCK_TEST_GUARDED_NATIVE").as_deref() == Ok("1") {
         // Explicit S7/S6f same-host-UID fixture only. Default builds have no
@@ -270,15 +283,25 @@ pub(super) fn clean_launch(
             .env("LD_PRELOAD", guard.to_str().unwrap())
             .env("S4_TEST_ALLOWED_PORTS", ports);
     }
+    #[cfg(not(windows))]
+    { launch = launch.env("PATH", "/usr/local/bin:/usr/bin:/bin"); }
     Ok(launch
-        .env(
-            "CODEX_HOME",
-            home.to_str().context("native home must be UTF-8")?,
-        )
-        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("CODEX_HOME", home.to_str().context("native home must be UTF-8")?)
         .env("LANG", "C.UTF-8")
         .env("TERM", "xterm-256color"))
 }
+/// Foreground rendering uses the user's terminal capabilities. The background
+/// runtime's deliberately minimal environment is not a terminal description.
+fn foreground_terminal(mut launch: LaunchCommand, environment: impl IntoIterator<Item=(String, String)>) -> LaunchCommand {
+    for (key, value) in environment {
+        if matches!(key.as_str(), "TERM" | "COLORTERM" | "TERM_PROGRAM" | "TERM_PROGRAM_VERSION"
+            | "WT_SESSION" | "NO_COLOR" | "FORCE_COLOR" | "CLICOLOR" | "CLICOLOR_FORCE") {
+            launch = launch.env_unset(&key).env(key, value);
+        }
+    }
+    launch
+}
+
 pub(super) fn option(
     launch: LaunchCommand,
     key: &str,
@@ -323,8 +346,12 @@ pub(super) fn configured(
             &profile.provider,
         )?;
     }
-    launch = option(launch, "approval_policy", &profile.approval)?;
-    launch = option(launch, "sandbox_mode", &profile.sandbox)?;
+    // Remote attach inherits permissions from the existing owner. Codex 0.154
+    // rejects explicit permission overrides when resuming a remote task.
+    if owner {
+        launch = option(launch, "approval_policy", &profile.approval)?;
+        launch = option(launch, "sandbox_mode", &profile.sandbox)?;
+    }
     if let Some(reasoning) = &profile.reasoning {
         launch = option(launch, "model_reasoning_effort", reasoning)?;
     }
@@ -342,7 +369,7 @@ pub(super) fn receiver_profile(sandbox: &str) -> anyhow::Result<&'static str> {
 
 /// A neutral, model-free owner. Never retries thread/start after an uncertain
 /// response; the provider journals the known ID before adoption and online.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(super) fn bootstrap_native(
     permit: &cutex::agent_management::BootstrapExecutionPermit<'_>,
     existing: Option<&str>,
@@ -354,8 +381,8 @@ pub(super) fn bootstrap_native(
     let mut spawned = false;
     let mut operation = || -> anyhow::Result<String> {
         ensure!(
-            cfg!(target_os = "linux"),
-            "private bootstrap requires Linux"
+            cfg!(any(target_os = "linux", windows)),
+            "private bootstrap unsupported on this platform"
         );
         ensure!(
             cutex::config::paths::host_codex_home_dir()?.canonicalize()? == review.native_home,
@@ -379,7 +406,7 @@ pub(super) fn bootstrap_native(
             cutex::launch::stock::bootstrap_configuration(spec)? == review.configuration,
             "bootstrap config changed before spawn"
         );
-        let directory = std::path::PathBuf::from(std::env::var("TMPDIR")?).join(format!(
+        let directory = launch_tmpdir(std::env::var("TMPDIR").ok().as_deref())?.join(format!(
             "cb-{}",
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         ));
@@ -388,7 +415,16 @@ pub(super) fn bootstrap_native(
             use std::os::unix::fs::DirBuilderExt;
             std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
         }
+        #[cfg(windows)]
+        {
+            std::fs::create_dir(&directory)?;
+            cutex::platform::private_fs::secure_directory(&directory)?;
+        }
+        #[cfg(windows)]
+        let layout = AppServerRuntimeLayout::prepare_stock(&format!("bootstrap-{}", uuid::Uuid::new_v4()))?;
+        #[cfg(unix)]
         let socket = directory.join("native.sock");
+        #[cfg(unix)]
         ensure!(
             socket.as_os_str().len() < 104,
             "private bootstrap socket path too long"
@@ -403,9 +439,12 @@ pub(super) fn bootstrap_native(
             launch,
             "default_permissions",
             receiver_profile(&review.configuration.sandbox)?,
-        )?
-        .arg("--listen")
-        .arg(format!("unix://{}", socket.display()));
+        )?;
+        #[cfg(unix)]
+        let launch = launch.arg("--listen").arg(format!("unix://{}", socket.display()));
+        #[cfg(windows)]
+        let launch = layout.app_server_args().into_iter().skip(1)
+            .fold(launch, |launch, arg| launch.arg(arg));
         let mut command = launch.to_command();
         if let Some(projection) = &review.configuration.selected_projection {
             if let Some(secret) = projection.secret()? {
@@ -450,12 +489,24 @@ pub(super) fn bootstrap_native(
                 let _ = self.0.wait();
             }
         }
+        #[cfg(unix)]
         let _owned = Owned(command.spawn()?);
+        #[cfg(windows)]
+        let _owned = {
+            let lease = std::fs::File::create(directory.join("bootstrap.lock"))?;
+            let secret = review.configuration.selected_projection.as_ref()
+                .map(|projection| projection.secret()).transpose()?.flatten();
+            let mut child = super::stock_publication::spawn_with_secret(&launch, &spec.cwd,
+                &directory.join("native.stderr.log"), &lease, secret.as_ref())?;
+            child.start_ephemeral()?;
+            child
+        };
         spawned = true;
-        let client =
-            AppServerClient::connect(AppServerClientOptions::new(AppServerEndpoint::UnixSocket {
-                socket_path: socket,
-            }))?;
+        #[cfg(unix)]
+        let endpoint = AppServerEndpoint::UnixSocket { socket_path: socket };
+        #[cfg(windows)]
+        let endpoint = layout.endpoint();
+        let client = AppServerClient::connect(AppServerClientOptions::new(endpoint))?;
         let handle = client.handle();
         let response = if let Some(native) = existing {
             handle.request("thread/resume", serde_json::json!({"threadId":native,"cwd":spec.cwd,"approvalPolicy":review.configuration.approval}))?
@@ -508,7 +559,7 @@ pub(super) fn bootstrap_native(
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub(super) fn bootstrap_native(
     _permit: &cutex::agent_management::BootstrapExecutionPermit<'_>,
     _existing: Option<&str>,
@@ -569,8 +620,21 @@ impl StockRuntimeExecutor for StockExecutor {
             self.publication(receipt)?;
             Ok(true)
         }
-        #[cfg(not(target_os = "linux"))]
-        anyhow::bail!("stock publication requires Linux")
+        #[cfg(windows)]
+        {
+            if cutex::platform::process::process_is_running(binding.pid) {
+                let actual = cutex::platform::process::process_started_at(binding.pid)?;
+                let expected = chrono::DateTime::parse_from_rfc3339(&binding.started_at)?;
+                if actual == expected { return Ok(false); }
+            }
+            ensure!(!AppServerRuntimeLayout::from_binding(binding)?.endpoint_ready(),
+                "published endpoint remains live; ownership ambiguous");
+            ensure!(receipt.publication.is_some(), "runtime publication evidence missing");
+            self.publication(receipt)?;
+            Ok(true)
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
+        anyhow::bail!("stock publication unsupported on this platform")
     }
     fn publication(
         &mut self,
@@ -652,7 +716,7 @@ impl StockRuntimeExecutor for StockExecutor {
         launch = option(
             launch,
             "mcp_servers.cutex",
-            serde_json::json!({"command":bundle.facade.path,"env_vars":mcp_env,"default_tools_approval_mode":"approve"}),
+            serde_json::json!({"command":bundle.facade.path,"env_vars":mcp_env,"default_tools_approval_mode":"approve","enabled":!record.is_owned_session()}),
         )?;
         launch = option(
             launch,
@@ -753,7 +817,7 @@ impl StockRuntimeExecutor for StockExecutor {
         let until = std::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
             if verify_stock_process(record, binding).is_ok()
-                && std::path::Path::new(binding.endpoint.trim_start_matches("unix://")).exists()
+                && AppServerRuntimeLayout::from_binding(binding)?.endpoint_ready()
             {
                 break;
             }
@@ -964,7 +1028,13 @@ pub(super) fn verify_stock_process_with_bundle(
         );
         Ok(())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        ensure!(super::stock_publication::verified_process(binding.pid, &binding.started_at,
+            &bundle.executable.path)?.is_some(), "runtime process exited");
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = bundle;
         anyhow::bail!("stock subset requires Linux")
@@ -998,6 +1068,9 @@ pub(super) fn request(path: &std::path::Path, management_url: &str) -> anyhow::R
 }
 
 pub(super) fn attach(id: &str) -> anyhow::Result<()> {
+    attach_status(id).map(|_| ())
+}
+pub(super) fn attach_status(id: &str) -> anyhow::Result<std::process::ExitStatus> {
     let store = cutex::session::store::load_cutex_session_store()?;
     let record = store
         .sessions
@@ -1044,12 +1117,10 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
     }).unwrap_or(&bundle);
     let cli = frontend.cli.as_ref().unwrap_or(&frontend.executable);
     let actual_cwd = cutex::session::reviewed_registration::occurrence_launch_cwd(ready)?;
-    let launch = clean_launch(&cli.path, &contract.native_home)?
+    let launch = foreground_terminal(clean_launch(&cli.path, &contract.native_home)?, std::env::vars())
         .env("CUTEX_NOTIFICATION_CONTROL", std::env::current_exe()?.to_string_lossy())
         .args([
         "resume",
-        "--remote",
-        &binding.endpoint,
         &contract.native_id,
         "--no-alt-screen",
         "--cd",
@@ -1057,6 +1128,8 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
         "-c",
         "tui.resume_cwd=\"current\"",
     ]);
+    let layout = AppServerRuntimeLayout::from_binding(binding)?;
+    let launch = launch.args(layout.remote_tui_args());
     let mut launch = configured(
         launch,
         &ready.review.configuration,
@@ -1080,19 +1153,12 @@ pub(super) fn attach(id: &str) -> anyhow::Result<()> {
     let status_items = ready.review.configuration.selected_projection.as_ref()
         .and_then(|p| p.settings.tui.as_ref()).and_then(|t| t.status_line.as_ref());
     launch = option(launch, "tui.status_line", super::notify::status_line(status_items))?;
-    if bundle.soon_ingress() {
-        launch = option(
-            launch,
-            "default_permissions",
-            receiver_profile(&ready.review.configuration.sandbox)?,
-        )?;
-    }
-    let status = launch.to_command().status()?;
+    let status = layout.apply_remote_tui_auth(launch).to_command().status()?;
     ensure!(
         status.success(),
         "stock CLI returned unsuccessfully; owner was not restarted"
     );
-    Ok(())
+    Ok(status)
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -1245,5 +1311,40 @@ mod ingress_guard_tests {
                 .sessions[&id],
             record
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_environment_tests {
+    use super::*;
+
+    #[test]
+    fn windows_launch_preserves_os_environment_and_can_run_a_child() {
+        let _home = crate::cli_app::test_home::IsolatedTestHome::new("windows-launch-env").unwrap();
+        let program = std::path::PathBuf::from(std::env::var("COMSPEC").unwrap());
+        let home = std::path::PathBuf::from(std::env::var("CUTEX_TEST_PRIVATE_HOME").unwrap());
+        let launch = clean_launch(&program, &home).unwrap().args(["/d", "/c", "exit", "0"]);
+        assert!(launch.envs.iter().any(|(key, value)| key == "PATH" && value == &std::env::var("PATH").unwrap()));
+        assert!(launch.envs.iter().any(|(key, _)| key == "SystemRoot"));
+        assert!(!launch.envs.iter().any(|(key, _)| matches!(key.as_str(), "OPENAI_API_KEY" | "CUTEX_AGENT_BUS_TOKEN")));
+        assert!(launch.to_command().status().unwrap().success());
+    }
+}
+
+#[cfg(test)]
+mod foreground_terminal_tests {
+    use super::*;
+    #[test]
+    fn frontend_preserves_terminal_color_capabilities_and_user_overrides() {
+        let launch = foreground_terminal(LaunchCommand::new("native").env("TERM", "xterm-256color"),
+            [("TERM", "xterm-direct"), ("COLORTERM", "truecolor"), ("NO_COLOR", "1"),
+             ("WT_SESSION", "terminal-id"), ("OPENAI_API_KEY", "must-not-forward")]
+                .map(|(k,v)|(k.to_string(), v.to_string())));
+        assert!(launch.envs.contains(&("COLORTERM".into(),"truecolor".into())));
+        assert!(launch.envs.contains(&("NO_COLOR".into(),"1".into())));
+        assert!(launch.envs.contains(&("WT_SESSION".into(),"terminal-id".into())));
+        assert_eq!(launch.envs.iter().filter(|(k,_)| k=="TERM").count(),1);
+        assert!(launch.envs.contains(&("TERM".into(),"xterm-direct".into())));
+        assert!(!launch.envs.iter().any(|(k,_)|k=="OPENAI_API_KEY"));
     }
 }

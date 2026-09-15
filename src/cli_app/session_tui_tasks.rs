@@ -514,6 +514,7 @@ fn spawn_refresh(sender: mpsc::Sender<RefreshResult>) {
         let config = load_codez_config();
         let request = match ActionId::new(format!("tasks-query-{}", Uuid::new_v4())) {
             Ok(action_id) => HumanManagementTaskQueryRequest {
+                reports_before: None,
                 schema: HumanManagementTaskQuerySchema::V1,
                 action_id,
                 selector: DirectorQuerySelector::All {},
@@ -610,6 +611,13 @@ fn run_loop(
         }
         terminal.draw(|frame| render(frame, model))?;
         if let Some(event) = events.next()? {
+            if matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release && key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('r' | 'R'))) {
+                if let Some(row)=model.selected_row() {
+                    let id=row.assignment_id.clone();
+                    super::session_tui_task_reports::run(terminal, events, id)?;
+                }
+                continue;
+            }
             if let Some(outcome) = handle_event(model, &mut cadence, event) { return Ok(outcome); }
         }
     }
@@ -777,6 +785,7 @@ fn render(frame: &mut Frame<'_>, model: &TaskModel) {
             ("Type", "filter"),
             ("Enter/Esc", "finish"),
             ("Ctrl+A", "history"),
+            ("Alt+R", "reports"),
         ])
     } else if model.detail {
         footer_hints(&[
@@ -791,6 +800,7 @@ fn render(frame: &mut Frame<'_>, model: &TaskModel) {
             ("←/→", "panels"),
             ("/", "filter"),
             ("Ctrl+A", "history"),
+            ("Alt+R", "reports"),
             ("F5", "refresh"),
             ("Esc", "back"),
         ])
@@ -1045,6 +1055,7 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, model: &TaskModel, focused: 
                 detail_field("Project", row.project_label()),
                 Line::default(),
                 detail_field("Status summary", row.status_summary.clone().unwrap_or_else(|| "-".into())),
+                detail_field("Report history", "Alt+R · browse previous status reports and result references".into()),
                 detail_field("Result ref", row.result_reference.clone().unwrap_or_else(|| "-".into())),
                 Line::default(),
                 detail_field("Task activity", row.activity.clone()),

@@ -379,6 +379,8 @@ enum SelectorControl {
     OpenRetiredSessions,
     OpenRecentSessions,
     ArchiveNative(String),
+    CloseOwnedSession { native: String, owner: String },
+    RevertHistory(String),
     Recent(RecentCommand),
     AdoptRecent(RecentAdoptionRequest),
     OpenProfileManager,
@@ -1692,7 +1694,23 @@ impl SelectorModel {
         SelectorControl::Continue
     }
 
+    fn native_owned_id(&self, native: &str) -> Option<String> {
+        self.recent.visible_rows().into_iter().find(|row| row.thread_id == native)
+            .and_then(|row| row.owned_runtime_id.clone())
+    }
+
     fn recent_catalog_reply(&mut self, reply: super::session_tui_recent::CatalogReply) {
+        if let super::session_tui_recent::CatalogReply::ClosedOwned { id, result } = &reply {
+            self.native_archive_pending = false;
+            match result {
+                Ok(()) => {
+                    if let Ok(store) = load_cutex_session_store() { self.recent.reproject(&store); }
+                    self.notice = Some(format!("Session runtime closed: {id}. History retained; Enter resumes."));
+                }
+                Err(error) => self.warning = Some(error.clone()),
+            }
+            return;
+        }
         if let super::session_tui_recent::CatalogReply::Archived { id, result } = &reply {
             self.native_archive_pending = false;
             match result {
@@ -3707,6 +3725,7 @@ impl SelectorModel {
         action: SessionTuiAction,
         launch_profile: Option<String>,
     ) -> SelectorControl {
+        if action == SessionTuiAction::RevertHistory { return SelectorControl::RevertHistory(agent_key); }
         if launch_profile.is_some()
             && !self
                 .rows
@@ -4788,6 +4807,10 @@ fn resume_recent_native(
         "unsupported native catalog source"
     );
     let store = load_cutex_session_store()?;
+    if let Some(record)=store.sessions.values().find(|r| r.codex_session_id.as_deref()==Some(thread) && r.is_owned_session()) {
+        super::stock_lifecycle::online(&record.cutex_session_id,false)?;
+        return super::stock_lifecycle::attach_status(&record.cutex_session_id);
+    }
     anyhow::ensure!(
         !store
             .sessions
@@ -6209,8 +6232,14 @@ fn route_selector_key(model: &mut SelectorModel, key: KeyEvent) -> SelectorKeyRo
                 if confirming { model.native_actions = Some((id, selected, false)); }
                 return SelectorKeyRoute::Control(None);
             }
-            KeyCode::Up | KeyCode::Down if !confirming => selected = 1 - selected,
-            KeyCode::Enter if confirming => return SelectorKeyRoute::Control(Some(SelectorControl::ArchiveNative(id))),
+            KeyCode::Up if !confirming => selected = (selected + 2) % 3,
+            KeyCode::Down if !confirming => selected = (selected + 1) % 3,
+            KeyCode::Enter if selected == 2 && !confirming => return SelectorKeyRoute::Control(Some(SelectorControl::RevertHistory(id))),
+            KeyCode::Enter if confirming => return SelectorKeyRoute::Control(Some(
+                match model.native_owned_id(&id) {
+                    Some(owner) => SelectorControl::CloseOwnedSession { native: id, owner },
+                    None => SelectorControl::ArchiveNative(id),
+                })),
             KeyCode::Enter if selected == 0 => {
                 model.recent.begin_review();
                 return SelectorKeyRoute::Control(None);
@@ -6537,7 +6566,7 @@ fn run_event_loop(
     loop {
         let now = Instant::now();
         if now >= next_activity_refresh {
-            if let Ok(activity_states) = load_session_activity_states() {
+            if let Ok(Some(activity_states)) = cutex::management::v2::activity::try_load_session_activity_states() {
                 model.refresh_activity_states(&activity_states);
             }
             next_activity_refresh = now + ACTIVITY_REFRESH_INTERVAL;
@@ -6704,6 +6733,14 @@ fn run_event_loop(
                             });
                             runtime_close = Some(receive);
                         }
+                        SelectorControl::RevertHistory(id) => {
+                            match super::session_history::run(terminal, events, id) {
+                                Ok(Some(message)) => model.notice=Some(message),
+                                Ok(None) => {},
+                                Err(error) => model.warning=Some(format!("History: {error:#}")),
+                            }
+                            terminal.clear()?;
+                        }
                         SelectorControl::Continue => {}
                         SelectorControl::Exit => return Ok(SessionTuiCycleOutcome::Exit),
                         SelectorControl::Selected(intent) if intent_runs_in_selector(&intent) => {
@@ -6728,6 +6765,12 @@ fn run_event_loop(
                         SelectorControl::OpenRecentSessions => {
                             model.mode = SelectorMode::RecentSessions;
                             model.notice = None;
+                        }
+                        SelectorControl::CloseOwnedSession { native, owner } => {
+                            if recent_catalog.as_ref().is_some_and(|catalog| catalog.close_owned(native, owner)) {
+                                model.native_archive_pending = true;
+                                model.notice = Some("Closing session runtime…".into());
+                            } else { model.warning = Some("Session worker unavailable; no close requested".into()); }
                         }
                         SelectorControl::ArchiveNative(id) => {
                             if recent_catalog.as_ref().is_some_and(|catalog| catalog.archive(id)) {
@@ -6928,6 +6971,7 @@ fn apply_session_management(
 fn adopt_recent_thread(request: &RecentAdoptionRequest) -> anyhow::Result<RecentAdoptionResult> {
     let client = super::management_control_plane::ManagementControlClient::connect()?;
     let result = client.adopt_saved_native(&cutex::agent_management::HumanAdoptRequest {
+            session_only: false,
             creation_defaults: None,
         action_id: cutex::agent_management::AgentActionId::new(request.action_id.clone())?, native_id:request.thread_id.clone(), cwd:request.cwd.clone(), formal_name:request.formal_name.clone(),
     }).map_err(|e| anyhow::anyhow!("Adoption response unconfirmed: {e:#}. Retry same action {}; no rollback or new identity retry claimed", request.action_id))?;
@@ -7335,12 +7379,16 @@ fn render_selector(frame: &mut Frame<'_>, model: &SelectorModel) {
     }
     render_workspace(frame, model, &SelectorWorkspaceRenderer);
     if let Some((id, selected, confirming)) = &model.native_actions {
-        let text = if *confirming {
+        let owned = model.native_owned_id(id).is_some();
+        let text = if *confirming && owned {
+            format!("Session: {id}\n\nClose this session's dedicated runtime.\nHistory is retained and the session stays in Recent Sessions.\n\nEnter: Close runtime    Esc: Cancel")
+        } else if *confirming {
             format!("Session: {id}\n\nClose the runtime and archive this session and spawned descendants.\nHistory is retained. Restore with:\ncutex session restore-native {id}\n\nEnter: Close and archive    Esc: Cancel")
         } else {
-            format!("Session: {id}\n\n{} Adopt as managed Agent\n{} Close and archive\n\n↑/↓ Select · Enter Open · Esc Back", if *selected == 0 { ">" } else { " " }, if *selected == 1 { ">" } else { " " })
+            format!("Session: {id}\n\n{} Adopt as managed Agent\n{} Close and archive\n{} Revert history\n\n↑/↓ Select · Enter Open · Esc Back", if *selected == 0 { ">" } else { " " }, if *selected == 1 { ">" } else { " " }, if *selected == 2 { ">" } else { " " })
         };
-        views::render_details(frame, frame.area(), if *confirming { " Close and archive · Confirm " } else { " Session Actions " }, &text, &model.status_scroll);
+        let text = if owned { text.replace("Close and archive", "Close runtime") } else { text };
+        views::render_details(frame, frame.area(), if *confirming { " Close session · Confirm " } else { " Session Actions " }, &text, &model.status_scroll);
     }
     if let Some(navigation) = &model.settings_navigation {
         navigation.render_titled(
@@ -9504,7 +9552,7 @@ fn homepage_action_label(action: SessionTuiAction) -> &'static str {
         | SessionTuiAction::CloseRuntime
         | SessionTuiAction::RepairInterruptedHistory
         | SessionTuiAction::RetireSession
-        | SessionTuiAction::RestoreSession => "manage",
+        | SessionTuiAction::RestoreSession | SessionTuiAction::RevertHistory => "manage",
     }
 }
 
@@ -10143,6 +10191,42 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn owned_session_close_is_confirmed_and_never_routes_to_archive() {
+        let native = "019e0995-cc8d-7f81-83cc-a4f09e8b4901";
+        let owner = format!("cutex.{native}");
+        let mut record = CutexSessionRecord::new(owner.clone(), Some(native.into()), "local".into(), "/workspace".into(), None).unwrap();
+        record.agent_enabled = false;
+        record.registration_class = cutex::agent_bus::model::AgentRegistrationClass::LocalOnly;
+        record.explicit_launch = Some(cutex::agent_management::ExplicitLaunchContract {
+            version:4, migration_action_id:None, native_id:native.into(), native_home:"/native".into(),
+            bundle_manifest:"/bundle.json".into(), bundle_sha256:cutex::role_revision::Sha256::new("a".repeat(64)).unwrap(),
+        });
+        let mut store = cutex::session::model::CutexSessionStore::default();
+        store.sessions.insert(owner.clone(),record);
+        let mut model = SelectorModel::new(vec![recent_sessions_row()], false, false);
+        model.recent.receive(super::super::session_tui_recent::CatalogReply::Page { cursor:None,
+            result:Ok(cutex::catalog::ThreadPage { data:Vec::new(), next_cursor:None, backwards_cursor:None })}, &store);
+        model.native_actions = Some((native.into(),1,false));
+        let enter = KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE);
+        route_selector_key(&mut model, enter);
+        assert!(model.native_actions.as_ref().unwrap().2);
+        assert!(matches!(route_selector_key(&mut model, enter),
+            SelectorKeyRoute::Control(Some(SelectorControl::CloseOwnedSession { native: id, owner: key })) if id == native && key == owner));
+    }
+
+    #[test]
+    fn native_actions_revert_opens_history_without_archiving_or_adopting() {
+        let mut model = SelectorModel::new(vec![recent_sessions_row()], false, false);
+        model.native_actions = Some(("thread-one".into(), 0, false));
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        route_selector_key(&mut model, press(KeyCode::Up));
+        assert_eq!(model.native_actions.as_ref().unwrap().1, 2);
+        assert!(matches!(route_selector_key(&mut model, press(KeyCode::Enter)),
+            SelectorKeyRoute::Control(Some(SelectorControl::RevertHistory(id))) if id=="thread-one"));
+        assert!(model.native_actions.is_none());
+    }
+
+    #[test]
     fn pro_review_profile_values_keep_semantic_colors_when_focus_changes() {
         let mut model = SelectorModel::new(vec![global_row()], false, false);
         model.mode = SelectorMode::ProfileManager {
@@ -10265,9 +10349,16 @@ mod tests {
     }
 
     #[test]
-    fn new_agent_shortcut_opens_creation_flow() {
+    fn new_agent_shortcut_respects_runtime_availability() {
         let mut model = SelectorModel::new(Vec::new(), false, false);
-        assert!(matches!(selector_command(&mut model, Command::NewManagedAgent), SelectorKeyRoute::Control(Some(SelectorControl::NewAgent))));
+        let available = cutex::launch::local_deployment::LocalDeployment::selected().ok().flatten().is_some();
+        let route = selector_command(&mut model, Command::NewManagedAgent);
+        if available {
+            assert!(matches!(route, SelectorKeyRoute::Control(Some(SelectorControl::NewAgent))));
+        } else {
+            assert!(matches!(route, SelectorKeyRoute::Control(None)));
+            assert_eq!(model.notice.as_deref(), Some("Install a local runtime to create an Agent"));
+        }
     }
 
     #[test]

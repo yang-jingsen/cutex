@@ -24,7 +24,7 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     AclSizeInformation, AddAccessAllowedAceEx, EqualSid, GetAce, GetAclInformation, GetLengthSid,
-    GetSecurityDescriptorControl, GetTokenInformation, InitializeAcl, IsValidSid, TokenUser,
+    GetSecurityDescriptorControl, GetTokenInformation, InitializeAcl, IsValidSid, TokenUser, TokenOwner, TOKEN_OWNER, TOKEN_INFORMATION_CLASS,
     ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE,
     DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
     PROTECTED_DACL_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
@@ -42,8 +42,20 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileIdentity {
-    volume: u64,
-    file_id: [u8; 16],
+    pub(crate) volume: u64,
+    pub(crate) file_id: [u8; 16],
+}
+
+impl FileIdentity {
+    /// A 128-bit digest of the volume and full file ID for portable publication receipts.
+    /// The legacy receipt's device/inode fields carry this digest on Windows.
+    pub fn publication_key(self) -> (u64, u64) {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::new().chain_update(self.volume.to_le_bytes())
+            .chain_update(self.file_id).finalize();
+        (u64::from_le_bytes(digest[..8].try_into().unwrap()),
+         u64::from_le_bytes(digest[8..16].try_into().unwrap()))
+    }
 }
 
 #[derive(Debug)]
@@ -186,6 +198,10 @@ pub fn identity(file: &File) -> Result<FileIdentity, PrivateFsError> {
 }
 
 fn current_user_sid() -> Result<Vec<u8>, PrivateFsError> {
+    token_sid(TokenUser)
+}
+
+fn token_sid(class: TOKEN_INFORMATION_CLASS) -> Result<Vec<u8>, PrivateFsError> {
     let mut token = null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
         return Err(io::Error::last_os_error().into());
@@ -193,7 +209,7 @@ fn current_user_sid() -> Result<Vec<u8>, PrivateFsError> {
     let token = OwnedHandle(token);
     let mut required = 0;
     unsafe {
-        GetTokenInformation(token.0, TokenUser, null_mut(), 0, &mut required);
+        GetTokenInformation(token.0, class, null_mut(), 0, &mut required);
     }
     if required == 0 {
         return Err(io::Error::last_os_error().into());
@@ -202,7 +218,7 @@ fn current_user_sid() -> Result<Vec<u8>, PrivateFsError> {
     if unsafe {
         GetTokenInformation(
             token.0,
-            TokenUser,
+            class,
             buffer.as_mut_ptr().cast(),
             required,
             &mut required,
@@ -211,7 +227,10 @@ fn current_user_sid() -> Result<Vec<u8>, PrivateFsError> {
     {
         return Err(io::Error::last_os_error().into());
     }
-    let sid = unsafe { (*(buffer.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+    let sid = unsafe {
+        if class == TokenOwner { (*(buffer.as_ptr().cast::<TOKEN_OWNER>())).Owner }
+        else { (*(buffer.as_ptr().cast::<TOKEN_USER>())).User.Sid }
+    };
     if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
         return Err(PrivateFsError::OwnerMismatch);
     }
@@ -256,16 +275,20 @@ fn security_info(file: &File) -> Result<(PSID, *mut ACL, SecurityDescriptor), Pr
 }
 
 fn validate_owner(file: &File) -> Result<(), PrivateFsError> {
-    // The private DACL is bound to TokenUser, so ownership must be checked
-    // against that same stable identity. TokenOwner can become the built-in
-    // Administrators SID for an elevated token belonging to the same user,
-    // which incorrectly makes user-owned state unreadable after elevation.
-    let sid = current_user_sid()?;
     let (owner, _, _descriptor) = security_info(file)?;
-    if owner.is_null() || unsafe { EqualSid(owner, sid.as_ptr() as PSID) } == 0 {
-        return Err(PrivateFsError::OwnerMismatch);
-    }
-    Ok(())
+    validate_token_owner(owner)
+}
+
+fn validate_token_owner(owner: PSID) -> Result<(), PrivateFsError> {
+    if owner.is_null() { return Err(PrivateFsError::OwnerMismatch); }
+    let user = current_user_sid()?;
+    if unsafe { EqualSid(owner, user.as_ptr() as PSID) } != 0 { return Ok(()); }
+    // Elevated Windows tokens create objects owned by their default owner
+    // (usually Administrators). Keep accepting existing user-owned objects
+    // across elevation; the protected DACL is always restricted to TokenUser.
+    let default_owner = token_sid(TokenOwner)?;
+    if unsafe { EqualSid(owner, default_owner.as_ptr() as PSID) } != 0 { Ok(()) }
+    else { Err(PrivateFsError::OwnerMismatch) }
 }
 
 fn private_acl(sid: PSID, directory: bool) -> Result<Vec<u8>, PrivateFsError> {
@@ -314,11 +337,8 @@ fn secure_owned_handle(file: &File, directory: bool) -> Result<(), PrivateFsErro
 fn validate_private_acl(file: &File, directory: bool) -> Result<(), PrivateFsError> {
     let sid = current_user_sid()?;
     let sid_pointer = sid.as_ptr() as PSID;
-    let owner_sid = current_user_sid()?;
     let (owner, dacl, descriptor) = security_info(file)?;
-    if owner.is_null() || unsafe { EqualSid(owner, owner_sid.as_ptr() as PSID) } == 0 {
-        return Err(PrivateFsError::OwnerMismatch);
-    }
+    validate_token_owner(owner)?;
     if dacl.is_null() {
         return Err(PrivateFsError::DaclNotPrivate);
     }
@@ -727,4 +747,16 @@ mod tests {
         assert!(unlink_child(&fixture.0, root_identity, "owner.lock").is_err());
         FileExt::unlock(&first).unwrap();
     }
+}
+
+/// Restrict a newly created job object to the account across elevation/session changes.
+pub fn secure_job_object(handle: HANDLE) -> Result<(), PrivateFsError> {
+    let sid = current_user_sid()?;
+    let acl = private_acl(sid.as_ptr() as PSID, false)?;
+    let status = unsafe { SetSecurityInfo(handle,
+        windows_sys::Win32::Security::Authorization::SE_KERNEL_OBJECT,
+        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+        null_mut(), null_mut(), acl.as_ptr().cast(), null()) };
+    if status != 0 { return Err(io::Error::from_raw_os_error(status as i32).into()); }
+    Ok(())
 }

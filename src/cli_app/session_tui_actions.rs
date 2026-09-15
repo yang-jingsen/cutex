@@ -10,6 +10,7 @@ use cutex::session::service::cutex_session_is_managed;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SessionTuiAction {
+    RevertHistory,
     RecoverRuntime,
     ResumeAttach,
     AttachExisting,
@@ -31,6 +32,7 @@ pub(super) enum SessionTuiAction {
 impl SessionTuiAction {
     pub(super) fn label(self) -> &'static str {
         match self {
+            Self::RevertHistory => "Revert history",
             Self::RecoverRuntime => "Recover interrupted start",
             Self::ResumeAttach => "takeover",
             Self::AttachExisting => "attach",
@@ -69,6 +71,7 @@ impl SessionTuiAction {
         attachable: bool,
     ) -> bool {
         match self {
+            Self::RevertHistory => false,
             Self::ResumeAttach => !attachable,
             Self::OpenTui => true,
             Self::Online => lifecycle != CutexSessionLifecycleState::Online,
@@ -96,7 +99,15 @@ pub(super) struct SessionTuiActionItem {
     pub primary: bool,
 }
 
-pub(super) fn session_tui_actions_for_record(
+pub(super) fn session_tui_actions_for_record(record: &CutexSessionRecord, alden_sessions: &[CuteAldenSession], live_agents: &[AgentBusAgent]) -> Vec<SessionTuiActionItem> {
+    let mut actions=base_session_tui_actions_for_record(record,alden_sessions,live_agents);
+    if !record.is_retired() && record.codex_session_id.is_some() {
+        actions.push(SessionTuiActionItem {action:SessionTuiAction::RevertHistory,detail:"Browse history, newest first, and choose the last turn to keep",primary:false});
+    }
+    actions
+}
+
+fn base_session_tui_actions_for_record(
     record: &CutexSessionRecord,
     alden_sessions: &[CuteAldenSession],
     live_agents: &[AgentBusAgent],
@@ -275,6 +286,7 @@ fn action_from_quick_kind(kind: StartQuickActionKind) -> Option<SessionTuiAction
 
 fn primary_action_detail(action: SessionTuiAction) -> &'static str {
     match action {
+        SessionTuiAction::RevertHistory => "Browse history and choose the last turn to keep",
         SessionTuiAction::RecoverRuntime => "Recover an interrupted start without removing history",
         SessionTuiAction::ResumeAttach => "Bring runtime online if needed, then take over TUI",
         SessionTuiAction::AttachExisting => "Join the existing TUI",
@@ -359,7 +371,7 @@ mod tests {
         mark_explicit_stock(&mut record);
 
         let actions = session_tui_actions_for_record(&record, &[], &[]);
-        assert_eq!(action_kinds(&actions), vec![SessionTuiAction::StockStart]);
+        assert_eq!(action_kinds(&actions), vec![SessionTuiAction::StockStart, SessionTuiAction::RevertHistory]);
         assert!(actions[0].primary);
     }
 
@@ -370,12 +382,12 @@ mod tests {
         record.app_server_launch_claim_id = Some("interrupted".into());
         assert_eq!(
             action_kinds(&session_tui_actions_for_record(&record, &[], &[])),
-            vec![SessionTuiAction::RecoverRuntime]
+            vec![SessionTuiAction::RecoverRuntime, SessionTuiAction::RevertHistory]
         );
         record.app_server_launch_claim_id = None;
         assert_eq!(
             action_kinds(&session_tui_actions_for_record(&record, &[], &[])),
-            vec![SessionTuiAction::StockStart]
+            vec![SessionTuiAction::StockStart, SessionTuiAction::RevertHistory]
         );
         assert!(!SessionTuiAction::StockStart.requires_confirmation());
     }
@@ -423,6 +435,7 @@ mod tests {
                 SessionTuiAction::StockAttach,
                 SessionTuiAction::StockRestart,
                 SessionTuiAction::CloseRuntime,
+                SessionTuiAction::RevertHistory,
             ]
         );
         assert!(actions[0].primary);
@@ -452,10 +465,11 @@ mod tests {
                 SessionTuiAction::Online,
                 SessionTuiAction::CloseAndRestart,
                 SessionTuiAction::CloseRuntime,
+                SessionTuiAction::RevertHistory,
             ]
         );
         assert!(actions
-            .last()
+            .iter().find(|item| item.action == SessionTuiAction::CloseRuntime)
             .expect("close action")
             .action
             .requires_confirmation());
@@ -473,9 +487,10 @@ mod tests {
                 SessionTuiAction::ResumeAttach,
                 SessionTuiAction::Online,
                 SessionTuiAction::RepairInterruptedHistory,
+                SessionTuiAction::RevertHistory,
             ]
         );
-        assert!(actions.last().unwrap().action.requires_confirmation());
+        assert!(actions.iter().find(|item| item.action == SessionTuiAction::RepairInterruptedHistory).unwrap().action.requires_confirmation());
     }
 
     #[test]
@@ -532,6 +547,7 @@ mod tests {
                 SessionTuiAction::Online,
                 SessionTuiAction::CloseAndRestart,
                 SessionTuiAction::CloseRuntime,
+                SessionTuiAction::RevertHistory,
             ]
         );
         assert!(actions[0].primary);
@@ -568,6 +584,7 @@ mod tests {
                 SessionTuiAction::ResumeHere,
                 SessionTuiAction::ResumeManaged,
                 SessionTuiAction::RepairInterruptedHistory,
+                SessionTuiAction::RevertHistory,
             ]
         );
         assert!(actions[0].primary);

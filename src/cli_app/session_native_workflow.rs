@@ -63,6 +63,12 @@ impl NativeLaunch {
     /// Called only inside TerminalShell handoff. Never exits the outer process
     /// or retries a launch whose external result is unknown.
     pub(super) fn interactive(&self, native_id: Option<&str>) -> anyhow::Result<ExitStatus> {
+        self.interactive_command(native_id)?.status().map_err(|error| {
+            anyhow::anyhow!("native launch result unknown; inspect Recent before creating again: {error}")
+        })
+    }
+
+    fn interactive_command(&self, native_id: Option<&str>) -> anyhow::Result<Command> {
         let operation = match native_id {
             Some(id) => {
                 anyhow::ensure!(
@@ -76,11 +82,24 @@ impl NativeLaunch {
             }
             None => Vec::new(),
         };
-        self.command(&operation)?.status().map_err(|error| {
-            anyhow::anyhow!(
-                "native launch result unknown; inspect Recent before creating again: {error}"
-            )
-        })
+        let mut command = self.command(&operation)?;
+        // Static display values are launcher input, not native session config.
+        // A bare resume otherwise renders the configured IDs as unavailable.
+        let config_path = self.native_home.join("config.toml");
+        let config_text = match std::fs::read_to_string(config_path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let config: toml::Value = toml::from_str(&config_text)?;
+        let order = config.get("tui").and_then(|t| t.get("status_line"))
+            .and_then(toml::Value::as_array).map(|items| items.iter()
+                .filter_map(toml::Value::as_str).map(str::to_owned).collect::<Vec<_>>());
+        if let Some(path) = cutex::launch::session_display::status_file(native_id, order.as_deref().unwrap_or_default())? {
+            command.arg("--status-items-file").arg(path);
+        }
+        command.env("CUTEX_NOTIFICATION_CONTROL", std::env::current_exe()?);
+        Ok(command)
     }
 
     pub(super) fn endpoint(&self) -> anyhow::Result<OwnedStdioEndpoint> {
@@ -103,7 +122,9 @@ impl NativeLaunch {
         let mut endpoint = OwnedStdioEndpoint::spawn_command(options, command)?;
         let initialized = endpoint.request("initialize", json!({"clientInfo": {"name":"cutex_native_workflow", "version":env!("CARGO_PKG_VERSION")}, "capabilities":{"experimentalApi":true}}))?;
         anyhow::ensure!(
-            initialized.get("codexHome").and_then(Value::as_str) == self.native_home.to_str(),
+            initialized.get("codexHome").and_then(Value::as_str)
+                .and_then(|home| std::path::Path::new(home).canonicalize().ok())
+                == Some(self.native_home.canonicalize()?),
             "native source home mismatch"
         );
         endpoint.notify("initialized", None)?;
@@ -199,6 +220,32 @@ fn isolated_command(launch: &LaunchCommand, cwd: &Path, native_home: &Path) -> C
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn resumed_session_materializes_static_items_without_adopting_or_guessing_profile() {
+        let home = crate::cli_app::test_home::IsolatedTestHome::new("session-display-resume").unwrap();
+        let native_home = home.root().join("native");
+        std::fs::create_dir_all(&native_home).unwrap();
+        std::fs::write(native_home.join("config.toml"), "[tui]\nstatus_line=['cutex_welcome','cutex_profile']\n").unwrap();
+        let launch = NativeLaunch { cwd: home.root().into(), native_home, profile: None, model: None };
+        let id = "01a09e36-7fb9-75e0-aad8-39e28d2abce6";
+        for profile in [None, Some("test-profile")] {
+            if let Some(name) = profile {
+                cutex::launch::session_display::save(id, cutex::launch::session_display::SessionProfile {
+                    profile_id: "profile-id".into(), profile_name: name.into(),
+                }).unwrap();
+            }
+            let command = launch.interactive_command(Some(id)).unwrap();
+            let args = command.get_args().map(|s| s.to_string_lossy().to_string()).collect::<Vec<_>>();
+            let pos = args.iter().position(|s| s == "--status-items-file").unwrap();
+            let value: Value = serde_json::from_slice(&std::fs::read(&args[pos+1]).unwrap()).unwrap();
+            let items = value["items"].as_array().unwrap();
+            assert!(items.iter().any(|i| i["text"] == "Bon voyage !"));
+            assert!(items.iter().any(|i| i["text"] == profile.unwrap_or("N/A")));
+            assert!(command.get_envs().any(|(k,v)| k == "CUTEX_NOTIFICATION_CONTROL" && v.is_some()));
+        }
+        assert!(cutex::session::store::load_cutex_session_store().unwrap().sessions.is_empty());
+    }
+
     #[test]
     #[ignore = "explicit saved private fixture only; no bootstrap or model turn"]
     fn ui_contract_d06_real_saved_native_resume_no_cutex_adoption() {

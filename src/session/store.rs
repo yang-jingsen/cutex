@@ -104,6 +104,52 @@ pub(crate) fn save_cutex_session_store_to_path(
     }
 }
 
+/// Commit one prepared record against its own previous value, preserving
+/// unrelated heartbeat updates and receipts in the latest store snapshot.
+pub fn save_cutex_session_record(
+    before: &CutexSessionStore,
+    after: &CutexSessionStore,
+    key: &str,
+) -> anyhow::Result<()> {
+    save_cutex_session_record_to_path(&cutex_sessions_path()?, before, after, key)
+}
+
+fn save_cutex_session_record_to_path(
+    path: &Path,
+    before: &CutexSessionStore,
+    after: &CutexSessionStore,
+    key: &str,
+) -> anyhow::Result<()> {
+    let replacement = after
+        .sessions
+        .get(key)
+        .context("prepared session missing")?;
+    with_locked_session_store(path, |current| {
+        anyhow::ensure!(
+            serde_json::to_value(current.sessions.get(key))?
+                == serde_json::to_value(before.sessions.get(key))?,
+            "target session changed while preparing update; reload before retrying"
+        );
+        for (other_key, other) in &current.sessions {
+            if other_key == key {
+                continue;
+            }
+            anyhow::ensure!(
+                replacement.codex_session_id.is_none()
+                    || other.codex_session_id != replacement.codex_session_id,
+                "native session was concurrently bound to another record"
+            );
+            anyhow::ensure!(
+                replacement.formal_agent_name.is_none()
+                    || other.formal_agent_name != replacement.formal_agent_name,
+                "agent name was concurrently assigned to another record"
+            );
+        }
+        current.sessions.insert(key.into(), replacement.clone());
+        save_locked_session_store(path, current)
+    })
+}
+
 fn open_store_lock(path: &Path) -> anyhow::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
@@ -168,6 +214,27 @@ mod tests {
             "2026-08-10T00:00:00Z".to_string(),
         )
         .expect("record")
+    }
+
+    #[test]
+    fn prepared_record_commit_preserves_other_writes_and_rejects_target_changes() {
+        let root =
+            std::env::temp_dir().join(format!("cutex-record-merge-{}", uuid::Uuid::new_v4()));
+        let path = root.join("cutex-sessions.json");
+        let initial = CutexSessionStore::default();
+        save_cutex_session_store_to_path(&path, &initial).unwrap();
+        let before = load_cutex_session_store_from_path(&path).unwrap();
+        let mut prepared = before.clone();
+        prepared.sessions.insert("cutex.new".into(), record("new"));
+        let mut other = load_cutex_session_store_from_path(&path).unwrap();
+        other.sessions.insert("cutex.other".into(), record("other"));
+        save_cutex_session_store_to_path(&path, &other).unwrap();
+        save_cutex_session_record_to_path(&path, &before, &prepared, "cutex.new").unwrap();
+        let current = load_cutex_session_store_from_path(&path).unwrap();
+        assert!(current.sessions.contains_key("cutex.other"));
+        assert!(current.sessions.contains_key("cutex.new"));
+        assert!(save_cutex_session_record_to_path(&path, &before, &prepared, "cutex.new").is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

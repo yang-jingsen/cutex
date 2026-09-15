@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::role_revision::{CutexSessionId, Sha256};
+use crate::role_revision::{CutexSessionId, Rfc3339, Sha256};
 use crate::seat::{DirectorSeatTransferRequest, SeatAuthorityError, SeatOccupancyStore};
 use crate::task_service::ActionId;
 use sha2::{Digest as _, Sha256 as Sha256Digest};
@@ -144,6 +144,17 @@ pub trait AgentLifecycle: Send + Sync {
         Err(LifecycleFailure::outcome_unknown(
             "native_bootstrap_reconciliation_unavailable",
             "lifecycle provider cannot prove the historical native bootstrap absent",
+        ))
+    }
+    fn reconcile_interrupted_native_bootstrap(
+        &self,
+        _spec: &ManagedAgentSpec,
+        _started_at: &Rfc3339,
+        _failed_at: &Rfc3339,
+    ) -> Result<NativeBootstrapIdentityReconciliation, LifecycleFailure> {
+        Err(LifecycleFailure::outcome_unknown(
+            "native_bootstrap_reconciliation_unavailable",
+            "provider cannot establish interrupted creator termination",
         ))
     }
     fn reconcile_ambiguous_native_bootstrap(
@@ -511,7 +522,21 @@ impl AgentManagementProvider {
             ));
         }
         let digest = request_sha256(request)?;
-        self.store.with_state(true, |mut state| {
+        let transfer = request
+            .expected_authorized_director_session
+            .as_ref()
+            .filter(|old| *old != &request.authorized_director_session)
+            .map(|old| DirectorSeatTransferRequest {
+                action_id: ActionId::new(format!(
+                    "human-authority-seat/{:x}",
+                    Sha256Digest::digest(request.action_id.as_str().as_bytes())
+                ))
+                .expect("fixed length action id"),
+                project_id: request.project_id.clone(),
+                expected_predecessor_cutex_session: old.clone(),
+                successor_cutex_session: request.authorized_director_session.clone(),
+            });
+        let receipt = self.store.with_state(true, |mut state| {
             if state
                 .durable_import_actions
                 .contains_key(&request.action_id)
@@ -576,6 +601,13 @@ impl AgentManagementProvider {
                     "primary_director_cannot_be_operator",
                 ));
             }
+            // Fence Task Service while the two durable stores commit. An exact
+            // retry can finish either side after a process or persistence failure.
+            if let Some(transfer) = &transfer {
+                self.director_seats
+                    .transfer_director(transfer)
+                    .map_err(seat_authority_error)?;
+            }
             let receipt = ProjectAuthorityReceipt {
                 schema: AgentManagementReceiptSchema::V1,
                 action_id: request.action_id.clone(),
@@ -587,7 +619,42 @@ impl AgentManagementProvider {
                 .authority_receipts
                 .insert(request.action_id.clone(), receipt.clone());
             Ok((state, receipt, true))
-        })
+        })?;
+        if let Some(transfer) = &transfer {
+            // Historical authority receipts predate coupled seat correction.
+            // Replaying those receipts must not silently perform a new handoff.
+            if self
+                .director_seats
+                .query()
+                .map_err(seat_authority_error)?
+                .receipts
+                .contains_key(&transfer.action_id)
+            {
+                self.director_seats
+                    .finish_director_transfer(transfer)
+                    .map_err(seat_authority_error)?;
+            }
+        }
+        Ok(receipt)
+    }
+
+    /// A failed cross-store correction may already have committed its seat.
+    /// The administration adapter must not describe that outcome as no-write.
+    pub fn project_authority_correction_has_writes(
+        &self,
+        request: &ProjectAuthorityRequest,
+    ) -> Result<bool, AgentManagementError> {
+        let id = ActionId::new(format!(
+            "human-authority-seat/{:x}",
+            Sha256Digest::digest(request.action_id.as_str().as_bytes())
+        ))
+        .expect("fixed length action id");
+        Ok(self
+            .director_seats
+            .query()
+            .map_err(seat_authority_error)?
+            .receipts
+            .contains_key(&id))
     }
 
     /// Atomically imports the one missing ownership record for an exact legacy
@@ -1211,7 +1278,8 @@ impl AgentManagementProvider {
                 ),
             };
         }
-        if !legacy_ambiguous_sid_recovery_candidate(action) {
+        let interrupted = interrupted_bootstrap_candidate(action);
+        if !interrupted && !legacy_ambiguous_sid_recovery_candidate(action) {
             return Ok(HistoricalBootstrapContinuation::None);
         }
         let Some((started_at, failed_at)) = latest_native_bootstrap_window(&snapshot, action)
@@ -1222,11 +1290,14 @@ impl AgentManagementProvider {
                 "the most recent native bootstrap attempt window is unavailable",
             ));
         };
-        let reconciliation = lifecycle
-            .reconcile_ambiguous_native_bootstrap(spec, &started_at, &failed_at)
-            .unwrap_or_else(|error| NativeBootstrapIdentityReconciliation::Unavailable {
-                reason: format!("{}: {}", error.code, error.detail),
-            });
+        let reconciliation = if interrupted {
+            lifecycle.reconcile_interrupted_native_bootstrap(spec, &started_at, &failed_at)
+        } else {
+            lifecycle.reconcile_ambiguous_native_bootstrap(spec, &started_at, &failed_at)
+        }
+        .unwrap_or_else(|error| NativeBootstrapIdentityReconciliation::Unavailable {
+            reason: format!("{}: {}", error.code, error.detail),
+        });
         match reconciliation {
             NativeBootstrapIdentityReconciliation::Exact {
                 native_session_id,
@@ -1241,6 +1312,9 @@ impl AgentManagementProvider {
                     &format!("reconciled native session identity is invalid: {reason}"),
                 )),
             },
+            NativeBootstrapIdentityReconciliation::Absent { .. } if interrupted => {
+                Ok(HistoricalBootstrapContinuation::RetryProvenAbsent)
+            }
             NativeBootstrapIdentityReconciliation::Absent { reason } => {
                 Err(reconciliation_fence_response(action, "absent", &reason))
             }
@@ -1386,7 +1460,8 @@ impl AgentManagementProvider {
                         return Err(AgentManagementError::Conflict("action_identity_conflict"));
                     }
                     if historical_continuation == HistoricalBootstrapContinuation::RetryProvenAbsent
-                        && legacy_pre_sid_retry_candidate(&existing)
+                        && (legacy_pre_sid_retry_candidate(&existing)
+                            || interrupted_bootstrap_candidate(&existing))
                     {
                         let action = state
                             .actions
@@ -1432,7 +1507,9 @@ impl AgentManagementProvider {
                     if let HistoricalBootstrapContinuation::CaptureExactSid(native_session_id) =
                         &historical_continuation
                     {
-                        if legacy_ambiguous_sid_recovery_candidate(&existing) {
+                        if legacy_ambiguous_sid_recovery_candidate(&existing)
+                            || interrupted_bootstrap_candidate(&existing)
+                        {
                             let action = state
                                 .actions
                                 .get_mut(&request.action_id)
@@ -3941,6 +4018,18 @@ fn legacy_pre_sid_failure_detail_matches(detail: &str) -> bool {
 /// Identifies only the one historical receipt class produced after the native
 /// bootstrap had already run but legacy UUID scraping could not select its SID.
 /// Receipt text is a trigger for evidence reconciliation, never identity proof.
+fn interrupted_bootstrap_candidate(action: &AgentActionRecord) -> bool {
+    action.operation == AgentOperationKind::Create
+        && action.phase == AgentActionPhase::OwnerActionRequired
+        && action.known_native_session_id.is_none()
+        && action.known_successor_cutex_session.is_none()
+        && !action.native_bootstrap_retryable
+        && matches!(action.response.as_ref().map(|r| &r.outcome),
+            Some(AgentManagementOutcome::OwnerActionRequired { failure })
+            if failure.detail.strip_prefix("owner_action_required: ").unwrap_or(&failure.detail)
+                == "native bootstrap outcome is unknown; no second Agent was created")
+}
+
 fn legacy_ambiguous_sid_recovery_candidate(action: &AgentActionRecord) -> bool {
     action.operation == AgentOperationKind::Create
         && action.phase == AgentActionPhase::OwnerActionRequired
@@ -4817,6 +4906,14 @@ mod tests {
             }
         }
 
+        fn reconcile_interrupted_native_bootstrap(
+            &self,
+            spec: &ManagedAgentSpec,
+            started: &Rfc3339,
+            failed: &Rfc3339,
+        ) -> Result<NativeBootstrapIdentityReconciliation, LifecycleFailure> {
+            self.reconcile_ambiguous_native_bootstrap(spec, started, failed)
+        }
         fn reconcile_ambiguous_native_bootstrap(
             &self,
             _spec: &ManagedAgentSpec,
@@ -5305,6 +5402,83 @@ mod tests {
                 expected_authority_epoch: expected.map(|value| value.1),
             })
             .unwrap()
+    }
+
+    #[test]
+    fn human_authority_correction_transfers_project_seat_and_replays() {
+        let provider = AgentManagementProvider::open(root("human-authority-correction")).unwrap();
+        bind(&provider, "init", "old", None);
+        let receipt = bind_project_only(
+            &provider,
+            "correct",
+            project().as_str(),
+            "new",
+            Some(("old", 1)),
+        );
+        assert_eq!(receipt.authority.authority_epoch, 2);
+        let seats = provider.director_seats.query().unwrap();
+        assert_eq!(
+            seats.project_director_occupancies[&project()].occupant_cutex_session,
+            session("new")
+        );
+        assert!(seats.active_project_director_transfers.is_empty());
+        // The unrelated legacy/global Director seat is not rewritten.
+        assert_eq!(
+            seats.occupancies[&crate::task_service::SeatId::new("cutex-director").unwrap()]
+                .occupant_cutex_session,
+            session("old")
+        );
+        assert_eq!(
+            bind_project_only(
+                &provider,
+                "correct",
+                project().as_str(),
+                "new",
+                Some(("old", 1))
+            ),
+            receipt
+        );
+    }
+
+    #[test]
+    fn human_authority_correction_recovers_seat_first_interruption() {
+        let provider = AgentManagementProvider::open(root("human-authority-interruption")).unwrap();
+        bind(&provider, "init", "old", None);
+        let transfer = DirectorSeatTransferRequest {
+            action_id: ActionId::new(format!(
+                "human-authority-seat/{:x}",
+                Sha256Digest::digest(b"correct")
+            ))
+            .unwrap(),
+            project_id: project(),
+            expected_predecessor_cutex_session: session("old"),
+            successor_cutex_session: session("new"),
+        };
+        provider
+            .director_seats
+            .transfer_director(&transfer)
+            .unwrap();
+        assert_eq!(
+            provider.store.snapshot().unwrap().projects[&project()].authority_epoch,
+            1
+        );
+        bind_project_only(
+            &provider,
+            "correct",
+            project().as_str(),
+            "new",
+            Some(("old", 1)),
+        );
+        assert!(provider
+            .director_seats
+            .query()
+            .unwrap()
+            .active_project_director_transfers
+            .is_empty());
+        assert_eq!(
+            provider.store.snapshot().unwrap().projects[&project()].authorized_director_session,
+            session("new")
+        );
     }
 
     fn invocation(director: &str) -> AgentManagementInvocation {
@@ -8244,13 +8418,17 @@ mod tests {
                 ),
                 &lifecycle,
             )));
-            bind_project_only(
-                &provider,
-                "bind-director",
-                project().as_str(),
-                predecessor.cutex_session_id.as_str(),
-                Some(("cutex.bootstrap", 1)),
-            );
+            // Construct a historical broken authority/seat pair explicitly;
+            // the human correction API now transfers the seat as well.
+            provider
+                .store
+                .with_state(true, |mut state| {
+                    let authority = state.projects.get_mut(&project()).unwrap();
+                    authority.authorized_director_session = predecessor.cutex_session_id.clone();
+                    authority.authority_epoch = 2;
+                    Ok((state, (), true))
+                })
+                .unwrap();
             if let Some(occupant) = stale_occupant {
                 provider
                     .director_seats
@@ -9254,6 +9432,80 @@ mod tests {
             Some(&original)
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_creation_reconciles_absent_exact_and_ambiguous_without_duplicates() {
+        for (label, evidence, expected_bootstraps, complete) in [
+            (
+                "absent",
+                NativeBootstrapIdentityReconciliation::Absent {
+                    reason: "creator stopped and sources absent".into(),
+                },
+                1,
+                true,
+            ),
+            (
+                "exact",
+                NativeBootstrapIdentityReconciliation::Exact {
+                    native_session_id: RECOVERED_NATIVE_SID.into(),
+                    reason: "exact saved thread".into(),
+                },
+                0,
+                true,
+            ),
+            (
+                "ambiguous",
+                NativeBootstrapIdentityReconciliation::Ambiguous {
+                    reason: "multiple candidates".into(),
+                },
+                0,
+                false,
+            ),
+            (
+                "unavailable",
+                NativeBootstrapIdentityReconciliation::Unavailable {
+                    reason: "creator still stopping".into(),
+                },
+                0,
+                false,
+            ),
+        ] {
+            let root = root(&format!("interrupted-{label}"));
+            let provider = AgentManagementProvider::open(&root).unwrap();
+            bind(&provider, "bind", "cutex.director", None);
+            let request = create_request("create", "worker", AgentStartMode::CustomMessage);
+            seed_legacy_ambiguous_sid_receipt(&provider, &request);
+            provider.store.with_state(true, |mut state| {
+                let action = state.actions.get_mut(&request.action_id).unwrap();
+                if let Some(AgentManagementResponse { outcome: AgentManagementOutcome::OwnerActionRequired { failure }, .. }) = &mut action.response {
+                    failure.detail = "owner_action_required: native bootstrap outcome is unknown; no second Agent was created".into();
+                }
+                Ok((state, (), true))
+            }).unwrap();
+            let lifecycle = FakeLifecycle::with_identity_reconciliation(evidence);
+            let response = provider.execute(&invocation("cutex.director"), &request, &lifecycle);
+            if complete {
+                let receipt = completed(response);
+                assert_eq!(
+                    completed(provider.execute(
+                        &invocation("cutex.director"),
+                        &request,
+                        &lifecycle
+                    )),
+                    receipt
+                );
+                assert_eq!(lifecycle.message_count(), 1);
+            } else {
+                assert!(matches!(
+                    response.outcome,
+                    AgentManagementOutcome::OwnerActionRequired { .. }
+                ));
+                assert_eq!(lifecycle.message_count(), 0);
+            }
+            assert_eq!(lifecycle.bootstrap_count(), expected_bootstraps);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

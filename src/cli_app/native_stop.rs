@@ -45,7 +45,23 @@ pub(super) fn stop_processes(
     {
         stop_linux(record, binding, force)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        let sessions = cutex::session::store::load_cutex_session_store()?;
+        let receipt = sessions.explicit_launch_receipts.values().find_map(|receipt| {
+            if let cutex::agent_management::ExplicitLaunchActionReceipt::Runtime(receipt) = receipt {
+                (receipt.review.subject.cutex_session_id.as_str() == record.cutex_session_id
+                    && receipt.binding.as_ref() == Some(binding)).then_some(receipt)
+            } else { None }
+        }).context("runtime publication receipt missing")?;
+        let bundle = cutex::launch::stock::StockBundle::load_running(&receipt.review.contract)?;
+        let process = super::stock_publication::verified_process(binding.pid, &binding.started_at,
+            &bundle.executable.path)?;
+        super::stock_publication::stop_published_job(
+            receipt.publication.as_ref().context("runtime publication evidence missing")?, process.as_ref())?;
+        Ok(ProcessTerminateOutcome { stopped: true, forced: force, detail: "owned_runtime_job_stopped".into() })
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = (binding, force);
         anyhow::bail!("native process stop requires supported process identity")

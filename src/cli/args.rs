@@ -1360,6 +1360,16 @@ pub enum NotifyCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum ProfileCommand {
+    /// Discover or inspect models offered by an OpenAI-compatible API profile
+    Models {
+        target: String,
+        /// Refresh from the provider's /models endpoint
+        #[arg(long)]
+        refresh: bool,
+        /// Apply the generated model catalog to future launches
+        #[arg(long)]
+        apply: bool,
+    },
     /// List profiles with full runtime/proxy/provider context
     List,
 

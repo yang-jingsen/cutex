@@ -3232,6 +3232,7 @@ mod tests {
             assert!(denied.durable_candidates().is_err());
             assert!(denied
                 .adopt_saved_native(&cutex::agent_management::HumanAdoptRequest {
+            session_only: false,
             creation_defaults: None,
                     action_id: cutex::agent_management::AgentActionId::new("denied-adopt").unwrap(),
                     native_id: "saved-native".into(),
@@ -3575,10 +3576,12 @@ mod tests {
         save_cutex_session_store(&durable_only).unwrap();
         // Real process boundary: unsupported online backend is rejected by the
         // authenticated production adapter before either stop or persistence.
-        let mut owned = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        #[cfg(unix)]
+        let mut owned = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        #[cfg(windows)]
+        let mut owned = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30"])
+            .spawn().unwrap();
         let mut uncontained = load_cutex_session_store().unwrap();
         let original = uncontained.sessions["cutex.durable-only"].clone();
         let record = uncontained.sessions.get_mut("cutex.durable-only").unwrap();
@@ -3801,6 +3804,7 @@ mod tests {
         // The real root HTTP route must replay an already committed adoption
         // without launching a native process, and retain its exact snapshot.
         let adoption = cutex::agent_management::HumanAdoptRequest {
+            session_only: false,
             creation_defaults: None,
             action_id: cutex::agent_management::AgentActionId::new("http-adopt-replay").unwrap(),
             native_id: "saved-http-native".into(),

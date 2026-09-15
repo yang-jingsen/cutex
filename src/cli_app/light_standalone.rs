@@ -8,11 +8,34 @@ use cutex::profiles::model::{CliKind, RuntimeConfig, StoredAccount};
 use std::path::{Path, PathBuf};
 
 fn executable_path(program: &str) -> Option<PathBuf> {
-    if program.contains(std::path::MAIN_SEPARATOR) {
-        return Path::new(program).canonicalize().ok();
+    let candidate = |path: PathBuf| -> Option<PathBuf> {
+        if path.is_file() { return path.canonicalize().ok(); }
+        #[cfg(windows)]
+        if path.extension().is_none() {
+            let exe=path.with_extension("exe");
+            if exe.is_file() { return exe.canonicalize().ok(); }
+        }
+        None
+    };
+    if Path::new(program).components().count()>1 {
+        return candidate(PathBuf::from(program));
     }
     std::env::split_paths(&std::env::var_os("PATH")?)
-        .find_map(|dir| dir.join(program).canonicalize().ok())
+        .find_map(|dir| candidate(dir.join(program)))
+}
+fn selected_cli_matches(program: &Path, cli: &cutex::launch::stock::VerifiedFile) -> anyhow::Result<bool> {
+    if program.canonicalize()? == cli.path.canonicalize()? { return Ok(true); }
+    // Windows shortcuts are executable copies, not symlinks. Recognize the
+    // selected artifact by content without treating arbitrary overrides as native.
+    Ok(std::fs::metadata(program)?.len() == std::fs::metadata(&cli.path)?.len()
+        && cutex::agent_management::file_sha256(program)? == cli.sha256)
+}
+
+pub(super) fn selected_entry_available() -> anyhow::Result<bool> {
+    let Some(deployment) = LocalDeployment::selected()? else { return Ok(false); };
+    let bundle: cutex::launch::stock::StockBundle = serde_json::from_slice(&std::fs::read(&deployment.bundle_manifest)?)?;
+    let Some(program) = executable_path(&cutex::launch::program::codex_program()) else { return Ok(false); };
+    selected_cli_matches(&program, bundle.cli.as_ref().unwrap_or(&bundle.executable))
 }
 
 pub(super) fn command(
@@ -29,9 +52,8 @@ pub(super) fn command(
         serde_json::from_slice(&std::fs::read(&deployment.bundle_manifest)?)?;
     let cli = bundle.cli.as_ref().unwrap_or(&bundle.executable);
     let program = cutex::launch::program::codex_program();
-    if executable_path(&program).as_deref() != Some(cli.path.canonicalize()?.as_path()) {
-        return Ok(None);
-    }
+    let Some(resolved) = executable_path(&program) else { return Ok(None); };
+    if !selected_cli_matches(&resolved, cli)? { return Ok(None); }
     let files = cutex::profiles::materialize::ensure_materialized_account_files(account)?;
     let mut value: toml::Value = toml::from_str(&std::fs::read_to_string(&files.config_path)?)?;
     let table = value
@@ -92,10 +114,7 @@ pub(super) fn command(
     launch = super::stock_lifecycle::option(
         launch,
         "model_provider",
-        match projection.route {
-            cutex::launch::selected_profile::Route::ChatgptFile => "openai",
-            cutex::launch::selected_profile::Route::GlmApiKey => "GLM",
-        },
+        projection.provider_id(),
     )?;
     launch = super::stock_lifecycle::option(launch, "model", model)?;
     if let Some(reasoning) = reasoning {
@@ -131,6 +150,8 @@ pub(super) fn command(
         account, &cutex::config::store::load_codez_config_checked()?,
     ));
     command.env("CUTEX_NOTIFICATION_CONTROL", std::env::current_exe()?);
+    command.env("CUTEX_SESSION_PROFILE_ID", &account.id);
+    command.env("CUTEX_SESSION_PROFILE_NAME", &account.name);
     // The helper only initializes UUIDs created after this launch, so /resume
     // within the foreground UI cannot change an old session's preference.
     if new_session {
@@ -144,4 +165,23 @@ pub(super) fn command(
         secret.apply(&mut command);
     }
     Ok(Some(command))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn copied_entry_uses_selected_profile_but_other_binary_does_not() {
+        let root=std::env::temp_dir().join(format!("cutex-cli-copy-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let original=root.join("codex.exe");let copied=root.join("cute-codex.exe");
+        std::fs::write(&original,b"native").unwrap();std::fs::copy(&original,&copied).unwrap();
+        let cli=cutex::launch::stock::VerifiedFile{path:original.clone(),sha256:cutex::agent_management::file_sha256(&original).unwrap()};
+        assert!(selected_cli_matches(&copied,&cli).unwrap());
+        std::fs::write(&copied,b"other!").unwrap();
+        assert!(!selected_cli_matches(&copied,&cli).unwrap());
+        #[cfg(windows)]
+        assert_eq!(executable_path(root.join("cute-codex").to_str().unwrap()),Some(copied.canonicalize().unwrap()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

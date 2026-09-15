@@ -1,6 +1,5 @@
 use std::fs;
 use std::fs::File;
-#[cfg(unix)]
 use std::fs::OpenOptions;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};

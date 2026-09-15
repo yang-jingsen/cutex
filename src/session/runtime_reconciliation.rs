@@ -179,6 +179,7 @@ pub fn reconcile_cutex_session_store_from_agent(
     let record = store.sessions.get_mut(&session_key).ok_or_else(|| {
         anyhow::anyhow!("cutex session disappeared during reconciliation: {session_key}")
     })?;
+    let owned_session = record.is_owned_session();
     let previous_runtime_agent_id = record.current_runtime_agent_id.clone();
     let endpoint_changed = previous_runtime_agent_id.as_deref() != Some(agent.id.as_str());
     if endpoint_changed {
@@ -222,7 +223,7 @@ pub fn reconcile_cutex_session_store_from_agent(
     // from the first user message), so it must not replace an existing managed
     // name. Unmanaged sessions still follow their runtime title, and legacy
     // persistent records without a display hint may be initialized here.
-    if record.registration_class != AgentRegistrationClass::Persistent
+    if (record.registration_class != AgentRegistrationClass::Persistent && !owned_session)
         || record.display_name_hint.is_none()
     {
         durable_changed |= replace_if_changed(
@@ -238,7 +239,7 @@ pub fn reconcile_cutex_session_store_from_agent(
     if record.managed_cwd.is_none() {
         durable_changed |= replace_if_changed(&mut record.cwd, agent.cwd.clone());
     }
-    durable_changed |= replace_if_changed(&mut record.agent_enabled, true);
+    if !owned_session { durable_changed |= replace_if_changed(&mut record.agent_enabled, true); }
     durable_changed |= replace_if_changed(&mut record.agent_groups, agent.groups.clone());
     let registration_class =
         reconcile_registration_class(record.registration_class, agent.registration_class);

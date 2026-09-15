@@ -172,6 +172,11 @@ pub fn persist_cutex_session_store_and_im_record(
     key: &str,
 ) -> anyhow::Result<()> {
     save_cutex_session_store(store)?;
+    persist_cutex_session_im_record(store, key)
+}
+
+/// Update the IM projection after the durable record has already committed.
+pub fn persist_cutex_session_im_record(store: &CutexSessionStore, key: &str) -> anyhow::Result<()> {
     let Some(record) = store.sessions.get(key) else {
         return Ok(());
     };

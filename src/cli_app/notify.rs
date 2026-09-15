@@ -20,6 +20,7 @@ pub(crate) fn run_command(command: NotifyCommand) -> anyhow::Result<()> {
                 (None, true) => Change::Cycle,
                 (None, false) => Change::Read,
             };
+            cutex::launch::session_display::record_from_launch(&thread_id)?;
             let preference = session::session(&thread_id, change)?;
             if json {
                 let mut value = serde_json::to_value(&preference)?;

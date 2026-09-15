@@ -244,7 +244,7 @@ mod linux {
 #[cfg(target_os = "linux")]
 pub(super) use linux::*;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 mod unsupported {
     use cutex::agent_management::StockPublication;
     pub struct GatedChild;
@@ -289,7 +289,7 @@ mod unsupported {
         anyhow::bail!("stock publication requires Linux")
     }
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 pub(super) use unsupported::*;
 
 #[cfg(all(test, target_os = "linux"))]
@@ -406,3 +406,9 @@ mod tests {
             .contains("replaced"));
     }
 }
+
+#[cfg(windows)]
+#[path = "stock_publication_windows.rs"]
+mod windows;
+#[cfg(windows)]
+pub(super) use windows::*;

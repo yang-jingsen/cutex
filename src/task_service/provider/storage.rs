@@ -155,7 +155,8 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
             drop(conn);
-            File::open(&temp)?.sync_all()?;
+            // FlushFileBuffers on Windows requires a writable handle.
+            OpenOptions::new().read(true).write(true).open(&temp)?.sync_all()?;
             crash_point("initialize-before-publish");
             fs::hard_link(&temp, self.root.join(DATABASE_FILE))?;
             #[cfg(unix)]

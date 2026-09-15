@@ -470,7 +470,7 @@ fn management_endpoint_for_record(
             return Ok((base_url, token.map(str::to_string)));
         }
         if !management_api_healthy(DEFAULT_MANAGEMENT_PORT, token) {
-            cutex::management::launch::ensure_management_api_running(
+            cutex::management::launch::require_management_api_running(
                 config,
                 DEFAULT_MANAGEMENT_PORT,
             )

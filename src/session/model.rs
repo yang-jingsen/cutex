@@ -184,7 +184,7 @@ pub fn parse_cutex_session_quick_action_mode(
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CutexSessionStore {
     /// Latest proven stopped native occurrence, saved with runtime clearing.
     #[serde(default)]
@@ -320,6 +320,13 @@ pub struct CutexSessionRecord {
 }
 
 impl CutexSessionRecord {
+    /// Runtime ownership does not grant managed Agent identity or Project authority.
+    pub fn is_owned_session(&self) -> bool {
+        self.explicit_launch.is_some() && !self.agent_enabled
+            && self.registration_class == crate::agent_bus::model::AgentRegistrationClass::LocalOnly
+            && self.formal_agent_name.is_none()
+    }
+
     #[allow(dead_code)]
     pub fn new(
         cutex_session_id: String,

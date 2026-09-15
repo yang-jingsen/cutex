@@ -268,11 +268,13 @@ mod tests {
     }
     #[test]
     fn frozen_payload_survives_catalog_removal_but_rejects_changed_materialization() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!("frozen-status-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         let path = root.join("catalog.json");
         std::fs::write(&path, serde_json::to_vec(&catalog()).unwrap()).unwrap();
+        #[cfg(unix)]
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let status = Status::review(&path, &["cutex_profile".into()], "profile").unwrap().unwrap();
         status.materialize().unwrap();
@@ -342,7 +344,8 @@ mod tests {
         std::fs::write(&source, serde_json::to_vec(&catalog()).unwrap()).unwrap();
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
+            #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
         let status = Status::review(&source, &["custom:profile".into()], "selected")
@@ -357,5 +360,31 @@ mod tests {
         let mut unknown = status.payload.clone();
         unknown.version = 2;
         assert!(unknown.validate().is_err());
+    }
+}
+
+/// Non-Agent sessions use current display settings without a runtime review.
+pub fn materialize_session_display(catalog: &[u8], order: &[String], profile: &str) -> anyhow::Result<PathBuf> {
+    let payload = resolve(catalog, order, profile)?;
+    let bytes = serde_json::to_vec(&payload)?;
+    let path = crate::config::paths::runtime_dir()?.join("session-presentation")
+        .join(format!("display-{}.json", digest(&bytes)));
+    if !path.exists() {
+        crate::config::atomic::write_private_pretty_json_atomic(&path, &payload, "session status display")?;
+    }
+    Ok(path)
+}
+
+#[cfg(test)]
+mod session_display_regression_tests {
+    #[test]
+    fn ordinary_resume_has_static_welcome_and_honest_unknown_profile() {
+        let catalog = br#"{"items":[{"id":"cutex_welcome","title":"Cutex Welcome","source":{"kind":"static","value":"Bon voyage !"}},{"id":"cutex_profile","title":"Cutex Profile","source":{"kind":"launch_profile"}}]}"#;
+        for (order, profile) in [(["cutex_welcome", "cutex_profile"], "N/A"), (["custom:bon-voyage", "custom:profile"], "aemeath")] {
+            let order = order.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            let payload = super::resolve(catalog, &order, profile).unwrap();
+            assert_eq!(payload.items[0].text, "Bon voyage !");
+            assert_eq!(payload.items[1].text, profile);
+        }
     }
 }

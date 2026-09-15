@@ -506,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn job_mcp_default_none_and_general_mcp_stays_rejected() {
+    fn job_mcp_default_none_and_native_mcp_config_is_allowed() {
         let request: crate::agent_management::ExplicitLaunchRequest = serde_json::from_value(serde_json::json!({"operation":"review_runtime","cutex_session_id":"cutex.private-test","restart":false})).unwrap();
         assert!(matches!(
             request,
@@ -515,7 +515,7 @@ mod tests {
         assert!(super::super::stock::validate_shared_config(
             "[mcp_servers.cutex_job]\ncommand='job'"
         )
-        .is_err());
+        .is_ok());
     }
 
     #[test]

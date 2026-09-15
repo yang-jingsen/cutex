@@ -1,8 +1,6 @@
 //! Per-`cutex_session` app-server endpoint layout and persisted runtime binding.
 
 use std::fs;
-#[cfg(windows)]
-use std::fs::OpenOptions;
 use std::io;
 #[cfg(windows)]
 use std::io::Write;
@@ -489,16 +487,21 @@ fn create_private_dir(path: &Path) -> anyhow::Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
             .with_context(|| format!("failed to secure app-server directory {}", path.display()))?;
     }
+    #[cfg(windows)]
+    crate::platform::private_fs::secure_directory(path)
+        .with_context(|| format!("failed to secure app-server directory {}", path.display()))?;
     Ok(())
 }
 
 #[cfg(windows)]
 fn write_private_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("failed to create app-server token file {}", path.display()))?;
+    let parent = path.parent().context("app-server token parent missing")?;
+    let name = path.file_name().and_then(|name| name.to_str())
+        .context("invalid app-server token name")?;
+    let (_directory, identity) = crate::platform::private_fs::open_validated_directory(parent)?;
+    let mut file = crate::platform::private_fs::open_child(
+        parent, identity, name, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, false,
+    ).with_context(|| format!("failed to create private app-server token file {}", path.display()))?;
     file.write_all(contents)?;
     file.flush()?;
     Ok(())
@@ -523,6 +526,23 @@ mod tests {
     enum CompatibleThreadStartSource {
         Startup,
         Clear,
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_runtime_token_has_private_acl_and_is_not_overwritten() {
+        let root = std::env::temp_dir().join(format!("cutex-runtime-acl-{}", Uuid::new_v4()));
+        let layout = AppServerRuntimeLayout::prepare_under(&root, "test-session").unwrap();
+        crate::platform::private_fs::open_validated_directory(&layout.runtime_dir).unwrap();
+        let path = layout.auth_token_path.as_ref().unwrap();
+        let file = std::fs::File::open(path).unwrap();
+        crate::platform::private_fs::validate_private_file(&file).unwrap();
+        drop(file);
+        let original = std::fs::read(path).unwrap();
+        assert!(write_private_file(path, b"replacement").is_err());
+        assert_eq!(std::fs::read(path).unwrap(), original);
+        assert_eq!(layout.auth_token.as_ref().unwrap().as_bytes(), original);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
