@@ -59,7 +59,7 @@ foreach($servicePid in $listeners) {{
   $process=Get-CimInstance Win32_Process -Filter "ProcessId=$servicePid"
   if (!$process -or [IO.Path]::GetFileName($process.ExecutablePath) -ne 'cutex.exe' -or $process.CommandLine -notmatch '\b{role}\s+serve\b') {{ throw 'Port belongs to another process; no service action performed' }}
 }}
-if ({stop}) {{ foreach($servicePid in $listeners) {{ Stop-Process -Id $servicePid -ErrorAction Stop; Wait-Process -Id $servicePid -Timeout 15 -ErrorAction SilentlyContinue; if(Get-Process -Id $servicePid -ErrorAction SilentlyContinue) {{ throw 'Service has not stopped' }} }}; $listeners=@() }}
+if ({stop}) {{ foreach($servicePid in $listeners) {{ Stop-Process -Id $servicePid -ErrorAction Stop; Wait-Process -Id $servicePid -Timeout 15 -ErrorAction SilentlyContinue; $remaining=Get-Process -Id $servicePid -ErrorAction SilentlyContinue; if($remaining -and !$remaining.HasExited) {{ throw 'Service has not stopped' }} }}; $listeners=@() }}
 if ({start} -and $listeners.Count -eq 0) {{
   $created=Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine=('"'+{exe}+'" {role} serve --port {port}')}}
   if($created.ReturnValue -ne 0) {{ throw ('Service creation failed: '+$created.ReturnValue) }}
