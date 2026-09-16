@@ -4316,6 +4316,39 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore = "explicit synthetic scale probe; no production state"]
+    fn synthetic_live_query_and_global_commit_scale() {
+        let fixture = Fixture::new("synthetic-scale");
+        fixture.provision();
+        let store = storage::Store::open(fixture.provider.root.as_ref()).unwrap();
+        for count in [100, 1000, 5000] {
+            let before = store.load_live().unwrap();
+            let mut after = before.clone();
+            let template = after.assignments[&assignment_id()].clone();
+            for index in 1..count {
+                let mut assignment = template.clone();
+                assignment.assignment_id = AssignmentId::new(format!("scale-{index}")).unwrap();
+                after.assignments.insert(assignment.assignment_id.clone(), assignment);
+            }
+            store.commit(&before, &mut after, "scale_seed", now()).unwrap();
+            let start = Instant::now();
+            let before = fixture.provider.query_live().unwrap();
+            let query_ms = start.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(before.assignments.len(), count);
+            let start = Instant::now();
+            let selected = fixture.provider.query_assignment(&assignment_id()).unwrap();
+            let scoped_ms = start.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(selected.assignments.len(), 1);
+            let mut after = before.clone();
+            after.assignments.get_mut(&assignment_id()).unwrap().local_revision += 1;
+            let start = Instant::now();
+            store.commit(&before, &mut after, "scale_single_change", now()).unwrap();
+            eprintln!("assignments={count} query_ms={query_ms:.3} scoped_ms={scoped_ms:.3} global_commit_ms={:.3}", start.elapsed().as_secs_f64() * 1000.0);
+        }
+        fs::remove_dir_all(fixture.provider.root.as_ref()).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_provider_full_assignment_lifecycle_smoke() {

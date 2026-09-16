@@ -14,6 +14,10 @@ pub struct GlobalConfigPatch {
     pub task_watchdog: Option<crate::task_service::TaskWatchdogSettings>,
     pub agent_sort: Option<crate::profiles::list_preferences::ListSort>,
     pub session_sort: Option<crate::profiles::list_preferences::ListSort>,
+    pub project_sort: Option<crate::profiles::list_preferences::ListSort>,
+    pub task_sort: Option<crate::profiles::list_preferences::ListSort>,
+    pub job_sort: Option<crate::profiles::list_preferences::ListSort>,
+
     pub session_enabled: Option<bool>,
     pub default_profile: ConfigValueUpdate<String>,
     pub default_profile_direct_launch: Option<bool>,
@@ -67,6 +71,10 @@ pub fn apply_global_config_patch(
     }
     changed |= apply_value_update(&mut config.agent_sort, patch.agent_sort);
     changed |= apply_value_update(&mut config.session_sort, patch.session_sort);
+    changed |= apply_value_update(&mut config.project_sort, patch.project_sort);
+    changed |= apply_value_update(&mut config.task_sort, patch.task_sort);
+    changed |= apply_value_update(&mut config.job_sort, patch.job_sort);
+
     changed |= apply_value_update(&mut config.terminal_truecolor, patch.terminal_truecolor);
     changed |= apply_value_update(&mut config.default_local_host_filter, patch.default_local_host_filter);
     changed |= apply_value_update(&mut config.docker_use_sudo, patch.docker_use_sudo);

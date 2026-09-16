@@ -1706,7 +1706,7 @@ fn task_service_worker_followup_inter_agent_params(
         recipient_metadata,
         other_recipients: Vec::new(),
         content: format!(
-            "Message Type: TASK_SERVICE_REQUEST_CHANGES\nTask name: {recipient_label}\nSender: {TASK_SERVICE_SYSTEM_SENDER}\nAssignment ID: {}\nTask ID: {}\nTask Revision: {}\nAttempt Number: {}\nDecision Reference:\n{}",
+            "Message Type: TASK_SERVICE_REQUEST_CHANGES\nTask name: {recipient_label}\nSender: {TASK_SERVICE_SYSTEM_SENDER}\nAssignment ID: {}\nTask ID: {}\nTask Revision: {}\nAttempt Number: {}\nThis decision concerns the attempt above. If already resubmitted or closed, treat it as history.\nDecision Reference:\n{}",
             metadata.assignment_id.as_str(),
             metadata.task_id.as_str(),
             metadata.task_revision.get(),
@@ -2663,7 +2663,7 @@ mod tests {
         assert_eq!(params.delivery_mode, AgentDeliveryMode::Soon);
         assert_eq!(
             params.content,
-            "Message Type: TASK_SERVICE_REQUEST_CHANGES\nTask name: worker\nSender: cutex-task-service\nAssignment ID: assignment-1\nTask ID: CUTEX-188\nTask Revision: 3\nAttempt Number: 2\nDecision Reference:\nfix the focused regression"
+            "Message Type: TASK_SERVICE_REQUEST_CHANGES\nTask name: worker\nSender: cutex-task-service\nAssignment ID: assignment-1\nTask ID: CUTEX-188\nTask Revision: 3\nAttempt Number: 2\nThis decision concerns the attempt above. If already resubmitted or closed, treat it as history.\nDecision Reference:\nfix the focused regression"
         );
         for forbidden in [
             "notification-1",

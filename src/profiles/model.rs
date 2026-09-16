@@ -243,6 +243,13 @@ pub struct CodezConfig {
     #[serde(default)]
     pub session_sort: super::list_preferences::ListSort,
     #[serde(default)]
+    pub project_sort: super::list_preferences::ListSort,
+    #[serde(default)]
+    pub task_sort: super::list_preferences::ListSort,
+    #[serde(default)]
+    pub job_sort: super::list_preferences::ListSort,
+
+    #[serde(default)]
     #[serde(skip)]
     pub notify_service_url: Option<String>,
     #[serde(default)]
@@ -321,6 +328,10 @@ impl Default for CodezConfig {
             task_watchdog: Default::default(),
             agent_sort: Default::default(),
             session_sort: Default::default(),
+            project_sort: Default::default(),
+            task_sort: Default::default(),
+            job_sort: Default::default(),
+
             notify_service_url: None,
             notify_service_token: None,
             notify_service_idle_timeout_secs: None,

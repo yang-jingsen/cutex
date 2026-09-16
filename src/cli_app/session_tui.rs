@@ -4661,6 +4661,8 @@ pub(crate) fn run() -> anyhow::Result<()> {
     let mut refresh_project_members = false;
     let mut tasks_model = None;
     loop {
+        let [project_sort, task_sort, job_sort] = selector_model.context.global_snapshot.as_ref()
+            .map(GlobalSettingsSnapshot::other_sort_defaults).unwrap_or_default();
         let outcome = match panel {
             PrimaryPanel::Agents | PrimaryPanel::Recent | PrimaryPanel::Settings => {
                 if panel == PrimaryPanel::Settings && !matches!(selector_model.mode, SelectorMode::Settings { target: SelectorTarget::GlobalSettings, .. }) {
@@ -4684,7 +4686,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
                 outcome
             }
             PrimaryPanel::Jobs => {
-                match super::session_tui_jobs::run(shell.terminal(), &mut events)? {
+                match super::session_tui_jobs::run(shell.terminal(), &mut events, job_sort)? {
                     PrimaryPanelOutcome::Exit => return Ok(()),
                     PrimaryPanelOutcome::Switch(next) => { panel = next; continue; }
                 }
@@ -4699,6 +4701,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
                     shell.terminal(),
                     &mut events,
                     projects_model.take(),
+                    project_sort,
                 )?;
                 if std::mem::take(&mut model.open_settings_requested) {
                     selector_command(&mut selector_model, Command::Settings);
@@ -4736,7 +4739,7 @@ pub(crate) fn run() -> anyhow::Result<()> {
             }
             PrimaryPanel::Tasks => {
                 let (outcome, mut model) =
-                    super::session_tui_tasks::run(shell.terminal(), &mut events, tasks_model.take())?;
+                    super::session_tui_tasks::run(shell.terminal(), &mut events, tasks_model.take(), task_sort)?;
                 if std::mem::take(&mut model.open_settings_requested) {
                     selector_command(&mut selector_model, Command::Settings);
                     selector_model.settings_return_panel = Some(PrimaryPanel::Tasks);
@@ -10730,6 +10733,7 @@ mod tests {
                         shell.terminal(),
                         &mut events,
                         projects.take(),
+                        Default::default(),
                     )
                     .unwrap();
                     assert_eq!(outcome, PrimaryPanelOutcome::Switch(PrimaryPanel::Agents));
@@ -16730,7 +16734,7 @@ mod tests {
         for _ in 0..4 { model.handle(SelectorEvent::Down); }
         model.handle(SelectorEvent::OpenActions);
         let screen = rendered_text_at(80, 36, &model);
-        for text in ["Theme colors", "Custom status items", "Fixture Status Name", "#E08EB2"] { assert!(screen.contains(text), "{screen}"); }
+        for text in ["Theme colors", "Custom status items", "#E08EB2"] { assert!(screen.contains(text), "{screen}"); }
         for text in ["DO_NOT_RENDER_DYNAMIC_VALUE", "20 settings", "Categories", "Global settings", "Inspector"] { assert!(!screen.contains(text), "{screen}"); }
         let first = model.active_setting_option().unwrap().label;
         model.handle(SelectorEvent::Down);
@@ -16739,7 +16743,10 @@ mod tests {
             model.handle(SelectorEvent::Down);
         }
         assert_eq!(model.active_setting_option().unwrap().presentation.name.as_deref(), Some("Fixture Status Name"));
-        assert!(rendered_text_at(80, 24, &model).contains("ID: cutex_fixture"));
+        let scrolled = rendered_text_at(80, 24, &model);
+        assert!(scrolled.contains("ID: cutex_fixture"));
+        assert!(scrolled.contains("Fixture Status Name"));
+        assert!(!scrolled.contains("DO_NOT_RENDER_DYNAMIC_VALUE"));
     }
 
     #[test]

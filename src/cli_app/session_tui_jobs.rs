@@ -282,8 +282,10 @@ fn render(frame: &mut ratatui::Frame, model: &mut Model) {
 pub(super) fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     events: &mut ShellEvents,
+    sort_order: cutex::profiles::list_preferences::ListSort,
 ) -> anyhow::Result<PrimaryPanelOutcome> {
     let mut model = Model {
+        sort_order,
         cursors: vec![None],
         ..Default::default()
     };

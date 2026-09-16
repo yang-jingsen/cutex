@@ -641,6 +641,27 @@ mod output_alignment_tests {
         json!({"bytesHex":hex::encode(bytes),"fromOffset":offset,"nextOffset":offset+bytes.len(),"gap":false,"truncated":false})
     }
     #[test]
+    fn tiny_byte_budgets_make_bounded_progress_without_claiming_lossless_text() {
+        let bytes = "中文🦀".as_bytes();
+        for budget in [1, 2] {
+            let mut offset = 0;
+            let mut original = Vec::new();
+            while offset < bytes.len() {
+                let end = (offset + budget).min(bytes.len());
+                let out = readable_output(page(&bytes[offset..end], offset)).unwrap();
+                let next = out["nextOffset"].as_u64().unwrap() as usize;
+                assert!(next > offset && next <= end);
+                assert_eq!(out["encoding"], "utf-8-lossy");
+                assert_eq!(out["text"], String::from_utf8_lossy(&bytes[offset..next]).as_ref());
+                assert!(serde_json::to_vec(&out).unwrap().len() <= 12 * 1024);
+                original.extend_from_slice(&bytes[offset..next]);
+                offset = next;
+            }
+            assert_eq!(original, bytes);
+        }
+    }
+
+    #[test]
     fn text_pages_preserve_unicode_and_bound_escaped_output() {
         for bytes in [
             "中文日志\n".repeat(5000).into_bytes(),

@@ -2475,6 +2475,35 @@ mod tests {
             worker_session.as_str(),
         )
         .unwrap();
+        // Deliver the original decision only after a newer result and closure.
+        let prepared = provider.prepare_worker_action(&worker, &crate::task_service::WorkerPrepareRequest {
+            schema: crate::task_service::WorkerPrepareRequestSchema::V2,
+            action: crate::task_service::WorkerActionRequest::Submit(crate::task_service::SubmitActionRequest {
+                schema: ProviderActionSchema::V2,
+                action_id: ActionId::new("resubmit-before-followup").unwrap(),
+                assignment_id: assignment_id.clone(),
+                result_sha256: sha("revised result"),
+                result_reference: "revised result".into(),
+            }),
+        }).unwrap();
+        let crate::task_service::WorkerPrepareOutcome::Prepared(envelope) = prepared else { panic!("resubmit prepares") };
+        provider.execute_worker_action(&worker, &envelope).unwrap();
+        validate_worker_followup_metadata_with_provider(&provider, &metadata, worker_session.as_str()).unwrap();
+        let context = provider.worker_context(&worker, &crate::task_service::WorkerContextRequest {
+            schema: crate::task_service::WorkerContextRequestSchema::V2,
+            assignment_id: assignment_id.clone(),
+        }).unwrap().context;
+        provider.execute_terminal_action(&authority, &crate::task_service::TerminalActionEnvelope {
+            schema: crate::task_service::TerminalRequestSchema::V2,
+            command: crate::task_service::TerminalAuthorityRequest::AcceptResult(crate::task_service::TerminalActionRequest {
+                schema: ProviderActionSchema::V2,
+                action_id: ActionId::new("accept-before-followup").unwrap(),
+                assignment_id: assignment_id.clone(),
+                decision_reference: Some("accepted revised result".into()),
+            }),
+            context,
+        }).unwrap();
+        let closed_assignment = provider.query().unwrap().assignments[&assignment_id].clone();
         let first = {
             validate_worker_followup_metadata_with_provider(
                 &provider,
@@ -2522,6 +2551,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(first, replay);
+        assert_eq!(provider.query().unwrap().assignments[&assignment_id], closed_assignment);
+
         let final_notification = provider.query().unwrap().worker_followup_notifications
             [&metadata.notification_id]
             .clone();

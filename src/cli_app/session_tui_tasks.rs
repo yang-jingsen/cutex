@@ -577,8 +577,9 @@ pub(super) fn run(
     terminal: &mut TaskTerminal,
     events: &mut super::session_tui::ShellEvents,
     previous_model: Option<TaskModel>,
+    sort_order: cutex::profiles::list_preferences::ListSort,
 ) -> anyhow::Result<(PrimaryPanelOutcome, TaskModel)> {
-    let mut model = previous_model.unwrap_or_default();
+    let mut model = previous_model.unwrap_or_else(|| TaskModel { sort_order, ..Default::default() });
     let outcome = run_loop(terminal, events, &mut model)?;
     Ok((outcome, model))
 }

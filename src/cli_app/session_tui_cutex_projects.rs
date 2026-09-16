@@ -485,6 +485,7 @@ pub(super) fn run(
     terminal: &mut ProjectTerminal,
     events: &mut super::session_tui::ShellEvents,
     previous_model: Option<CutexProjectsModel>,
+    sort_order: cutex::profiles::list_preferences::ListSort,
 ) -> anyhow::Result<(PrimaryPanelOutcome, CutexProjectsModel)> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         anyhow::bail!("Cutex Projects requires an interactive terminal");
@@ -504,6 +505,7 @@ pub(super) fn run(
         model = load_model().unwrap_or_else(|error| {
             CutexProjectsModel::empty_with_failure(format!("Cutex Projects unavailable: {error:#}"))
         });
+        model.sort_order = sort_order;
     } else if model.view == ProjectView::Create {
         // Return from saved-session selection without replacing the draft.
         match model

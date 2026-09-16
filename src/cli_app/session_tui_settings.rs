@@ -859,6 +859,9 @@ pub(super) enum GlobalSettingsField {
     DefaultLocalHostFilter,
     AgentSort,
     SessionSort,
+    ProjectSort,
+    TaskSort,
+    JobSort,
     WatchdogPoll,
     WatchdogStale,
     WatchdogEscalation,
@@ -890,7 +893,7 @@ pub(super) enum GlobalSettingsField {
 impl GlobalSettingsField {
     pub(super) fn editor_kind(self) -> SessionSettingsEditorKind {
         match self {
-            Self::AgentSort | Self::SessionSort | Self::DefaultLocalHostFilter | Self::TerminalColors | Self::DefaultReasoning | Self::DefaultNotification | Self::ManagedSessions
+            Self::AgentSort | Self::SessionSort | Self::ProjectSort | Self::TaskSort | Self::JobSort | Self::DefaultLocalHostFilter | Self::TerminalColors | Self::DefaultReasoning | Self::DefaultNotification | Self::ManagedSessions
             | Self::DockerSudo
             | Self::DefaultProfile
             | Self::DefaultProfileDirectLaunch
@@ -990,6 +993,10 @@ impl GlobalSettingsSnapshot {
     }
 
 
+    pub(super) fn other_sort_defaults(&self) -> [cutex::profiles::list_preferences::ListSort; 3] {
+        [self.config.project_sort, self.config.task_sort, self.config.job_sort]
+    }
+
     pub(super) fn list_sort_defaults(&self) -> (cutex::profiles::list_preferences::ListSort, cutex::profiles::list_preferences::ListSort) {
         (self.config.agent_sort, self.config.session_sort)
     }
@@ -1008,6 +1015,7 @@ impl GlobalSettingsSnapshot {
             GlobalSettingsField::TerminalColors => &[("Auto", Some("auto")), ("TrueColor", Some("truecolor"))][..],
             GlobalSettingsField::DefaultNotification => &[("CIAO!", Some("important")), ("ON", Some("normal")), ("OFF", Some("off"))][..],
             GlobalSettingsField::AgentSort => &[("Panel default", Some("default")), ("Name A–Z", Some("name_asc")), ("Name Z–A", Some("name_desc")), ("Pin first", Some("pinned")), ("Project first", Some("project"))][..],
+            GlobalSettingsField::ProjectSort | GlobalSettingsField::TaskSort | GlobalSettingsField::JobSort => &[("Panel default", Some("default")), ("A–Z", Some("name_asc")), ("Z–A", Some("name_desc"))][..],
             GlobalSettingsField::SessionSort => &[("Panel default", Some("default")), ("Name A–Z", Some("name_asc")), ("Name Z–A", Some("name_desc")), ("Project first", Some("project"))][..],
             GlobalSettingsField::DefaultLocalHostFilter => &[("Local", Some("local")), ("All hosts", Some("all"))][..],
             GlobalSettingsField::ManagedSessions
@@ -1087,6 +1095,15 @@ impl GlobalSettingsSnapshot {
                 let mut sessions = self.editable_option("Session sort", GlobalSettingsField::SessionSort, draft);
                 sessions.presentation.detail = Some("Next launch: Default keeps recency order. Name sorting applies to loaded rows; Alt+L loads more history. Alt+S changes the current list.".into());
                 let mut options = vec![terminal, host, agents, sessions];
+                for (label, field, detail) in [
+                    ("Project sort", GlobalSettingsField::ProjectSort, "Next launch: order Projects by display name. Alt+S changes the current list."),
+                    ("Task sort", GlobalSettingsField::TaskSort, "Next launch: order Tasks by Task ID. Alt+S changes the current list."),
+                    ("Job sort", GlobalSettingsField::JobSort, "Order Jobs by action name within the loaded page. Alt+S changes the current list."),
+                ] {
+                    let mut option = self.editable_option(label, field, draft);
+                    option.presentation.detail = Some(detail.into());
+                    options.push(option);
+                }
                 options.extend(self.appearance_display_options());
                 options
             }),
@@ -1236,6 +1253,10 @@ pub(super) struct GlobalSettingsDraft {
     watchdog_dirty: [bool; 3],
     agent_sort: Option<cutex::profiles::list_preferences::ListSort>,
     session_sort: Option<cutex::profiles::list_preferences::ListSort>,
+    project_sort: Option<cutex::profiles::list_preferences::ListSort>,
+    task_sort: Option<cutex::profiles::list_preferences::ListSort>,
+    job_sort: Option<cutex::profiles::list_preferences::ListSort>,
+
     managed_sessions: Option<bool>,
     docker_sudo: Option<bool>,
     default_profile: ConfigValueUpdate<String>,
@@ -1309,6 +1330,16 @@ impl GlobalSettingsDraft {
                     settings.stale_secs != snapshot.config.task_watchdog.stale_secs,
                     settings.escalation_secs != snapshot.config.task_watchdog.escalation_secs];
                 self.task_watchdog = (settings != snapshot.config.task_watchdog).then_some(settings);
+            }
+            GlobalSettingsField::ProjectSort | GlobalSettingsField::TaskSort | GlobalSettingsField::JobSort => {
+                use cutex::profiles::list_preferences::ListSort;
+                let order = ListSort::parse(value.as_deref().unwrap_or("default"))?;
+                anyhow::ensure!(matches!(order, ListSort::Default | ListSort::NameAsc | ListSort::NameDesc), "Expected default, name_asc or name_desc");
+                match field {
+                    GlobalSettingsField::ProjectSort => self.project_sort = (order != snapshot.config.project_sort).then_some(order),
+                    GlobalSettingsField::TaskSort => self.task_sort = (order != snapshot.config.task_sort).then_some(order),
+                    _ => self.job_sort = (order != snapshot.config.job_sort).then_some(order),
+                }
             }
             GlobalSettingsField::AgentSort | GlobalSettingsField::SessionSort => {
                 let order = cutex::profiles::list_preferences::ListSort::parse(value.as_deref().unwrap_or("default"))?;
@@ -1621,6 +1652,9 @@ impl GlobalSettingsDraft {
             GlobalSettingsField::WatchdogEscalation => self.task_watchdog.as_ref().unwrap_or(&snapshot.config.task_watchdog).escalation_secs.to_string(),
             GlobalSettingsField::AgentSort => self.agent_sort.unwrap_or(snapshot.config.agent_sort).key().into(),
             GlobalSettingsField::SessionSort => self.session_sort.unwrap_or(snapshot.config.session_sort).key().into(),
+            GlobalSettingsField::JobSort => self.job_sort.unwrap_or(snapshot.config.job_sort).key().into(),
+            GlobalSettingsField::TaskSort => self.task_sort.unwrap_or(snapshot.config.task_sort).key().into(),
+            GlobalSettingsField::ProjectSort => self.project_sort.unwrap_or(snapshot.config.project_sort).key().into(),
             GlobalSettingsField::DefaultLocalHostFilter => if self.default_local_host_filter.unwrap_or(snapshot.config.default_local_host_filter) { "local" } else { "all" }.into(),
             GlobalSettingsField::TerminalColors => if self.terminal_truecolor.unwrap_or(snapshot.config.terminal_truecolor) { "truecolor" } else { "auto" }.into(),
             GlobalSettingsField::DefaultNotification => match self.new_session_notification.unwrap_or(snapshot.config.new_session_notification) {
@@ -1801,6 +1835,9 @@ impl GlobalSettingsDraft {
             GlobalSettingsField::WatchdogEscalation => self.watchdog_dirty[2],
             GlobalSettingsField::AgentSort => self.agent_sort.is_some(),
             GlobalSettingsField::SessionSort => self.session_sort.is_some(),
+            GlobalSettingsField::JobSort => self.job_sort.is_some(),
+            GlobalSettingsField::TaskSort => self.task_sort.is_some(),
+            GlobalSettingsField::ProjectSort => self.project_sort.is_some(),
             GlobalSettingsField::DefaultLocalHostFilter => self.default_local_host_filter.is_some(),
             GlobalSettingsField::TerminalColors => self.terminal_truecolor.is_some(),
             GlobalSettingsField::DefaultNotification => self.new_session_notification.is_some(),
@@ -1889,6 +1926,9 @@ impl GlobalSettingsDraft {
             GlobalSettingsField::TerminalColors,
             GlobalSettingsField::DefaultLocalHostFilter,
             GlobalSettingsField::SessionSort,
+            GlobalSettingsField::JobSort,
+            GlobalSettingsField::TaskSort,
+            GlobalSettingsField::ProjectSort,
             GlobalSettingsField::AgentSort,
             GlobalSettingsField::WatchdogEscalation,
             GlobalSettingsField::WatchdogStale,
@@ -1974,6 +2014,9 @@ impl GlobalSettingsDraft {
             terminal_truecolor: self.terminal_truecolor,
             default_local_host_filter: self.default_local_host_filter,
             session_sort: self.session_sort,
+            job_sort: self.job_sort,
+            task_sort: self.task_sort,
+            project_sort: self.project_sort,
             agent_sort: self.agent_sort,
             task_watchdog: self.task_watchdog.clone(),
             session_enabled: self.managed_sessions,
@@ -2182,6 +2225,26 @@ mod tests {
     use cutex::agent_bus::model::AgentRegistrationClass;
     use cutex::profiles::model::ProxyConfig;
     use cutex::session::model::{CutexSessionQuickActionMode, CutexSessionRuntimeBackend};
+
+    #[test]
+    fn other_panel_sort_defaults_survive_save_and_reload() {
+        use cutex::profiles::list_preferences::ListSort;
+        let mut config = CodezConfig::default();
+        let snapshot = GlobalSettingsSnapshot::from_config(&config);
+        let mut draft = GlobalSettingsDraft::default();
+        for field in [GlobalSettingsField::ProjectSort, GlobalSettingsField::TaskSort, GlobalSettingsField::JobSort] {
+            draft.stage(&snapshot, field, Some("name_desc".into())).unwrap();
+            assert!(draft.stage(&snapshot, field, Some("pinned".into())).is_err());
+        }
+        let patch = draft.patch(&config).unwrap();
+        cutex::config::global_settings::apply_global_config_patch(&mut config, &patch).unwrap();
+        let restored: CodezConfig = serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert_eq!(GlobalSettingsSnapshot::from_config(&restored).other_sort_defaults(), [ListSort::NameDesc; 3]);
+        for field in [GlobalSettingsField::ProjectSort, GlobalSettingsField::TaskSort, GlobalSettingsField::JobSort] {
+            draft.stage(&snapshot, field, Some("default".into())).unwrap();
+        }
+        assert!(draft.project_sort.is_none() && draft.task_sort.is_none() && draft.job_sort.is_none());
+    }
 
     fn flattened(categories: &[SessionTuiSettingCategory]) -> String {
         categories
@@ -2852,7 +2915,7 @@ mod tests {
                 .flat_map(|category| category.options.iter())
                 .filter(|option| option.global_field.is_some())
                 .count(),
-            17
+            20
         );
     }
 
