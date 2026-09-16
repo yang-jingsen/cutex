@@ -18,7 +18,6 @@ use tui_input::Input;
 pub(super) enum Outcome {
     Back,
     Exit,
-    Foreground(Connection, String),
 }
 pub(super) fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -38,7 +37,7 @@ pub(super) fn run_selected(terminal:&mut Terminal<CrosstermBackend<Stdout>>,even
     let mut next = None;
     let mut due = true;
     let mut loading = false;
-    let mut notice = String::new();
+    let mut notice = remote_sessions::ssh_hint(&c);
     let mut close_confirm = false;
     let mut detail=false;let mut scroll=0u16;
     let mut refresh_at=std::time::Instant::now();
@@ -92,10 +91,10 @@ pub(super) fn run_selected(terminal:&mut Terminal<CrosstermBackend<Stdout>>,even
    let table=Table::new(rows.iter().map(|r|Row::new(vec![Cell::from(r.name.clone()),Cell::from(r.state.clone()).style(Style::default().fg(match r.state.as_str(){"Online"=>theme::accent(),"Unobserved"=>theme::focus(),_=>theme::text()})),Cell::from(r.kind.clone())])),[Constraint::Min(18),Constraint::Length(12),Constraint::Length(8)])
     .header(Row::new(["NAME","STATUS","KIND"]).style(Style::default().fg(theme::muted()))).block(Block::bordered().title(" Sessions ")).row_highlight_style(Style::default().bg(theme::selection())).highlight_symbol("> ");
    f.render_stateful_widget(table,l[1],&mut TableState::default().with_selected((!rows.is_empty()).then_some(selected)));
-   if let Some(right)=right.or_else(||detail.then_some(areas[1])){let detail=rows.get(selected).map(|r|vec![Line::from(r.name.clone()),Line::from(format!("Host: {} ({})",c.name,r.host_id)),Line::from(format!("ID: {}",r.id)),Line::from(format!("Native: {}",r.native_id.as_deref().unwrap_or("N/A"))),Line::from(format!("Profile: {}",r.profile.as_deref().unwrap_or("N/A"))),Line::from(format!("Generation: {}",r.generation)),Line::from(format!("Directory: {}",r.cwd)),Line::from(""),Line::from("Enter opens this host's frontend over SSH. X closes only its runtime; history is retained.")]).unwrap_or_default();f.render_widget(Paragraph::new(detail).wrap(Wrap{trim:false}).scroll((scroll,0)).block(Block::bordered().title(" Details ")),right);}
+   if let Some(right)=right.or_else(||detail.then_some(areas[1])){let detail=rows.get(selected).map(|r|vec![Line::from(r.name.clone()),Line::from(format!("Host: {} ({})",c.name,r.host_id)),Line::from(format!("ID: {}",r.id)),Line::from(format!("Native: {}",r.native_id.as_deref().unwrap_or("N/A"))),Line::from(format!("Profile: {}",r.profile.as_deref().unwrap_or("N/A"))),Line::from(format!("Generation: {}",r.generation)),Line::from(format!("Directory: {}",r.cwd)),Line::from(""),Line::from(remote_sessions::ssh_hint(&c)),Line::from("X closes only the remote runtime; history is retained.")]).unwrap_or_default();f.render_widget(Paragraph::new(detail).wrap(Wrap{trim:false}).scroll((scroll,0)).block(Block::bordered().title(" Details ")),right);}
    let status=if close_confirm{"Close selected remote runtime? Y confirms · Esc cancels".into()}else if loading{"Request running…".into()}else if !notice.is_empty(){notice.clone()}else{format!("Page {} · {} records · {}",cursors.len(),rows.len(),c.host_id)};
    f.render_widget(Paragraph::new(status).wrap(Wrap{trim:false}),areas[2]);
-   let hints=if filtering{vec![("Enter","apply"),("Esc","cancel filter")]}else{vec![("↑/↓","select"),("Enter","foreground"),("I","details"),("O","online"),("X","close"),("/","filter"),("N/P","pages"),("R","refresh"),("Esc","back")]};
+   let hints=if filtering{vec![("Enter","apply"),("Esc","cancel filter")]}else{vec![("↑/↓","select"),("Enter","SSH help"),("I","details"),("X","close"),("/","filter"),("N/P","pages"),("R","refresh"),("Esc","back")]};
    f.render_widget(Paragraph::new(Line::from(super::session_tui::footer_hints(&hints))).wrap(Wrap{trim:true}),areas[3]);
   })?;
         let Some(event) = events.next()? else {
@@ -165,20 +164,8 @@ pub(super) fn run_selected(terminal:&mut Terminal<CrosstermBackend<Stdout>>,even
             KeyCode::Down if detail=>scroll=scroll.saturating_add(1).min(2048),
             KeyCode::Up => selected = selected.saturating_sub(1),
             KeyCode::Down => selected = (selected + 1).min(rows.len().saturating_sub(1)),
-            KeyCode::Enter if !loading && !rows.is_empty() => {
-                return Ok(Outcome::Foreground(c.clone(), rows[selected].id.clone()))
-            }
-            KeyCode::Char('o' | 'O') if !loading && !rows.is_empty() => {
-                let id = rows[selected].id.clone();
-                let c = c.clone();
-                let tx = tx.clone();
-                loading = true;
-                std::thread::spawn(move || {
-                    let _ = tx.send((
-                        false,
-                        remote_sessions::lifecycle(&c, &id, false).map_err(|e| format!("{e:#}")),
-                    ));
-                });
+            KeyCode::Enter | KeyCode::Char('o' | 'O') if !rows.is_empty() => {
+                notice = remote_sessions::ssh_hint(&c);
             }
             KeyCode::Char('x' | 'X') if !loading && !rows.is_empty() => close_confirm = true,
             KeyCode::Char('r' | 'R') => {

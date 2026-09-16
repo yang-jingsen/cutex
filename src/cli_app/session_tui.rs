@@ -386,7 +386,6 @@ enum SelectorControl {
     AdoptRecent(RecentAdoptionRequest),
     OpenProfileManager,
     OpenHosts,
-    RemoteForeground(cutex::management::connections::Connection,String),
     RemoteBrowse(cutex::management::connections::Connection,String),
     OpenCutexProjects,
     OpenProjects,
@@ -484,7 +483,6 @@ struct ProfileManagerStartup {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SessionTuiCycleOutcome {
-    RemoteForeground(cutex::management::connections::Connection,String),
     NewSession,
     NewAgent,
     NativeResume {
@@ -4725,11 +4723,6 @@ pub(crate) fn run() -> anyhow::Result<()> {
             }
         };
         match outcome {
-            SessionTuiCycleOutcome::RemoteForeground(connection,id) => {
-                let result=shell.handoff(||super::remote_sessions::foreground(&connection,&id))?;
-                match result {Ok(status)=>selector_model.notice=Some(format!("Remote frontend returned ({status})")),Err(error)=>selector_model.warning=Some(format!("Remote frontend: {error:#}"))};
-                // Preserve the page and selection from which foreground was opened.
-            }
             SessionTuiCycleOutcome::NewSession => {
                 match shell.handoff(|| -> anyhow::Result<std::process::ExitStatus> {
                     Ok(std::process::Command::new(std::env::current_exe()?)
@@ -6418,7 +6411,7 @@ fn route_selector_key(model: &mut SelectorModel, key: KeyEvent) -> SelectorKeyRo
         }
     }
     if key.code==KeyCode::Enter && !(matches!(model.mode,SelectorMode::Agents) && model.filter_focused) && !(matches!(model.mode,SelectorMode::RecentSessions) && model.recent.filter_focused()) && !selector_modal(model) {
-        if let Some(e)=remote_projection::selected(model) {return SelectorKeyRoute::Control(Some(SelectorControl::RemoteForeground(e.connection,e.session.id)));}
+        if let Some(e)=remote_projection::selected(model) {return SelectorKeyRoute::Control(Some(SelectorControl::RemoteBrowse(e.connection,e.session.id)));}
     }
     // Editors consume plain text and cursor keys, not page/exit commands.
     if let Some(input) = selector_input(model) {
@@ -6856,13 +6849,11 @@ fn run_event_loop(
                                 Err(error) => model.recent_adoption_failed(format!("{error:#}")),
                             }
                         }
-                        SelectorControl::RemoteForeground(c,id)=>return Ok(SessionTuiCycleOutcome::RemoteForeground(c,id)),
-                        SelectorControl::RemoteBrowse(c,id)=>{match super::session_tui_remote::run_selected(terminal,events,c,Some(id))? {super::session_tui_remote::Outcome::Foreground(c,id)=>return Ok(SessionTuiCycleOutcome::RemoteForeground(c,id)),super::session_tui_remote::Outcome::Exit=>return Ok(SessionTuiCycleOutcome::Exit),_=>{}}},
+                        SelectorControl::RemoteBrowse(c,id)=>{match super::session_tui_remote::run_selected(terminal,events,c,Some(id))? {super::session_tui_remote::Outcome::Exit=>return Ok(SessionTuiCycleOutcome::Exit),_=>{}}},
                         SelectorControl::OpenHosts => {
                             match super::session_tui_hosts::run(terminal, events) {
                                 Ok(super::session_tui_remote::Outcome::Exit) => return Ok(SessionTuiCycleOutcome::Exit),
                                 Ok(super::session_tui_remote::Outcome::Back) => {},
-                                Ok(super::session_tui_remote::Outcome::Foreground(c,id)) => return Ok(SessionTuiCycleOutcome::RemoteForeground(c,id)),
                                 Err(error) => model.notice = Some(format!("Hosts: {error:#}")),
                             }
                         }
@@ -7831,9 +7822,9 @@ fn render_recent_context(frame: &mut Frame<'_>, area: Rect, model: &SelectorMode
         RecentLoadState::Ready => format!(
             "Native threads, newest first  {}",
             if model.recent.next_cursor().is_some() {
-                "more available"
+                "search loaded history · Alt+L load more"
             } else {
-                "end of catalog"
+                "all history loaded"
             }
         ),
         RecentLoadState::Empty => {

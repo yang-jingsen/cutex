@@ -272,7 +272,7 @@ mod tests {
         m.remote_entries = vec![e.clone()];
         assert!(m.selected_row().unwrap().target.agent_key().is_none());
         assert!(
-            matches!(route_selector_key(&mut m,KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE)),SelectorKeyRoute::Control(Some(SelectorControl::RemoteForeground(_,id))) if id==e.session.id)
+            matches!(route_selector_key(&mut m,KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE)),SelectorKeyRoute::Control(Some(SelectorControl::RemoteBrowse(_,id))) if id==e.session.id)
         );
         assert!(
             matches!(selector_command(&mut m,Command::Actions),SelectorKeyRoute::Control(Some(SelectorControl::RemoteBrowse(_,id))) if id==e.session.id)
@@ -290,7 +290,7 @@ mod tests {
         m.remote_entries = vec![e.clone()];
         m.recent.replace_remote(vec![e.recent_row()]);
         assert!(
-            matches!(route_selector_key(&mut m,KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE)),SelectorKeyRoute::Control(Some(SelectorControl::RemoteForeground(_,id))) if id==e.session.id)
+            matches!(route_selector_key(&mut m,KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE)),SelectorKeyRoute::Control(Some(SelectorControl::RemoteBrowse(_,id))) if id==e.session.id)
         );
         assert!(matches!(
             selector_command(&mut m, Command::Actions),

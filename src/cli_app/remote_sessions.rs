@@ -116,6 +116,12 @@ fn command(platform: &str, exe: &str, id: &str) -> anyhow::Result<String> {
         anyhow::bail!("Unsupported remote platform {platform}")
     }
 }
+/// A display-only handoff; TUI navigation never starts SSH or a remote runtime.
+pub(super) fn ssh_hint(c: &Connection) -> String {
+    let target = if cfg!(windows) { ps(&c.ssh_target) } else { posix(&c.ssh_target) };
+    format!("Connect: ssh -- {target}\nThen run cutex on {} to start or enter this session.", c.name)
+}
+
 pub(super) fn foreground(c: &Connection, id: &str) -> anyhow::Result<std::process::ExitStatus> {
     let current=connection(&c.id)?;
     ensure!(current.enabled && current.host_id.eq_ignore_ascii_case(&c.host_id),"Connection disabled or host changed; refresh before retrying");

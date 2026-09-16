@@ -688,6 +688,8 @@ impl RecentSessionsWorkspace {
                 let matches = query.is_empty()
                     || row.title.to_lowercase().contains(&query)
                     || row.thread_id.to_lowercase().contains(&query)
+                    || row.owned_runtime_id.as_deref().is_some_and(|id| id.to_lowercase().contains(&query))
+                    || matches!(&row.view.subject, SubjectRef::Managed(id) if id.to_lowercase().contains(&query))
                     || row.managed_name.as_deref().is_some_and(|name|name.to_lowercase().contains(&query));
                 matches.then_some(index)
             })
@@ -1048,6 +1050,14 @@ mod tests {
         workspace.reproject(&store);
         assert_eq!(workspace.rows[0].view.configured_profile.as_deref(), Some("test-profile"));
         assert_eq!(workspace.rows[0].view.runtime.known().map(String::as_str), Some("Offline"));
+        // The ordinary owner ID is distinct from the native thread ID and display name.
+        for query in [record.cutex_session_id.clone(), record.cutex_session_id.to_uppercase()] {
+            workspace.clear_filter();
+            for c in query.chars() { workspace.push_filter(c); }
+            assert_eq!(workspace.visible_rows().len(), 1);
+            assert_eq!(workspace.visible_rows()[0].owned_runtime_id.as_deref(), Some(record.cutex_session_id.as_str()));
+        }
+
     }
 
     use super::*;
@@ -1213,6 +1223,20 @@ mod tests {
             workspace.push_filter(character);
         }
         assert!(!workspace.begin_review());
+    }
+
+    #[test]
+    fn recent_search_matches_managed_identity_independently_of_native_id() {
+        let store = store_with("native-thread", true, false);
+        let mut workspace = RecentSessionsWorkspace::default();
+        workspace.receive(CatalogReply::Page { cursor: None, result: Ok(ThreadPage {
+            data: vec![thread("native-thread", "other-session", 1)],
+            next_cursor: Some("next".into()), backwards_cursor: None,
+        })}, &store);
+        for c in "cutex-test".chars() { workspace.push_filter(c); }
+        assert_eq!(workspace.visible_rows().len(), 1);
+        assert_eq!(workspace.visible_rows()[0].thread_id, "native-thread");
+        assert_eq!(workspace.next_cursor().as_deref(), Some("next"));
     }
 
     #[test]
