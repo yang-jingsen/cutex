@@ -790,6 +790,7 @@ struct SelectorModel {
     inspector_visible: bool,
     filter_focused: bool,
     facets: super::session_tui_filters::Facets,
+    sort_order: cutex::profiles::list_preferences::ListSort,
     help: Option<Help>,
     leave_review: Option<LeaveReview>,
     rows: Vec<SelectorRow>,
@@ -847,6 +848,8 @@ impl SelectorModel {
         }
         let mut recent = RecentSessionsWorkspace::default();
         recent.facets = initial_facets.clone();
+        let (agent_sort, session_sort) = context.global_snapshot.as_ref().map(GlobalSettingsSnapshot::list_sort_defaults).unwrap_or_default();
+        recent.sort_order = session_sort;
         let mut model = Self {
             details: None,
             status_scroll: Default::default(),
@@ -859,6 +862,7 @@ impl SelectorModel {
             inspector_visible: true,
             filter_focused: false,
             facets: initial_facets,
+            sort_order: agent_sort,
             help: None,
             leave_review: None,
             rows,
@@ -1084,7 +1088,7 @@ impl SelectorModel {
 
     fn visible_indices(&self) -> Vec<usize> {
         let query = self.query.value().to_lowercase();
-        self.rows
+        let mut indices: Vec<usize> = self.rows
             .iter()
             .enumerate()
             .filter_map(|(index, row)| {
@@ -1097,7 +1101,21 @@ impl SelectorModel {
                     && (query.is_empty() || selector_row_matches_query(row, &query)))
                 .then_some(index)
             })
-            .collect()
+            .collect();
+        use cutex::profiles::list_preferences::{ListSort, compare_projects};
+        if self.sort_order != ListSort::Default {
+            indices.sort_by(|a, b| {
+                let left = &self.rows[*a]; let right = &self.rows[*b];
+                let groups = match self.sort_order {
+                    ListSort::Pinned => right.pinned.cmp(&left.pinned),
+                    ListSort::Project => compare_projects(left.project.as_ref().map(|p| p.display_name.as_str()), right.project.as_ref().map(|p| p.display_name.as_str())),
+                    _ => std::cmp::Ordering::Equal,
+                };
+                groups.then_with(|| self.sort_order.compare_names(&left.agent, &right.agent))
+                    .then_with(|| left.target.agent_key().cmp(&right.target.agent_key()))
+            });
+        }
+        indices
     }
 
     fn visible_rows(&self) -> Vec<&SelectorRow> {
@@ -5982,6 +6000,7 @@ fn selector_commands(model: &SelectorModel) -> Vec<(Command, Option<&'static str
                 Command::NewProject | Command::NewManagedAgent
                     if !matches!(model.mode, SelectorMode::Agents | SelectorMode::RecentSessions) =>
                     Some("Available on Agents / Sessions"),
+                Command::Sort if !matches!(model.mode, SelectorMode::Agents | SelectorMode::RecentSessions) => Some("Available on Agents / Sessions"),
                 Command::Scope if !matches!(model.mode, SelectorMode::Agents) => {
                     Some("Available on Managed")
                 }
@@ -6161,6 +6180,13 @@ fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyR
         Command::Refresh if matches!(model.mode, SelectorMode::RetiredSessions { .. }) =>
             SelectorKeyRoute::Control(Some(SelectorControl::OpenRetiredSessions)),
         Command::Refresh => SelectorKeyRoute::Refresh,
+        Command::Sort => {
+            let order = if matches!(model.mode, SelectorMode::RecentSessions) { &mut model.recent.sort_order } else { &mut model.sort_order };
+            *order = order.next();
+            if matches!(model.mode, SelectorMode::RecentSessions) && *order == cutex::profiles::list_preferences::ListSort::Pinned { *order = order.next(); }
+            model.notice = Some(format!("Sort: {} · Settings controls the next-launch default", order.label()));
+            SelectorKeyRoute::Control(None)
+        }
         Command::Scope => {
             model.managed_scope = (model.managed_scope + 1) % 3;
             if model.selected_visible_index().is_none() {
@@ -7687,6 +7713,10 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
                 Style::new().fg(Color::DarkGray),
             ));
         }
+    }
+    if matches!(model.mode, SelectorMode::Agents | SelectorMode::RecentSessions) {
+        let order = if matches!(model.mode, SelectorMode::Agents) {model.sort_order} else {model.recent.sort_order};
+        spans.push(Span::styled(format!("  Sort: {} · Alt+S", order.label()), Style::new().fg(crate::cli_app::session_tui_layout::focus())));
     }
     if let Some(settings_view) = model.settings_view() {
         let global = matches!(model.mode, SelectorMode::Settings { target: SelectorTarget::GlobalSettings, .. });
@@ -9786,13 +9816,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel) {
             Line::from(footer_hints(&[
                 ("↑/↓", "select"), ("Enter", "open"), ("Alt+I", "inspect"),
                 ("Alt+M", "agent"), ("Alt+N", "session"), ("←/→", "panels"),
-                ("/", "filter"), ("F1", "help"), ("Esc", "back"),
+                ("/", "filter"), ("Alt+S", "sort"), ("F1", "help"), ("Esc", "back"),
             ]))
         } else {
             Line::from(footer_hints(&[
                 ("↑/↓", "select"), ("Enter", "open"), ("Alt+I", "inspect"), ("Alt+A", "actions"), ("Alt+E", "edit"),
                 ("Alt+M", "new agent"), ("Alt+N", "new session"),
-                ("←/→", "panels"), ("/", "filter"),
+                ("←/→", "panels"), ("/", "filter"), ("Alt+S", "sort"),
                 ("F5", "refresh"), ("F2", "details"), ("F1", "commands"), ("Esc", "back"),
             ]))
         };
@@ -16619,6 +16649,46 @@ mod tests {
     }
 
     #[test]
+    fn agent_sort_preserves_selection_and_supports_pin_and_project_groups() {
+        use cutex::profiles::list_preferences::ListSort;
+        let mut config = CodezConfig::default();
+        config.agent_sort = ListSort::NameAsc;
+        let mut zulu = row("id-z", "Zulu", CutexSessionLifecycleState::Offline, true, true);
+        zulu.project = Some(SelectorProjectContext { agent_name: "Zulu".into(), project_id: "p-z".into(), display_name: "Project Z".into(), badge_label: "PZ".into(), color: ProjectPaletteColor::Cyan });
+        let mut model = SelectorModel::new(vec![global_settings_row(&config), zulu,
+            row("id-a", "alpha", CutexSessionLifecycleState::Offline, false, true),
+            row("id-b", "Beta", CutexSessionLifecycleState::Online, false, true)], false, false);
+        assert_eq!(model.visible_rows().iter().map(|r| r.agent.as_str()).collect::<Vec<_>>(), ["alpha", "Beta", "Zulu"]);
+        model.workspace_selection.select(Some(SelectorTarget::Agent("id-a".into())));
+        selector_command(&mut model, Command::Sort);
+        assert_eq!(model.visible_rows().iter().map(|r| r.agent.as_str()).collect::<Vec<_>>(), ["Zulu", "Beta", "alpha"]);
+        assert_eq!(model.selected_managed_agent().unwrap().target.agent_key(), Some("id-a"));
+        model.sort_order = ListSort::NameAsc;
+        model.sort_order = ListSort::Pinned;
+        assert_eq!(model.visible_rows()[0].agent, "Zulu");
+        model.sort_order = ListSort::Project;
+        assert_eq!(model.visible_rows().iter().map(|r| r.agent.as_str()).collect::<Vec<_>>(), ["Zulu", "alpha", "Beta"]);
+        model.query = Input::new("alpha".into());
+        assert_eq!(model.visible_rows().len(), 1);
+        assert_eq!(model.visible_rows()[0].agent, "alpha");
+    }
+
+    #[test]
+    fn sort_and_watchdog_settings_render_as_editable_rows() {
+        let mut model = SelectorModel::new(vec![global_row()], false, false);
+        selector_command(&mut model, Command::Settings);
+        for _ in 0..4 { model.handle(SelectorEvent::Down); }
+        model.handle(SelectorEvent::OpenActions);
+        for width in [80, 120, 180] {
+            let appearance = rendered_text_at(width, 36, &model);
+            for label in ["Agent sort", "Session sort"] { assert!(appearance.contains(label), "{appearance}"); }
+        }
+        if let SelectorMode::Settings {category, option, focus, ..} = &mut model.mode { *category=5; *option=0; *focus=SettingsFocus::Options; }
+        let watchdog = rendered_text_at(140, 32, &model);
+        for label in ["Task Watchdog", "Check interval", "Remind after", "Escalate after", "600", "restart"] { assert!(watchdog.contains(label), "{watchdog}"); }
+    }
+
+    #[test]
     fn local_host_default_applies_to_both_lists_only_on_open() {
         let mut config = CodezConfig::default();
         config.default_local_host_filter = true;
@@ -16641,7 +16711,8 @@ mod tests {
         for _ in 0..4 { model.handle(SelectorEvent::Down); }
         for focused in [false, true] {
             if focused { model.handle(SelectorEvent::OpenActions); }
-            if let SelectorMode::Settings { option, .. } = &mut model.mode { *option = 2; }
+            let swatch_index = model.active_setting_category().unwrap().options.iter().position(|o| o.presentation.swatch.is_some()).unwrap();
+            if let SelectorMode::Settings { option, .. } = &mut model.mode { *option = swatch_index; }
             for width in [80, 120, 160] {
                 let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 24)).unwrap();
                 terminal.draw(|frame| render_categorized_settings(frame, frame.area(), &model)).unwrap();

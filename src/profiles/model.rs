@@ -237,6 +237,12 @@ pub struct CodezConfig {
     #[serde(default)]
     pub default_local_host_filter: bool,
     #[serde(default)]
+    pub task_watchdog: crate::task_service::TaskWatchdogSettings,
+    #[serde(default)]
+    pub agent_sort: super::list_preferences::ListSort,
+    #[serde(default)]
+    pub session_sort: super::list_preferences::ListSort,
+    #[serde(default)]
     #[serde(skip)]
     pub notify_service_url: Option<String>,
     #[serde(default)]
@@ -312,6 +318,9 @@ impl Default for CodezConfig {
             new_session_notification: Default::default(),
             terminal_truecolor: false,
             default_local_host_filter: false,
+            task_watchdog: Default::default(),
+            agent_sort: Default::default(),
+            session_sort: Default::default(),
             notify_service_url: None,
             notify_service_token: None,
             notify_service_idle_timeout_secs: None,

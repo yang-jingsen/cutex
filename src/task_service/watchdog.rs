@@ -63,22 +63,31 @@ impl Default for TaskWatchdogConfig {
 
 impl TaskWatchdogConfig {
     pub fn from_env() -> anyhow::Result<Self> {
+        let settings = crate::config::store::load_codez_config_checked()?.task_watchdog;
+        Self::from_settings(&settings, |name| std::env::var_os(name))
+    }
+
+    fn from_settings(settings: &super::TaskWatchdogSettings, lookup: impl Fn(&str) -> Option<std::ffi::OsString>) -> anyhow::Result<Self> {
+        settings.validate()?;
         Ok(Self {
             poll_interval: Duration::from_secs(env_seconds(
                 "CUTEX_TASK_WATCHDOG_POLL_SECS",
-                DEFAULT_POLL_SECS,
+                lookup("CUTEX_TASK_WATCHDOG_POLL_SECS"),
+                settings.poll_secs,
                 MIN_POLL_SECS,
                 MAX_POLL_SECS,
             )?),
             first_stale_threshold: Duration::from_secs(env_seconds(
                 "CUTEX_TASK_WATCHDOG_STALE_SECS",
-                DEFAULT_STALE_SECS,
+                lookup("CUTEX_TASK_WATCHDOG_STALE_SECS"),
+                settings.stale_secs,
                 MIN_STAGE_SECS,
                 MAX_STAGE_SECS,
             )?),
             director_escalation_interval: Duration::from_secs(env_seconds(
                 "CUTEX_TASK_WATCHDOG_ESCALATION_SECS",
-                DEFAULT_ESCALATION_SECS,
+                lookup("CUTEX_TASK_WATCHDOG_ESCALATION_SECS"),
+                settings.escalation_secs,
                 MIN_STAGE_SECS,
                 MAX_STAGE_SECS,
             )?),
@@ -95,8 +104,8 @@ impl TaskWatchdogConfig {
     }
 }
 
-fn env_seconds(name: &str, default: u64, minimum: u64, maximum: u64) -> anyhow::Result<u64> {
-    let Some(value) = std::env::var_os(name) else {
+fn env_seconds(name: &str, value: Option<std::ffi::OsString>, default: u64, minimum: u64, maximum: u64) -> anyhow::Result<u64> {
+    let Some(value) = value else {
         return Ok(default);
     };
     let value = value
@@ -1015,6 +1024,18 @@ mod tests {
         WorkflowId,
     };
     use std::sync::RwLock;
+
+    #[test]
+    fn saved_watchdog_settings_and_environment_precedence() {
+        let settings = super::super::TaskWatchdogSettings { poll_secs: 15, stale_secs: 120, escalation_secs: 180 };
+        let saved = TaskWatchdogConfig::from_settings(&settings, |_| None).unwrap();
+        assert_eq!(saved, TaskWatchdogConfig { poll_interval: Duration::from_secs(15), first_stale_threshold: Duration::from_secs(120), director_escalation_interval: Duration::from_secs(180) });
+        let overridden = TaskWatchdogConfig::from_settings(&settings, |key| (key == "CUTEX_TASK_WATCHDOG_POLL_SECS").then(|| "30".into())).unwrap();
+        assert_eq!(overridden, TaskWatchdogConfig { poll_interval: Duration::from_secs(30), ..saved });
+        assert!(TaskWatchdogConfig::from_settings(&settings, |_| Some("0".into())).is_err());
+        let invalid = super::super::TaskWatchdogSettings { poll_secs: 0, ..settings };
+        assert!(TaskWatchdogConfig::from_settings(&invalid, |_| None).is_err());
+    }
 
     #[test]
     fn config_defaults_are_conservative() {

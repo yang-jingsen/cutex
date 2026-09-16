@@ -1313,7 +1313,7 @@ fn project_commands(model: &CutexProjectsModel) -> Vec<(Command, Option<&'static
                 {
                     Some("Finish the current editor/review")
                 }
-                Command::LoadMore | Command::Titles | Command::Scope => {
+                Command::Sort | Command::LoadMore | Command::Titles | Command::Scope => {
                     Some("Available on Recent / Managed")
                 }
                 Command::Actions | Command::Edit | Command::Inspect

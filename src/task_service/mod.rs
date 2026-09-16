@@ -17,6 +17,8 @@ mod persist;
 mod provider;
 mod store;
 mod watchdog;
+mod watchdog_settings;
+pub use watchdog_settings::TaskWatchdogSettings;
 
 pub(crate) use digest::canonical_command_digest;
 pub use director_transport::*;

@@ -154,6 +154,7 @@ pub(super) enum Command {
     NewManagedAgent,
     LoadMore,
     Scope,
+    Sort,
     Titles,
     Refresh,
     Exit,
@@ -241,6 +242,7 @@ pub(super) const BINDINGS: &[Binding] = &[
         "Managed scope: All / Online / Pinned",
         "Alt+O",
     ),
+    alt(Command::Sort, 's', "Cycle list sort", "Alt+S"),
     alt(Command::Titles, 'v', "Toggle thread titles", "Alt+V"),
     Binding {
         command: Command::Refresh,

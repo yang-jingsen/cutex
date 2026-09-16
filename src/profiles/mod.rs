@@ -13,3 +13,5 @@ pub mod references;
 pub mod store;
 
 pub mod model_discovery;
+
+pub mod list_preferences;

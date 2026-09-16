@@ -291,6 +291,7 @@ pub(super) struct RecentSessionsWorkspace {
     query: tui_input::Input,
     filter_focused: bool,
     pub(super) facets: super::session_tui_filters::Facets,
+    pub(super) sort_order: cutex::profiles::list_preferences::ListSort,
 }
 
 impl Default for RecentSessionsWorkspace {
@@ -306,6 +307,7 @@ impl Default for RecentSessionsWorkspace {
             query: tui_input::Input::default(),
             filter_focused: false,
             facets: Default::default(),
+            sort_order: Default::default(),
         }
     }
 }
@@ -678,7 +680,7 @@ impl RecentSessionsWorkspace {
 
     fn visible_indices(&self) -> Vec<usize> {
         let query = self.query.value().trim().to_lowercase();
-        self.rows
+        let mut indices: Vec<usize> = self.rows
             .iter()
             .enumerate()
             .filter_map(|(index, row)| {
@@ -693,7 +695,18 @@ impl RecentSessionsWorkspace {
                     || row.managed_name.as_deref().is_some_and(|name|name.to_lowercase().contains(&query));
                 matches.then_some(index)
             })
-            .collect()
+            .collect();
+        use cutex::profiles::list_preferences::{ListSort, compare_projects};
+        indices.sort_by(|a,b| {
+            let left = &self.rows[*a]; let right = &self.rows[*b];
+            match self.sort_order {
+                ListSort::Default | ListSort::Pinned => right.recency_at.cmp(&left.recency_at).then_with(|| left.thread_id.cmp(&right.thread_id)),
+                ListSort::NameAsc | ListSort::NameDesc => self.sort_order.compare_names(&left.view.name, &right.view.name).then_with(|| left.thread_id.cmp(&right.thread_id)),
+                ListSort::Project => compare_projects(left.view.project_id.as_deref().map(|id| left.view.project.known().map(String::as_str).unwrap_or(id)), right.view.project_id.as_deref().map(|id| right.view.project.known().map(String::as_str).unwrap_or(id)))
+                    .then_with(|| self.sort_order.compare_names(&left.view.name, &right.view.name)).then_with(|| left.thread_id.cmp(&right.thread_id)),
+            }
+        });
+        indices
     }
 
     fn normalize_visible_selection(&mut self) {
@@ -1104,6 +1117,27 @@ mod tests {
         }
         store.sessions.insert("cutex-test".to_string(), record);
         store
+    }
+
+    #[test]
+    fn session_sort_is_stable_across_loaded_pages_and_keeps_selected_identity() {
+        use cutex::profiles::list_preferences::ListSort;
+        let mut workspace = RecentSessionsWorkspace::default();
+        let mut first = thread("thread-z", "tree-z", 20); first.name = Some("Zulu".into());
+        let mut second = thread("thread-a", "tree-a", 10); second.name = Some("alpha".into());
+        workspace.receive(CatalogReply::Page { cursor: None, result: Ok(ThreadPage { data: vec![first, second], next_cursor: Some("next".into()), backwards_cursor: None }) }, &CutexSessionStore::default());
+        let selected = workspace.selected_row().unwrap().thread_id.clone();
+        workspace.sort_order = ListSort::NameAsc;
+        assert_eq!(workspace.visible_rows().iter().map(|r|r.thread_id.as_str()).collect::<Vec<_>>(), ["thread-a", "thread-z"]);
+        assert_eq!(workspace.selected_row().unwrap().thread_id, selected);
+        let mut third = thread("thread-b", "tree-b", 5); third.name = Some("Beta".into());
+        workspace.receive(CatalogReply::Page { cursor: Some("next".into()), result: Ok(ThreadPage { data: vec![third], next_cursor: None, backwards_cursor: None }) }, &CutexSessionStore::default());
+        assert_eq!(workspace.visible_rows().iter().map(|r|r.thread_id.as_str()).collect::<Vec<_>>(), ["thread-a", "thread-b", "thread-z"]);
+        assert_eq!(workspace.selected_row().unwrap().thread_id, selected);
+        let target = workspace.rows.iter_mut().find(|r|r.thread_id == "thread-z").unwrap();
+        target.view.project_id = Some("project-z".into()); target.view.project = Observation::Known("Project Z".into());
+        workspace.sort_order = ListSort::Project;
+        assert_eq!(workspace.visible_rows()[0].thread_id, "thread-z");
     }
 
     #[test]

@@ -857,6 +857,11 @@ pub(super) enum GlobalSettingsField {
     DefaultNotification,
     TerminalColors,
     DefaultLocalHostFilter,
+    AgentSort,
+    SessionSort,
+    WatchdogPoll,
+    WatchdogStale,
+    WatchdogEscalation,
     ProxyEnabled,
     ProxyUrl,
     ProxyNoProxy,
@@ -885,7 +890,7 @@ pub(super) enum GlobalSettingsField {
 impl GlobalSettingsField {
     pub(super) fn editor_kind(self) -> SessionSettingsEditorKind {
         match self {
-            Self::DefaultLocalHostFilter | Self::TerminalColors | Self::DefaultReasoning | Self::DefaultNotification | Self::ManagedSessions
+            Self::AgentSort | Self::SessionSort | Self::DefaultLocalHostFilter | Self::TerminalColors | Self::DefaultReasoning | Self::DefaultNotification | Self::ManagedSessions
             | Self::DockerSudo
             | Self::DefaultProfile
             | Self::DefaultProfileDirectLaunch
@@ -896,7 +901,7 @@ impl GlobalSettingsField {
             | Self::RateLimitThresholdWarning
             | Self::RateLimitModelNudge
             | Self::AgentBusEnabled => SessionSettingsEditorKind::Choice,
-            Self::DefaultModel | Self::ProxyUrl
+            Self::WatchdogPoll | Self::WatchdogStale | Self::WatchdogEscalation | Self::DefaultModel | Self::ProxyUrl
             | Self::ProxyNoProxy
             | Self::NotifyServiceUrl
             | Self::NotifyIdleTimeout
@@ -978,6 +983,17 @@ impl GlobalSettingsSnapshot {
         &self.profile_names
     }
 
+    fn watchdog_option(&self, label: &'static str, field: GlobalSettingsField, draft: &GlobalSettingsDraft, detail: &str) -> SessionTuiSettingOption {
+        let mut option = self.editable_option(label, field, draft);
+        option.presentation.detail = Some(format!("{detail} Saved defaults apply after restarting Agent Bus and Management services. CUTEX_TASK_WATCHDOG_* environment overrides take precedence."));
+        option
+    }
+
+
+    pub(super) fn list_sort_defaults(&self) -> (cutex::profiles::list_preferences::ListSort, cutex::profiles::list_preferences::ListSort) {
+        (self.config.agent_sort, self.config.session_sort)
+    }
+
     pub(super) fn default_local_host_filter(&self) -> bool {
         self.config.default_local_host_filter
     }
@@ -991,6 +1007,8 @@ impl GlobalSettingsSnapshot {
             GlobalSettingsField::DefaultReasoning => &[("Follow profile", None), ("none", Some("none")), ("minimal", Some("minimal")), ("low", Some("low")), ("medium", Some("medium")), ("high", Some("high")), ("xhigh", Some("xhigh"))][..],
             GlobalSettingsField::TerminalColors => &[("Auto", Some("auto")), ("TrueColor", Some("truecolor"))][..],
             GlobalSettingsField::DefaultNotification => &[("CIAO!", Some("important")), ("ON", Some("normal")), ("OFF", Some("off"))][..],
+            GlobalSettingsField::AgentSort => &[("Panel default", Some("default")), ("Name A–Z", Some("name_asc")), ("Name Z–A", Some("name_desc")), ("Pin first", Some("pinned")), ("Project first", Some("project"))][..],
+            GlobalSettingsField::SessionSort => &[("Panel default", Some("default")), ("Name A–Z", Some("name_asc")), ("Name Z–A", Some("name_desc")), ("Project first", Some("project"))][..],
             GlobalSettingsField::DefaultLocalHostFilter => &[("Local", Some("local")), ("All hosts", Some("all"))][..],
             GlobalSettingsField::ManagedSessions
             | GlobalSettingsField::DockerSudo
@@ -1013,7 +1031,7 @@ impl GlobalSettingsSnapshot {
                 }))
                 .collect();
             }
-            GlobalSettingsField::DefaultModel | GlobalSettingsField::ProxyUrl
+            GlobalSettingsField::WatchdogPoll | GlobalSettingsField::WatchdogStale | GlobalSettingsField::WatchdogEscalation | GlobalSettingsField::DefaultModel | GlobalSettingsField::ProxyUrl
             | GlobalSettingsField::ProxyNoProxy
             | GlobalSettingsField::NotifyServiceUrl
             | GlobalSettingsField::NotifyServiceToken
@@ -1064,10 +1082,22 @@ impl GlobalSettingsSnapshot {
                 terminal.presentation.detail = Some("Auto preserves terminal detection. TrueColor supplies COLORTERM=truecolor to Cutex foreground TUI launches, including SSH; background runtimes are unchanged.".into());
                 let mut host = self.editable_option("Default host filter", GlobalSettingsField::DefaultLocalHostFilter, draft);
                 host.presentation.detail = Some("Local starts Agents and Sessions on this host. All hosts includes remote rows. Applies next time Cutex opens; the filter remains changeable.".into());
-                let mut options = vec![terminal, host];
+                let mut agents = self.editable_option("Agent sort", GlobalSettingsField::AgentSort, draft);
+                agents.presentation.detail = Some("Next launch: Default keeps status/pinned order. Pin first puts pinned Agents first. Project first groups assigned rows by project name, then agent name; unassigned rows follow. Alt+S changes the current list without changing this preference.".into());
+                let mut sessions = self.editable_option("Session sort", GlobalSettingsField::SessionSort, draft);
+                sessions.presentation.detail = Some("Next launch: Default keeps recency order. Name sorting applies to loaded rows; Alt+L loads more history. Alt+S changes the current list.".into());
+                let mut options = vec![terminal, host, agents, sessions];
                 options.extend(self.appearance_display_options());
                 options
             }),
+            SessionTuiSettingCategory::new("Task Watchdog", vec![
+                self.watchdog_option("Check interval (s)", GlobalSettingsField::WatchdogPoll, draft,
+                    "How often to check running assignments. 5–3600 seconds."),
+                self.watchdog_option("Remind after (s)", GlobalSettingsField::WatchdogStale, draft,
+                    "Notify the Worker after this much time without authoritative progress. 60–86400 seconds."),
+                self.watchdog_option("Escalate after (s)", GlobalSettingsField::WatchdogEscalation, draft,
+                    "Additional time beyond the reminder threshold before escalating to the Director. Measured from the same progress watermark, not delivery or reminder count. 60–86400 seconds."),
+            ]),
             SessionTuiSettingCategory::new("Messages", vec![
                 SessionTuiSettingOption::new("Sender identity", "Structured Agent Bus provenance"),
                 SessionTuiSettingOption::new("Message display", "Sender and delivery timing are shown with each message"),
@@ -1197,6 +1227,10 @@ impl GlobalSettingsSnapshot {
 pub(super) struct GlobalSettingsDraft {
     terminal_truecolor: Option<bool>,
     default_local_host_filter: Option<bool>,
+    task_watchdog: Option<cutex::task_service::TaskWatchdogSettings>,
+    watchdog_dirty: [bool; 3],
+    agent_sort: Option<cutex::profiles::list_preferences::ListSort>,
+    session_sort: Option<cutex::profiles::list_preferences::ListSort>,
     managed_sessions: Option<bool>,
     docker_sudo: Option<bool>,
     default_profile: ConfigValueUpdate<String>,
@@ -1255,6 +1289,30 @@ impl GlobalSettingsDraft {
                 self.default_model_dirty = defaults.keys().chain(snapshot.config.new_session_defaults.keys()).any(|name| defaults.get(name).and_then(|d| d.model.as_ref()) != snapshot.config.new_session_defaults.get(name).and_then(|d| d.model.as_ref()));
                 self.default_reasoning_dirty = defaults.keys().chain(snapshot.config.new_session_defaults.keys()).any(|name| defaults.get(name).and_then(|d| d.reasoning.as_ref()) != snapshot.config.new_session_defaults.get(name).and_then(|d| d.reasoning.as_ref()));
                 self.new_session_defaults = (defaults != snapshot.config.new_session_defaults).then_some(defaults);
+            }
+            GlobalSettingsField::WatchdogPoll | GlobalSettingsField::WatchdogStale | GlobalSettingsField::WatchdogEscalation => {
+                let seconds: u64 = value.as_deref().unwrap_or_default().parse()
+                    .map_err(|_| anyhow::anyhow!("Enter a whole number of seconds"))?;
+                let mut settings = self.task_watchdog.clone().unwrap_or_else(|| snapshot.config.task_watchdog.clone());
+                match field {
+                    GlobalSettingsField::WatchdogPoll => settings.poll_secs = seconds,
+                    GlobalSettingsField::WatchdogStale => settings.stale_secs = seconds,
+                    _ => settings.escalation_secs = seconds,
+                }
+                settings.validate()?;
+                self.watchdog_dirty = [settings.poll_secs != snapshot.config.task_watchdog.poll_secs,
+                    settings.stale_secs != snapshot.config.task_watchdog.stale_secs,
+                    settings.escalation_secs != snapshot.config.task_watchdog.escalation_secs];
+                self.task_watchdog = (settings != snapshot.config.task_watchdog).then_some(settings);
+            }
+            GlobalSettingsField::AgentSort | GlobalSettingsField::SessionSort => {
+                let order = cutex::profiles::list_preferences::ListSort::parse(value.as_deref().unwrap_or("default"))?;
+                if field == GlobalSettingsField::AgentSort {
+                    self.agent_sort = (order != snapshot.config.agent_sort).then_some(order);
+                } else {
+                    anyhow::ensure!(order != cutex::profiles::list_preferences::ListSort::Pinned, "Sessions do not expose a Pin state");
+                    self.session_sort = (order != snapshot.config.session_sort).then_some(order);
+                }
             }
             GlobalSettingsField::DefaultLocalHostFilter => {
                 let enabled = match value.as_deref() {
@@ -1553,6 +1611,11 @@ impl GlobalSettingsDraft {
                 let entry = name.as_ref().and_then(|n| defaults.get(n));
                 entry.and_then(|e| if field == GlobalSettingsField::DefaultModel { e.model.clone() } else { e.reasoning.clone() }).unwrap_or_default()
             }
+            GlobalSettingsField::WatchdogPoll => self.task_watchdog.as_ref().unwrap_or(&snapshot.config.task_watchdog).poll_secs.to_string(),
+            GlobalSettingsField::WatchdogStale => self.task_watchdog.as_ref().unwrap_or(&snapshot.config.task_watchdog).stale_secs.to_string(),
+            GlobalSettingsField::WatchdogEscalation => self.task_watchdog.as_ref().unwrap_or(&snapshot.config.task_watchdog).escalation_secs.to_string(),
+            GlobalSettingsField::AgentSort => self.agent_sort.unwrap_or(snapshot.config.agent_sort).key().into(),
+            GlobalSettingsField::SessionSort => self.session_sort.unwrap_or(snapshot.config.session_sort).key().into(),
             GlobalSettingsField::DefaultLocalHostFilter => if self.default_local_host_filter.unwrap_or(snapshot.config.default_local_host_filter) { "local" } else { "all" }.into(),
             GlobalSettingsField::TerminalColors => if self.terminal_truecolor.unwrap_or(snapshot.config.terminal_truecolor) { "truecolor" } else { "auto" }.into(),
             GlobalSettingsField::DefaultNotification => match self.new_session_notification.unwrap_or(snapshot.config.new_session_notification) {
@@ -1728,6 +1791,11 @@ impl GlobalSettingsDraft {
         match field {
             GlobalSettingsField::DefaultModel => self.default_model_dirty,
             GlobalSettingsField::DefaultReasoning => self.default_reasoning_dirty,
+            GlobalSettingsField::WatchdogPoll => self.watchdog_dirty[0],
+            GlobalSettingsField::WatchdogStale => self.watchdog_dirty[1],
+            GlobalSettingsField::WatchdogEscalation => self.watchdog_dirty[2],
+            GlobalSettingsField::AgentSort => self.agent_sort.is_some(),
+            GlobalSettingsField::SessionSort => self.session_sort.is_some(),
             GlobalSettingsField::DefaultLocalHostFilter => self.default_local_host_filter.is_some(),
             GlobalSettingsField::TerminalColors => self.terminal_truecolor.is_some(),
             GlobalSettingsField::DefaultNotification => self.new_session_notification.is_some(),
@@ -1815,6 +1883,11 @@ impl GlobalSettingsDraft {
             GlobalSettingsField::DefaultNotification,
             GlobalSettingsField::TerminalColors,
             GlobalSettingsField::DefaultLocalHostFilter,
+            GlobalSettingsField::SessionSort,
+            GlobalSettingsField::AgentSort,
+            GlobalSettingsField::WatchdogEscalation,
+            GlobalSettingsField::WatchdogStale,
+            GlobalSettingsField::WatchdogPoll,
             GlobalSettingsField::ProxyEnabled,
             GlobalSettingsField::ProxyUrl,
             GlobalSettingsField::ProxyNoProxy,
@@ -1895,6 +1968,9 @@ impl GlobalSettingsDraft {
             docker_use_sudo: self.docker_sudo,
             terminal_truecolor: self.terminal_truecolor,
             default_local_host_filter: self.default_local_host_filter,
+            session_sort: self.session_sort,
+            agent_sort: self.agent_sort,
+            task_watchdog: self.task_watchdog.clone(),
             session_enabled: self.managed_sessions,
             default_profile: self.default_profile.clone(),
             default_profile_direct_launch: self.default_profile_direct_launch,
@@ -2113,6 +2189,46 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn list_sort_settings_validate_save_and_restore_panel_defaults() {
+        use cutex::profiles::list_preferences::ListSort;
+        let snapshot = GlobalSettingsSnapshot::from_config(&CodezConfig::default());
+        let mut draft = GlobalSettingsDraft::default();
+        draft.stage(&snapshot, GlobalSettingsField::AgentSort, Some("pinned".into())).unwrap();
+        draft.stage(&snapshot, GlobalSettingsField::SessionSort, Some("name_asc".into())).unwrap();
+        assert_eq!(draft.dirty_count(), 2);
+        assert!(draft.stage(&snapshot, GlobalSettingsField::SessionSort, Some("pinned".into())).is_err());
+        assert_eq!(draft.session_sort, Some(ListSort::NameAsc));
+        let mut config = CodezConfig::default();
+        cutex::config::global_settings::apply_global_config_patch(&mut config, &cutex::config::global_settings::GlobalConfigPatch {
+            agent_sort: draft.agent_sort, session_sort: draft.session_sort,
+            task_watchdog: Some(cutex::task_service::TaskWatchdogSettings {poll_secs: 20, stale_secs: 180, escalation_secs: 240}),
+            ..Default::default()
+        }).unwrap();
+        let restored: CodezConfig = serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!((restored.agent_sort, restored.session_sort), (ListSort::Pinned, ListSort::NameAsc));
+        assert_eq!(restored.task_watchdog, config.task_watchdog);
+        draft.stage(&snapshot, GlobalSettingsField::AgentSort, Some("default".into())).unwrap();
+        draft.stage(&snapshot, GlobalSettingsField::SessionSort, Some("default".into())).unwrap();
+        assert_eq!(draft.dirty_count(), 0);
+    }
+
+    #[test]
+    fn watchdog_edits_validate_before_mutation_and_count_individual_fields() {
+        let snapshot = GlobalSettingsSnapshot::from_config(&CodezConfig::default());
+        let mut draft = GlobalSettingsDraft::default();
+        draft.stage(&snapshot, GlobalSettingsField::WatchdogPoll, Some("15".into())).unwrap();
+        draft.stage(&snapshot, GlobalSettingsField::WatchdogStale, Some("120".into())).unwrap();
+        assert_eq!(draft.dirty_count(), 2);
+        assert!(draft.stage(&snapshot, GlobalSettingsField::WatchdogEscalation, Some("0".into())).is_err());
+        assert_eq!(draft.task_watchdog.as_ref().unwrap().escalation_secs, 600);
+        draft.stage(&snapshot, GlobalSettingsField::WatchdogPoll, Some("60".into())).unwrap();
+        assert_eq!(draft.dirty_count(), 1);
+        draft.stage(&snapshot, GlobalSettingsField::WatchdogStale, Some("600".into())).unwrap();
+        assert!(draft.task_watchdog.is_none());
+        assert_eq!(draft.dirty_count(), 0);
     }
 
     #[test]
@@ -2713,7 +2829,7 @@ mod tests {
                 .map(|category| category.label)
                 .collect::<Vec<_>>(),
             vec![
-                "Profiles", "Defaults", "Network", "Notifications", "Appearance", "Messages", "Services", "Hosts / Connections",
+                "Profiles", "Defaults", "Network", "Notifications", "Appearance", "Task Watchdog", "Messages", "Services", "Hosts / Connections",
             ]
         );
         let settings = flattened(&categories);
@@ -2731,7 +2847,7 @@ mod tests {
                 .flat_map(|category| category.options.iter())
                 .filter(|option| option.global_field.is_some())
                 .count(),
-            12
+            17
         );
     }
 
