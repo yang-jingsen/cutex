@@ -228,10 +228,9 @@ impl ProfileSettingsSnapshot {
                     self.editable_option("Name", ProfileSettingsField::Name, draft),
                     self.editable_option("Agent name", ProfileSettingsField::AgentName, draft),
                     SessionTuiSettingOption::profile_read_only(
-                        "Active home",
+                        "Selected account",
                         if self.active { "yes" } else { "no" },
                     ),
-                    SessionTuiSettingOption::profile_read_only("CLI", self.cli_kind.clone()),
                 ],
             ),
             SessionTuiSettingCategory::profile(
@@ -1544,7 +1543,7 @@ mod tests {
         assert!(categories[0]
             .options
             .iter()
-            .any(|option| option.label == "Active home" && option.value == "yes"));
+            .any(|option| option.label == "Selected account" && option.value == "yes"));
         assert!(categories[1]
             .options
             .iter()

@@ -91,9 +91,10 @@ impl LocalDeployment {
             "exact native UUID required"
         );
         let source_home = self.native_home.canonicalize()?;
-        let source_history = find_history(&source_home, &native_id)?;
+        let source_history = super::native_history::current(&source_home, &native_id)?;
+        let sources = super::native_history::recovery_sources(&source_home, &source_history)?;
         ensure!(
-            !has_history_writer(&source_history)?,
+            !sources.iter().map(|path| has_history_writer(path)).collect::<anyhow::Result<Vec<_>>>()?.into_iter().any(|open| open),
             "saved thread is open for writing; stop its native session before Adopt"
         );
         let destination = crate::config::paths::runtime_dir()?
@@ -139,7 +140,12 @@ impl LocalDeployment {
         }
         super::stock::migration_configuration(&candidate)?.validate_auth_home(&source_home)?;
         let history_hash = file_sha256(&source_history)?;
-        let provenance = serde_json::json!({"native_id": native_id, "source_history": source_history, "sha256": history_hash});
+        let mut provenance = serde_json::json!({"native_id": native_id, "source_history": source_history, "sha256": history_hash});
+        if sources.len() > 1 {
+            provenance["dependencies"] = serde_json::Value::Array(sources.iter().skip(1)
+                .map(|path| Ok(serde_json::json!({"path":path,"sha256":file_sha256(path)?})))
+                .collect::<anyhow::Result<Vec<_>>>()?);
+        }
         let materialization = if destination.exists() {
             destination.clone()
         } else {
@@ -161,17 +167,9 @@ impl LocalDeployment {
                 builder.mode(0o700);
             }
             builder.create(materialization.join("sessions"))?;
-            let target = materialization.join("sessions").join(
-                source_history
-                    .file_name()
-                    .context("history filename required")?,
-            );
-            std::fs::copy(&source_history, &target)?;
-            ensure!(
-                file_sha256(&target)? == history_hash
-                    && file_sha256(&source_history)? == history_hash,
-                "history changed during adoption; source retained"
-            );
+            copy_adoption_history(&source_home, &source_history, &materialization)?;
+            ensure!(file_sha256(&source_history)? == history_hash,
+                "history changed during adoption; source retained");
             crate::config::atomic::write_private_pretty_json_atomic(
                 &materialization.join("adoption.json"),
                 &provenance,
@@ -219,6 +217,31 @@ impl LocalDeployment {
 mod tests {
     use super::*;
 
+    #[test]
+    fn adoption_preserves_reverted_history_chain_without_resuming_ancestor() {
+        let root = std::env::temp_dir().join(format!("adopt-chain-{}", uuid::Uuid::new_v4()));
+        let home = root.join("source");
+        let target = root.join("target");
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let revision = uuid::Uuid::new_v4();
+        let old = home.join("sessions").join(format!("rollout-2026-09-13T00-00-00-{id}.jsonl"));
+        let current = home.join("sessions").join(format!("rollout-2026-09-15T00-00-00-{id}_{revision}.jsonl"));
+        for (path, base) in [(&old, serde_json::Value::Null), (&current, serde_json::json!({"thread_id":id,"end_ordinal_exclusive":1,"end_byte_offset":1}))] {
+            std::fs::write(path, serde_json::json!({"type":"session_meta","payload":{"id":id,"history_base":base}}).to_string()).unwrap();
+        }
+        copy_adoption_history(&home, &current, &target).unwrap();
+        let selected = super::super::native_history::current(&target, &id.to_string()).unwrap();
+        assert_eq!(selected, target.join("sessions").join(current.file_name().unwrap()));
+        let chain = super::super::native_history::recovery_sources(&target, &selected).unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(std::fs::read(&chain[0]).unwrap(), std::fs::read(&current).unwrap());
+        assert_eq!(std::fs::read(&chain[1]).unwrap(), std::fs::read(&old).unwrap());
+        std::fs::remove_file(&old).unwrap();
+        assert!(copy_adoption_history(&home, &current, &root.join("missing")).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn open_history_writer_blocks_adoption_until_closed() {
@@ -243,13 +266,23 @@ mod tests {
     }
 }
 
-fn find_history(home: &Path, native_id: &str) -> anyhow::Result<PathBuf> {
-    let path = super::native_history::current(home, native_id)?;
-    // Adoption currently copies one rollout into a private home. A reference-
-    // backed history needs its ancestors and native catalog transferred too.
-    ensure!(super::native_history::metadata(&path)?["history_base"].is_null(),
-        "this history references other rollouts; migrate its native home before adoption");
-    Ok(path)
+/// Keep only the selected rollout active. Immutable ancestors remain available
+/// to native rollout-ID lookup in archived_sessions, never as resume candidates.
+fn copy_adoption_history(home: &Path, current: &Path, destination: &Path) -> anyhow::Result<()> {
+    let sources = super::native_history::recovery_sources(home, current)?;
+    let hashes = sources.iter().map(|p| file_sha256(p)).collect::<anyhow::Result<Vec<_>>>()?;
+    for (index, (source, hash)) in sources.iter().zip(&hashes).enumerate() {
+        ensure!(!has_history_writer(source)?, "saved history is open for writing; stop its native session before Adopt");
+        let directory = destination.join(if index == 0 { "sessions" } else { "archived_sessions" });
+        std::fs::create_dir_all(&directory)?;
+        let target = directory.join(source.file_name().context("history filename required")?);
+        std::fs::copy(source, &target)?;
+        ensure!(file_sha256(&target)? == *hash, "history copy mismatch");
+    }
+    for (source, hash) in sources.iter().zip(hashes) {
+        ensure!(file_sha256(source)? == hash, "history changed during adoption; source retained");
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

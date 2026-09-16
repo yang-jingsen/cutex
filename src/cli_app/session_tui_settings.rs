@@ -1103,6 +1103,11 @@ impl GlobalSettingsSnapshot {
                 SessionTuiSettingOption::new("Message display", "Sender and delivery timing are shown with each message"),
             ]),
             SessionTuiSettingCategory::new("Services", vec![
+                SessionTuiSettingOption {
+                    navigation: Some(super::session_tui_input::Command::Services),
+                    presentation: SettingPresentation { detail: Some("Explicit local Agent Bus / Management start, stop, restart and status. Does not stop agent runtimes or Job Service.".into()), ..Default::default() },
+                    ..SessionTuiSettingOption::new("Manage services", "Enter to open")
+                },
                 SessionTuiSettingOption::new("Agent Bus", "Required for managed agents"),
                 self.editable_option("Agent Bus port", GlobalSettingsField::AgentBusPort, draft),
                 self.editable_option("Agent Bus token", GlobalSettingsField::AgentBusToken, draft),

@@ -109,6 +109,7 @@ struct AdoptionReview {
 enum CatalogCommand {
     CloseOwned { request: u64, id: String, owner: String },
     Archive { request: u64, id: String },
+    CloseNative { request: u64, id: String },
     Load {
         request: u64,
         cursor: Option<String>,
@@ -177,6 +178,12 @@ impl RecentCatalog {
         self.commands.send(CatalogCommand::Archive { request, id }).is_ok()
     }
 
+    pub(super) fn close_native(&self, id: String) -> bool {
+        let request = self.request.get().wrapping_add(1);
+        self.request.set(request);
+        self.commands.send(CatalogCommand::CloseNative { request, id }).is_ok()
+    }
+
     pub(super) fn close_owned(&self, id: String, owner: String) -> bool {
         let request = self.request.get().wrapping_add(1);
         self.request.set(request);
@@ -210,6 +217,18 @@ fn catalog_worker(commands: Receiver<CatalogCommand>, replies: Sender<(u64, Cata
     let mut client = CatalogClient::spawn_local();
     while let Ok(command) = commands.recv() {
         let (request, cursor, retry) = match command {
+            CatalogCommand::CloseNative { request, id } => {
+                let result = cutex::catalog::native_archive::close_and_restore(&id, None)
+                    .map(|_| ()).map_err(|error| format!("{error:#}"));
+                if replies.send((request, CatalogReply::ClosedOwned { id, result })).is_err() { break; }
+                // Archive also affects descendants. Refresh even after partial failure.
+                let result = match &mut client {
+                    Ok(client) => client.thread_list(thread_list_params(None)),
+                    Err(error) => Err(error.clone()),
+                };
+                if replies.send((request, CatalogReply::Page { cursor: None, result })).is_err() { break; }
+                continue;
+            }
             CatalogCommand::CloseOwned { request, id, owner } => {
                 let result = (|| -> anyhow::Result<()> {
                     let store = cutex::session::store::load_cutex_session_store()?;

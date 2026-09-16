@@ -95,7 +95,10 @@ impl NativeLaunch {
         let order = config.get("tui").and_then(|t| t.get("status_line"))
             .and_then(toml::Value::as_array).map(|items| items.iter()
                 .filter_map(toml::Value::as_str).map(str::to_owned).collect::<Vec<_>>());
-        if let Some(path) = cutex::launch::session_display::status_file(native_id, order.as_deref().unwrap_or_default())? {
+        let order = super::status_preferences::selected_order(order.as_ref())?;
+        let preferences = super::status_preferences::apply(LaunchCommand::new(""), Some(&order))?;
+        command.args(preferences.args).envs(preferences.envs);
+        if let Some(path) = cutex::launch::session_display::status_file(native_id, &order)? {
             command.arg("--status-items-file").arg(path);
         }
         command.env("CUTEX_NOTIFICATION_CONTROL", std::env::current_exe()?);

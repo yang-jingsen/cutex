@@ -36,6 +36,7 @@ pub fn current(home: &Path, id: &str) -> anyhow::Result<PathBuf> {
     let files = files(home)?;
     let candidates: Vec<_> = files
         .into_iter()
+        .filter(|p| p.starts_with(home.join("sessions")))
         .filter(|p| {
             let name = p.file_name().unwrap_or_default().to_string_lossy();
             name.ends_with(&format!("-{id}.jsonl")) || name.contains(&format!("-{id}_"))

@@ -1162,7 +1162,7 @@ pub(super) fn attach_status(id: &str) -> anyhow::Result<std::process::ExitStatus
     }
     let status_items = ready.review.configuration.selected_projection.as_ref()
         .and_then(|p| p.settings.tui.as_ref()).and_then(|t| t.status_line.as_ref());
-    launch = option(launch, "tui.status_line", super::notify::status_line(status_items))?;
+    launch = super::status_preferences::apply(launch, status_items)?;
     let status = layout.apply_remote_tui_auth(launch).to_command().status()?;
     ensure!(
         status.success(),

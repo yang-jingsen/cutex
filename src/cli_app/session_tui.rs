@@ -380,12 +380,14 @@ enum SelectorControl {
     OpenRetiredSessions,
     OpenRecentSessions,
     ArchiveNative(String),
+    CloseNative(String),
     CloseOwnedSession { native: String, owner: String },
     RevertHistory(String),
     Recent(RecentCommand),
     AdoptRecent(RecentAdoptionRequest),
     OpenProfileManager,
     OpenHosts,
+    OpenServices,
     RemoteBrowse(cutex::management::connections::Connection,String),
     OpenCutexProjects,
     OpenProjects,
@@ -6080,6 +6082,7 @@ fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyR
             | Command::Inspect
             | Command::Profiles
             | Command::Hosts
+            | Command::Services
             | Command::Workspaces
             | Command::Archive
             | Command::Appearance
@@ -6107,6 +6110,7 @@ fn selector_command(model: &mut SelectorModel, command: Command) -> SelectorKeyR
         }
     }
     match command {
+        Command::Services => SelectorKeyRoute::Control(Some(SelectorControl::OpenServices)),
         Command::Hosts => SelectorKeyRoute::Control(Some(SelectorControl::OpenHosts)),
         Command::Profiles => {
             model.profiles_from_settings = matches!(model.mode, SelectorMode::Settings { target: SelectorTarget::GlobalSettings, .. });
@@ -6283,17 +6287,19 @@ fn route_selector_key(model: &mut SelectorModel, key: KeyEvent) -> SelectorKeyRo
             model.native_actions = Some((id, selected, confirming));
             return SelectorKeyRoute::Control(None);
         }
+        let count = if model.native_owned_id(&id).is_some() { 3 } else { 4 };
         match key.code {
             KeyCode::Esc => {
                 if confirming { model.native_actions = Some((id, selected, false)); }
                 return SelectorKeyRoute::Control(None);
             }
-            KeyCode::Up if !confirming => selected = (selected + 2) % 3,
-            KeyCode::Down if !confirming => selected = (selected + 1) % 3,
+            KeyCode::Up if !confirming => selected = (selected + count - 1) % count,
+            KeyCode::Down if !confirming => selected = (selected + 1) % count,
             KeyCode::Enter if selected == 2 && !confirming => return SelectorKeyRoute::Control(Some(SelectorControl::RevertHistory(id))),
             KeyCode::Enter if confirming => return SelectorKeyRoute::Control(Some(
                 match model.native_owned_id(&id) {
                     Some(owner) => SelectorControl::CloseOwnedSession { native: id, owner },
+                    None if selected == 3 => SelectorControl::CloseNative(id),
                     None => SelectorControl::ArchiveNative(id),
                 })),
             KeyCode::Enter if selected == 0 => {
@@ -6858,6 +6864,12 @@ fn run_event_loop(
                                 model.notice = Some("Closing session runtime…".into());
                             } else { model.warning = Some("Session worker unavailable; no close requested".into()); }
                         }
+                        SelectorControl::CloseNative(id) => {
+                            if recent_catalog.as_ref().is_some_and(|catalog| catalog.close_native(id)) {
+                                model.native_archive_pending = true;
+                                model.notice = Some("Closing runtime and restoring history…".into());
+                            } else { model.warning = Some("Session worker unavailable; no close requested".into()); }
+                        }
                         SelectorControl::ArchiveNative(id) => {
                             if recent_catalog.as_ref().is_some_and(|catalog| catalog.archive(id)) {
                                 model.native_archive_pending = true;
@@ -6885,6 +6897,13 @@ fn run_event_loop(
                             }
                         }
                         SelectorControl::RemoteBrowse(c,id)=>{match super::session_tui_remote::run_selected(terminal,events,c,Some(id))? {super::session_tui_remote::Outcome::Exit=>return Ok(SessionTuiCycleOutcome::Exit),_=>{}}},
+                        SelectorControl::OpenServices => {
+                            match super::session_tui_services::run(terminal, events) {
+                                Ok(super::session_tui_remote::Outcome::Exit) => return Ok(SessionTuiCycleOutcome::Exit),
+                                Ok(super::session_tui_remote::Outcome::Back) => {},
+                                Err(error) => model.notice = Some(format!("Services: {error:#}")),
+                            }
+                        }
                         SelectorControl::OpenHosts => {
                             match super::session_tui_hosts::run(terminal, events) {
                                 Ok(super::session_tui_remote::Outcome::Exit) => return Ok(SessionTuiCycleOutcome::Exit),
@@ -7484,12 +7503,16 @@ fn render_selector(frame: &mut Frame<'_>, model: &SelectorModel) {
         let owned = model.native_owned_id(id).is_some();
         let text = if *confirming && owned {
             format!("Session: {id}\n\nClose this session's dedicated runtime.\nHistory is retained and the session stays in Recent Sessions.\n\nEnter: Close runtime    Esc: Cancel")
+        } else if *confirming && *selected == 3 {
+            format!("Session: {id}\n\nClose via native archive, then restore this session's history.\nNo runtime is restarted. You can Adopt afterwards.\nSpawned descendants are also closed and remain archived.\n\nEnter: Close and restore history    Esc: Cancel")
         } else if *confirming {
             format!("Session: {id}\n\nClose the runtime and archive this session and spawned descendants.\nHistory is retained. Restore with:\ncutex session restore-native {id}\n\nEnter: Close and archive    Esc: Cancel")
         } else {
             format!("Session: {id}\n\n{} Adopt as managed Agent\n{} Close and archive\n{} Revert history\n\n↑/↓ Select · Enter Open · Esc Back", if *selected == 0 { ">" } else { " " }, if *selected == 1 { ">" } else { " " }, if *selected == 2 { ">" } else { " " })
         };
-        let text = if owned { text.replace("Close and archive", "Close runtime") } else { text };
+        let text = if owned { text.replace("Close and archive", "Close runtime") } else if !confirming {
+            text.replace("\n\n↑/↓", &format!("\n{} Close and restore history\n\n↑/↓", if *selected == 3 { ">" } else { " " }))
+        } else { text };
         views::render_details(frame, frame.area(), if *confirming { " Close session · Confirm " } else { " Session Actions " }, &text, &model.status_scroll);
     }
     if let Some(navigation) = &model.settings_navigation {
@@ -8105,70 +8128,23 @@ fn render_profile_list(frame: &mut Frame<'_>, area: Rect, model: &SelectorModel)
     };
     let default_profile = model.current_default_profile_name();
     let default_style = Style::new().fg(crate::cli_app::session_tui_layout::focus()).add_modifier(Modifier::BOLD);
-    let mut rows = if area.width >= 40 {
-        vec![Row::new([
-            Cell::from("Default").style(default_style),
-            Cell::from("-"),
-            Cell::from(default_profile.as_deref().unwrap_or("none"))
-                .style(Style::new().fg(crate::cli_app::session_tui_layout::focus())),
-        ])]
-    } else {
-        vec![Row::new([
-            Cell::from("Default").style(default_style),
-            Cell::from(default_profile.as_deref().unwrap_or("none"))
-                .style(Style::new().fg(crate::cli_app::session_tui_layout::focus())),
-        ])]
-    };
-    rows.extend(
-        profiles
-            .iter()
-            .map(|profile| {
-                let state = profile_list_state_label(profile, default_profile.as_deref());
-                if area.width >= 40 {
-                    Row::new([
-                        Cell::from(profile.name.as_str()),
-                        Cell::from(profile.cli_kind.as_str()).style(Style::new().fg(Color::Gray)),
-                        Cell::from(state)
-                            .style(profile_state_style(profile, default_profile.as_deref())),
-                    ])
-                } else {
-                    Row::new([
-                        Cell::from(profile.name.as_str()),
-                        Cell::from(state)
-                            .style(profile_state_style(profile, default_profile.as_deref())),
-                    ])
-                }
-            })
-            .collect::<Vec<_>>(),
-    );
-    let add_style = Style::new().fg(crate::cli_app::session_tui_layout::focus()).add_modifier(Modifier::BOLD);
-    if area.width >= 40 {
-        rows.push(Row::new([
-            Cell::from("Add profile").style(add_style),
-            Cell::from("-"),
-            Cell::from("new").style(Style::new().fg(Color::DarkGray)),
-        ]));
-    } else {
-        rows.push(Row::new([
-            Cell::from("Add profile").style(add_style),
-            Cell::from("new").style(Style::new().fg(Color::DarkGray)),
-        ]));
-    }
-    let (header, widths) = if area.width >= 40 {
-        (
-            Row::new(["PROFILE", "CLI", "STATUS"]),
-            vec![
-                Constraint::Min(12),
-                Constraint::Length(7),
-                Constraint::Length(14),
-            ],
-        )
-    } else {
-        (
-            Row::new(["PROFILE", "STATUS"]),
-            vec![Constraint::Min(12), Constraint::Length(14)],
-        )
-    };
+    let mut rows = vec![Row::new([
+        Cell::from("Default").style(default_style),
+        Cell::from(default_profile.as_deref().unwrap_or("none")).style(default_style),
+    ])];
+    rows.extend(profiles.iter().map(|profile| {
+        Row::new([
+            Cell::from(profile.name.as_str()),
+            Cell::from(profile_list_state_label(profile, default_profile.as_deref()))
+                .style(profile_state_style(profile, default_profile.as_deref())),
+        ])
+    }));
+    rows.push(Row::new([
+        Cell::from("Add profile").style(default_style),
+        Cell::from("new").style(Style::new().fg(Color::DarkGray)),
+    ]));
+    let header = Row::new(["PROFILE", "STATUS"]);
+    let widths = [Constraint::Min(12), Constraint::Length(14)];
     let table = Table::new(rows, widths)
         .header(
             header
@@ -8334,21 +8310,15 @@ fn profile_list_state_label(
     profile: &ProfileCatalogEntry,
     default_profile: Option<&str>,
 ) -> &'static str {
-    match (
-        profile.active,
-        default_profile == Some(profile.name.as_str()),
-    ) {
-        (true, true) => "home+default",
-        (true, false) => "active home",
-        (false, true) => "launch default",
-        (false, false) => "-",
+    if default_profile == Some(profile.name.as_str()) {
+        "default"
+    } else {
+        "-"
     }
 }
 
 fn profile_state_style(profile: &ProfileCatalogEntry, default_profile: Option<&str>) -> Style {
-    if profile.active {
-        Style::new().fg(Color::Green)
-    } else if default_profile == Some(profile.name.as_str()) {
+    if default_profile == Some(profile.name.as_str()) {
         Style::new().fg(crate::cli_app::session_tui_layout::focus())
     } else {
         Style::new().fg(Color::DarkGray)
@@ -10334,7 +10304,8 @@ mod tests {
         let mut model = SelectorModel::new(vec![recent_sessions_row()], false, false);
         model.native_actions = Some(("thread-one".into(), 0, false));
         let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
-        route_selector_key(&mut model, press(KeyCode::Up));
+        route_selector_key(&mut model, press(KeyCode::Down));
+        route_selector_key(&mut model, press(KeyCode::Down));
         assert_eq!(model.native_actions.as_ref().unwrap().1, 2);
         assert!(matches!(route_selector_key(&mut model, press(KeyCode::Enter)),
             SelectorKeyRoute::Control(Some(SelectorControl::RevertHistory(id))) if id=="thread-one"));
@@ -10353,7 +10324,7 @@ mod tests {
             let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 36)).unwrap();
             terminal.draw(|frame| render_profile_details(frame, frame.area(), &model)).unwrap();
             let buffer = terminal.backend().buffer();
-            for (label, value, expected) in [("Active home", "yes", crate::cli_app::session_tui_layout::muted()), ("Name", "review-profile", Color::White)] {
+            for (label, value, expected) in [("Selected account", "yes", crate::cli_app::session_tui_layout::muted()), ("Name", "review-profile", Color::White)] {
                 let y = (0..36).find(|y| (0..160).map(|x| buffer[(x,*y)].symbol()).collect::<String>().contains(label)).unwrap();
                 let line = (0..160).map(|x| buffer[(x,y)].symbol()).collect::<String>();
                 let x = line.find(value).unwrap() as u16;
@@ -13700,7 +13671,7 @@ mod tests {
         let wide = rendered_text_at(100, 48, &model);
         assert!(wide.contains("SETTING"));
         assert!(wide.contains("Identity"));
-        assert!(wide.contains("  Active home"));
+        assert!(wide.contains("  Selected account"));
         assert!(wide.contains("yes"));
         assert!(wide.contains("Imported metadata"));
         assert!(wide.contains("alpha@example.test"));
@@ -13710,13 +13681,13 @@ mod tests {
         assert!(!wide.contains("Status"));
 
         let medium = rendered_text_at(80, 24, &model);
-        assert!(medium.contains("home+default"));
+        assert!(medium.contains("default"));
         assert!(medium.contains("S"));
         assert!(medium.contains("Left/Tab"));
 
         let narrow = rendered_text_at(50, 18, &model);
         assert!(narrow.contains("SETTING"));
-        assert!(narrow.contains("Active home"));
+        assert!(narrow.contains("Selected account"));
         assert!(narrow.contains("Imported metadata"));
         assert!(!narrow.contains("PROFILE  CLI"));
     }
@@ -13805,7 +13776,7 @@ mod tests {
         open_profiles(&mut model, vec![profile]);
         model.handle(SelectorEvent::Down);
         model.handle(SelectorEvent::Activate);
-        for _ in 0..7 {
+        for _ in 0..6 {
             model.handle(SelectorEvent::Down);
         }
         assert_eq!(
@@ -13875,7 +13846,7 @@ mod tests {
         open_profiles(&mut model, vec![profile]);
         model.handle(SelectorEvent::Down);
         model.handle(SelectorEvent::Activate);
-        for _ in 0..8 {
+        for _ in 0..7 {
             model.handle(SelectorEvent::Down);
         }
         assert_eq!(
@@ -16352,6 +16323,24 @@ mod tests {
         contract_key(&mut model, KeyCode::Char('x'));
         assert_eq!(model.query.value(), "zx");
         assert_eq!(model.recent.query(), "nNqaev /");
+    }
+
+    #[test]
+    fn native_close_restore_menu_confirms_exact_target_and_retains_history_row() {
+        let mut model = contract_recent_model();
+        selector_command(&mut model, Command::Actions);
+        let id = model.native_actions.as_ref().unwrap().0.clone();
+        contract_key(&mut model, KeyCode::Up);
+        assert_eq!(model.native_actions.as_ref().unwrap().1, 3);
+        contract_key(&mut model, KeyCode::Enter);
+        assert!(model.native_actions.as_ref().unwrap().2);
+        let text = rendered_text_at(100, 30, &model);
+        assert!(text.contains("remain archived"));
+        assert!(matches!(route_selector_key(&mut model, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), SelectorKeyRoute::Control(Some(SelectorControl::CloseNative(target))) if target == id));
+        model.native_archive_pending = true;
+        model.recent_catalog_reply(super::super::session_tui_recent::CatalogReply::ClosedOwned { id: id.clone(), result: Ok(()) });
+        assert!(!model.native_archive_pending);
+        assert!(model.recent.rows().iter().any(|row| row.thread_id == id));
     }
 
     #[test]
