@@ -838,6 +838,15 @@ impl SelectorModel {
             .all(|row| { SessionTuiWorkspace::PRODUCTION.contains(&row.target.workspace()) }));
         sort_rows(&mut rows);
         let context = AppContext::extract(&mut rows);
+        let mut initial_facets = super::session_tui_filters::Facets::default();
+        if context.global_snapshot.as_ref().is_some_and(GlobalSettingsSnapshot::default_local_host_filter) {
+            let host = cutex::platform::host::current_host_name();
+            initial_facets.host = Some(super::session_tui_filters::Choice {
+                label: cutex::management::connections::short_display(&host), key: host,
+            });
+        }
+        let mut recent = RecentSessionsWorkspace::default();
+        recent.facets = initial_facets.clone();
         let mut model = Self {
             details: None,
             status_scroll: Default::default(),
@@ -849,7 +858,7 @@ impl SelectorModel {
             context,
             inspector_visible: true,
             filter_focused: false,
-            facets: Default::default(),
+            facets: initial_facets,
             help: None,
             leave_review: None,
             rows,
@@ -857,7 +866,7 @@ impl SelectorModel {
             remote_worker:None,remote_due:Instant::now(),
             retired_rows: Vec::new(),
             archive_return_panel: PrimaryPanel::Agents,
-            recent: RecentSessionsWorkspace::default(),
+            recent,
             query: Input::default(),
             workspace_selection: WorkspaceSelection::default(),
             mode: SelectorMode::Agents,
@@ -16610,13 +16619,29 @@ mod tests {
     }
 
     #[test]
+    fn local_host_default_applies_to_both_lists_only_on_open() {
+        let mut config = CodezConfig::default();
+        config.default_local_host_filter = true;
+        let mut model = SelectorModel::new(vec![global_settings_row(&config)], false, false);
+        let local = cutex::platform::host::current_host_name();
+        assert_eq!(model.facets.host.as_ref().map(|h|h.key.as_str()), Some(local.as_str()));
+        assert_eq!(model.recent.facets.host, model.facets.host);
+        model.facets.host = None;
+        model.ensure_selection();
+        assert!(model.facets.host.is_none());
+        config.default_local_host_filter = false;
+        let model = SelectorModel::new(vec![global_settings_row(&config)], false, false);
+        assert!(model.facets.host.is_none() && model.recent.facets.host.is_none());
+    }
+
+    #[test]
     fn settings_frame_encloses_details_and_keeps_selected_color_swatch() {
         let mut model = SelectorModel::new(vec![global_row()], false, false);
         selector_command(&mut model, Command::Settings);
         for _ in 0..4 { model.handle(SelectorEvent::Down); }
         for focused in [false, true] {
             if focused { model.handle(SelectorEvent::OpenActions); }
-            if let SelectorMode::Settings { option, .. } = &mut model.mode { *option = 1; }
+            if let SelectorMode::Settings { option, .. } = &mut model.mode { *option = 2; }
             for width in [80, 120, 160] {
                 let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 24)).unwrap();
                 terminal.draw(|frame| render_categorized_settings(frame, frame.area(), &model)).unwrap();

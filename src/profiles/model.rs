@@ -233,6 +233,9 @@ pub struct CodezConfig {
     /// Frontend-only opt-in for terminals whose TrueColor marker is lost over SSH.
     #[serde(default)]
     pub terminal_truecolor: bool,
+    /// Start Agents and Sessions with the local host selected.
+    #[serde(default)]
+    pub default_local_host_filter: bool,
     #[serde(default)]
     #[serde(skip)]
     pub notify_service_url: Option<String>,
@@ -308,6 +311,7 @@ impl Default for CodezConfig {
             new_session_defaults: Default::default(),
             new_session_notification: Default::default(),
             terminal_truecolor: false,
+            default_local_host_filter: false,
             notify_service_url: None,
             notify_service_token: None,
             notify_service_idle_timeout_secs: None,

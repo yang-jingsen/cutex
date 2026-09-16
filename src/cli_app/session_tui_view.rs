@@ -636,13 +636,17 @@ fn name_line(row: &AgentSessionView, width: usize) -> Line<'static> {
         }
         None => Span::raw("    "),
     };
+    let remote = !row.host.is_empty() && !cutex::runtime::lifecycle::cutex_session_host_is_local(
+        &row.host, &cutex::platform::host::current_host_name(),
+    );
+    let suffix = if remote { format!("@{}", cutex::management::connections::short_display(&row.host)) } else { String::new() };
+    let available = width - 5;
+    let suffix = clipped(&suffix, available.saturating_sub(1).min(available / 2));
     Line::from(vec![
         badge,
         Span::raw(" "),
-        Span::styled(
-            clipped(&row.name, width - 5),
-            Style::new().add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(clipped(&row.name, available.saturating_sub(suffix.width())), Style::new().add_modifier(Modifier::BOLD)),
+        Span::styled(suffix, Style::new().fg(super::session_tui_layout::focus())),
     ])
 }
 
@@ -697,7 +701,8 @@ pub(super) fn render_table(
     let block = Block::bordered();
     let inner = block.inner(area);
     let mut columns = visible_columns(inner.width.saturating_sub(2), kind);
-    if rows.iter().map(|r|r.host.to_lowercase()).collect::<std::collections::HashSet<_>>().len()<=1 {columns.retain(|(c,_)|*c!=Column::Host);}
+    // Remote identity is visible beside the name at every table width.
+    columns.retain(|(c,_)|*c!=Column::Host);
     let table = Table::new(
         rows.iter().enumerate().map(|(index, row)| {
             let selected = state.selected() == Some(index);
@@ -1091,4 +1096,21 @@ fn inspector_lines(row: &AgentSessionView) -> Vec<Line<'static>> {
 #[cfg(test)] mod stale_status_test {
 use super::*;
 #[test] fn stale_state_is_not_hidden_after_column_clipping(){let mut row=tests::visual_row();row.runtime=Observation::Stale("Online".into(),"host unreachable".into());assert_eq!(Column::Status.value(&row),"Stale");}
+}
+
+#[cfg(test)]
+#[test]
+fn remote_suffix_is_visible_and_colored_even_when_name_is_long() {
+    let mut row = tests::visual_row();
+    row.name = "a-very-long-remote-agent-name".into();
+    row.host = "eva-remote-fixture".into();
+    for width in [24, 48, 80] {
+        let line = name_line(&row, width);
+        assert!(line.width() <= width);
+        let suffix = line.spans.last().unwrap();
+        assert!(suffix.content.starts_with('@'));
+        assert_eq!(suffix.style.fg, Some(super::session_tui_layout::focus()));
+    }
+    row.host = cutex::platform::host::current_host_name();
+    assert!(!name_line(&row, 80).to_string().contains('@'));
 }
