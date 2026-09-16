@@ -30,6 +30,7 @@ pub const EVENT_TYPES: &[&str] = &[
     "agent.turn_interrupted",
     "task.review_ready",
     "task.closed",
+    "job.completed",
 ];
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -268,6 +269,7 @@ pub fn map_event(e: &EventEnvelope, level: Level, name: &str) -> Option<Value> {
             Some("closed") => "task.closed",
             _ => return None,
         },
+        "cutex/jobService/terminalObserved" if e.native.is_none() => "job.completed",
         _ => return None,
     };
     // Native events do not consistently carry their occurrence timestamp.
@@ -281,9 +283,23 @@ pub fn map_event(e: &EventEnvelope, level: Level, name: &str) -> Option<Value> {
             .take(256)
             .collect::<String>()
     };
-    Some(
-        json!({"schema":"cutex/notification/v1","eventId":e.event_id,"sourceStreamId":e.stream_id,"sourceCursor":e.cursor,"type":kind,"observedAt":e.received_at,"occurredAt":occurred,"priority":level,"severity":if kind=="agent.turn_failed" {"error"} else if kind=="agent.attention_required" {"attention"} else {"info"},"synthetic":false,"agent":{"id":e.cutex_session_id,"name":bounded(name)},"threadId":e.correlation.thread_id,"turnId":e.correlation.turn_id,"projectId":p.get("project_id").and_then(Value::as_str).map(bounded),"taskId":p.get("task_id").and_then(Value::as_str).map(bounded),"summary":kind}),
-    )
+    let mut payload = json!({"schema":"cutex/notification/v1","eventId":e.event_id,"sourceStreamId":e.stream_id,"sourceCursor":e.cursor,"type":kind,"observedAt":e.received_at,"occurredAt":occurred,"priority":level,"severity":if kind=="agent.turn_failed" {"error"} else if kind=="agent.attention_required" {"attention"} else {"info"},"synthetic":false,"agent":{"id":e.cutex_session_id,"name":bounded(name)},"threadId":e.correlation.thread_id,"turnId":e.correlation.turn_id,"projectId":p.get("project_id").and_then(Value::as_str).map(bounded),"taskId":p.get("task_id").and_then(Value::as_str).map(bounded),"summary":kind});
+    if kind == "job.completed" {
+        let job: crate::agent_bus::job_completion::CompletionV2 =
+            serde_json::from_value(p.clone()).ok()?;
+        job.validate().ok()?;
+        if job.target_cutex_session_id != e.cutex_session_id {
+            return None;
+        }
+        payload["job"] = json!({
+            "id": job.job_id, "actionId": job.facts.action_id,
+            "state": job.terminal_status, "exitCode": job.facts.exit_code,
+            "execution": job.facts.execution,
+            "stdout": job.facts.stdout, "stderr": job.facts.stderr,
+            "outputReference": job.output_reference,
+        });
+    }
+    Some(payload)
 }
 
 // curl is the platform HTTP/TLS client. Credentials and payload travel through stdin,
@@ -718,6 +734,39 @@ mod tests {
         )
         .is_none());
     }
+    #[test]
+    fn job_terminal_projects_metadata_only_and_requires_matching_owner() {
+        let params = json!({
+            "schema":"cutex.job_service.completion.v2", "eventId":"job-terminal:job_123:3",
+            "jobId":"job_123", "jobRevision":3, "terminalStatus":"exited",
+            "resultSha256":"a".repeat(64),
+            "targetCutexSessionId":"cutex.11111111-1111-4111-8111-111111111111",
+            "facts":{"factsVersion":1,"actionId":"run-training", "exitCode":0,
+                "execution":{"basis":"runner_release_to_wait_v1", "observedRunDurationMillis":0},
+                "stdout":{"observedBytes":100,"retainedBytes":39,"truncated":true},
+                "stderr":{"observedBytes":0,"retainedBytes":0,"truncated":false}},
+            "outputReference":"job-output:job_123"
+        });
+        let mut e = event("cutex/jobService/terminalObserved", params.clone());
+        e.cutex_session_id = params["targetCutexSessionId"].as_str().unwrap().into();
+        assert!(map_event(&e, Level::Normal, "a").is_none());
+        e.native = None;
+        e.source = EventSource::Cutex;
+        e.cutex = Some(crate::management::v2::model::CutexMessage {
+            method: "cutex/jobService/terminalObserved".into(), params,
+        });
+        let mapped = map_event(&e, Level::Normal, "a").unwrap();
+        assert_eq!(mapped["type"], "job.completed");
+        assert_eq!(mapped["job"]["exitCode"], 0);
+        assert_eq!(mapped["job"]["execution"]["observedRunDurationMillis"], 0);
+        assert_eq!(mapped["job"]["stdout"]["truncated"], true);
+        assert!(mapped["occurredAt"].is_null());
+        assert!(mapped["job"]["stdout"].get("text").is_none());
+        assert!(map_event(&e, Level::Off, "a").is_none());
+        e.cutex_session_id = "another-owner".into();
+        assert!(map_event(&e, Level::Normal, "a").is_none());
+    }
+
     #[test]
     fn queue_cursor_and_enqueue_commit_together_and_dedupe() {
         let temp = Temp::new();

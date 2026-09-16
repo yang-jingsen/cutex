@@ -195,6 +195,31 @@ pub(super) fn create_native(
 
 /// Foreground form shared by the main selector's New action.
 pub(super) fn wizard() -> anyhow::Result<Option<cutex::agent_management::HumanAdoptResult>> {
+    let result = wizard_form();
+    match &result {
+        Ok(Some(created)) => println!("Created Cutex Agent: {}", created.adopted.record.formal_agent_name.as_deref().unwrap_or("")),
+        Ok(None) => println!("Creation cancelled."),
+        Err(error) => println!("Creation did not complete: {error:#}"),
+    }
+    super::prompt::prompt_line("Press Enter to return to Cutex", "")?;
+    result
+}
+
+fn selected_profile(input: &str, profiles: &[String]) -> anyhow::Result<String> {
+    if let Some(name) = profiles.iter().find(|name| name.as_str() == input) {
+        return Ok(name.clone());
+    }
+    if let Some(name) = input.parse::<usize>().ok().and_then(|n| n.checked_sub(1)).and_then(|i| profiles.get(i)) {
+        return Ok(name.clone());
+    }
+    anyhow::bail!("Unknown profile; choose a listed name or number")
+}
+
+fn valid_reasoning(value: &str) -> bool {
+    value.is_empty() || ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "persistent"].contains(&value)
+}
+
+fn wizard_form() -> anyhow::Result<Option<cutex::agent_management::HumanAdoptResult>> {
     let name = super::prompt::prompt_line("New agent name (empty cancels)", "")?;
     if name.is_empty() {
         return Ok(None);
@@ -204,11 +229,24 @@ pub(super) fn wizard() -> anyhow::Result<Option<cutex::agent_management::HumanAd
         &std::env::current_dir()?.to_string_lossy(),
     )?;
     let defaults = cutex::config::store::load_codez_config_checked()?;
-    let profile = super::prompt::prompt_line("Profile", defaults.default_profile.as_deref().unwrap_or(""))?;
+    let profiles = super::account_store::load_profile_names_read_only()?;
+    ensure!(!profiles.is_empty(), "No profiles configured; add a profile in Settings first");
+    println!("Available profiles:");
+    for (index, name) in profiles.iter().enumerate() { println!("  {}. {}", index + 1, name); }
+    let profile = loop {
+        let input = super::prompt::prompt_line("Profile (name or number)", defaults.default_profile.as_deref().unwrap_or(""))?;
+        match selected_profile(&input, &profiles) {
+            Ok(profile) => break profile,
+            Err(error) => println!("{error}"),
+        }
+    };
     let mut configuration = cutex::launch::stock::local_configuration_with_profile(Some(&profile))?;
     configuration.model = super::prompt::prompt_line("Model", &configuration.model)?;
-    let reasoning = super::prompt::prompt_line("Reasoning effort (none/minimal/low/medium/high/xhigh)", configuration.reasoning.as_deref().unwrap_or(""))?;
-    ensure!(reasoning.is_empty() || ["none", "minimal", "low", "medium", "high", "xhigh"].contains(&reasoning.as_str()), "Unknown reasoning effort");
+    let reasoning = loop {
+        let value = super::prompt::prompt_line("Reasoning effort (none/minimal/low/medium/high/xhigh/max/ultra/persistent)", configuration.reasoning.as_deref().unwrap_or(""))?;
+        if valid_reasoning(&value) { break value; }
+        println!("Unknown reasoning effort; choose a listed value.");
+    };
     configuration.reasoning = (!reasoning.is_empty()).then_some(reasoning);
     let notification = super::prompt::prompt_line("Notification (important/normal/off)", match defaults.new_session_notification {
         cutex::notify::session::Level::Important => "important",
@@ -280,4 +318,21 @@ pub(super) fn create_owned_session(profile: &str, cwd: &std::path::Path) -> anyh
             creation_defaults:Some(cutex::agent_management::HumanCreationDefaults{profile:profile.into(),model:configuration.model,reasoning:configuration.reasoning}),
         }).with_context(||format!("Session {native} exists; runtime registration incomplete, retain this ID"))?;
     Ok(result.adopted.record.cutex_session_id)
+}
+
+#[cfg(test)]
+mod wizard_tests {
+    use super::*;
+    #[test]
+    fn profiles_accept_names_or_numbers_without_silent_fallback() {
+        let profiles = vec!["aemeath".into(), "GLM".into()];
+        assert_eq!(selected_profile("GLM", &profiles).unwrap(), "GLM");
+        assert_eq!(selected_profile("2", &profiles).unwrap(), "GLM");
+        for invalid in ["0", "3", "unknown", ""] { assert!(selected_profile(invalid, &profiles).is_err()); }
+    }
+    #[test]
+    fn native_reasoning_defaults_are_accepted() {
+        for value in ["", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "persistent"] { assert!(valid_reasoning(value)); }
+        assert!(!valid_reasoning("maximum"));
+    }
 }

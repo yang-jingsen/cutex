@@ -376,10 +376,11 @@ impl Settings {
             self.model_auto_compact_token_limit.is_none_or(|v| v > 0),
             "invalid compaction limit"
         );
-        for (path, trust) in &self.projects {
+        // Trust keys are native configuration metadata, not launch paths.
+        // A shared profile can retain keys from another operating system.
+        for trust in self.projects.values() {
             ensure!(
-                Path::new(path).is_absolute()
-                    && matches!(trust.trust_level.as_str(), "trusted" | "untrusted"),
+                matches!(trust.trust_level.as_str(), "trusted" | "untrusted"),
                 "invalid reviewed project trust"
             );
         }
@@ -827,6 +828,20 @@ impl Projection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_trust_keys_preserve_both_platforms_without_becoming_launch_paths() {
+        let config = Config::parse(r#"cutex_provider_mode="selected_profile_v2"
+[projects.'/home/example/work']
+trust_level = "trusted"
+[projects.'E:\work']
+trust_level = "untrusted"
+"#).unwrap();
+        let settings = Settings { projects: config.projects, ..Default::default() };
+        settings.validate().unwrap();
+        assert_eq!(settings.projects.len(), 2);
+        assert_eq!(settings.projects[r"E:\work"].trust_level, "untrusted");
+        assert_eq!(settings.projects["/home/example/work"].trust_level, "trusted");
+    }
     #[test]
     fn native_windows_options_are_accepted_and_preserved() {
         let config = Config::parse("cutex_provider_mode='selected_profile_v2'\n[windows]\nsandbox='unelevated'\n").unwrap();

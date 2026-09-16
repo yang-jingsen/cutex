@@ -323,6 +323,26 @@ pub(crate) fn ensure_task_watchdog_fact_committed(
     Ok(())
 }
 
+/// Records an authenticated terminal observation, not delivery/read acknowledgement.
+pub(crate) fn ensure_job_terminal_observed(
+    request: &crate::agent_bus::job_completion::CompletionV2,
+) -> anyhow::Result<()> {
+    request.validate()?;
+    let _ = append_owner_event_once_with_repository_policy(
+        management_v2_repository()?,
+        &request.target_cutex_session_id,
+        "cutex/jobService/terminalObserved",
+        &request.event_id,
+        serde_json::to_value(request)?,
+        EventCorrelation {
+            management_request_id: Some(request.event_id.clone()),
+            ..Default::default()
+        },
+        MissingCommittedEventPolicy::AcceptCommittedOutsideRetention,
+    )?;
+    Ok(())
+}
+
 fn task_watchdog_fact_method(
     fact: &crate::task_service::TaskWatchdogFact,
 ) -> anyhow::Result<&'static str> {
@@ -583,6 +603,44 @@ fn find_integration_event(
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn job_terminal_observation_retry_commits_one_owner_event() {
+        let root = std::env::temp_dir().join(format!("cutex-job-event-{}", uuid::Uuid::new_v4()));
+        let repository = EventRepository::open(&root, current_host_name()).unwrap();
+        let owner = "cutex.11111111-1111-4111-8111-111111111111";
+        let params = serde_json::json!({
+            "schema":"cutex.job_service.completion.v2", "eventId":"job-terminal:job_123:3",
+            "jobId":"job_123", "jobRevision":3, "terminalStatus":"exited",
+            "resultSha256":"a".repeat(64), "targetCutexSessionId":owner,
+            "facts":{"factsVersion":1,"actionId":"run",
+                "stdout":{"observedBytes":0,"retainedBytes":0,"truncated":false},
+                "stderr":{"observedBytes":0,"retainedBytes":0,"truncated":false}},
+            "outputReference":"job-output:job_123"
+        });
+        let mut event_id = None;
+        for _ in 0..2 {
+            let event = append_owner_event_once_with_repository_policy(
+                &repository, owner, "cutex/jobService/terminalObserved", "job-terminal:job_123:3",
+                params.clone(), EventCorrelation {
+                    management_request_id: Some("job-terminal:job_123:3".into()),
+                    ..Default::default()
+                }, MissingCommittedEventPolicy::AcceptCommittedOutsideRetention,
+            ).unwrap().unwrap();
+            if let Some(id) = &event_id { assert_eq!(id, &event.event_id); }
+            event_id = Some(event.event_id);
+        }
+        let page = repository.page(ReplayQuery {
+            stream_id: None, after: None, limit: 100,
+            cutex_session_id: Some(owner.into()),
+        }).unwrap();
+        assert_eq!(page.events.len(), 1);
+        assert!(crate::notify::outbound::map_event(
+            &page.events[0], crate::notify::session::Level::Normal, "worker"
+        ).is_some());
+        drop(repository);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn management_phase_fact_replay_keeps_one_raw_frontend_event() {

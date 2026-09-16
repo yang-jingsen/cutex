@@ -130,6 +130,7 @@ impl ProjectMenuAction {
 
 #[derive(Debug)]
 pub(super) struct CutexProjectsModel {
+    sort_order: cutex::profiles::list_preferences::ListSort,
     details_text: Option<String>,
     status_scroll: views::DetailScroll,
     detail_scroll: views::DetailScroll,
@@ -177,6 +178,7 @@ pub(super) struct CutexProjectsModel {
 impl CutexProjectsModel {
     fn empty_with_failure(error: impl Into<String>) -> Self {
         Self {
+            sort_order: Default::default(),
             member_selected: None,
             member_index: 0,
             member_inspecting: false,
@@ -224,7 +226,7 @@ impl CutexProjectsModel {
 
     fn visible_indices(&self) -> Vec<usize> {
         let query = self.query.value().trim().to_lowercase();
-        self.projects
+        let mut indices: Vec<usize> = self.projects
             .iter()
             .enumerate()
             .filter_map(|(index, project)| {
@@ -252,7 +254,11 @@ impl CutexProjectsModel {
                             .contains(&query)))
                 .then_some(index)
             })
-            .collect()
+            .collect();
+        indices.sort_by(|a, b| self.sort_order.compare_names(
+            &self.projects[*a].presentation.display_name,
+            &self.projects[*b].presentation.display_name));
+        indices
     }
 
     fn retain_selection(&mut self) {
@@ -551,6 +557,7 @@ fn load_model() -> anyhow::Result<CutexProjectsModel> {
     let durable_candidates = client.durable_candidates()?;
     let available_agents = candidate_choices(&durable_candidates);
     Ok(CutexProjectsModel {
+        sort_order: Default::default(),
         member_selected: None,
         member_index: 0,
         member_inspecting: false,
@@ -1313,7 +1320,8 @@ fn project_commands(model: &CutexProjectsModel) -> Vec<(Command, Option<&'static
                 {
                     Some("Finish the current editor/review")
                 }
-                Command::Sort | Command::LoadMore | Command::Titles | Command::Scope => {
+                Command::Sort if model.view != ProjectView::List => Some("Return to the Project list"),
+                Command::LoadMore | Command::Titles | Command::Scope => {
                     Some("Available on Recent / Managed")
                 }
                 Command::Actions | Command::Edit | Command::Inspect
@@ -1373,6 +1381,13 @@ fn project_command(
         }
     }
     match command {
+        Command::Sort => {
+            let selected = model.selected_project().map(|p| p.project_id.clone());
+            model.sort_order = model.sort_order.next_names();
+            model.selected = model.visible_indices().iter().position(|i| Some(&model.projects[*i].project_id) == selected.as_ref()).unwrap_or(0);
+            model.notice = Some(format!("Sort: {}", model.sort_order.label()));
+            None
+        }
         Command::Archived => {
             if model.view == ProjectView::List {
                 model.show_archived = !model.show_archived;
@@ -2096,6 +2111,7 @@ fn render(frame: &mut Frame<'_>, model: &CutexProjectsModel) {
                 ("Alt+N", "create"),
                 ("←/→", "panels"),
                 ("/", "filter"),
+                ("Alt+S", "sort"),
                 ("F5", "refresh"),
                 ("F2", "details"),
                 ("F1", "commands"),
@@ -4670,6 +4686,16 @@ mod tests {
         assert!(rendered(&model_with_projects(), 90, 18).contains("Render Lab"));
     }
 
+    #[test]
+    fn project_name_sort_preserves_original_order_when_reset() {
+        let mut model = model_with_projects();
+        model.projects[0].presentation.display_name = "Zebra".into();
+        model.projects[1].presentation.display_name = "alpha".into();
+        model.sort_order = cutex::profiles::list_preferences::ListSort::NameAsc;
+        assert_eq!(model.visible_indices(), vec![1, 0]);
+        model.sort_order = Default::default();
+        assert_eq!(model.visible_indices(), vec![0, 1]);
+    }
     #[test]
     fn projects_rows_show_configured_badges_selected_narrow_wide_and_blank_slot() {
         let mut model = model_with_projects();

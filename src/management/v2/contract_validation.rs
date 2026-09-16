@@ -73,6 +73,12 @@ fn validate_task_service_event_contract(message: &Value) -> Result<(), String> {
         return Ok(());
     };
     let result = match method {
+        "cutex/jobService/terminalObserved" => {
+            let fact: crate::agent_bus::job_completion::CompletionV2 =
+                serde_json::from_value(params.clone())
+                    .map_err(|error| format!("invalid Job terminal fact: {error}"))?;
+            fact.validate().map_err(|error| error.to_string())
+        }
         "cutex/taskService/assignmentCommitted" | "cutex/taskService/communicationRecorded" => {
             let receipt: ProviderReceipt = serde_json::from_value(params.clone())
                 .map_err(|error| format!("invalid Task Service receipt: {error}"))?;

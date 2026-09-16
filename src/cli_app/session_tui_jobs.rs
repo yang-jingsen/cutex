@@ -24,6 +24,8 @@ use tui_input::Input;
 
 #[derive(Default)]
 struct Model {
+    sort_order: cutex::profiles::list_preferences::ListSort,
+    original_rows: Vec<Value>,
     rows: Vec<Value>,
     selected: usize,
     query: Input,
@@ -36,6 +38,14 @@ struct Model {
     loading: bool,
     notice: String,
     generation: u64,
+}
+impl Model {
+    fn apply_sort(&mut self) {
+        let selected = self.rows.get(self.selected).map(|v| text(v, "jobId"));
+        self.rows = self.original_rows.clone();
+        self.rows.sort_by(|a, b| self.sort_order.compare_names(&text(a, "actionId"), &text(b, "actionId")));
+        self.selected = selected.and_then(|id| self.rows.iter().position(|v| text(v, "jobId") == id)).unwrap_or(0);
+    }
 }
 fn text(value: &Value, key: &str) -> String {
     value[key]
@@ -255,6 +265,7 @@ fn render(frame: &mut ratatui::Frame, model: &mut Model) {
             ("Enter", "details"),
             ("/", "filter"),
             ("N/P", "pages"),
+            ("Alt+S", "sort"),
             ("R", "refresh"),
             ("Alt+B", "details"),
             ("Esc", "back"),
@@ -285,7 +296,8 @@ pub(super) fn run(
                 match result {
                     Ok(value) => {
                         let selected = model.rows.get(model.selected).map(|v| text(v, "jobId"));
-                        model.rows = value["data"].as_array().cloned().unwrap_or_default();
+                        model.original_rows = value["data"].as_array().cloned().unwrap_or_default();
+                        model.apply_sort();
                         model.selected = selected
                             .and_then(|id| model.rows.iter().position(|v| text(v, "jobId") == id))
                             .unwrap_or(0);
@@ -356,6 +368,12 @@ pub(super) fn run(
             }
             continue;
         }
+        if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('s' | 'S')) {
+            model.sort_order = model.sort_order.next_names();
+            model.apply_sort();
+            model.notice = format!("Sort: {} (action name, current page)", model.sort_order.label());
+            continue;
+        }
         if !key.modifiers.is_empty() {
             continue;
         }
@@ -401,6 +419,19 @@ pub(super) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sorting_keeps_job_selection_and_restores_server_order() {
+        let original = vec![json!({"jobId":"b","actionId":"Zebra"}), json!({"jobId":"a","actionId":"alpha"})];
+        let mut model = Model { rows: original.clone(), original_rows: original.clone(), ..Default::default() };
+        model.sort_order = model.sort_order.next_names();
+        model.apply_sort();
+        assert_eq!(model.rows[0]["jobId"], "a");
+        assert_eq!(model.rows[model.selected]["jobId"], "b");
+        model.sort_order = Default::default();
+        model.apply_sort();
+        assert_eq!(model.rows, original);
+        assert_eq!(model.selected, 0);
+    }
     #[test]
     fn pasted_filter_respects_utf8_byte_limit() {
         let result = append_filter(

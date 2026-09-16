@@ -448,9 +448,12 @@ impl AgentBusMessageRepository {
             if message.canonical_envelope.control_type.as_deref()
                 == Some(crate::agent_bus::job_completion::SCHEMA_V2)
             {
-                crate::agent_bus::job_completion::FrozenProjection::from_message(
+                let frozen = crate::agent_bus::job_completion::FrozenProjection::from_message(
                     &message.canonical_envelope,
                 )?;
+                if record_management_event {
+                    super::integration_events::ensure_job_terminal_observed(&frozen.request)?;
+                }
                 store.version = store.version.max(6);
             } else if presentation.is_some() {
                 store.version = store.version.max(5);

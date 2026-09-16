@@ -375,6 +375,7 @@ fn bounded_single_line(value: &str, max: usize) -> String {
 
 #[derive(Debug, Clone)]
 pub(super) struct TaskModel {
+    sort_order: cutex::profiles::list_preferences::ListSort,
     rows: Vec<TaskRow>,
     selected_assignment_id: Option<String>,
     query: Input,
@@ -391,6 +392,7 @@ pub(super) struct TaskModel {
 impl Default for TaskModel {
     fn default() -> Self {
         Self {
+            sort_order: Default::default(),
             rows: Vec::new(),
             selected_assignment_id: None,
             query: Input::default(),
@@ -408,14 +410,16 @@ impl Default for TaskModel {
 
 impl TaskModel {
     fn visible_indices(&self) -> Vec<usize> {
-        self.rows
+        let mut indices: Vec<usize> = self.rows
             .iter()
             .enumerate()
             .filter(|(_, row)| {
                 (self.show_closed || !row.state.is_closed()) && row.matches(self.query.value())
             })
             .map(|(index, _)| index)
-            .collect()
+            .collect();
+        indices.sort_by(|a, b| self.sort_order.compare_names(&self.rows[*a].task_id, &self.rows[*b].task_id));
+        indices
     }
 
     fn selected_visible_index(&self) -> Option<usize> {
@@ -664,6 +668,11 @@ fn handle_key(
         model.retain_selection();
         return None;
     }
+    if !model.filter_focused && input_policy::resolve(key) == Some(Command::Sort) {
+        model.sort_order = model.sort_order.next_names();
+        model.retain_selection();
+        return None;
+    }
     if input_policy::resolve(key) == Some(Command::Inspect) {
         model.filter_focused = false;
         model.detail = model.selected_row().is_some();
@@ -799,6 +808,7 @@ fn render(frame: &mut Frame<'_>, model: &TaskModel) {
             ("Enter/Alt+I", "inspect"),
             ("←/→", "panels"),
             ("/", "filter"),
+            ("Alt+S", "sort"),
             ("Ctrl+A", "history"),
             ("Alt+R", "reports"),
             ("F5", "refresh"),
@@ -816,8 +826,8 @@ fn render(frame: &mut Frame<'_>, model: &TaskModel) {
 }
 
 fn render_filter(frame: &mut Frame<'_>, area: Rect, model: &TaskModel) {
-    let title = if model.show_closed { " Filter tasks · all history [/] " } else { " Filter tasks · active [/] " };
-    input_policy::render_input(frame, area, &model.query, title, model.filter_focused);
+    let title = format!(" Filter tasks · {} · {} [/] ", if model.show_closed { "all history" } else { "active" }, model.sort_order.label());
+    input_policy::render_input(frame, area, &model.query, &title, model.filter_focused);
 }
 
 fn render_table(frame: &mut Frame<'_>, area: Rect, model: &TaskModel) {
@@ -1084,6 +1094,16 @@ fn detail_field(label: &str, value: String) -> Line<'static> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sort_keeps_assignment_selected_and_default_order() {
+        let mut model = TaskModel { rows: vec![row("z", TaskState::Running, "2026-01-01"), row("a", TaskState::Running, "2026-01-01")], selected_assignment_id: Some("z".into()), ..Default::default() };
+        let mut cadence = RefreshCadence::new(Instant::now());
+        handle_key(&mut model, &mut cadence, KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT));
+        assert_eq!(model.visible_indices(), vec![1, 0]);
+        assert_eq!(model.selected_row().unwrap().assignment_id, "z");
+        model.sort_order = Default::default();
+        assert_eq!(model.visible_indices(), vec![0, 1]);
+    }
     #[test]
     fn task_filter_handles_paste_only_while_focused() {
         let mut model = TaskModel::default();

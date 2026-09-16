@@ -39,6 +39,13 @@ impl ListSort {
             _ => anyhow::bail!("Unknown list sort order"),
         }
     }
+    pub fn next_names(self) -> Self {
+        match self {
+            Self::Default => Self::NameAsc,
+            Self::NameAsc => Self::NameDesc,
+            _ => Self::Default,
+        }
+    }
     pub fn next(self) -> Self {
         match self {
             Self::Default => Self::NameAsc,
