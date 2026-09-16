@@ -2317,7 +2317,7 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_selects_the_profiles_actual_host_or_docker_codex_home() {
+    fn reconciliation_selects_host_home_and_rejects_retired_docker() {
         let home = crate::cli_app::test_home::IsolatedTestHome::new(
             "cutex-agent-management-profile-codex-home",
         )
@@ -2332,14 +2332,7 @@ mod tests {
             image: "cutex-dev".to_string(),
             user_name: Some("worker".to_string()),
         });
-        assert_eq!(
-            selected_profile_codex_home(&docker).unwrap(),
-            home.root()
-                .join(".cutex")
-                .join("runtime")
-                .join("docker-home")
-                .join(".codex")
-        );
+        assert!(selected_profile_codex_home(&docker).unwrap_err().to_string().contains("Docker integration was retired"));
     }
 
     #[cfg(unix)]

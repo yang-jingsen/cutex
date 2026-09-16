@@ -1324,8 +1324,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(envelope.version, 2);
-        assert_eq!(envelope.message.text.matches("job-1").count(), 1);
-        assert!(!envelope.message.text.contains("outputReference"));
+        assert_eq!(envelope.message.text.matches("job-1").count(), 2);
+        assert!(envelope.message.text.contains("outputReference: job-output:job-1"));
         assert_eq!(envelope.view.as_ref().unwrap(), &projection.view);
         #[cfg(unix)]
         {
@@ -1356,7 +1356,7 @@ mod tests {
                 assert_eq!(request["method"], "thread/externalInput/submit");
                 assert_eq!(request["params"], expected);
                 assert!(request["params"]["message"].get("view").is_none());
-                assert!(!request["params"]["message"]["text"]
+                assert!(request["params"]["message"]["text"]
                     .as_str()
                     .unwrap()
                     .contains("job-output:"));

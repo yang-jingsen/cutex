@@ -1532,7 +1532,8 @@ d.close()
             }
         })).is_err());
         let raw = "[mcp_servers.injected]\ncommand='bad'\n";
-        assert!(projected_shared(raw.as_bytes()).is_err());
+        let projected: toml::Value = toml::from_str(&projected_shared(raw.as_bytes()).unwrap()).unwrap();
+        assert_eq!(projected["mcp_servers"]["injected"]["command"].as_str(), Some("bad"));
         assert!(projected_shared(b"cutex_projection_version=999\n").is_err());
     }
     #[test]

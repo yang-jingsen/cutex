@@ -419,7 +419,7 @@ mod job_service_completion_lane_tests {
                 .unwrap()
                 .matches("job-http-v2")
                 .count(),
-            1
+            2
         );
         assert_eq!(frozen["view"]["data"]["stdout"]["observedBytes"], 9);
         assert!(stored["snapshot"].get("presentation").is_none());

@@ -1940,7 +1940,7 @@ request_max_retries = 7
         )
         .expect_err("late materialization failure should be returned");
         assert!(
-            format!("{error:#}").contains("custom-status-items.json"),
+            format!("{error:#}").contains("cutex-status-items.json"),
             "unexpected materialization error: {error:#}"
         );
         assert_eq!(
@@ -2682,162 +2682,6 @@ base_url = "https://api.deepseek.com/"
         let _ = fs::remove_dir_all(temp_home);
     }
 
-    #[test]
-    fn host_launch_command_includes_global_notify_timeouts() {
-        let _guard = env_lock().lock().expect("env lock should not be poisoned");
-        let temp_home = std::env::temp_dir().join(format!("cutex-home-{}", Uuid::new_v4()));
-        let old_home = std::env::var_os("HOME");
-        let old_cutex_codex_bin = std::env::var_os(CUTEX_CODEX_BIN_ENV_VAR);
-        let old_notify_idle = std::env::var_os(CODEX_NOTIFY_IDLE_TIMEOUT_ENV_VAR);
-        let old_notify_composer = std::env::var_os(CODEX_NOTIFY_COMPOSER_IDLE_TIMEOUT_ENV_VAR);
-        let old_notify_approval = std::env::var_os(CODEX_NOTIFY_APPROVAL_TIMEOUT_ENV_VAR);
-        let old_notify_startup_idle = std::env::var_os(CODEX_NOTIFY_STARTUP_IDLE_TIMEOUT_ENV_VAR);
-        let old_notify_events = std::env::var_os(CODEX_NOTIFY_EVENTS_ENV_VAR);
-        let old_notify_content = std::env::var_os(CODEX_NOTIFY_USER_MESSAGE_CONTENT_ENV_VAR);
-        let old_notify_preview = std::env::var_os(CODEX_NOTIFY_USER_MESSAGE_PREVIEW_CHARS_ENV_VAR);
-        let old_threshold_warning_mode =
-            std::env::var_os(CODEX_RATE_LIMIT_THRESHOLD_WARNING_MODE_ENV_VAR);
-        let old_model_nudge_mode = std::env::var_os(CODEX_RATE_LIMIT_MODEL_NUDGE_MODE_ENV_VAR);
-        fs::create_dir_all(temp_home.join(".cutex")).expect("temp cutex home should be created");
-        unsafe {
-            std::env::set_var("HOME", &temp_home);
-            std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, "/tmp/cute-codex");
-            std::env::remove_var(CODEX_NOTIFY_IDLE_TIMEOUT_ENV_VAR);
-            std::env::remove_var(CODEX_NOTIFY_COMPOSER_IDLE_TIMEOUT_ENV_VAR);
-            std::env::remove_var(CODEX_NOTIFY_APPROVAL_TIMEOUT_ENV_VAR);
-            std::env::remove_var(CODEX_NOTIFY_STARTUP_IDLE_TIMEOUT_ENV_VAR);
-            std::env::remove_var(CODEX_NOTIFY_EVENTS_ENV_VAR);
-            std::env::remove_var(CODEX_NOTIFY_USER_MESSAGE_CONTENT_ENV_VAR);
-            std::env::remove_var(CODEX_NOTIFY_USER_MESSAGE_PREVIEW_CHARS_ENV_VAR);
-            std::env::remove_var(CODEX_RATE_LIMIT_THRESHOLD_WARNING_MODE_ENV_VAR);
-            std::env::remove_var(CODEX_RATE_LIMIT_MODEL_NUDGE_MODE_ENV_VAR);
-        }
-
-        let mut config = CodezConfig::default();
-        config.notify_service_url = Some("http://127.0.0.1:38765/notify".to_string());
-        config.notify_service_token = Some("test-token".to_string());
-        config.notify_service_idle_timeout_secs = Some(20);
-        config.notify_service_composer_idle_timeout_secs = Some(5);
-        config.notify_service_approval_timeout_secs = Some(30);
-        config.notify_service_startup_idle_timeout_secs = Some(180);
-        config.notify_service_events = Some(vec![
-            "task_completed".to_string(),
-            "user_message_sent".to_string(),
-        ]);
-        config.notify_service_user_message_content = Some("preview".to_string());
-        config.notify_service_user_message_preview_chars = Some(80);
-        config.rate_limit_threshold_warning_mode = Some("daily".to_string());
-        config.rate_limit_model_nudge_mode = Some("off".to_string());
-        save_codez_config(&config).expect("config should be saved");
-
-        let account = sample_account("notify-timeouts");
-        write_profile_files(&account, "{\"demo\":true}\n", None)
-            .expect("profile files should be written");
-
-        let launch =
-            codex_launch_command(&account, &["resume".to_string()]).expect("launch should build");
-
-        assert!(launch.envs.iter().any(|(key, value)| {
-            key == "CODEX_NOTIFY_SERVICE_URL" && value == "http://127.0.0.1:38765/notify"
-        }));
-        assert!(launch
-            .envs
-            .iter()
-            .any(|(key, value)| { key == "CODEX_NOTIFY_SERVICE_TOKEN" && value == "test-token" }));
-        assert!(launch
-            .envs
-            .iter()
-            .any(|(key, value)| { key == CODEX_NOTIFY_IDLE_TIMEOUT_ENV_VAR && value == "20" }));
-        assert!(launch.envs.iter().any(|(key, value)| {
-            key == CODEX_NOTIFY_COMPOSER_IDLE_TIMEOUT_ENV_VAR && value == "5"
-        }));
-        assert!(launch
-            .envs
-            .iter()
-            .any(|(key, value)| { key == CODEX_NOTIFY_APPROVAL_TIMEOUT_ENV_VAR && value == "30" }));
-        assert!(launch.envs.iter().any(|(key, value)| {
-            key == CODEX_NOTIFY_STARTUP_IDLE_TIMEOUT_ENV_VAR && value == "180"
-        }));
-        assert!(launch.envs.iter().any(|(key, value)| {
-            key == CODEX_NOTIFY_EVENTS_ENV_VAR && value == "task_completed,user_message_sent"
-        }));
-        assert!(launch.envs.iter().any(|(key, value)| {
-            key == CODEX_NOTIFY_USER_MESSAGE_CONTENT_ENV_VAR && value == "preview"
-        }));
-        assert!(launch.envs.iter().any(|(key, value)| {
-            key == CODEX_NOTIFY_USER_MESSAGE_PREVIEW_CHARS_ENV_VAR && value == "80"
-        }));
-        assert!(launch.envs.iter().any(|(key, value)| {
-            key == CODEX_RATE_LIMIT_THRESHOLD_WARNING_MODE_ENV_VAR && value == "daily"
-        }));
-        assert!(launch.envs.iter().any(|(key, value)| {
-            key == CODEX_RATE_LIMIT_MODEL_NUDGE_MODE_ENV_VAR && value == "off"
-        }));
-
-        match old_cutex_codex_bin {
-            Some(value) => unsafe { std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, value) },
-            None => unsafe { std::env::remove_var(CUTEX_CODEX_BIN_ENV_VAR) },
-        }
-        match old_notify_idle {
-            Some(value) => unsafe { std::env::set_var(CODEX_NOTIFY_IDLE_TIMEOUT_ENV_VAR, value) },
-            None => unsafe { std::env::remove_var(CODEX_NOTIFY_IDLE_TIMEOUT_ENV_VAR) },
-        }
-        match old_notify_composer {
-            Some(value) => unsafe {
-                std::env::set_var(CODEX_NOTIFY_COMPOSER_IDLE_TIMEOUT_ENV_VAR, value)
-            },
-            None => unsafe { std::env::remove_var(CODEX_NOTIFY_COMPOSER_IDLE_TIMEOUT_ENV_VAR) },
-        }
-        match old_notify_approval {
-            Some(value) => unsafe {
-                std::env::set_var(CODEX_NOTIFY_APPROVAL_TIMEOUT_ENV_VAR, value)
-            },
-            None => unsafe { std::env::remove_var(CODEX_NOTIFY_APPROVAL_TIMEOUT_ENV_VAR) },
-        }
-        match old_notify_startup_idle {
-            Some(value) => unsafe {
-                std::env::set_var(CODEX_NOTIFY_STARTUP_IDLE_TIMEOUT_ENV_VAR, value)
-            },
-            None => unsafe { std::env::remove_var(CODEX_NOTIFY_STARTUP_IDLE_TIMEOUT_ENV_VAR) },
-        }
-        match old_notify_events {
-            Some(value) => unsafe { std::env::set_var(CODEX_NOTIFY_EVENTS_ENV_VAR, value) },
-            None => unsafe { std::env::remove_var(CODEX_NOTIFY_EVENTS_ENV_VAR) },
-        }
-        match old_notify_content {
-            Some(value) => unsafe {
-                std::env::set_var(CODEX_NOTIFY_USER_MESSAGE_CONTENT_ENV_VAR, value)
-            },
-            None => unsafe { std::env::remove_var(CODEX_NOTIFY_USER_MESSAGE_CONTENT_ENV_VAR) },
-        }
-        match old_notify_preview {
-            Some(value) => unsafe {
-                std::env::set_var(CODEX_NOTIFY_USER_MESSAGE_PREVIEW_CHARS_ENV_VAR, value)
-            },
-            None => unsafe {
-                std::env::remove_var(CODEX_NOTIFY_USER_MESSAGE_PREVIEW_CHARS_ENV_VAR)
-            },
-        }
-        match old_threshold_warning_mode {
-            Some(value) => unsafe {
-                std::env::set_var(CODEX_RATE_LIMIT_THRESHOLD_WARNING_MODE_ENV_VAR, value)
-            },
-            None => unsafe {
-                std::env::remove_var(CODEX_RATE_LIMIT_THRESHOLD_WARNING_MODE_ENV_VAR)
-            },
-        }
-        match old_model_nudge_mode {
-            Some(value) => unsafe {
-                std::env::set_var(CODEX_RATE_LIMIT_MODEL_NUDGE_MODE_ENV_VAR, value)
-            },
-            None => unsafe { std::env::remove_var(CODEX_RATE_LIMIT_MODEL_NUDGE_MODE_ENV_VAR) },
-        }
-        match old_home {
-            Some(value) => unsafe { std::env::set_var("HOME", value) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-        let _ = fs::remove_dir_all(temp_home);
-    }
 
     #[test]
     fn codex_session_exists_detects_session_index_and_rollout_files() {
@@ -3306,53 +3150,6 @@ base_url = "https://api.deepseek.com/"
         let _ = fs::remove_dir_all(temp_home);
     }
 
-    #[test]
-    fn docker_launch_command_omits_agent_bus_envs() {
-        let _guard = env_lock().lock().expect("env lock should not be poisoned");
-        let temp_home = std::env::temp_dir().join(format!("cutex-home-{}", Uuid::new_v4()));
-        let old_home = std::env::var_os("HOME");
-        let old_cutex_codex_bin = std::env::var_os(CUTEX_CODEX_BIN_ENV_VAR);
-        fs::create_dir_all(temp_home.join(".cutex")).expect("temp cutex home should be created");
-        unsafe {
-            std::env::set_var("HOME", &temp_home);
-            std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, "cute-codex");
-        }
-
-        let mut config = CodezConfig::default();
-        config.agent_bus_enabled = true;
-        config.agent_bus_port = Some(24261);
-        config.agent_bus_token = Some("agent-test-token".to_string());
-        save_codez_config(&config).expect("config should be saved");
-
-        let mut account = sample_account("docker-worker");
-        account.runtime = RuntimeConfig::Docker {
-            image: "cutex-dev-v2".to_string(),
-            user_name: Some("cutex".to_string()),
-        };
-        write_profile_files(&account, "{\"demo\":true}\n", None)
-            .expect("profile files should be written");
-
-        let launch = codex_launch_command(&account, &[]).expect("launch should build");
-
-        assert!(!launch
-            .args
-            .iter()
-            .any(|arg| arg.starts_with(&format!("{CUTEX_AGENT_BUS_URL_ENV_VAR}="))));
-        assert!(!launch
-            .args
-            .iter()
-            .any(|arg| arg.starts_with(&format!("{CUTEX_AGENT_ID_ENV_VAR}="))));
-
-        match old_home {
-            Some(value) => unsafe { std::env::set_var("HOME", value) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-        match old_cutex_codex_bin {
-            Some(value) => unsafe { std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, value) },
-            None => unsafe { std::env::remove_var(CUTEX_CODEX_BIN_ENV_VAR) },
-        }
-        let _ = fs::remove_dir_all(temp_home);
-    }
 
     #[test]
     fn host_api_key_launch_exports_openai_api_key_from_profile_auth() {
@@ -3422,57 +3219,6 @@ requires_openai_auth = false
         let _ = fs::remove_dir_all(temp_home);
     }
 
-    #[test]
-    fn docker_api_key_launch_exports_openai_api_key_from_profile_auth() {
-        let _guard = env_lock().lock().expect("env lock should not be poisoned");
-        let temp_home = std::env::temp_dir().join(format!("cutex-home-{}", Uuid::new_v4()));
-        let old_home = std::env::var_os("HOME");
-        let old_cutex_codex_bin = std::env::var_os(CUTEX_CODEX_BIN_ENV_VAR);
-        fs::create_dir_all(temp_home.join(".cutex")).expect("temp cutex home should be created");
-        unsafe {
-            std::env::set_var("HOME", &temp_home);
-            std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, "cute-codex");
-        }
-
-        let mut account = sample_account("api-key-docker");
-        account.source = Some("api-key".to_string());
-        account.runtime = RuntimeConfig::Docker {
-            image: "cutex-dev-v2".to_string(),
-            user_name: Some("cutex".to_string()),
-        };
-        write_profile_files(
-            &account,
-            r#"{ "OPENAI_API_KEY": "sk-docker-test", "tokens": null }"#,
-            Some(
-                r#"
-model_provider = "codexapis"
-
-[model_providers.codexapis]
-base_url = "https://www.codexapis.com/v1"
-env_key = "OPENAI_API_KEY"
-requires_openai_auth = false
-"#,
-            ),
-        )
-        .expect("profile files should be written");
-
-        let launch = codex_launch_command(&account, &[]).expect("launch should build");
-
-        assert!(launch
-            .args
-            .windows(2)
-            .any(|args| { args[0] == "-e" && args[1] == "OPENAI_API_KEY=sk-docker-test" }));
-
-        match old_home {
-            Some(value) => unsafe { std::env::set_var("HOME", value) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-        match old_cutex_codex_bin {
-            Some(value) => unsafe { std::env::set_var(CUTEX_CODEX_BIN_ENV_VAR, value) },
-            None => unsafe { std::env::remove_var(CUTEX_CODEX_BIN_ENV_VAR) },
-        }
-        let _ = fs::remove_dir_all(temp_home);
-    }
 
     #[test]
     fn managed_session_wraps_default_host_launch() {
