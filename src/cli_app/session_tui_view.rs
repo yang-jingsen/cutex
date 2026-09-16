@@ -986,7 +986,7 @@ fn inspector_lines(row: &AgentSessionView) -> Vec<Line<'static>> {
         ])
     };
     let mut lines = vec![
-        name_line(row, row.name.width() + 5),
+        name_line(row, row.name.width() + cutex::management::connections::short_display(&row.host).width() + 6),
         field(
             "Status",
             row.runtime.label(),
